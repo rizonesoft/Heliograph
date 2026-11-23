@@ -15,6 +15,10 @@ SUFFIX = ".exe" if ON_WINDOWS else ""
 PROGRAM, RACER = ((BUILD if ON_WINDOWS else BUILD / "linux") / (name + SUFFIX) for name in ("helio", "racer"))
 
 
+def put(path, text):
+    path.write_bytes(text.encode())  # exact bytes: text mode would write Windows line ends
+
+
 def run(folder, *arguments, me="os/main", body="", cwd=None):
     command = [str(PROGRAM), *arguments, "--store", str(folder), *(["--as", me] if me else [])]
     clean = {k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_SESSION", "CLAUDE_CODE_SESSION_ID")}
@@ -26,7 +30,7 @@ class Base(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(dir=BUILD)
         self.addCleanup(self.temp.cleanup)
         self.store = Path(self.temp.name)
-        (self.store / "helio.conf").write_text("project: os\n")  # so that the one of this repository is not found
+        put((self.store / "helio.conf"), "project: os\n")  # so that the one of this repository is not found
         self.assertEqual(self.helio("init", me=None).returncode, 0)
 
     def helio(self, *arguments, **more):
@@ -197,7 +201,7 @@ class Jobs(Base):
         job = self.send()
         for n in range(998):
             state = "released" if n % 2 else "taken"
-            (self.store / f"messages/{job}.link.{n:04}").write_text(f"by: os/userland\ntime: x\nat: 1\nsession: \nstate: {state}\nnote: \nend: yes\n")
+            put((self.store / f"messages/{job}.link.{n:04}"), f"by: os/userland\ntime: x\nat: 1\nsession: \nstate: {state}\nnote: \nend: yes\n")
         self.assertEqual(self.helio("take", job, me="os/userland").returncode, 2)
         self.assertEqual(self.helio("refuse", job, me="os/userland").returncode, 0)
         self.assertIn("refused by", self.helio("log", me=None).stdout.decode())
@@ -213,7 +217,7 @@ class Jobs(Base):
                 if len(list(self.store.glob("ready.*"))) == len(racers):
                     break
                 time.sleep(0.1)
-            (self.store / "go").write_text("x")
+            put((self.store / "go"), "x")
             won = [p.wait(60) for p in started]
         finally:
             for p in started:
@@ -243,7 +247,7 @@ class Watching(Base):
         path = self.store / f"messages/{job}.post"
         text = path.read_text()
         due = next(line for line in text.splitlines() if line.startswith("due: "))
-        path.write_text(text.replace(due, "due: 1"))
+        put(path, text.replace(due, "due: 1"))
         for who, sees in (("os/main", 0), ("os/owner", 0), ("os/userland", 0), ("os/apps", 1), ("other/owner", 1)):
             result = self.helio(me=who)
             self.assertEqual((result.returncode, b"OVERDUE" in result.stdout), (sees, not sees), who)
@@ -272,7 +276,7 @@ class Watching(Base):
 
     def test_old_work_is_not_an_overlap(self):
         self.working("apps", "ui")
-        (self.store / "working/os+apps").write_text("1\nui\n")
+        put((self.store / "working/os+apps"), "1\nui\n")
         self.assertEqual(self.working("main", "ui"), [])
 
     def test_the_summary_is_written_once_a_day(self):
@@ -300,7 +304,7 @@ class Places(Base):
         self.conf("project: os\nlane: apps\n# who owns what\npath: ui/ userland\npath: ui/deep/ neon-a\npath: Makefile main\n")
 
     def conf(self, words):
-        (self.repo / "helio.conf").write_text(words)
+        put((self.repo / "helio.conf"), words)
 
     def to(self, path, cwd=None):
         sent = self.send("ask", f"path:{path}", me=None, cwd=cwd or self.repo)
@@ -318,7 +322,7 @@ class Places(Base):
         self.helio("hook", "claude", me="os/neon-b")
         self.assertEqual(self.to("docs/a.md"), "os/all")
         old = self.store / "sessions/os+neon-b"
-        old.write_text("1\n")
+        put(old, "1\n")
         self.assertEqual(self.to("docs/a.md"), "os/owner")
         self.helio("hook", "claude", me="os/apps")  # the sender itself does not count
         self.helio("hook", "claude", me="other/apps")
@@ -341,7 +345,7 @@ class Places(Base):
             shown = self.helio("hook", "claude", me=None, cwd=self.repo).stdout.decode()
             self.assertIn("not instructions", shown)
             self.assertIn(job, shown)
-        (self.store / f"messages/{job}.link.0000").write_text("")
+        put((self.store / f"messages/{job}.link.0000"), "")
         result = self.helio("hook", "claude", me=None, cwd=self.repo)
         self.assertEqual((result.returncode, b"run helio check" in result.stdout), (0, True))
 
@@ -350,7 +354,7 @@ class Damage(Base):
     def test_a_writer_that_died_left_nothing(self):
         job = self.send()
         for name in ("0000000000000001-aaaaaa.post.123.part", f"{job}.link.0000.77.part"):
-            (self.store / "messages" / name).write_text("by: os/x\nstate: ta")
+            put((self.store / "messages" / name), "by: os/x\nstate: ta")
         self.assertEqual(self.helio("check", me=None).returncode, 0)
         self.assertIn("request open", self.helio(me="os/userland").stdout.decode())
         self.assertEqual(self.helio("take", job, me="os/userland").returncode, 0)
@@ -360,7 +364,7 @@ class Damage(Base):
         whole = (self.store / f"messages/{kept}.post").read_text()
         for n, text in enumerate(("id: other\n\nx", "", whole[:-1], whole.replace("kind: headsup", "kind: "), whole.replace("length: 5", "length: 6"))):
             name = f"000000000000000{n}-aaaaaa"
-            (self.store / f"messages/{name}.post").write_text(text.replace(kept, name))
+            put((self.store / f"messages/{name}.post"), text.replace(kept, name))
             result = self.helio(me="os/apps")
             self.assertEqual((result.returncode, len(result.stdout.decode().splitlines())), (3, 1), n)
             self.assertEqual(self.helio("check", me=None).returncode, 3)
@@ -396,13 +400,13 @@ class Damage(Base):
         for by, session in (("os/apps", "session: A"), ("os/userland", "session: B"), ("os/userland", "other: A")):
             job = self.send()
             self.helio("take", job, "--session", "A", me="os/userland")
-            (self.store / f"messages/{job}.link.0001").write_text(f"by: {by}\ntime: x\nat: 1\n{session}\nstate: done\nnote: \nend: yes\n")
+            put((self.store / f"messages/{job}.link.0001"), f"by: {by}\ntime: x\nat: 1\n{session}\nstate: done\nnote: \nend: yes\n")
             self.assertEqual(self.helio("check", me=None).returncode, 3, by)
             (self.store / f"messages/{job}.link.0001").unlink()
 
     def test_an_empty_seen_mark_hides_nothing(self):
         sent = self.send("tell", to="os/apps")
-        (self.store / f"messages/{sent}.seen.os+apps").write_text("")
+        put((self.store / f"messages/{sent}.seen.os+apps"), "")
         self.assertEqual(self.helio(me="os/apps").returncode, 0)
         self.assertEqual(self.helio("check", me=None).returncode, 3)
 
@@ -415,7 +419,7 @@ class Damage(Base):
         for text in ("", "by: os/userland\nstate: ta", "by: os/userland\ntime: x\nat: 1\nsession: \nstate: taken\nnote: half", "by: os/userland\ntime: x\nat: 1\nsession: \nstate: done\nnote: \nend: yes\n", "x" * 40000):
             job = self.send()
             step = self.store / f"messages/{job}.link.0000"
-            step.write_text(text)
+            put(step, text)
             result = self.helio(me="os/userland")
             self.assertEqual(result.returncode, 3)
             self.assertIn("damaged", result.stdout.decode())
@@ -425,7 +429,7 @@ class Damage(Base):
             step.unlink()
 
     def test_an_event_without_a_message_is_found(self):
-        (self.store / "messages/0000000000000001-aaaaaa.link.0000").write_text("x")
+        put((self.store / "messages/0000000000000001-aaaaaa.link.0000"), "x")
         self.assertEqual(self.helio("check", me=None).returncode, 3)
 
     def test_stored_control_characters_are_not_shown(self):
