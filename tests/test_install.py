@@ -1,6 +1,5 @@
 import concurrent.futures
 import errno
-import hashlib
 import importlib.util
 import json
 import os
@@ -9,7 +8,6 @@ import subprocess
 import sys
 import tempfile
 import threading
-import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -33,6 +31,21 @@ def find_built_binaries() -> tuple[Path, Path]:
     return helio, helio_exe
 
 
+def find_mingw_gcc() -> Path | None:
+    sdk_dir = Path(os.environ.get("IMPOSSIBLE_SDK_DIR") or (REPO.parent / "ImpossibleSDK"))
+    bootstrap_py = sdk_dir / "tools" / "bootstrap.py"
+    if not bootstrap_py.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location("sdk_bootstrap", bootstrap_py)
+    if not spec or not spec.loader:
+        return None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    part = {p["name"]: p for p in mod.components()}
+    cc = mod.home(part["llvm-mingw"]) / "bin" / "x86_64-w64-mingw32-gcc"
+    return cc if cc.is_file() else None
+
+
 def make_distinct_binary(src: Path, dst: Path, tag: bytes) -> None:
     """Copy a real executable and append a trailing marker so its SHA-256 is distinct while staying runnable."""
     data = src.read_bytes() + b"\n#HELIO_TEST_TAG=" + tag + b"\n"
@@ -54,8 +67,8 @@ def init_git_repo(path: Path, message: str = "init") -> str:
     return subprocess.run(["git", "rev-parse", "HEAD"], cwd=path, capture_output=True, text=True, check=True).stdout.strip()
 
 
-def make_fixture_sdk_bare_repo(root: Path, exe_src: Path) -> Path:
-    """Create a local bare git repo acting as ImpossibleSDK that compiles fixture C source into build/linux/linux/helio and runs unittest."""
+def make_fixture_sdk_bare_repo(root: Path, mingw_gcc: Path) -> Path:
+    """Create a local bare git repo acting as ImpossibleSDK that compiles BOTH helio and helio.exe from C source and runs unittest."""
     work = root / "sdk-work"
     work.mkdir(parents=True, exist_ok=True)
     tools = work / "tools"
@@ -67,12 +80,10 @@ repo = Path(sys.argv[1]).resolve()
 out_linux = repo / "build" / "linux" / "linux"
 out_linux.mkdir(parents=True, exist_ok=True)
 h_dst = out_linux / "helio"
-# Compile the fixture repo's own C source directly into the installed helio binary.
+e_dst = repo / "build" / "linux" / "helio.exe"
 subprocess.run(["cc", "-std=gnu23", "-O2", str(repo / "src" / "helio_fixture.c"), "-o", str(h_dst)], check=True)
 os.chmod(h_dst, 0o755)
-tag = (repo / "VERSION").read_bytes() if (repo / "VERSION").exists() else b"v1"
-e_dst = repo / "build" / "linux" / "helio.exe"
-e_dst.write_bytes(Path({str(exe_src)!r}).read_bytes() + b"\\n#TAG=" + tag + b"\\n")
+subprocess.run([{str(mingw_gcc)!r}, "-O2", str(repo / "src" / "helio_fixture_win.c"), "-o", str(e_dst)], check=True)
 os.chmod(e_dst, 0o755)
 subprocess.run([sys.executable, "-B", "-m", "unittest", "discover", "-s", str(repo / "tests"), "-v"], check=True)
 """
@@ -96,6 +107,7 @@ class TestQuickInstaller(unittest.TestCase):
         cls.helio_bin, cls.helio_exe = find_built_binaries()
         if not cls.helio_bin.is_file() or not cls.helio_exe.is_file():
             raise unittest.SkipTest(f"built binaries not found at {cls.helio_bin} and {cls.helio_exe}")
+        cls.mingw_gcc = find_mingw_gcc()
 
     def test_readme_documents_quick_start_and_subcommands(self) -> None:
         readme = (REPO / "README.md").read_text(encoding="utf-8")
@@ -105,36 +117,48 @@ class TestQuickInstaller(unittest.TestCase):
         self.assertIn("python3 Heliograph/tools/install.py --remove", readme)
         self.assertIn("python3 Heliograph/tools/install.py --to /custom/bin --status", readme)
 
-    def test_documented_command_missing_sdk_real_compile_and_failed_test(self) -> None:
+    def test_documented_command_missing_sdk_compiles_both_and_failed_test_preserves(self) -> None:
+        self.assertIsNotNone(self.mingw_gcc, "pinned llvm-mingw cross-compiler not found")
+        assert self.mingw_gcc is not None
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            bare_sdk = make_fixture_sdk_bare_repo(root, self.helio_exe)
+            bare_sdk = make_fixture_sdk_bare_repo(root, self.mingw_gcc)
             ws = root / "workspace"
             fixture_repo = ws / "Heliograph"
             (fixture_repo / "src").mkdir(parents=True)
             (fixture_repo / "tests").mkdir(parents=True)
             (fixture_repo / "tools").mkdir(parents=True)
             shutil.copy2(INSTALL_SCRIPT, fixture_repo / "tools" / "install.py")
-            # Real C source compiled by the fixture SDK into build/linux/linux/helio.
-            (fixture_repo / "src" / "helio_fixture.c").write_text(
-                '#include <stdio.h>\n'
-                '#include <string.h>\n'
-                '#include <sys/stat.h>\n'
-                'static const char *m1 = "HELIO_STORE";\n'
-                'static const char *m2 = "helio passes messages";\n'
-                'int main(int argc, char **argv) {\n'
-                '    if (argc >= 4 && strcmp(argv[1], "init") == 0 && strcmp(argv[2], "--store") == 0) {\n'
-                '        mkdir(argv[3], 0755);\n'
-                '        char buf[1024];\n'
-                '        snprintf(buf, sizeof buf, "%s/messages", argv[3]);\n'
-                '        mkdir(buf, 0755);\n'
-                '        return 0;\n'
-                '    }\n'
-                '    printf("%s %s fixture-v1\\n", m1, m2);\n'
-                '    return 0;\n'
-                '}\n',
-                encoding="utf-8",
-            )
+
+            def write_fixture_sources(tag: str) -> None:
+                (fixture_repo / "src" / "helio_fixture.c").write_text(
+                    '#include <stdio.h>\n'
+                    '#include <string.h>\n'
+                    '#include <sys/stat.h>\n'
+                    'static const char *m1 = "HELIO_STORE";\n'
+                    'static const char *m2 = "helio passes messages";\n'
+                    'int main(int argc, char **argv) {\n'
+                    '    if (argc >= 4 && strcmp(argv[1], "init") == 0 && strcmp(argv[2], "--store") == 0) {\n'
+                    '        mkdir(argv[3], 0755);\n'
+                    '        char buf[1024];\n'
+                    '        snprintf(buf, sizeof buf, "%s/messages", argv[3]);\n'
+                    '        mkdir(buf, 0755);\n'
+                    '        return 0;\n'
+                    '    }\n'
+                    f'    printf("%s %s {tag}\\n", m1, m2);\n'
+                    '    return 0;\n'
+                    '}\n',
+                    encoding="utf-8",
+                )
+                (fixture_repo / "src" / "helio_fixture_win.c").write_text(
+                    '#include <stdio.h>\n'
+                    'static const char *m1 = "HELIO_STORE";\n'
+                    'static const char *m2 = "helio passes messages";\n'
+                    f'int main(void) {{ printf("%s %s {tag}\\n", m1, m2); return 0; }}\n',
+                    encoding="utf-8",
+                )
+
+            write_fixture_sources("fixture-v1")
             (fixture_repo / "tests" / "test_fixture.py").write_text(
                 "import unittest\n"
                 "from pathlib import Path\n"
@@ -143,32 +167,22 @@ class TestQuickInstaller(unittest.TestCase):
                 "        self.assertFalse((Path(__file__).resolve().parents[1] / 'FAIL_TEST').exists())\n",
                 encoding="utf-8",
             )
-            (fixture_repo / "VERSION").write_text("v1", encoding="utf-8")
             commit1 = init_git_repo(fixture_repo, "v1")
 
             home = root / "home"
             home.mkdir()
-            env = {
-                **os.environ,
-                "HOME": str(home),
-                "HELIO_SDK_URL": str(bare_sdk),
-                "HELIO_NO_BOSUN": "1",
-            }
+            env = {**os.environ, "HOME": str(home), "HELIO_SDK_URL": str(bare_sdk), "HELIO_NO_BOSUN": "1"}
             env.pop("HELIO_STORE", None)
             env.pop("HELIO_REPO", None)
 
-            # Run the exact documented Quick start command from workspace parent without HELIO_REPO.
-            res = subprocess.run(
-                [sys.executable, "Heliograph/tools/install.py"],
-                cwd=ws,
-                env=env,
-                capture_output=True,
-                text=True,
-            )
+            # Exact documented Quick start command from workspace parent without HELIO_REPO.
+            res = subprocess.run([sys.executable, "Heliograph/tools/install.py"], cwd=ws, env=env, capture_output=True, text=True)
             self.assertEqual(res.returncode, 0, res.stderr + res.stdout)
             to_dir = ws / "bin"
-            built_bin = fixture_repo / "build" / "linux" / "linux" / "helio"
-            self.assertEqual(self.mod.sha256_file(to_dir / "helio"), self.mod.sha256_file(built_bin))
+            built_h = fixture_repo / "build" / "linux" / "linux" / "helio"
+            built_e = fixture_repo / "build" / "linux" / "helio.exe"
+            self.assertEqual(self.mod.sha256_file(to_dir / "helio"), self.mod.sha256_file(built_h))
+            self.assertEqual(self.mod.sha256_file(to_dir / "helio.exe"), self.mod.sha256_file(built_e))
             probe = subprocess.run([str(home / ".local" / "bin" / "helio")], env=env, capture_output=True, text=True)
             self.assertEqual(probe.returncode, 0)
             self.assertIn("fixture-v1", probe.stdout)
@@ -176,26 +190,20 @@ class TestQuickInstaller(unittest.TestCase):
             manifest = json.loads((to_dir / "installed.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["current"]["commit"], commit1)
             self.assertFalse(manifest["current"]["dirty"])
-            old_sha = self.mod.sha256_file(to_dir / "helio")
+            old_h_sha = self.mod.sha256_file(to_dir / "helio")
+            old_e_sha = self.mod.sha256_file(to_dir / "helio.exe")
 
-            # Failed test installs nothing and preserves existing installation.
+            # Change BOTH C sources so the failing build produces distinct bytes, then fail tests.
+            write_fixture_sources("fixture-v2-broken")
             (fixture_repo / "FAIL_TEST").write_text("1", encoding="utf-8")
-            fail = subprocess.run(
-                [sys.executable, "Heliograph/tools/install.py"],
-                cwd=ws,
-                env=env,
-                capture_output=True,
-                text=True,
-            )
+            fail = subprocess.run([sys.executable, "Heliograph/tools/install.py"], cwd=ws, env=env, capture_output=True, text=True)
             self.assertNotEqual(fail.returncode, 0)
-            self.assertEqual(self.mod.sha256_file(to_dir / "helio"), old_sha)
-            st = subprocess.run(
-                [sys.executable, "Heliograph/tools/install.py", "--status"],
-                cwd=ws,
-                env=env,
-                capture_output=True,
-                text=True,
-            )
+            # Confirm the rejected build produced distinct bytes on disk, yet NEITHER was installed.
+            self.assertNotEqual(self.mod.sha256_file(built_h), old_h_sha)
+            self.assertNotEqual(self.mod.sha256_file(built_e), old_e_sha)
+            self.assertEqual(self.mod.sha256_file(to_dir / "helio"), old_h_sha)
+            self.assertEqual(self.mod.sha256_file(to_dir / "helio.exe"), old_e_sha)
+            st = subprocess.run([sys.executable, "Heliograph/tools/install.py", "--status"], cwd=ws, env=env, capture_output=True, text=True)
             self.assertEqual(st.returncode, 0, st.stdout + st.stderr)
             self.assertIn(commit1, st.stdout)
 
@@ -251,7 +259,7 @@ class TestQuickInstaller(unittest.TestCase):
             self.assertEqual(still_there.returncode, 0)
             self.assertIn("default-subject", still_there.stdout)
 
-    def test_status_partial_unreadable_back_wrapper_and_repair_completeness(self) -> None:
+    def test_status_dirty_back_wrapper_repair_refusal_and_idempotent_remove(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo = root / "repo"
@@ -261,7 +269,6 @@ class TestQuickInstaller(unittest.TestCase):
             wrap_a = root / "home" / ".local" / "bin" / "helio"
             wrap_b = root / "home" / ".local" / "bin" / "helio-alt"
 
-            # Absent status -> exit 1.
             code, _ = self.mod.status(to_dir=to_dir, wrapper_path=wrap_a)
             self.assertEqual(code, 1)
 
@@ -272,18 +279,27 @@ class TestQuickInstaller(unittest.TestCase):
                 make_distinct_binary(self.helio_bin, h_p, tag)
                 make_distinct_binary(self.helio_exe, e_p, tag)
 
-            # Install A with wrap_a + store_a, then upgrade to B (dirty) with wrap_b + store_b.
+            # Install A (clean) with wrap_a + store_a, then upgrade to B (dirty) with wrap_b + store_b.
             self.mod.install(repo=repo, to_dir=to_dir, store_dir=store_a, wrapper_path=wrap_a, prebuilt=(a_h, a_e))
             (repo / "README.txt").write_text("dirty\n", encoding="utf-8")
-            self.mod.install(repo=repo, to_dir=to_dir, store_dir=store_b, wrapper_path=wrap_b, prebuilt=(b_h, b_e))
+            m_b = self.mod.install(repo=repo, to_dir=to_dir, store_dir=store_b, wrapper_path=wrap_b, prebuilt=(b_h, b_e))
+            # Unconditional post-condition: previous pair is complete and matches backups.
+            self.assertIsNotNone(m_b["previous"])
+            self.assertEqual(self.mod.sha256_file(to_dir / "helio.old"), m_b["previous"]["helio_sha256"])
+            self.assertEqual(self.mod.sha256_file(to_dir / "helio.exe.old"), m_b["previous"]["helio_exe_sha256"])
 
-            # Unreadable live binary -> status returns exit 3 (not OSError traceback).
+            # Direct dirty status check on B.
+            code, lines = self.mod.status(to_dir=to_dir, wrapper_path=wrap_b)
+            self.assertEqual(code, 0)
+            self.assertIn(f"{commit_a} (dirty)", "\n".join(lines))
+
+            # Unreadable live binary -> status returns exit 3.
             with mock.patch.object(self.mod, "sha256_file", side_effect=PermissionError(errno.EACCES, "denied")):
                 code, lines = self.mod.status(to_dir=to_dir, wrapper_path=wrap_b)
             self.assertEqual(code, 3)
             self.assertIn("unreadable binary", "\n".join(lines))
 
-            # Modified live binary -> --back refuses with exit 2 and leaves live+backups unchanged!
+            # Modified live binary -> --back refuses with exit 2 and leaves live+backups unchanged.
             saved_b = (to_dir / "helio").read_bytes()
             (to_dir / "helio").write_bytes(b"foreign live replacement")
             with self.assertRaises(self.mod.InstallError) as ctx:
@@ -292,6 +308,15 @@ class TestQuickInstaller(unittest.TestCase):
             self.assertEqual((to_dir / "helio").read_bytes(), b"foreign live replacement")
             self.assertEqual(self.mod.sha256_file(to_dir / "helio.old"), self.mod.sha256_file(a_h))
             (to_dir / "helio").write_bytes(saved_b)
+
+            # If another destination took wrap_a, --back refuses with exit 2 without clobbering it.
+            other_dir = root / "other_bin"
+            self.mod.install(repo=repo, to_dir=other_dir, store_dir=store_a, wrapper_path=wrap_a, prebuilt=(c_h, c_e))
+            with self.assertRaises(self.mod.InstallError) as ctx:
+                self.mod.go_back(to_dir=to_dir, wrapper_path=wrap_b)
+            self.assertEqual(ctx.exception.code, 2)
+            self.assertTrue(self.mod.wrapper_belongs_to(wrap_a, other_dir))
+            self.mod.remove(to_dir=other_dir, wrapper_path=wrap_a)
 
             # Valid --back from wrap_b restores A AND moves wrapper binding back to wrap_a (removing wrap_b).
             m_back = self.mod.go_back(to_dir=to_dir, wrapper_path=wrap_b)
@@ -304,16 +329,30 @@ class TestQuickInstaller(unittest.TestCase):
             self.assertIn(commit_a, "\n".join(lines))
             self.assertNotIn("(dirty)", "\n".join(lines))
 
-            # Repairing a missing live binary preserves valid previous backups (or clears incomplete previous) so --back stays trustworthy.
+            # Missing live binary -> install refuses with exit 2 instead of committing an incomplete previous generation.
+            saved_exe = (to_dir / "helio.exe").read_bytes()
             (to_dir / "helio.exe").unlink()
-            m_rep = self.mod.install(repo=repo, to_dir=to_dir, store_dir=store_a, wrapper_path=wrap_a, prebuilt=(c_h, c_e))
-            self.assertEqual(self.mod.sha256_file(to_dir / "helio"), self.mod.sha256_file(c_h))
-            self.assertEqual(self.mod.sha256_file(to_dir / "helio.exe"), self.mod.sha256_file(c_e))
-            if m_rep["previous"] is not None:
-                self.assertEqual(self.mod.sha256_file(to_dir / "helio.old"), m_rep["previous"]["helio_sha256"])
-                self.assertEqual(self.mod.sha256_file(to_dir / "helio.exe.old"), m_rep["previous"]["helio_exe_sha256"])
-                # One --back succeeds cleanly!
-                self.mod.go_back(to_dir=to_dir, wrapper_path=wrap_a)
+            with self.assertRaises(self.mod.InstallError) as ctx:
+                self.mod.install(repo=repo, to_dir=to_dir, store_dir=store_a, wrapper_path=wrap_a, prebuilt=(c_h, c_e))
+            self.assertEqual(ctx.exception.code, 2)
+            (to_dir / "helio.exe").write_bytes(saved_exe)
+            os.chmod(to_dir / "helio.exe", 0o755)
+
+            # Unrelated files including dot-prefixed .stage.notes and .rec.keep survive --remove; repeated remove is idempotent.
+            unrelated = to_dir / "other-tool"
+            dot_stage = to_dir / ".stage.notes"
+            dot_rec = to_dir / ".rec.keep"
+            for f in (unrelated, dot_stage, dot_rec):
+                f.write_text("keep\n", encoding="utf-8")
+            self.assertTrue(self.mod.remove(to_dir=to_dir, wrapper_path=wrap_a))
+            for f in (unrelated, dot_stage, dot_rec):
+                self.assertTrue(f.is_file(), f"deleted unrelated file {f}")
+            self.assertFalse((to_dir / "helio").exists())
+            self.assertFalse(wrap_a.exists())
+            self.assertTrue(store_a.is_dir())
+            self.assertFalse(self.mod.remove(to_dir=to_dir, wrapper_path=wrap_a))
+            code, _ = self.mod.status(to_dir=to_dir, wrapper_path=wrap_a)
+            self.assertEqual(code, 1)
 
             # Partial installation (only helio.old without manifest) -> status returns 3, not 1.
             partial_dir = root / "partial_bin"
@@ -323,7 +362,7 @@ class TestQuickInstaller(unittest.TestCase):
             self.assertEqual(code, 3)
             self.assertIn("helio.old", "\n".join(lines))
 
-    def test_adversarial_foreign_journal_non_object_and_pre_journal_cleanup(self) -> None:
+    def test_adversarial_journal_manifest_ownership_and_staging_crash_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo = root / "repo"
@@ -336,7 +375,7 @@ class TestQuickInstaller(unittest.TestCase):
             make_distinct_binary(self.helio_bin, b_h, b"B")
             make_distinct_binary(self.helio_exe, b_e, b"B")
 
-            # 1. Non-object JSON journal raises InstallError(code=2), not AttributeError.
+            # 1. Non-object JSON journal raises InstallError(code=2).
             jdir = root / "j_non_obj"
             jdir.mkdir()
             (jdir / self.mod.JOURNAL_NAME).write_text("[]\n", encoding="utf-8")
@@ -344,46 +383,51 @@ class TestQuickInstaller(unittest.TestCase):
                 self.mod.recover_if_needed(jdir, root / "jw" / "helio")
             self.assertEqual(ctx.exception.code, 2)
 
-            # 2. Foreign journal trying to delete an unrelated dotfile via temp_files is refused.
+            # 2. Foreign journal trying to delete an unrelated dotfile or write an arbitrary alt_wrapper_path is refused.
             fdir = root / "j_dotfile"
             fdir.mkdir()
             secret_dot = fdir / ".env"
             secret_dot.write_text("keep=1\n", encoding="utf-8")
+            outside_target = root / "pwned_outside"
             (fdir / self.mod.JOURNAL_NAME).write_text(
                 json.dumps({
                     "schema_version": 1,
-                    "op": "remove",
+                    "op": "back",
+                    "phase": "publishing",
                     "tx_id": "0123456789ab",
                     "to_dir": str(fdir.resolve()),
                     "wrapper_path": str((root / "fw" / "helio").resolve()),
+                    "alt_wrapper_path": str(outside_target),
                     "saved_files": {},
-                    "temp_files": [".env"],
-                    "expected_hashes": {},
+                    "temp_files": [],
                 }),
                 encoding="utf-8",
             )
             with self.assertRaises(self.mod.InstallError) as ctx:
                 self.mod.recover_if_needed(fdir, root / "fw" / "helio")
             self.assertEqual(ctx.exception.code, 2)
-            self.assertTrue(secret_dot.is_file())
+            self.assertFalse(outside_target.exists())
 
-            # 3. Failure BEFORE journal publication cleans up all staged/snapshot files (zero leak).
-            leak_dir = root / "pre_journal"
+            # 3. Simulated SIGKILL during staging (after_snapshot, leaving staging journal on disk) cleans up ALL snapshots on retry.
+            leak_dir = root / "sigkill_staging"
             leak_wrap = root / "lw" / "helio"
             self.mod.install(repo=repo, to_dir=leak_dir, store_dir=store, wrapper_path=leak_wrap, prebuilt=(a_h, a_e))
 
-            def fail_before_journal(stage: str) -> None:
+            def kill_during_staging(stage: str) -> None:
                 if stage == "after_snapshot":
-                    raise OSError(errno.ENOSPC, "no space left on device")
+                    raise SimulatedCrash(stage)
 
-            with self.assertRaises(OSError):
-                self.mod.install(repo=repo, to_dir=leak_dir, store_dir=store, wrapper_path=leak_wrap, prebuilt=(b_h, b_e), on_boundary=fail_before_journal)
+            with self.assertRaises(SimulatedCrash):
+                self.mod.install(repo=repo, to_dir=leak_dir, store_dir=store, wrapper_path=leak_wrap, prebuilt=(b_h, b_e), on_boundary=kill_during_staging)
+            self.assertTrue((leak_dir / self.mod.JOURNAL_NAME).exists())
+            self.assertTrue(any(p.name.endswith(".rec") for p in leak_dir.iterdir()))
+            # Retry recovers staging journal and leaves zero orphaned snapshots.
+            self.mod.install(repo=repo, to_dir=leak_dir, store_dir=store, wrapper_path=leak_wrap, prebuilt=(b_h, b_e))
             leftovers = [p.name for p in leak_dir.iterdir() if p.name.endswith((".stage", ".rec"))]
             self.assertEqual(leftovers, [])
-            self.assertFalse((leak_dir / self.mod.JOURNAL_NAME).exists())
 
-            # 4. Recovery refuses to overwrite an externally placed file at target after an interrupted upgrade.
-            ext_dir = root / "ext_replace"
+            # 4. Recovery refuses to overwrite an externally modified manifest after an interrupted upgrade.
+            ext_dir = root / "ext_manifest"
             ext_wrap = root / "ew" / "helio"
             self.mod.install(repo=repo, to_dir=ext_dir, store_dir=store, wrapper_path=ext_wrap, prebuilt=(a_h, a_e))
 
@@ -393,11 +437,29 @@ class TestQuickInstaller(unittest.TestCase):
 
             with self.assertRaises(SimulatedCrash):
                 self.mod.install(repo=repo, to_dir=ext_dir, store_dir=store, wrapper_path=ext_wrap, prebuilt=(b_h, b_e), on_boundary=crash_after_helio)
-            (ext_dir / "helio").write_bytes(b"user manual replacement")
+            m = json.loads((ext_dir / self.mod.MANIFEST_NAME).read_text(encoding="utf-8"))
+            m["current"]["commit"] = "0" * 40
+            (ext_dir / self.mod.MANIFEST_NAME).write_text(json.dumps(m), encoding="utf-8")
             with self.assertRaises(self.mod.InstallError) as ctx:
                 self.mod.recover_if_needed(ext_dir, ext_wrap)
             self.assertEqual(ctx.exception.code, 2)
-            self.assertEqual((ext_dir / "helio").read_bytes(), b"user manual replacement")
+
+            # 5. Committed branch refuses to discard snapshots if wrapper is missing.
+            comm_dir = root / "comm_check"
+            comm_wrap = root / "cw" / "helio"
+            self.mod.install(repo=repo, to_dir=comm_dir, store_dir=store, wrapper_path=comm_wrap, prebuilt=(a_h, a_e))
+
+            def crash_after_manifest(stage: str) -> None:
+                if stage == "after_manifest":
+                    raise SimulatedCrash(stage)
+
+            with self.assertRaises(SimulatedCrash):
+                self.mod.install(repo=repo, to_dir=comm_dir, store_dir=store, wrapper_path=comm_wrap, prebuilt=(b_h, b_e), on_boundary=crash_after_manifest)
+            comm_wrap.unlink()
+            with self.assertRaises(self.mod.InstallError) as ctx:
+                self.mod.recover_if_needed(comm_dir, comm_wrap)
+            self.assertEqual(ctx.exception.code, 3)
+            self.assertTrue((comm_dir / self.mod.JOURNAL_NAME).exists())
 
     def test_legacy_adoption_symlinks_collisions_and_locks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -412,7 +474,6 @@ class TestQuickInstaller(unittest.TestCase):
             make_distinct_binary(self.helio_bin, b_h, b"B")
             make_distinct_binary(self.helio_exe, b_e, b"B")
 
-            # Legacy adoption without executing candidate ELF.
             leg_dir = root / "legacy_bin"
             leg_dir.mkdir()
             leg_wrap = root / "leg_home" / ".local" / "bin" / "helio"
@@ -430,7 +491,7 @@ class TestQuickInstaller(unittest.TestCase):
             self.assertEqual(m_leg["previous"]["commit"], "legacy")
             self.assertEqual(m_leg["previous"]["helio_sha256"], legacy_sha)
 
-            # Unrelated ELF, dangling symlink wrapper, wrapper==to/helio, newline path, credential URL, file store.
+            # Unrelated ELF, dangling symlink wrapper, wrapper==to/helio, newline path, credential URL.
             evil_dir = root / "evil_elf"
             evil_dir.mkdir()
             shutil.copy2("/bin/sh", evil_dir / "helio")
@@ -454,7 +515,6 @@ class TestQuickInstaller(unittest.TestCase):
                 self.mod._validate_sdk_url("https://alice:supersecret@example.com/sdk.git")
             self.assertNotIn("supersecret", str(ctx.exception))
 
-            # Same-destination lock refuses concurrent run; interrupted A + install B + remove A preserves B's wrapper.
             dir_a, dir_b = root / "binA", root / "binB"
             wrapper = root / "home_ab" / ".local" / "bin" / "helio"
             dir_a.mkdir()
@@ -483,7 +543,7 @@ class TestQuickInstaller(unittest.TestCase):
                 f2.result()
             self.assertTrue(self.mod.wrapper_belongs_to(wrapper, dir_a) or self.mod.wrapper_belongs_to(wrapper, dir_b))
 
-    def test_crash_recovery_every_distinct_boundary_and_two_gen_remove(self) -> None:
+    def test_crash_recovery_every_distinct_boundary_two_wrappers_and_store_message(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo = root / "repo"
@@ -495,13 +555,20 @@ class TestQuickInstaller(unittest.TestCase):
                 make_distinct_binary(self.helio_bin, h_p, tag)
                 make_distinct_binary(self.helio_exe, e_p, tag)
 
-            # Install: every distinct publication boundary including separate backup publications.
+            # Install: every distinct publication boundary + store message readability check.
             for boundary in ("after_journal", "after_backup_helio", "after_backup_exe", "after_helio", "after_helio_exe", "after_wrapper", "after_manifest"):
                 to_dir = root / f"inst_{boundary}"
                 store = root / f"store_{boundary}"
                 wrapper = root / f"w_inst_{boundary}" / "helio"
                 self.mod.install(repo=repo, to_dir=to_dir, store_dir=store, wrapper_path=wrapper, prebuilt=(a_h, a_e))
                 self.mod.install(repo=repo, to_dir=to_dir, store_dir=store, wrapper_path=wrapper, prebuilt=(b_h, b_e))
+                msg_id = subprocess.run(
+                    [str(to_dir / "helio"), "tell", "p/a", "keep-msg", "--as", "p/b", "--store", str(store)],
+                    input="body\n",
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout.strip()
 
                 def fail_at(stage: str, target=boundary) -> None:
                     if stage == target:
@@ -518,23 +585,28 @@ class TestQuickInstaller(unittest.TestCase):
                 self.assertEqual(self.mod.sha256_file(to_dir / "helio.exe"), self.mod.sha256_file(exp_cur_e))
                 self.assertEqual(self.mod.sha256_file(to_dir / "helio.old"), self.mod.sha256_file(exp_old_h))
                 self.assertEqual(self.mod.sha256_file(to_dir / "helio.exe.old"), self.mod.sha256_file(exp_old_e))
+                chk = subprocess.run([str(to_dir / "helio"), "show", msg_id, "--as", "p/a", "--store", str(store)], capture_output=True, text=True)
+                self.assertEqual(chk.returncode, 0)
+                self.assertIn("keep-msg", chk.stdout)
 
-            # --back: every distinct boundary including separate backup publications AND after_wrapper.
-            for boundary in ("after_journal", "after_backup_helio", "after_backup_exe", "after_helio", "after_helio_exe", "after_wrapper", "after_manifest"):
+            # --back with TWO DISTINCT WRAPPERS (wrap_a != wrap_b) across every boundary including after_target_wrapper.
+            for boundary in ("after_journal", "after_backup_helio", "after_backup_exe", "after_helio", "after_helio_exe", "after_target_wrapper", "after_wrapper", "after_manifest"):
                 to_dir = root / f"back_{boundary}"
                 store_a, store_b = root / f"bsa_{boundary}", root / f"bsb_{boundary}"
-                wrapper = root / f"w_back_{boundary}" / "helio"
-                self.mod.install(repo=repo, to_dir=to_dir, store_dir=store_a, wrapper_path=wrapper, prebuilt=(a_h, a_e))
-                self.mod.install(repo=repo, to_dir=to_dir, store_dir=store_b, wrapper_path=wrapper, prebuilt=(b_h, b_e))
+                wrap_a = root / f"wa_back_{boundary}" / "helio"
+                wrap_b = root / f"wb_back_{boundary}" / "helio-alt"
+                self.mod.install(repo=repo, to_dir=to_dir, store_dir=store_a, wrapper_path=wrap_a, prebuilt=(a_h, a_e))
+                self.mod.install(repo=repo, to_dir=to_dir, store_dir=store_b, wrapper_path=wrap_b, prebuilt=(b_h, b_e))
 
                 def fail_at(stage: str, target=boundary) -> None:
                     if stage == target:
                         raise SimulatedCrash(stage)
 
                 with self.assertRaises(SimulatedCrash):
-                    self.mod.go_back(to_dir=to_dir, wrapper_path=wrapper, on_boundary=fail_at)
-                self.assertTrue(self.mod.recover_if_needed(to_dir, wrapper))
-                code, lines = self.mod.status(to_dir=to_dir, wrapper_path=wrapper)
+                    self.mod.go_back(to_dir=to_dir, wrapper_path=wrap_b, on_boundary=fail_at)
+                self.assertTrue(self.mod.recover_if_needed(to_dir, wrap_b))
+                active_wrap = wrap_a if boundary == "after_manifest" else wrap_b
+                code, lines = self.mod.status(to_dir=to_dir, wrapper_path=active_wrap)
                 self.assertEqual(code, 0, f"back {boundary}: {lines}")
                 exp_cur_h, exp_cur_e = (a_h, a_e) if boundary == "after_manifest" else (b_h, b_e)
                 exp_old_h, exp_old_e = (b_h, b_e) if boundary == "after_manifest" else (a_h, a_e)
@@ -543,8 +615,17 @@ class TestQuickInstaller(unittest.TestCase):
                 self.assertEqual(self.mod.sha256_file(to_dir / "helio.old"), self.mod.sha256_file(exp_old_h))
                 self.assertEqual(self.mod.sha256_file(to_dir / "helio.exe.old"), self.mod.sha256_file(exp_old_e))
 
-            # --remove on a TWO-GENERATION installation (with helio.old and helio.exe.old present).
-            for boundary in ("after_journal", "after_wrapper", "after_binaries"):
+            # --remove on a TWO-GENERATION installation across EVERY individual unlink boundary.
+            rem_boundaries = (
+                "after_journal",
+                "after_wrapper",
+                "after_unlink_helio",
+                "after_unlink_helio_exe",
+                "after_unlink_helio_old",
+                "after_unlink_helio_exe_old",
+                "after_manifest",
+            )
+            for boundary in rem_boundaries:
                 to_dir = root / f"rem2_{boundary}"
                 store = root / f"rstore2_{boundary}"
                 wrapper = root / f"w_rem2_{boundary}" / "helio"
@@ -564,7 +645,7 @@ class TestQuickInstaller(unittest.TestCase):
                 code, _ = self.mod.status(to_dir=to_dir, wrapper_path=wrapper)
                 self.assertEqual(code, 1)
 
-    def test_zero_gap_replacement_and_concurrent_held_windows_exe(self) -> None:
+    def test_zero_gap_posix_replacement_and_busy_deferral(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo = root / "repo"
@@ -581,7 +662,6 @@ class TestQuickInstaller(unittest.TestCase):
 
             self.mod.install(repo=repo, to_dir=to_dir, store_dir=store, wrapper_path=wrapper, prebuilt=(a_h, a_e))
 
-            # 1. Busy executable refusal rolls back without removing or breaking the existing live pair.
             real_replace = os.replace
 
             def busy_exe_replace(src, dst):
@@ -596,7 +676,6 @@ class TestQuickInstaller(unittest.TestCase):
             self.assertEqual(self.mod.sha256_file(to_dir / "helio"), self.mod.sha256_file(a_h))
             self.assertEqual(self.mod.sha256_file(to_dir / "helio.exe"), self.mod.sha256_file(a_e))
 
-            # 2. Concurrent POSIX caller during live replacement.
             stop = threading.Event()
             failures: list[str] = []
             completed = 0
@@ -624,73 +703,91 @@ class TestQuickInstaller(unittest.TestCase):
             self.assertEqual(failures, [])
             self.assertGreater(completed, 0)
 
-            # 3. Held Windows helio.exe with a second Windows caller overlapping publication.
-            is_wsl = "microsoft" in Path("/proc/version").read_text(encoding="utf-8", errors="ignore").lower()
-            if is_wsl or (shutil.which("python.exe") and shutil.which("wslpath")):
-                self.assertTrue(shutil.which("python.exe") and shutil.which("wslpath"), "WSL interop tools missing")
-                win_exe = subprocess.run(
-                    ["wslpath", "-w", str(to_dir / "helio.exe")],
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                ).stdout.strip()
-                holder = subprocess.Popen(
-                    ["python.exe", "-c", f"import time; f = open({win_exe!r}, 'rb'); print('HELD', flush=True); time.sleep(10)"],
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                )
-                win_stop = threading.Event()
-                first_call_done = threading.Event()
-                win_failures: list[str] = []
-                win_completed = 0
+    def test_held_windows_exe_concurrent_caller_during_publication(self) -> None:
+        if not (shutil.which("python.exe") and shutil.which("wslpath")):
+            self.skipTest("WSL Windows interop (python.exe/wslpath) not available")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            init_git_repo(repo)
+            to_dir = root / "bin"
+            store = root / "store"
+            wrapper = root / "home" / ".local" / "bin" / "helio"
+            a_h, a_e = root / "a_h", root / "a_e"
+            b_h, b_e = root / "b_h", root / "b_e"
+            make_distinct_binary(self.helio_bin, a_h, b"A")
+            make_distinct_binary(self.helio_exe, a_e, b"A")
+            make_distinct_binary(self.helio_bin, b_h, b"B")
+            make_distinct_binary(self.helio_exe, b_e, b"B")
 
-                def win_caller():
-                    nonlocal win_completed
-                    while not win_stop.is_set():
-                        try:
-                            r = subprocess.run(
-                                [str(to_dir / "helio.exe"), "help"],
-                                stdin=subprocess.DEVNULL,
-                                capture_output=True,
-                                text=True,
-                                timeout=30,
-                            )
-                            if r.returncode != 0:
-                                win_failures.append(f"rc={r.returncode} stderr={r.stderr}")
-                            else:
-                                win_completed += 1
-                                first_call_done.set()
-                        except (OSError, subprocess.SubprocessError) as exc:
-                            win_failures.append(f"exc={exc}")
+            self.mod.install(repo=repo, to_dir=to_dir, store_dir=store, wrapper_path=wrapper, prebuilt=(a_h, a_e))
+            win_exe = subprocess.run(["wslpath", "-w", str(to_dir / "helio.exe")], capture_output=True, text=True, check=True).stdout.strip()
+            holder = subprocess.Popen(
+                ["python.exe", "-c", f"import time; f = open({win_exe!r}, 'rb'); print('HELD', flush=True); time.sleep(10)"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            win_stop = threading.Event()
+            in_pub_window = threading.Event()
+            overlap_proved = threading.Event()
+            win_failures: list[str] = []
+            overlap_calls = 0
 
-                wt = threading.Thread(target=win_caller)
+            def win_caller():
+                nonlocal overlap_calls
+                while not win_stop.is_set():
+                    during = in_pub_window.is_set()
+                    try:
+                        r = subprocess.run(
+                            [str(to_dir / "helio.exe"), "help"],
+                            stdin=subprocess.DEVNULL,
+                            capture_output=True,
+                            text=True,
+                            timeout=30,
+                        )
+                        if r.returncode != 0:
+                            win_failures.append(f"rc={r.returncode} stderr={r.stderr}")
+                        elif during:
+                            overlap_calls += 1
+                            overlap_proved.set()
+                    except (OSError, subprocess.SubprocessError) as exc:
+                        win_failures.append(f"exc={exc}")
+
+            def wait_for_overlap(stage: str) -> None:
+                if stage == "after_helio":
+                    in_pub_window.set()
+                    self.assertTrue(overlap_proved.wait(timeout=15), "no Windows caller completed during publication window")
+                elif stage == "after_helio_exe":
+                    in_pub_window.clear()
+
+            wt = threading.Thread(target=win_caller)
+            try:
+                assert holder.stdout is not None
+                self.assertEqual(holder.stdout.readline().strip(), "HELD")
+                wt.start()
                 try:
-                    assert holder.stdout is not None
-                    self.assertEqual(holder.stdout.readline().strip(), "HELD")
-                    wt.start()
-                    self.assertTrue(first_call_done.wait(timeout=15), "second Windows caller did not start before publication")
-                    before_pub = win_completed
-                    # Run multiple replacements while the Windows caller actively invokes helio.exe.
-                    for pair in ((a_h, a_e), (b_h, b_e), (a_h, a_e)):
-                        try:
-                            self.mod.install(repo=repo, to_dir=to_dir, store_dir=store, wrapper_path=wrapper, prebuilt=pair)
-                        except self.mod.BusyExecutableError as exc:
-                            self.assertEqual(exc.code, 3)
-                    # Wait briefly for an overlapping/in-flight call to finish before stopping.
-                    deadline = time.monotonic() + 5.0
-                    while win_completed <= before_pub and not win_failures and time.monotonic() < deadline:
-                        time.sleep(0.05)
-                finally:
-                    win_stop.set()
-                    wt.join(timeout=35)
-                    holder.terminate()
-                    holder.wait(timeout=10)
-                self.assertEqual(win_failures, [])
-                self.assertGreater(win_completed, before_pub)
-                code, _ = self.mod.status(to_dir=to_dir, wrapper_path=wrapper)
-                self.assertEqual(code, 0)
+                    self.mod.install(
+                        repo=repo,
+                        to_dir=to_dir,
+                        store_dir=store,
+                        wrapper_path=wrapper,
+                        prebuilt=(b_h, b_e),
+                        on_boundary=wait_for_overlap,
+                    )
+                except self.mod.BusyExecutableError as exc:
+                    self.assertEqual(exc.code, 3)
+            finally:
+                in_pub_window.clear()
+                win_stop.set()
+                wt.join(timeout=35)
+                holder.terminate()
+                holder.wait(timeout=10)
+            self.assertEqual(win_failures, [])
+            self.assertGreater(overlap_calls, 0)
+            code, _ = self.mod.status(to_dir=to_dir, wrapper_path=wrapper)
+            self.assertEqual(code, 0)
 
 
 if __name__ == "__main__":
