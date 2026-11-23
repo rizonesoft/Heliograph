@@ -8,7 +8,7 @@ Messages and jobs between agent sessions on one machine.
 
 ## This repository
 
-- Edit, build, commit and run unattended in WSL only, so one side writes the repository. Windows only proves the programs.
+- The repository lives in WSL, in `~/ImpossibleOS`. The copy on drive D is the Windows proof copy: never edit it. `python3 ../ImpossibleSDK/tools/prove.py .` sends a commit there and builds and tests it with Windows' own tools.
 - Build and test: `python3 ../ImpossibleSDK/tools/app_build.py .`. It uses the SDK commit in `sdk.json`.
 - The engine calls no system function and uses no floating point, so Impossible OS can take it.
 - Never depend on Impossible OS. What is needed from it is declared in `app.json` under `needs` and never waited for. A feature a second program could use belongs in Impossible SDK. The rules are in Impossible SDK's `docs/specs/2026-11-23-interface-and-apps-design.md`.
