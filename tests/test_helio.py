@@ -212,7 +212,8 @@ class Jobs(Base):
     def race(self, racers, jobs=40):
         ids = [self.send(to="os/all") for _ in range(jobs)]
         # Windows starts from the other end, because Linux is done before it would meet it.
-        started = [subprocess.Popen([program, store, f"os/lane-{n}", *(ids[::-1] if program.endswith(".exe") and not ON_WINDOWS else ids)])
+        started = [subprocess.Popen([program, store, f"os/lane-{n}", *(ids[::-1] if program.endswith(".exe") and not ON_WINDOWS else ids)],
+                                    stdin=subprocess.DEVNULL)
                    for n, (program, store) in enumerate(racers)]
         try:
             for _ in range(300):
