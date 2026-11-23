@@ -1,0 +1,105 @@
+#define _GNU_SOURCE
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
+#include "plat.h"
+
+static p_result why(void) {
+    return errno == ENOENT ? P_MISSING : errno == EEXIST ? P_EXISTS : P_FAILED;
+}
+
+void *p_alloc(size_t bytes) { return calloc(1, bytes ? bytes : 1); }
+void p_free(void *memory) { free(memory); }
+
+static p_result all(int file, size_t most, char **data, size_t *length) {
+    char *buffer = malloc(most + 2);
+    size_t have = 0;
+    if (!buffer) return P_FAILED;
+    for (;;) {
+        ssize_t got = read(file, buffer + have, most + 1 - have);
+        if (got < 0 && errno == EINTR) continue;
+        if (got < 0 || (have += (size_t)got) > most) {
+            free(buffer);
+            return got < 0 ? P_FAILED : P_TOO_LARGE;
+        }
+        if (!got) break;
+    }
+    buffer[have] = 0;
+    *data = buffer, *length = have;
+    return P_OK;
+}
+
+p_result p_read(const char *path, size_t most, char **data, size_t *length) {
+    int file = open(path, O_RDONLY | O_CLOEXEC);
+    if (file < 0) return why();
+    p_result result = all(file, most, data, length);
+    close(file);
+    return result;
+}
+
+p_result p_input(size_t most, char **data, size_t *length) { return all(0, most, data, length); }
+
+p_result p_write(const char *path, const char *data, size_t length, bool replace, const char *unique) {
+    char temp[4096];
+    if ((size_t)snprintf(temp, sizeof temp, "%s.%s.part", path, unique) >= sizeof temp) return P_FAILED;
+    int file = open(temp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (file < 0) return why();
+    size_t done = 0;
+    bool good = true;
+    while (good && done < length) {
+        ssize_t wrote = write(file, data + done, length - done);
+        if (wrote < 0 && errno == EINTR) continue;
+        good = wrote > 0;
+        if (good) done += (size_t)wrote;
+    }
+    good = good && !fsync(file);
+    good = !close(file) && good;
+    p_result result = P_FAILED;
+    if (good && replace) result = rename(temp, path) ? why() : P_OK;
+    else if (good) result = link(temp, path) ? why() : P_OK; /* fails when the name is taken, on D: too */
+    if (!(good && replace && result == P_OK)) unlink(temp);
+    return result;
+}
+
+p_result p_folder(const char *path) {
+    struct stat info;
+    if (!mkdir(path, 0700)) return P_OK;
+    return errno == EEXIST && !stat(path, &info) && S_ISDIR(info.st_mode) ? P_OK : errno == EEXIST ? P_FAILED : why();
+}
+
+p_result p_list(const char *path, bool (*each)(void *user, const char *name), void *user) {
+    DIR *folder = opendir(path);
+    if (!folder) return why();
+    errno = 0;
+    for (struct dirent *entry; (entry = readdir(folder)); errno = 0)
+        if (strcmp(entry->d_name, ".") && strcmp(entry->d_name, "..") && !each(user, entry->d_name)) break;
+    p_result result = errno ? P_FAILED : P_OK;
+    closedir(folder);
+    return result;
+}
+
+uint64_t p_now(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_REALTIME, &t);
+    return (uint64_t)t.tv_sec * 1000000 + (uint64_t)t.tv_nsec / 1000;
+}
+
+uint64_t p_tick(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return ((uint64_t)t.tv_nsec ^ (uint64_t)getpid() << 32) * 0x9E3779B97F4A7C15ull;
+}
+
+char *p_env(const char *name) {
+    const char *value = getenv(name);
+    return value ? strdup(value) : NULL;
+}
+
+bool p_print(const char *text) { return fputs(text, stdout) >= 0 && !fflush(stdout); }
+bool p_error(const char *text) { return fputs(text, stderr) >= 0; }
