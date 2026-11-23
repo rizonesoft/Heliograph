@@ -1,8 +1,11 @@
 {
-  "title": "Implementation plan",
-  "acceptance": null,
+  "title": "Heliograph implementation plan",
+  "acceptance": "No message is lost, no job has two takers, and every command can be read by a script, from Windows and WSL.",
   "phases": {
     "0": "Repository and tooling",
+    "1": "A store that stays small",
+    "2": "The right reader",
+    "3": "Scripts and queues",
     "99": "Manual, operator only"
   }
 }
