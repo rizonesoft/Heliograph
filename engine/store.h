@@ -49,6 +49,6 @@ s_result store_check(store *s, text *report); /* S_DAMAGED when anything is wron
 
 bool is_job(const message *m);
 bool is_for(const message *m, const char *me);
-bool was_seen(const store *s, const char *id, const char *me);
-s_result store_job(store *s, const char *id, job *out);
+bool was_seen(store *s, const char *id, const char *me);
+s_result store_job(store *s, const message *m, job *out);
 void clean(text *out, const char *in, bool one_line);

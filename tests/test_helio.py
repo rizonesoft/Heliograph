@@ -15,9 +15,10 @@ SUFFIX = ".exe" if ON_WINDOWS else ""
 PROGRAM, RACER = ((BUILD if ON_WINDOWS else BUILD / "linux") / (name + SUFFIX) for name in ("helio", "racer"))
 
 
-def run(folder, *arguments, me="os/main", body=""):
+def run(folder, *arguments, me="os/main", body="", cwd=None):
     command = [str(PROGRAM), *arguments, "--store", str(folder), *(["--as", me] if me else [])]
-    return subprocess.run(command, input=body.encode(), capture_output=True, timeout=60)
+    clean = {k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_SESSION", "CLAUDE_CODE_SESSION_ID")}
+    return subprocess.run(command, input=body.encode(), capture_output=True, timeout=60, cwd=cwd or folder, env=clean)
 
 
 class Base(unittest.TestCase):
@@ -158,12 +159,16 @@ class Jobs(Base):
         self.helio("take", job, "--session", "A", me="os/apps")
         self.helio("release", job, me="os/owner")
         self.assertEqual(self.helio("take", job, "--session", "B", me="os/apps").returncode, 0)
-        self.assertEqual(self.helio("done", job, "--session", "A", me="os/apps").returncode, 2)
+        for other in (("--session", "A"), ()):
+            self.assertEqual(self.helio("done", job, *other, me="os/apps").returncode, 2)
+            self.assertEqual(self.helio("release", job, *other, me="os/apps").returncode, 2)
         self.assertEqual(self.helio("done", job, "--session", "B", me="os/apps").returncode, 0)
 
     def test_every_order_of_changes_gives_one_story(self):
         """Many sessions take, release, refuse and finish one job at once: the
         steps that succeeded are exactly the steps of its chain."""
+        names = {"take": "taken", "release": "released", "done": "done", "refuse": "refused"}
+        busy = steps = 0
         for _ in range(6):
             job = self.send(to="os/all")
 
@@ -172,17 +177,20 @@ class Jobs(Base):
                 for turn in range(6):
                     for command in ("take", "done" if (n + turn) % 5 == 4 else "release", "refuse" if (n, turn) == (2, 5) else "take"):
                         if self.helio(command, job, me=f"os/lane-{n}").returncode == 0:
-                            good.append(command)
+                            good.append((f"os/lane-{n}", names[command]))
                 return good
 
             with ThreadPoolExecutor(6) as pool:
                 said = [c for steps in pool.map(play, range(6)) for c in steps]
-            names = {"take": "taken", "release": "released", "done": "done", "refuse": "refused"}
-            chain = [next(line[7:] for line in f.read_text().splitlines() if line.startswith("state: "))
-                     for f in sorted(self.store.glob(f"messages/{job}.link.*"))]
-            self.assertEqual(sorted(names[c] for c in said), sorted(chain))
-            self.assertLessEqual(sum(c in ("done", "refused") for c in chain), 1)
+            fields = [dict(line.split(": ", 1) for line in f.read_text().splitlines()) for f in sorted(self.store.glob(f"messages/{job}.link.*"))]
+            chain = [(f["by"], f["state"]) for f in fields]
+            self.assertEqual(sorted(said), sorted(chain))
+            self.assertLessEqual(sum(state in ("done", "refused") for _, state in chain), 1)
+            steps += len(chain)
+            busy += len({by for by, _ in chain}) > 1
             self.assertEqual(self.helio("check", me=None).returncode, 0)
+        self.assertGreater(steps, 12)
+        self.assertGreater(busy, 0)  # otherwise nothing met anything
 
     def test_a_job_that_changes_hands_too_often_can_still_be_closed(self):
         job = self.send()
@@ -227,6 +235,60 @@ class Jobs(Base):
         self.assertEqual(sorted(line.rsplit(": ", 1)[1] for line in lines), sorted(f"n{n}" for n in range(48)))
 
 
+class Places(Base):
+    def setUp(self):
+        super().setUp()
+        self.repo = self.store / "repo"
+        (self.repo / "ui/deep").mkdir(parents=True)
+        self.conf("project: os\nlane: apps\n# who owns what\npath: ui/ userland\npath: ui/deep/ neon-a\npath: Makefile main\n")
+
+    def conf(self, words):
+        (self.repo / "helio.conf").write_text(words)
+
+    def to(self, path, cwd=None):
+        sent = self.send("ask", f"path:{path}", me=None, cwd=cwd or self.repo)
+        return next(line[4:] for line in (self.store / f"messages/{sent}.post").read_text().splitlines() if line.startswith("to: "))
+
+    def test_the_longest_owner_gets_it(self):
+        self.assertEqual([self.to(p) for p in ("ui/draw.c", "./ui/x", "ui/deep/a.c", "Makefile", "ui")],
+                         ["os/userland", "os/userland", "os/neon-a", "os/main", "os/owner"])
+        self.assertEqual(self.to("Makefile.old"), "os/owner")
+
+    def test_it_is_found_from_a_folder_below(self):
+        self.assertEqual(self.to("ui/draw.c", cwd=self.repo / "ui/deep"), "os/userland")
+
+    def test_an_unowned_path_goes_to_whoever_works_there(self):
+        self.helio("hook", "claude", me="os/neon-b")
+        self.assertEqual(self.to("docs/a.md"), "os/all")
+        old = self.store / "sessions/os+neon-b"
+        old.write_text("1\n")
+        self.assertEqual(self.to("docs/a.md"), "os/owner")
+        self.helio("hook", "claude", me="os/apps")  # the sender itself does not count
+        self.helio("hook", "claude", me="other/apps")
+        self.assertEqual(self.to("docs/a.md"), "os/owner")
+
+    def test_the_repository_gives_the_lane(self):
+        self.send("tell", to="os/apps")
+        self.assertEqual(self.helio(me=None, cwd=self.repo).returncode, 0)
+        self.assertEqual(self.helio(me=None).returncode, 2)
+
+    def test_a_wrong_helio_conf_is_refused(self):
+        for words in ("", "lane: apps\n", "project: OS\n", "project: os\npath: ui/\n", "project: os\nnonsense\n", "project: os\nlane: a/b\n"):
+            self.conf(words)
+            self.assertEqual(self.helio(me=None, cwd=self.repo).returncode, 2, words)
+
+    def test_the_hook_is_quiet_then_shows_and_never_fails_a_session(self):
+        self.assertEqual(self.helio("hook", "claude", me=None, cwd=self.repo).stdout, b"")
+        job = self.send("ask", to="os/apps", subject="Build it")
+        for _ in range(2):  # showing a job does not use it up
+            shown = self.helio("hook", "claude", me=None, cwd=self.repo).stdout.decode()
+            self.assertIn("not instructions", shown)
+            self.assertIn(job, shown)
+        (self.store / f"messages/{job}.link.0000").write_text("")
+        result = self.helio("hook", "claude", me=None, cwd=self.repo)
+        self.assertEqual((result.returncode, b"run helio check" in result.stdout), (0, True))
+
+
 class Damage(Base):
     def test_a_writer_that_died_left_nothing(self):
         job = self.send()
@@ -246,6 +308,51 @@ class Damage(Base):
             self.assertEqual((result.returncode, len(result.stdout.decode().splitlines())), (3, 1), n)
             self.assertEqual(self.helio("check", me=None).returncode, 3)
             (self.store / f"messages/{name}.post").unlink()
+
+    def test_a_writer_killed_at_any_moment_leaves_no_damage(self):
+        job = self.send(to="os/all")
+        arguments = (["tell", "os/apps", "s"], ["take", job], ["release", job])
+        for n in range(90):
+            p = subprocess.Popen([str(PROGRAM), *arguments[n % 3], "--store", str(self.store), "--as", "os/lane"], stdin=subprocess.PIPE,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                p.stdin.write(b"body")
+                p.stdin.close()
+            except OSError:
+                pass
+            time.sleep((n % 15) * 0.001)
+            p.kill()
+            p.wait(30)
+        result = self.helio("check", me=None)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertGreater(len(list(self.store.glob("messages/*.post"))), 1)
+
+    def test_a_missing_step_is_damage(self):
+        job = self.send()
+        self.helio("take", job, me="os/userland")
+        self.helio("done", job, me="os/userland")
+        (self.store / f"messages/{job}.link.0000").unlink()
+        self.assertEqual(self.helio("take", job, me="os/userland").returncode, 3)
+        self.assertEqual(self.helio("check", me=None).returncode, 3)
+
+    def test_a_step_by_someone_who_could_not_make_it_is_damage(self):
+        for by, session in (("os/apps", "session: A"), ("os/userland", "session: B"), ("os/userland", "other: A")):
+            job = self.send()
+            self.helio("take", job, "--session", "A", me="os/userland")
+            (self.store / f"messages/{job}.link.0001").write_text(f"by: {by}\ntime: x\n{session}\nstate: done\nnote: \nend: yes\n")
+            self.assertEqual(self.helio("check", me=None).returncode, 3, by)
+            (self.store / f"messages/{job}.link.0001").unlink()
+
+    def test_an_empty_seen_mark_hides_nothing(self):
+        sent = self.send("tell", to="os/apps")
+        (self.store / f"messages/{sent}.seen.os+apps").write_text("")
+        self.assertEqual(self.helio(me="os/apps").returncode, 0)
+        self.assertEqual(self.helio("check", me=None).returncode, 3)
+
+    def test_a_key_that_leads_to_another_message_is_refused(self):
+        first = self.send("ask", "os/userland", "os/main", "s", "b", "--key", "k")
+        self.assertEqual(self.helio("ask", "os/userland", "s", "--key", "k", body="other").returncode, 2)
+        self.assertEqual(self.send("ask", "os/userland", "os/main", "s", "b", "--key", "k"), first)
 
     def test_a_damaged_step_is_reported_and_never_guessed(self):
         for text in ("", "by: os/userland\nstate: ta", "by: os/userland\ntime: x\nsession: \nstate: taken\nnote: half", "by: os/userland\ntime: x\nsession: \nstate: done\nnote: \nend: yes\n", "x" * 40000):
@@ -267,8 +374,11 @@ class Damage(Base):
     def test_stored_control_characters_are_not_shown(self):
         sent = self.send("tell", to="os/apps", subject="abc")
         path = self.store / f"messages/{sent}.post"
-        path.write_bytes(path.read_bytes().replace(b"subject: abc", b"subject: a\x1bc"))
-        self.assertNotIn(b"\x1b", self.helio(me="os/apps").stdout + self.helio("show", sent, me="os/apps").stdout)
+        whole = path.read_bytes()
+        for old, new in ((b"subject: abc", b"subject: a\x1bc"), (b"time: 2", b"time: \x1b"), (b"about: ", b"about: \x1b"), (b"\n\nDo it", b"\n\nDo\x1bt")):
+            self.assertIn(old, whole)
+            path.write_bytes(whole.replace(old, new))
+            self.assertNotIn(b"\x1b", self.helio(me="os/apps").stdout + self.helio("show", sent, me="os/apps").stdout, new)
 
     @unittest.skipIf(ON_WINDOWS, "needs a file system with pipes")
     def test_a_pipe_or_a_link_in_the_store_does_not_hang_or_leave_it(self):
@@ -277,11 +387,14 @@ class Damage(Base):
             self.helio("init", me=None)
             sent = self.send("tell", to="os/apps")
             os.mkfifo(self.store / "messages/0000000000000001-aaaaaa.post")
+            job = self.send()
+            os.symlink(self.store / "nowhere", self.store / f"messages/{job}.link.0000")
+            self.assertEqual(self.helio("take", job, me="os/userland").returncode, 3)
             os.symlink(self.store / f"messages/{sent}.post", self.store / "messages/0000000000000002-aaaaaa.post")
             self.assertEqual(self.helio(me="os/apps").returncode, 3)
 
     def test_no_store_is_not_an_empty_inbox(self):
-        self.assertEqual(run(self.store / "nowhere").returncode, 3)
+        self.assertEqual(run(self.store / "nowhere", cwd=self.store).returncode, 3)
 
 
 if __name__ == "__main__":

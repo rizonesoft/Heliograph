@@ -39,7 +39,7 @@ Agent sessions on this machine (Claude, Codex, Antigravity, on Windows and in WS
 
 ## How does it find the reader?
 
-A repository may carry `helio.json`: its project name, its lanes and the paths each owns. Sessions announce themselves with `helio hello` (agent, repository, lane), run by a hook. A message "about `ui/draw.c`" goes to the lane that owns the path, to whoever works in that repository when no lane does, and to the owner when nobody is there. A session sees only its own project's messages and those sent to it by name. Private projects stay apart.
+A repository may carry `helio.conf`: its project name, its lanes and the paths each owns. Sessions announce themselves with `helio hello` (agent, repository, lane), run by a hook. A message "about `ui/draw.c`" goes to the lane that owns the path, to whoever works in that repository when no lane does, and to the owner when nobody is there. A session sees only its own project's messages and those sent to it by name. Private projects stay apart.
 
 ## How does it reach the reader?
 
@@ -79,7 +79,7 @@ helio hook <agent> <event>
 ## In what order?
 
 1. Store, kinds, states and `take`, with a crash and race test from Windows and WSL at once.
-2. Routing and `helio.json`.
+2. Routing and `helio.conf`.
 3. Hooks for Claude, then the run steps for Codex and Antigravity. Installing a hook in other repositories is done project by project and only for those the owner names.
 4. Watching and the summary.
 5. `tools/mail.py` is removed and OS §55 is changed.

@@ -1,5 +1,7 @@
 #include "store.h"
 
+typedef enum { TAKE, RELEASE, FINISH, REFUSE } change;
+
 static s_result say(store *s, s_result result, const char *why) {
     s->why = why;
     return result;
@@ -25,6 +27,14 @@ static bool id_ok(const char *id) {
     for (size_t i = 0; i < n; i++)
         if (!((id[i] >= '0' && id[i] <= '9') || (id[i] >= 'a' && id[i] <= 'f') || (id[i] == '-' && i))) return false;
     return true;
+}
+
+static bool time_ok(const char *t) {
+    static const char shape[] = "0000-00-00T00:00:00Z";
+    size_t i = 0;
+    for (; shape[i]; i++)
+        if (shape[i] == '0' ? t[i] < '0' || t[i] > '9' : t[i] != shape[i]) return false;
+    return !t[i];
 }
 
 static void path(const store *s, text *out, const char *id, const char *event) {
@@ -152,7 +162,7 @@ s_result store_message(store *s, const char *id, message *out) {
     const char *all[] = {out->id, out->time, out->from, out->to, out->kind, out->about, out->urgency, out->re, out->subject};
     for (size_t i = 0; i < sizeof all / sizeof *all; i++) if (*all[i]) cut(all[i]);
     if (!same(out->id, id) || !address_ok(out->from, false) || !address_ok(out->to, true) || !*out->subject
-        || !one_of(out->kind, kinds) || !one_of(out->urgency, urgencies) || !*out->body || len(out->body) != body) {
+        || !time_ok(out->time) || (*out->re && !id_ok(out->re)) || !one_of(out->kind, kinds) || !one_of(out->urgency, urgencies) || !*out->body || len(out->body) != body) {
         message_free(out);
         return say(s, S_DAMAGED, "the message is not what its name says");
     }
@@ -192,10 +202,15 @@ static void seen_name(text *out, const char *me) {
     for (; *me; me++) add_bytes(out, *me == '/' ? "+" : me, 1);
 }
 
-bool was_seen(const store *s, const char *id, const char *me) {
+static s_result event_of(store *s, const char *id, const char *event, char **data);
+static const char SEEN[] = "seen\n";
+
+bool was_seen(store *s, const char *id, const char *me) {
     text event = {0};
     seen_name(&event, me);
-    bool found = !event.failed && has(s, id, event.data);
+    char *data = NULL;
+    bool found = !event.failed && has(s, id, event.data) && event_of(s, id, event.data, &data) == S_OK && same(data, SEEN);
+    p_free(data);
     text_free(&event);
     return found;
 }
@@ -221,39 +236,74 @@ static s_result event_of(store *s, const char *id, const char *event, char **dat
     return result == P_OK ? S_OK : result == P_MISSING ? S_NOTHING : say(s, S_DAMAGED, "an event cannot be read");
 }
 
-static bool keep(char *to, size_t room, const char *value) {
-    size_t n = 0;
-    while (value[n] && value[n] != '\n') n++;
-    if (n >= room) return false;
-    memcpy(to, value, n);
-    to[n] = 0;
-    return true;
+/* The value of a field that must be there. */
+static bool keep(char *to, size_t room, char *data, const char *name) {
+    for (char *line = data; *line;) {
+        char *end = line;
+        while (*end && *end != '\n') end++;
+        size_t skip = len(name) + 2;
+        if (*end && starts(line, name) && line[skip - 2] == ':' && line[skip - 1] == ' ') {
+            size_t n = (size_t)(end - line) - skip;
+            if (n >= room) return false;
+            memcpy(to, line + skip, n);
+            to[n] = 0;
+            return true;
+        }
+        line = *end ? end + 1 : end;
+    }
+    return false;
 }
+
+static void copy_to(char *to, const char *from) { memcpy(to, from, len(from) + 1); }
 
 static void link_name(text *out, unsigned n) { add(out, "link."), add_number(out, n, 4); }
 
-/* Replays the chain from the disk, because others write meanwhile. */
-s_result store_job(store *s, const char *id, job *out) {
+static bool owns(const char *lane, const message *m);
+static const char *objection(const message *m, const job *now, actor me, change what);
+
+/* A later step on the disk means that the one after the last we read is lost. */
+static bool gap(const store *s, const char *id, unsigned links) {
+    text first = {0}, next = {0};
+    add(&first, id), add(&first, "."), link_name(&first, links);
+    add(&next, id), add(&next, "."), link_name(&next, links + 1);
+    size_t low = 0, high = s->count, n = len(id) + 6;
+    while (!first.failed && low < high) {
+        size_t mid = low + (high - low) / 2;
+        if (compare(s->names[mid], first.data) <= 0) low = mid + 1;
+        else high = mid;
+    }
+    bool found = first.failed || next.failed;
+    if (!found && low < s->count) {
+        found = true;
+        for (size_t i = 0; i < n && found; i++) found = s->names[low][i] == first.data[i];
+    }
+    text_free(&first), text_free(&next);
+    return found;
+}
+
+/* Replays the chain from the disk, because others write meanwhile. A step counts
+   only if its actor was allowed to make it: the rules are those of a new step. */
+s_result store_job(store *s, const message *m, job *out) {
+    static const char *const states[] = {"taken", "released", "done", "refused"};
+    static const job_state after[] = {TAKEN, OPEN, DONE, REFUSED};
     *out = (job){.state = OPEN};
     for (; out->links < MOST_LINKS; out->links++) {
         text name = {0};
         link_name(&name, out->links);
         char *data = NULL, what[16], by[72], session[72], end[8];
-        s_result result = name.failed ? say(s, S_DAMAGED, "out of memory") : event_of(s, id, name.data, &data);
+        s_result result = name.failed ? say(s, S_DAMAGED, "out of memory") : event_of(s, m->id, name.data, &data);
         text_free(&name);
-        if (result == S_NOTHING) return S_OK;
+        if (result == S_NOTHING) return gap(s, m->id, out->links) ? say(s, S_DAMAGED, "a step of this job is missing") : S_OK;
         if (result != S_OK) return result;
-        bool good = keep(what, sizeof what, field(data, "state")) && keep(by, sizeof by, field(data, "by")) && address_ok(by, false)
-                    && keep(session, sizeof session, field(data, "session")) && keep(end, sizeof end, field(data, "end")) && same(end, "yes");
+        bool good = keep(what, sizeof what, data, "state") && keep(by, sizeof by, data, "by") && address_ok(by, false)
+                    && keep(session, sizeof session, data, "session") && keep(end, sizeof end, data, "end") && same(end, "yes");
         p_free(data);
-        bool was = out->state == TAKEN;
-        if (good && same(what, "taken") && out->state == OPEN) out->state = TAKEN;
-        else if (good && same(what, "released") && was) out->state = OPEN;
-        else if (good && same(what, "done") && was) out->state = DONE;
-        else if (good && same(what, "refused") && (was || out->state == OPEN)) out->state = REFUSED;
-        else return say(s, S_DAMAGED, "a step of this job is damaged");
-        keep(out->by, sizeof out->by, out->state == OPEN ? "" : by);
-        keep(out->session, sizeof out->session, out->state == OPEN ? "" : session);
+        int step = 0;
+        while (good && step < 4 && !same(what, states[step])) step++;
+        if (!good || step == 4 || objection(m, out, (actor){by, session}, (change)step)) return say(s, S_DAMAGED, "a step of this job is damaged");
+        out->state = after[step];
+        bool open = out->state == OPEN;
+        copy_to(out->by, open ? "" : by), copy_to(out->session, open ? "" : session);
     }
     return S_OK;
 }
@@ -336,6 +386,7 @@ s_result store_post(store *s, const message *m, const char *key, text *id) {
     if (!address_ok(m->from, false)) return say(s, S_REFUSED, "say who you are: --as project/lane");
     if (!address_ok(m->to, true)) return say(s, S_REFUSED, "the reader is project/lane, or project/all");
     if (!one_of(m->kind, kinds)) return say(s, S_REFUSED, "the kind is request, handoff, answer, finding or headsup");
+    if (s->count >= MOST_NAMES / 2) return say(s, S_REFUSED, "the store is full: archive it first");
     if (!one_of(m->urgency, urgencies)) return say(s, S_REFUSED, "the urgency is now, next or whenever");
     if (len(m->subject) > 120 || len(m->about) > 1000 || len(m->body) > MOST_BODY) return say(s, S_REFUSED, "the message is too long");
     if (*m->re) {
@@ -366,7 +417,15 @@ s_result store_post(store *s, const message *m, const char *key, text *id) {
             add(&out, "\nre: "), add(&out, m->re), add(&out, "\nlength: "), add_number(&out, body.length, 0);
             add(&out, "\nsubject: "), add(&out, subject.data), add(&out, "\n\n"), add(&out, body.data);
             result = out.failed ? say(s, S_DAMAGED, "out of memory") : make(s, id->data, "post", out.data);
-            if (result == S_NOTHING) result = *key ? S_OK : say(s, S_DAMAGED, "two messages got one id: send it again");
+            if (result == S_NOTHING && *key) {
+                message there;
+                result = store_message(s, id->data, &there);
+                if (result == S_OK && !(same(there.from, m->from) && same(there.to, m->to) && same(there.kind, m->kind) && same(there.subject, subject.data) && same(there.body, body.data)))
+                    result = say(s, S_REFUSED, "that key stands for another message");
+                message_free(&there);
+            } else if (result == S_NOTHING) {
+                result = say(s, S_DAMAGED, "two messages got one id: send it again");
+            }
         }
     }
     text_free(&subject), text_free(&about), text_free(&body), text_free(&out);
@@ -403,10 +462,8 @@ static bool owns(const char *lane, const message *m) {
     return false;
 }
 
-typedef enum { TAKE, RELEASE, FINISH, REFUSE } change;
-
 static const char *objection(const message *m, const job *now, actor me, change what) {
-    bool taker = now->state == TAKEN && same(now->by, me.lane) && (!*now->session || !*me.session || same(now->session, me.session));
+    bool taker = now->state == TAKEN && same(now->by, me.lane) && (!*now->session || same(now->session, me.session));
     if (now->state == DONE || now->state == REFUSED) return "it is already closed";
     switch (what) {
     case TAKE: return now->state == TAKEN ? "it is already taken" : is_for(m, me.lane) ? NULL : "it is not for you";
@@ -423,9 +480,15 @@ static s_result change_job(store *s, const char *id, actor me, change what, cons
     s_result result = store_message(s, id, &m);
     if (result != S_OK) return result;
     if (!is_job(&m)) result = say(s, S_REFUSED, "only a request or a handoff can be taken");
+    unsigned before = MOST_LINKS + 1;
     while (result == S_OK) {
         job now;
-        if ((result = store_job(s, id, &now)) != S_OK) break;
+        if ((result = store_job(s, &m, &now)) != S_OK) break;
+        if (now.links == before) {
+            result = say(s, S_DAMAGED, "the next step of this job is there but cannot be read");
+            break;
+        }
+        before = now.links;
         const char *why = objection(&m, &now, me, what);
         result = why ? say(s, S_REFUSED, why) : add_link(s, id, &now, me, states[what], note);
         if (result != S_NOTHING) break;
@@ -443,7 +506,7 @@ s_result store_seen(store *s, const char *id, const char *me) {
     if (!address_ok(me, false)) return say(s, S_REFUSED, "say who you are: --as project/lane");
     text event = {0};
     seen_name(&event, me);
-    s_result result = event.failed ? say(s, S_DAMAGED, "out of memory") : make(s, id, event.data, "seen\n");
+    s_result result = event.failed ? say(s, S_DAMAGED, "out of memory") : make(s, id, event.data, SEEN);
     text_free(&event);
     return result == S_NOTHING ? S_OK : result;
 }
@@ -460,7 +523,12 @@ s_result store_check(store *s, text *report) {
         if (!id) return say(s, S_DAMAGED, "out of memory");
         if (same(id, "key")) {}
         else if (store_message(s, id, &m) != S_OK) why = s->why;
-        else if (same(dot, ".post") && is_job(&m) && store_job(s, id, &now) != S_OK) why = s->why;
+        else if (same(dot, ".post") && is_job(&m) && store_job(s, &m, &now) != S_OK) why = s->why;
+        else if (starts(dot, ".seen.")) {
+            char *data = NULL;
+            if (event_of(s, id, dot + 1, &data) != S_OK || !same(data, SEEN)) why = "a seen mark is damaged";
+            p_free(data);
+        }
         if (why) {
             text line = {0};
             clean(&line, name, true);
