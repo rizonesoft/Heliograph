@@ -29,7 +29,8 @@ uint64_t p_tick(void) {
 typedef struct { bool (*each)(void *, const char *); void *user; } listing;
 static bool entry(void *user, const char *name, bool folder) {
     listing *l = user;
-    return folder || l->each(l->user, name);
+    (void)folder; /* reported like a file, as on Linux: what cannot be read is damage */
+    return l->each(l->user, name);
 }
 p_result p_list(const char *path, bool (*each)(void *user, const char *name), void *user) {
     listing l = {each, user};
