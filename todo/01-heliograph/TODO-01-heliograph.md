@@ -377,10 +377,10 @@ One command takes a checkout to a working `helio` in WSL. It records what it ins
 
 ## 16. Installer for Windows sessions
 
-A Windows session has no `helio` on its `PATH`, so its hook finds nothing. The installer gives it one that uses the store in WSL.
+A Windows session has no `helio` on its `PATH`, so its hook finds nothing. The installer gives it one that uses the store in WSL. It is worked on in WSL: the Windows half runs through Windows' own Python, as `tools/prove.py` of Impossible SDK does.
 
 **Phase:** 0
-**Needs:** windows-host
+**Needs:** none
 **Surface:** no
 
 **Build order:**

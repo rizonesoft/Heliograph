@@ -10,11 +10,11 @@ Format and rules: `todo/README.md`. Run sections with the `process-plan`, `proce
 
 Sections: 3 | Checklist items: 21
 
-| Status | Reference   | Deliverable                                     | Needs        | Items |
-| ------ | ----------- | ----------------------------------------------- | ------------ | ----- |
-| [ ]    | D01 T01 §15 | Quick installer                                 | none         | 7     |
-| [ ]    | D01 T01 §16 | Installer for Windows sessions                  | windows-host | 6     |
-| [ ]    | D01 T01 §17 | Installed program replaced after a tested phase | none         | 8     |
+| Status | Reference   | Deliverable                                     | Needs | Items |
+| ------ | ----------- | ----------------------------------------------- | ----- | ----- |
+| [ ]    | D01 T01 §15 | Quick installer                                 | none  | 7     |
+| [ ]    | D01 T01 §16 | Installer for Windows sessions                  | none  | 6     |
+| [ ]    | D01 T01 §17 | Installed program replaced after a tested phase | none  | 8     |
 
 ### Phase 1: A store that stays small
 
