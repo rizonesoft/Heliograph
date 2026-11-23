@@ -8,11 +8,11 @@ Format and rules: `todo/README.md`. Run sections with the `process-plan`, `proce
 
 ### Phase 0: Repository and tooling
 
-Sections: 3 | Checklist items: 21
+Sections: 3 | Checklist items: 22
 
 | Status | Reference   | Deliverable                                     | Needs | Items |
 | ------ | ----------- | ----------------------------------------------- | ----- | ----- |
-| [ ]    | D01 T01 §15 | Quick installer                                 | none  | 7     |
+| [ ]    | D01 T01 §15 | Quick installer                                 | none  | 8     |
 | [ ]    | D01 T01 §16 | Installer for Windows sessions                  | none  | 6     |
 | [ ]    | D01 T01 §17 | Installed program replaced after a tested phase | none  | 8     |
 
@@ -53,4 +53,4 @@ Sections: 4 | Checklist items: 19
 
 Progress: 0/17 verified sections, 4 ready to run now.
 
-Checklist: 0/96 items completed (includes Commit items).
+Checklist: 0/97 items completed (includes Commit items).

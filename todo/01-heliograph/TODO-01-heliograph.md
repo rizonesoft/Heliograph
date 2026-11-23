@@ -354,7 +354,11 @@ A path that no lane owns goes to whoever works in that repository, and to the ow
 
 ## 15. Quick installer
 
+> **Started:** 2026-11-23T23:17:30Z
+
 One command takes a checkout to a working `helio` in WSL. It records what it installed, so that §17 can compare and go back.
+
+**Corrected 2026-11-24:** Added the external-file safety contract (exclusive lock, durable in-progress journal, ownership check before replacing or deleting external files, journal removal rule, and failure/stop recovery) before plan review because `tools/install.py` writes and removes files outside the repository.
 
 **Phase:** 0
 **Needs:** none
@@ -366,10 +370,11 @@ One command takes a checkout to a working `helio` in WSL. It records what it ins
 2. Cover it in `tests/test_install.py`. Done when: a home in a temporary folder is installed, replaced, put back and removed.
 
 - [ ] Find Impossible SDK beside the checkout in `tools/install.py`, or clone it there, then build and test with its `tools/app_build.py`. Done when: a failed test installs nothing. Cheaper substitute: `--no-test`.
+- [ ] Guard external writes in `tools/install.py` with an exclusive lock (`<to>/.install.lock`), an atomically written durable journal (`<to>/install.journal.json`) removed only after `installed.json` commits (or `--remove` completes) and the directory is fsynced, and automatic recovery from a leftover journal on failure, stop, or next run. Done when: a concurrent run is refused without touching files and an interrupted install recovers cleanly on the next run without leaving `helio` or `helio.exe` missing. Cheaper substitute: writing without a lock or journal.
 - [ ] Copy `helio` and `helio.exe` to the program folder in `tools/install.py` (`--to`, `bin` beside the checkout when absent), each under a temporary name and then renamed. Done when: a call made during the replacement gets the old or the new program, never none, and a program in use by Windows is renamed away first. Cheaper substitute: copying over.
 - [ ] Keep the programs before them as `helio.old` and `helio.exe.old`, and write `installed.json` with commit, time and SHA-256 of each, in `tools/install.py`. Done when: both are read back and compared. Cheaper substitute: a printed line.
-- [ ] Make the store when it is not there, and the wrapper in `~/.local/bin`, in `tools/install.py` (`--store`, the folder beside the checkout when absent). Done when: an existing store keeps every byte, and a wrapper that is not ours is refused and named. Cheaper substitute: replacing it.
-- [ ] Add `--status`, `--back` and `--remove` to `tools/install.py`. Done when: status names the commit and says when a program is not the recorded one, back restores the program before, and remove leaves the store and nothing else. Cheaper substitute: deleting by hand.
+- [ ] Make the store when it is not there, and the wrapper in `~/.local/bin`, in `tools/install.py` (`--store`, the folder beside the checkout when absent). Done when: an existing store keeps every byte, only a wrapper carrying the installer ownership marker (or the prior `# Heliograph with this machine's store.` wrapper) is replaced or deleted, and any other file or symlink at that path is refused and named. Cheaper substitute: replacing it.
+- [ ] Add `--status`, `--back` and `--remove` to `tools/install.py`. Done when: status names the commit and says when a program is not the recorded one, back restores the program before, and remove deletes only installer-owned files and leaves the store and unrelated files untouched. Cheaper substitute: deleting by hand.
 - [ ] Put the one command in the Quick start of `README.md`. Done when: it is the command the test runs. Cheaper substitute: the steps as they are.
 - [ ] Commit: `install: one command`
 
