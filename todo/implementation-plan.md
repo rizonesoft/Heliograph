@@ -6,6 +6,16 @@ The acceptance bar is No message is lost, no job has two takers, and every comma
 
 Format and rules: `todo/README.md`. Run sections with the `process-plan`, `process-phase` and `process-todo-section` skills; `python scripts/todo-graph.py query ready` lists what can run now. Pasting a whole row from a table below into `process todo section:` is a complete instruction.
 
+### Phase 0: Repository and tooling
+
+Sections: 3 | Checklist items: 21
+
+| Status | Reference   | Deliverable                                     | Needs        | Items |
+| ------ | ----------- | ----------------------------------------------- | ------------ | ----- |
+| [ ]    | D01 T01 §15 | Quick installer                                 | none         | 7     |
+| [ ]    | D01 T01 §16 | Installer for Windows sessions                  | windows-host | 6     |
+| [ ]    | D01 T01 §17 | Installed program replaced after a tested phase | none         | 8     |
+
 ### Phase 1: A store that stays small
 
 Sections: 3 | Checklist items: 19
@@ -41,6 +51,6 @@ Sections: 4 | Checklist items: 19
 | [ ]    | D01 T01 §12 | Expiry of seen heads-ups and findings  | none  | 4     |
 | [ ]    | D01 T01 §13 | Design and help that match the program | none  | 4     |
 
-Progress: 0/14 verified sections, 3 ready to run now.
+Progress: 0/17 verified sections, 4 ready to run now.
 
-Checklist: 0/75 items completed (includes Commit items).
+Checklist: 0/96 items completed (includes Commit items).

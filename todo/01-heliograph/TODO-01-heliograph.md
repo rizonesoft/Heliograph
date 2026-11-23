@@ -10,12 +10,13 @@ title: "TODO-01 -- Heliograph"
 
 > **Goal:** Heliograph does all that its approved design says: the store stays small, a silent taker is reported, every command can be read by a script, and a driver can use it as its queue.
 
-> **Current state:** Measured 2026-11-24 at `438d434`. Messages, jobs with one taker, routing to the lane that owns a path, the Claude hook, overdue jobs, overlap warnings and the daily summary work and are tested in `tests/test_helio.py`; they get no section here. Missing: archiving (`engine/store.c` says "archive it" and there is no such command), expiry, sign-of-life reports, messages for one session, project privacy in `log` and `show`, fixed marks around inbox and log lines, a mark for landed work, an unowned path sent to its repository only, `--json`, `hello`, `summary`, and `take` without an id. The design's command list also differs from the program's. `tools/mail.py`, which the design says to remove, is in neither this repository, Impossible SDK nor the history of the local Impossible OS clone.
+> **Current state:** Measured 2026-11-24 at `438d434`. Messages, jobs with one taker, routing to the lane that owns a path, the Claude hook, overdue jobs, overlap warnings and the daily summary work and are tested in `tests/test_helio.py`; they get no section here. Missing: archiving (`engine/store.c` says "archive it" and there is no such command), expiry, sign-of-life reports, messages for one session, project privacy in `log` and `show`, fixed marks around inbox and log lines, a mark for landed work, an unowned path sent to its repository only, `--json`, `hello`, `summary`, and `take` without an id. There is no installer: the two programs in `~/ImpossibleOS/bin`, `helio.cmd` there and the wrapper in `~/.local/bin` were copied by hand, no folder with `helio` is on Windows' `PATH`, and nothing records which commit is installed. The design's command list also differs from the program's. `tools/mail.py`, which the design says to remove, is in neither this repository, Impossible SDK nor the history of the local Impossible OS clone.
 
 ## Inputs
 
 - `docs/specs/2026-11-23-heliograph-design.md`: the approved design; each item names the heading it comes from.
 - `engine/store.c`: messages, steps and keys (§1, §2, §3, §4, §6, §8). `engine/watch.c`: overdue work and the summary (§3, §5). `engine/place.c`: sessions (§4, §5, §6). `engine/helio.c`: commands and output (all).
+- Impossible SDK `tools/app_build.py` and `tools/prove.py`: what builds and proves a commit (§15, §17). Its `08-release` file plans packages for released programs; §15 and §16 install from a checkout and end when such a package replaces them.
 - `src/plat_linux.c`, `src/plat_windows.c`: the only files that call a system (§2).
 
 ## Outcome
@@ -23,11 +24,12 @@ title: "TODO-01 -- Heliograph"
 - A closed job and a seen heads-up leave the working store by month, and can still be shown and answered.
 - No job is taken twice and no keyed message is sent twice because of archiving, raced from Windows and WSL.
 - A silent taker reaches the sender and the owner, and the job stays with its taker until someone releases it.
+- One command builds, tests and installs Heliograph, and one removes it; after each phase the installed program is the tested one, and the one before it can be put back.
 - Every command has a `--json` form, and `helio take --kind request --lane neon-a --json` takes one job.
 
 **Adjacency:** list=applicable @ D01 T01 §7; document=not-applicable (messages are read in a terminal or by a script); settings=applicable @ D01 T01 §5; reporting=applicable @ D01 T01 §10; notifications=applicable @ D01 T01 §5; permissions=applicable @ D01 T01 §7; audit=applicable @ D01 T01 §3; exchange=applicable @ D01 T01 §10; reverse=applicable @ D01 T01 §5
 
-**Adjacency rationale:** The log is the list and is kept inside a project by §7. The only new setting is how long silence lasts, read in §5. JSON (§10) is the report and the exchange form; nothing is imported. Archived steps stay readable in §3, which keeps the trail. The reverse of a take is `release`, which exists and which §5 proves still works after a silent report; archiving has no undo because an archived message still opens by its id.
+**Adjacency rationale:** The log is the list and is kept inside a project by §7. The only new setting is how long silence lasts, read in §5. JSON (§10) is the report and the exchange form; nothing is imported. Archived steps stay readable in §3, which keeps the trail. The installer keeps the program before it and can remove everything it made (§15). The reverse of a take is `release`, which exists and which §5 proves still works after a silent report; archiving has no undo because an archived message still opens by its id.
 
 ## Implementation Order
 
@@ -47,6 +49,9 @@ title: "TODO-01 -- Heliograph"
 | 12 | §12 | Expiry of seen heads-ups and findings | §3, §4 | [ ] |
 | 13 | §13 | Design and help that match the program | §11, §12, §14 | [ ] |
 | 14 | §14 | Unowned paths kept to their repository | §4, §6 | [ ] |
+| 15 | §15 | Quick installer | -- | [ ] |
+| 16 | §16 | Installer for Windows sessions | §15 | [ ] |
+| 17 | §17 | Installed program replaced after a tested phase | §15 | [ ] |
 
 ## 1. Steps that notice an archived job
 
@@ -344,6 +349,75 @@ A path that no lane owns goes to whoever works in that repository, and to the ow
 - [ ] Compare the actor's repository in `is_for` and `objection` of `engine/store.c`. Done when: two lanes of the repository both see the one job and one of them takes it, and a lane of another repository neither sees nor takes it. Cheaper substitute: hiding it in the inbox alone.
 - [ ] Replace `test_an_unowned_path_goes_to_whoever_works_there` in `tests/test_helio.py` with the three cases, its lane announced from inside the repository. Done when: it fails with the old `reader`. Cheaper substitute: keeping the project-wide expectation.
 - [ ] Commit: `routing: an unowned path stays in its repository`
+
+**Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
+
+## 15. Quick installer
+
+One command takes a checkout to a working `helio` in WSL. It records what it installed, so that §17 can compare and go back.
+
+**Phase:** 0
+**Needs:** none
+**Surface:** no
+
+**Build order:**
+
+1. Write `tools/install.py`. Done when: a clean home has a working `helio` after one command.
+2. Cover it in `tests/test_install.py`. Done when: a home in a temporary folder is installed, replaced, put back and removed.
+
+- [ ] Find Impossible SDK beside the checkout in `tools/install.py`, or clone it there, then build and test with its `tools/app_build.py`. Done when: a failed test installs nothing. Cheaper substitute: `--no-test`.
+- [ ] Copy `helio` and `helio.exe` to the program folder in `tools/install.py` (`--to`, `bin` beside the checkout when absent), each under a temporary name and then renamed. Done when: a call made during the replacement gets the old or the new program, never none, and a program in use by Windows is renamed away first. Cheaper substitute: copying over.
+- [ ] Keep the programs before them as `helio.old` and `helio.exe.old`, and write `installed.json` with commit, time and SHA-256 of each, in `tools/install.py`. Done when: both are read back and compared. Cheaper substitute: a printed line.
+- [ ] Make the store when it is not there, and the wrapper in `~/.local/bin`, in `tools/install.py` (`--store`, the folder beside the checkout when absent). Done when: an existing store keeps every byte, and a wrapper that is not ours is refused and named. Cheaper substitute: replacing it.
+- [ ] Add `--status`, `--back` and `--remove` to `tools/install.py`. Done when: status names the commit and says when a program is not the recorded one, back restores the program before, and remove leaves the store and nothing else. Cheaper substitute: deleting by hand.
+- [ ] Put the one command in the Quick start of `README.md`. Done when: it is the command the test runs. Cheaper substitute: the steps as they are.
+- [ ] Commit: `install: one command`
+
+**Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
+
+## 16. Installer for Windows sessions
+
+A Windows session has no `helio` on its `PATH`, so its hook finds nothing. The installer gives it one that uses the store in WSL.
+
+**Phase:** 0
+**Needs:** windows-host
+**Surface:** no
+
+**Build order:**
+
+1. Write the Windows half of `tools/install.py`. Done when: `helio check` works in a new Windows terminal.
+2. Cover it in `tests/test_install.py` with folders and a registry key of its own. Done when: it runs on Windows through `tools/prove.py`.
+
+- [ ] Copy `helio.exe` to `%LOCALAPPDATA%\Heliograph` in `tools/install.py --windows`, as §15 replaces it. Done when: one in use is renamed away and removed by the next install. Cheaper substitute: running it from WSL's disk.
+- [ ] Write `helio.cmd` beside it with the store's `\\wsl.localhost` path, unless `HELIO_STORE` is set. Done when: a message sent in WSL is shown on Windows. Cheaper substitute: a store of its own.
+- [ ] Add the folder to the user's `PATH` once in `tools/install.py`, keeping every other entry and its kind, and tell running programs. Done when: a second install changes nothing and an entry with `%` stays unexpanded. Cheaper substitute: `setx`, which cuts a long `PATH`.
+- [ ] Undo all three with `--windows --remove`. Done when: `PATH` is what it was and the folder is gone. Cheaper substitute: leaving the entry.
+- [ ] Say what is missing when WSL or its distro cannot be reached in `helio.cmd`. Done when: the message names it and the exit code is 3. Cheaper substitute: an empty inbox.
+- [ ] Commit: `install: Windows sessions`
+
+**Test checkpoint:** `python3 ../ImpossibleSDK/tools/prove.py .` exits 0 after the commit and the new tests fail when their production change is reverted.
+
+## 17. Installed program replaced after a tested phase
+
+When a phase is closed and everything is tested, the program that the sessions use becomes the tested one, without anybody asking. It is never replaced by anything else.
+
+**Phase:** 0
+**Needs:** none
+**Surface:** no
+
+**Build order:**
+
+1. Write the conditions in `tools/install.py --phase <n>`. Done when: each one that does not hold refuses and says which.
+2. Make it a step of the phase's end. Done when: attended and unattended runs both reach it.
+
+- [ ] Refuse in `tools/install.py --phase` unless `scripts/todo-graph.py query plan` shows every section of the phase verified. Done when: one open section refuses. Cheaper substitute: the run's word.
+- [ ] Refuse unless the tree is clean, `HEAD` is on `origin/main`, `app_build.py` passes in WSL with the race against Windows run and not skipped, and `prove.py` passes, in `tools/install.py --phase`. Done when: each is planted and refuses with the installed program untouched. Cheaper substitute: a passing build.
+- [ ] Install the programs that were proved, by their SHA-256 taken before the proof, in `tools/install.py --phase`. Done when: a program rebuilt after the proof is refused. Cheaper substitute: building again.
+- [ ] Try both installed programs after the replacement in `tools/install.py --phase`: `helio check` on the real store, then send, take and finish between Windows and WSL in a store of its own. Done when: a planted fault puts the program before it back and exits 3. Cheaper substitute: `helio help`.
+- [ ] Run the program before it on a store the new one wrote, in `tests/test_install.py`. Done when: `helio check` passes, so that going back loses nothing. Cheaper substitute: trusting the format.
+- [ ] Add the step to the end of a phase in `AGENTS.md` and `docs/unattended-prompt.md`: run it after the closeout, record the commit in the run file, and heal a refusal as any red gate. Done when: both name the one command. Cheaper substitute: a note in `README.md`.
+- [ ] Tell the other lanes with `helio tell impossible/all` from `tools/install.py --phase`, keyed by the commit. Done when: a repeat sends nothing new. Cheaper substitute: silence.
+- [ ] Commit: `install: after a tested phase`
 
 **Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
 
