@@ -9,6 +9,7 @@ are read from the checkout's resources; --font is Plus Jakarta Sans (OFL), the v
 """
 import argparse
 import os
+import struct
 import subprocess
 import tempfile
 from pathlib import Path
@@ -74,14 +75,28 @@ def done(body, width, height):
     return f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {height}" width="{w}" height="{height}">' + body + "</svg>\n", w, height
 
 
-def scaled(drawn, height):
-    text, w, h = drawn
-    return text.replace(f'width="{w}" height="{h}"', f'width="{w * height / h:.1f}" height="{height}" style="display:block"', 1)
+def picture(path, width, height):
+    """An SVG as a picture: the browser runs nothing inside it."""
+    return f"<img src='{path.as_uri()}' width='{width:g}' height='{height:g}' style='display:block' alt=''>"
 
 
 def icon(size):
-    box = size if size in SMALL else 48
-    return source(size).read_text(encoding="utf-8").replace(f'width="{box}" height="{box}"', f'width="{size}" height="{size}" style="display:block"', 1)
+    return picture(source(size), size, size)
+
+
+def mark(light, height):
+    path = BRAND / f"wordmark-{'light' if light else 'dark'}.svg"
+    w, h = (int(v) for v in path.read_text(encoding="utf-8").split('viewBox="0 0 ', 1)[1].split('"', 1)[0].split())
+    return picture(path, round(w * height / h, 1), height)
+
+
+def icon_file(pngs):
+    """icon.ico from PNG pictures, (size, bytes) each."""
+    head, at = struct.pack("<HHH", 0, 1, len(pngs)), 6 + 16 * len(pngs)
+    for size, data in pngs:
+        head += struct.pack("<BBBBHHII", size % 256, size % 256, 0, 0, 1, 32, len(data), at)
+        at += len(data)
+    return head + b"".join(data for _, data in pngs)
 
 
 def theme(light):
@@ -127,13 +142,12 @@ def ground(light):
             "radial-gradient(60% 120% at 46% 0%,rgba(46,181,240,.3),transparent 70%),radial-gradient(60% 120% at 100% 100%,rgba(21,92,222,.55),transparent 70%),linear-gradient(#0B1324,#080E1C)")
 
 
-def banner(font, light, social):
-    mark = scaled(wordmark(font, light), 132 if social else 106)
+def banner(light, social):
     soft = "#3f4754" if light else "#C9D6EA"
     words = f"<div style='font-size:{27 if social else 20}px;line-height:1.38;color:{soft};max-width:{760 if social else 470}px'>{TAG}</div>"
     place = "left:80px;top:70px" if social else "left:56px;top:0;bottom:0;justify-content:center"
     return (f"<div style='position:absolute;inset:0;background:{ground(light)}'></div>{scene(light, social)}"
-            f"<div style='position:absolute;{place};display:flex;flex-direction:column;gap:{20 if social else 14}px'><div style='margin-left:-8px'>{mark}</div>{words}</div>")
+            f"<div style='position:absolute;{place};display:flex;flex-direction:column;gap:{20 if social else 14}px'><div style='margin-left:-8px'>{mark(light, 132 if social else 106)}</div>{words}</div>")
 
 
 def badge(light):
@@ -162,12 +176,13 @@ def main():
     parser.add_argument("--font", type=Path, required=True)
     given = parser.parse_args()
     resources, font, chrome, png = (given.os / "resources").resolve(), Type(given.font), chromium(), BRAND / "png"
-    if not (resources / "fonts/selawk.ttf").is_file():
-        parser.error(f"{resources} does not have the fonts")
+    for name in ("selawk.ttf", "selawksb.ttf", "CascadiaCode-Regular.ttf"):
+        if not (resources / "fonts" / name).is_file():
+            parser.error(f"{resources} does not have the font {name}")
     png.mkdir(exist_ok=True)
     for size in SMALL + LARGE:
         subprocess.run(["rsvg-convert", "-w", str(size), source(size), "-o", png / f"icon-{size}.png"], check=True, timeout=60)
-    subprocess.run(["convert", *(png / f"icon-{s}.png" for s in (*SMALL, 48, 64, 256)), BRAND / "icon.ico"], check=True, timeout=60)
+    (BRAND / "icon.ico").write_bytes(icon_file([(s, (png / f"icon-{s}.png").read_bytes()) for s in (*SMALL, 48, 64, 256)]))
     with tempfile.TemporaryDirectory() as folder:
         def shot(name, body, width, height, scale, trim):
             html, out = Path(folder, "page.html"), BRAND / f"{name}.png"
@@ -179,9 +194,9 @@ def main():
             on = "light" if light else "dark"
             (BRAND / f"wordmark-{on}.svg").write_text(wordmark(font, light)[0], encoding="utf-8")
             subprocess.run(["rsvg-convert", "-z", "2", BRAND / f"wordmark-{on}.svg", "-o", BRAND / f"wordmark-{on}.png"], check=True, timeout=60)
-            shot(f"banner-{on}", banner(font, light, False), 1280, 360, 2, False)
+            shot(f"banner-{on}", banner(light, False), 1280, 360, 2, False)
             shot(f"badge-{on}", badge(light), 400, 120, 2, True)
-        shot("social-preview", banner(font, False, True), 1280, 640, 1, False)
+        shot("social-preview", banner(False, True), 1280, 640, 1, False)
 
 
 if __name__ == "__main__":

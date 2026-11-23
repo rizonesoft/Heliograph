@@ -42,7 +42,7 @@ Several sessions work on one machine at the same time, and a person used to carr
 
 - **Nothing is lost.** A message is one file, written under a temporary name, flushed, then given its name.
 - **Nothing is done twice.** A job has one numbered chain of steps, and each step can be made only once.
-- **Nobody is flooded.** At most 5 messages and 2,000 characters are shown at once, urgent first.
+- **Nobody is flooded.** The inbox shows at most 5 messages and 2,000 characters, urgent first; `helio --all` shows the rest.
 - **A message is information, never permission.** It approves no work and changes no rule, and text that looks like a secret is refused.
 
 ## What works today?
@@ -52,11 +52,12 @@ Legend: ✅ works · 📋 planned
 | Area | Status | What you get |
 | --- | :---: | --- |
 | Messages and jobs | ✅ | Ask, hand over, tell, find and answer; take, release, finish or refuse a job |
-| One taker for each job | ✅ | Raced from Windows and Linux at once in [the tests](tests/test_helio.py) |
+| One taker for each job | ✅ | Raced from Windows and Linux at once by [the tests](tests/test_helio.py) when they run in WSL |
 | Routing by path | ✅ | [`helio.conf`](engine/place.h) says who owns which path |
 | Claude Code hook | ✅ | New messages at the start of a session and with each prompt |
 | Codex and Antigravity | ✅ | They run `helio` between sections of their work |
-| Due times, overlap warnings, daily summary | ✅ | Looked at by each call, with nothing running in between |
+| Due times, overlap warnings | ✅ | Shown by the inbox and by `helio working` |
+| Daily summary | ✅ | Written by the first inbox or hook of the day |
 | Archive by month, expiry | 📋 | [§1 to §3 and §12](todo/01-heliograph/TODO-01-heliograph.md) |
 | Silent takers, messages for one session | 📋 | [§4 to §6](todo/01-heliograph/TODO-01-heliograph.md) |
 | Projects kept apart, landed work, fixed marks | 📋 | [§7 to §9](todo/01-heliograph/TODO-01-heliograph.md) |
@@ -73,16 +74,16 @@ python ImpossibleSDK/tools/bootstrap.py           # the pinned toolchain, once p
 python ImpossibleSDK/tools/app_build.py Heliograph
 ```
 
-It builds with the SDK commit in [`sdk.json`](sdk.json), also when the SDK has moved on, and runs the tests. From WSL it makes `helio.exe` for Windows and `linux/helio` for WSL in `build/linux`.
+It builds with the SDK commit in [`sdk.json`](sdk.json), also when the SDK has moved on, and runs the tests. From WSL it makes `helio.exe` for Windows and `linux/helio` for WSL in `build/linux`; on Windows it makes `helio.exe` in `build/windows`. Put the one you need in a folder on your `PATH`.
 
 ## How do I use it?
 
-Say where the store is with `HELIO_STORE` (or `--store`) and who you are with `HELIO_AS` (or `--as`), then make a store once with `helio init`.
+With `helio` on your `PATH`, say where the store is with `HELIO_STORE` (or `--store`) and who you are with `HELIO_AS` (or `--as`), then make a store once with `helio init`.
 
 ```
 $ export HELIO_STORE=~/signals
 $ helio init
-$ helio ask impossible/all "Check the archive rule" --now --as impossible/main < note.txt
+$ echo "Look at engine/store.c" | helio ask impossible/all "Check the archive rule" --now --as impossible/main
 1795472530719051-5faf73
 $ helio --as impossible/apps
 1795472530719051-5faf73  2026-11-23T22:22:10Z  impossible/main to impossible/all  request open  NOW: Check the archive rule
@@ -140,14 +141,14 @@ path: ui/ userland
 <details>
 <summary><strong>Does anything run in the background?</strong></summary>
 
-No. Each call looks, so a reminder appears when someone next works.
+No. The inbox, the hook and `helio working` look when they are called, so a reminder appears when someone next works.
 
 </details>
 
 <details>
 <summary><strong>Can a message make an agent do something?</strong></summary>
 
-It should not. Every message says that it is information from another agent, and the body stands behind bars. A session still works by its own rules and its owner's word.
+It should not. `helio show` and the Claude hook say that a message is information from another agent, and `show` puts bars before its lines. The inbox and the log do not yet ([§9](todo/01-heliograph/TODO-01-heliograph.md)). A session still works by its own rules and its owner's word.
 
 </details>
 

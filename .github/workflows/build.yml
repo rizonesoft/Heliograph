@@ -1,5 +1,7 @@
 name: Build
 
+# The race between Windows and Linux needs WSL, which hosted runners do not have:
+# it is run by app_build.py and prove.py on a WSL machine before a change counts.
 on:
   push:
     branches: [main]
@@ -31,7 +33,15 @@ jobs:
       - name: The pinned SDK commit
         id: sdk
         shell: bash
-        run: echo "commit=$(python -c 'import json; print(json.load(open("Heliograph/sdk.json"))["commit"])')" >> "$GITHUB_OUTPUT"
+        run: |
+          python - <<'END'
+          import json, os, re, sys
+          commit = json.load(open("Heliograph/sdk.json", encoding="utf-8"))["commit"]
+          if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
+              sys.exit("sdk.json: the commit is not a full hash")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              print(f"commit={commit}", file=out)
+          END
       - uses: actions/checkout@v7
         with:
           repository: rizonesoft/ImpossibleSDK
@@ -53,8 +63,6 @@ jobs:
             sudo update-alternatives --install /usr/bin/cc cc /usr/bin/gcc-14 100
             sudo update-alternatives --set cc /usr/bin/gcc-14
           fi
-      - name: Install the pinned toolchain
-        run: python ImpossibleSDK/tools/bootstrap.py
       - name: Build and test
         run: python ImpossibleSDK/tools/app_build.py Heliograph
       - name: Work list
