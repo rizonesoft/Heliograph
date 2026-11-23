@@ -216,8 +216,8 @@ def acquire_lock(lock_path: Path, *, blocking: bool) -> Any:
 
 
 @contextlib.contextmanager
-def acquire_ordered_locks(to_dir: Path, *wrapper_paths: Path) -> Any:
-    """Acquire destination lock first, then distinct wrapper-dir locks in sorted order to prevent deadlocks."""
+def acquire_wrapper_locks(to_dir: Path, *wrapper_paths: Path) -> Any:
+    """Acquire distinct wrapper-dir locks in sorted order while destination lock is already held."""
     to_lock = (to_dir / LOCK_NAME).resolve()
     extra_locks = sorted(
         {
@@ -228,10 +228,18 @@ def acquire_ordered_locks(to_dir: Path, *wrapper_paths: Path) -> Any:
         key=str,
     )
     with contextlib.ExitStack() as stack:
-        stack.enter_context(acquire_lock(to_lock, blocking=False))
         for wl in extra_locks:
             stack.enter_context(acquire_lock(wl, blocking=True))
         yield
+
+
+@contextlib.contextmanager
+def acquire_ordered_locks(to_dir: Path, *wrapper_paths: Path) -> Any:
+    """Acquire destination lock first, then distinct wrapper-dir locks in sorted order to prevent deadlocks."""
+    to_lock = (to_dir / LOCK_NAME).resolve()
+    with acquire_lock(to_lock, blocking=False):
+        with acquire_wrapper_locks(to_dir, *wrapper_paths):
+            yield
 
 
 def _validate_manifest_dict(data: Any, path: Path) -> dict[str, Any]:
@@ -514,7 +522,7 @@ def _validate_journal_paths(journal: Any, to_dir: Path, wrapper_path: Path) -> d
 
 
 def _verify_published_set(to_dir: Path, manifest: dict[str, Any]) -> bool:
-    """Confirm live binaries, recorded backups, bound wrapper, and store all match the committed manifest."""
+    """Confirm live binaries, recorded backups, exact wrapper text (target + store), and store all match the committed manifest."""
     cur = manifest["current"]
     for name, key in (("helio", "helio_sha256"), ("helio.exe", "helio_exe_sha256")):
         p = to_dir / name
@@ -526,17 +534,39 @@ def _verify_published_set(to_dir: Path, manifest: dict[str, Any]) -> bool:
             p = to_dir / name
             if p.is_symlink() or not p.is_file() or sha256_file(p) != prev[key]:
                 return False
-    w_raw = cur.get("wrapper")
-    if isinstance(w_raw, str) and w_raw:
-        wp = _normalize_wrapper_path(Path(w_raw))
-        if not wrapper_belongs_to(wp, to_dir):
-            return False
     s_raw = cur.get("store")
     if isinstance(s_raw, str) and s_raw:
         sp = Path(s_raw)
         if sp.is_symlink() or not sp.is_dir() or not (sp / "messages").is_dir():
             return False
+    w_raw = cur.get("wrapper")
+    if isinstance(w_raw, str) and w_raw:
+        wp = _normalize_wrapper_path(Path(w_raw))
+        if not wrapper_belongs_to(wp, to_dir):
+            return False
+        if isinstance(s_raw, str) and s_raw:
+            try:
+                actual_wrapper = wp.read_text(encoding="utf-8")
+            except OSError:
+                return False
+            if actual_wrapper != render_wrapper(to_dir, Path(s_raw)):
+                return False
     return True
+
+
+def _is_independently_owned_reserved_file(path: Path, name: str) -> bool:
+    """Independently verify file identity without trusting a journal alone."""
+    if name in ("helio", "helio.old"):
+        return _is_heliograph_elf(path)
+    if name in ("helio.exe", "helio.exe.old"):
+        return _is_heliograph_pe(path)
+    if name == MANIFEST_NAME:
+        try:
+            _validate_manifest_dict(json.loads(path.read_text(encoding="utf-8")), path)
+            return True
+        except (InstallError, OSError, ValueError):
+            return False
+    return False
 
 
 def _restore_wrapper_from_manifest(wrapper_path: Path, to_dir: Path, store_str: str | None) -> None:
@@ -583,6 +613,8 @@ def recover_if_needed(to_dir: Path, wrapper_path: Path) -> bool:
                 raise InstallError(f"remove recovery refusing unexpected file {p} not recorded in journal", code=2)
             if sha256_file(p) != expected_hashes[name]:
                 raise InstallError(f"remove recovery refusing modified file {p} whose hash changed since removal started", code=2)
+            if not _is_independently_owned_reserved_file(p, name):
+                raise InstallError(f"remove recovery refusing unowned file {p}: not a Heliograph artifact", code=2)
         for name in BINARY_NAMES + BACKUP_NAMES + (MANIFEST_NAME,):
             p = to_dir / name
             if p.exists():
@@ -675,8 +707,14 @@ def recover_if_needed(to_dir: Path, wrapper_path: Path) -> bool:
             if not journal.get("alt_wrapper_existed"):
                 alt_wp.unlink()
                 fsync_dir(alt_wp.parent)
-            elif prev_store:
-                _restore_wrapper_from_manifest(alt_wp, to_dir, prev_store)
+            else:
+                alt_prev_store = (
+                    prev_manifest["previous"].get("store")
+                    if isinstance(prev_manifest, dict) and isinstance(prev_manifest.get("previous"), dict)
+                    else None
+                )
+                if alt_prev_store:
+                    _restore_wrapper_from_manifest(alt_wp, to_dir, alt_prev_store)
 
     # Restore manifest state.
     if journal.get("had_manifest") and isinstance(prev_manifest, dict):
@@ -985,9 +1023,10 @@ def install(
                     if on_boundary:
                         on_boundary("after_manifest")
 
-                    # 6. Remove journal and transaction temp files.
-                    (to_dir / JOURNAL_NAME).unlink()
+                    # 6. Remove transaction temp files BEFORE unlinking the journal so a crash here leaves zero orphaned snapshots.
                     _cleanup_temp_files(to_dir, temp_files, tx_id)
+                    (to_dir / JOURNAL_NAME).unlink()
+                    fsync_dir(to_dir)
                     return desired_manifest
                 except BaseException as exc:
                     if getattr(exc, "_leave_journal_for_test", False):
@@ -1086,169 +1125,168 @@ def go_back(
     if not to_dir.is_dir():
         raise InstallError(f"cannot roll back: {to_dir} does not exist", code=2)
 
-    # Peek manifest to discover any secondary wrapper path so all involved wrapper directories are locked in order.
-    lock_wrappers = [wrapper_path]
-    with contextlib.suppress(InstallError):
-        peek = read_manifest(to_dir)
-        if peek and isinstance(peek.get("previous"), dict) and isinstance(peek["previous"].get("wrapper"), str):
-            lock_wrappers.append(_normalize_wrapper_path(Path(peek["previous"]["wrapper"])))
-
     prev_handlers = _install_signal_handlers()
     try:
-        with acquire_ordered_locks(to_dir, *lock_wrappers):
-            recover_if_needed(to_dir, wrapper_path)
+        # Acquire destination lock FIRST, then inspect manifest/journal under that lock to discover all wrapper dirs.
+        with acquire_lock(to_dir / LOCK_NAME, blocking=False):
+            lock_wrappers = [wrapper_path]
+            with contextlib.suppress(InstallError):
+                peek = read_manifest(to_dir)
+                if peek and isinstance(peek.get("previous"), dict) and isinstance(peek["previous"].get("wrapper"), str):
+                    lock_wrappers.append(_normalize_wrapper_path(Path(peek["previous"]["wrapper"])))
+                if peek and isinstance(peek.get("current"), dict) and isinstance(peek["current"].get("wrapper"), str):
+                    lock_wrappers.append(_normalize_wrapper_path(Path(peek["current"]["wrapper"])))
+            with acquire_wrapper_locks(to_dir, *lock_wrappers):
+                recover_if_needed(to_dir, wrapper_path)
 
-            manifest = read_manifest(to_dir)
-            if manifest is None:
-                raise InstallError(f"cannot roll back: {to_dir / MANIFEST_NAME} is missing", code=2)
-            previous = manifest.get("previous")
-            if previous is None:
-                raise InstallError("cannot roll back: no previous installation is recorded", code=2)
+                manifest = read_manifest(to_dir)
+                if manifest is None:
+                    raise InstallError(f"cannot roll back: {to_dir / MANIFEST_NAME} is missing", code=2)
+                previous = manifest.get("previous")
+                if previous is None:
+                    raise InstallError("cannot roll back: no previous installation is recorded", code=2)
 
-            verify_destination_ownership(to_dir, manifest, require_live=True)
+                verify_destination_ownership(to_dir, manifest, require_live=True)
 
-            for name, key in (("helio.old", "helio_sha256"), ("helio.exe.old", "helio_exe_sha256")):
-                p = to_dir / name
-                if p.is_symlink() or not p.is_file():
-                    raise InstallError(f"cannot roll back: backup {p} is missing or not a regular file", code=2)
-                actual = sha256_file(p)
-                if actual != previous[key]:
-                    raise InstallError(
-                        f"cannot roll back: backup {p} hash mismatch (expected {previous[key][:12]}, actual {actual[:12]})",
-                        code=2,
-                    )
+                for name, key in (("helio.old", "helio_sha256"), ("helio.exe.old", "helio_exe_sha256")):
+                    p = to_dir / name
+                    if p.is_symlink() or not p.is_file():
+                        raise InstallError(f"cannot roll back: backup {p} is missing or not a regular file", code=2)
+                    actual = sha256_file(p)
+                    if actual != previous[key]:
+                        raise InstallError(
+                            f"cannot roll back: backup {p} hash mismatch (expected {previous[key][:12]}, actual {actual[:12]})",
+                            code=2,
+                        )
 
-            cur = manifest["current"]
-            target_wrapper = _normalize_wrapper_path(Path(previous["wrapper"])) if previous.get("wrapper") else wrapper_path
-            for name in RESERVED_NAMES:
-                if target_wrapper == to_dir / name:
-                    raise InstallError(f"wrapper path {target_wrapper} collides with destination file {to_dir / name}", code=2)
+                cur = manifest["current"]
+                target_wrapper = _normalize_wrapper_path(Path(previous["wrapper"])) if previous.get("wrapper") else wrapper_path
+                for name in RESERVED_NAMES:
+                    if target_wrapper == to_dir / name:
+                        raise InstallError(f"wrapper path {target_wrapper} collides with destination file {to_dir / name}", code=2)
 
-            # Refuse if target_wrapper is owned by a different destination (or is a foreign file/symlink).
-            if not _wrapper_is_available_for(target_wrapper, to_dir):
-                raise InstallError(f"refusing to overwrite wrapper at {target_wrapper} owned by another installation or user", code=2)
+                if not _wrapper_is_available_for(target_wrapper, to_dir):
+                    raise InstallError(f"refusing to overwrite wrapper at {target_wrapper} owned by another installation or user", code=2)
 
-            tx_id = secrets.token_hex(6)
-            temp_files = _planned_temp_names(tx_id)
-            staging_journal = {
-                "schema_version": 1,
-                "op": "back",
-                "phase": "staging",
-                "tx_id": tx_id,
-                "to_dir": str(to_dir),
-                "wrapper_path": str(wrapper_path),
-                "temp_files": temp_files,
-            }
-            write_json_atomic(to_dir / JOURNAL_NAME, staging_journal)
-
-            try:
-                saved = _snapshot_files(to_dir, tx_id)
-                if on_boundary:
-                    on_boundary("after_snapshot")
-
-                stage_helio = to_dir / f".helio.{tx_id}.stage"
-                stage_exe = to_dir / f".helio.exe.{tx_id}.stage"
-                bak_h = to_dir / f".helio.old.{tx_id}.stage"
-                bak_e = to_dir / f".helio.exe.old.{tx_id}.stage"
-                copy_to_staged(to_dir / "helio.old", stage_helio, mode=0o755)
-                copy_to_staged(to_dir / "helio.exe.old", stage_exe, mode=0o755)
-
-                new_previous = {
-                    "commit": cur["commit"],
-                    "dirty": bool(cur.get("dirty", False)),
-                    "installed_at": cur.get("installed_at"),
-                    "helio_sha256": cur["helio_sha256"],
-                    "helio_exe_sha256": cur["helio_exe_sha256"],
-                    "store": cur.get("store", ""),
-                    "wrapper": cur.get("wrapper", str(wrapper_path)),
-                }
-                restored_store = previous.get("store") or cur.get("store", "")
-                new_current = {
-                    "commit": previous["commit"],
-                    "dirty": bool(previous.get("dirty", False)),
-                    "installed_at": previous.get("installed_at") or utc_now(),
-                    "helio_sha256": previous["helio_sha256"],
-                    "helio_exe_sha256": previous["helio_exe_sha256"],
-                    "store": restored_store,
-                    "wrapper": str(target_wrapper),
-                }
-                desired_manifest = {
-                    "schema_version": 1,
-                    "current": new_current,
-                    "previous": new_previous,
-                }
-
-                prev_wrapper_existed = wrapper_belongs_to(wrapper_path, to_dir)
-                alt_wrapper_existed = wrapper_belongs_to(target_wrapper, to_dir) if target_wrapper != wrapper_path else False
-                desired_wrapper_content = render_wrapper(to_dir, Path(restored_store)) if restored_store else None
-
-                journal = {
+                tx_id = secrets.token_hex(6)
+                temp_files = _planned_temp_names(tx_id)
+                staging_journal = {
                     "schema_version": 1,
                     "op": "back",
-                    "phase": "publishing",
+                    "phase": "staging",
                     "tx_id": tx_id,
                     "to_dir": str(to_dir),
                     "wrapper_path": str(wrapper_path),
-                    "alt_wrapper_path": str(target_wrapper) if target_wrapper != wrapper_path else None,
-                    "alt_wrapper_existed": alt_wrapper_existed,
-                    "store_dir": restored_store,
-                    "had_manifest": True,
-                    "previous_manifest": manifest,
-                    "previous_wrapper_existed": prev_wrapper_existed,
-                    "saved_files": saved,
                     "temp_files": temp_files,
-                    "desired_manifest": desired_manifest,
                 }
-                write_json_atomic(to_dir / JOURNAL_NAME, journal)
-                if on_boundary:
-                    on_boundary("after_journal")
+                write_json_atomic(to_dir / JOURNAL_NAME, staging_journal)
 
-                copy_to_staged(to_dir / saved["helio"]["rec_name"], bak_h, mode=0o755)
-                replace_binary_atomic(bak_h, to_dir / "helio.old")
-                if on_boundary:
-                    on_boundary("after_backup_helio")
+                try:
+                    saved = _snapshot_files(to_dir, tx_id)
+                    if on_boundary:
+                        on_boundary("after_snapshot")
 
-                copy_to_staged(to_dir / saved["helio.exe"]["rec_name"], bak_e, mode=0o755)
-                replace_binary_atomic(bak_e, to_dir / "helio.exe.old")
-                if on_boundary:
-                    on_boundary("after_backup_exe")
+                    stage_helio = to_dir / f".helio.{tx_id}.stage"
+                    stage_exe = to_dir / f".helio.exe.{tx_id}.stage"
+                    bak_h = to_dir / f".helio.old.{tx_id}.stage"
+                    bak_e = to_dir / f".helio.exe.old.{tx_id}.stage"
+                    copy_to_staged(to_dir / "helio.old", stage_helio, mode=0o755)
+                    copy_to_staged(to_dir / "helio.exe.old", stage_exe, mode=0o755)
 
-                replace_binary_atomic(stage_helio, to_dir / "helio")
-                if on_boundary:
-                    on_boundary("after_helio")
+                    new_previous = {
+                        "commit": cur["commit"],
+                        "dirty": bool(cur.get("dirty", False)),
+                        "installed_at": cur.get("installed_at"),
+                        "helio_sha256": cur["helio_sha256"],
+                        "helio_exe_sha256": cur["helio_exe_sha256"],
+                        "store": cur.get("store", ""),
+                        "wrapper": cur.get("wrapper", str(wrapper_path)),
+                    }
+                    restored_store = previous.get("store") or cur.get("store", "")
+                    new_current = {
+                        "commit": previous["commit"],
+                        "dirty": bool(previous.get("dirty", False)),
+                        "installed_at": previous.get("installed_at") or utc_now(),
+                        "helio_sha256": previous["helio_sha256"],
+                        "helio_exe_sha256": previous["helio_exe_sha256"],
+                        "store": restored_store,
+                        "wrapper": str(target_wrapper),
+                    }
+                    desired_manifest = {
+                        "schema_version": 1,
+                        "current": new_current,
+                        "previous": new_previous,
+                    }
 
-                replace_binary_atomic(stage_exe, to_dir / "helio.exe")
-                if on_boundary:
-                    on_boundary("after_helio_exe")
+                    prev_wrapper_existed = wrapper_belongs_to(wrapper_path, to_dir)
+                    alt_wrapper_existed = wrapper_belongs_to(target_wrapper, to_dir) if target_wrapper != wrapper_path else False
+                    desired_wrapper_content = render_wrapper(to_dir, Path(restored_store)) if restored_store else None
 
-                if desired_wrapper_content is not None:
-                    if target_wrapper == wrapper_path:
-                        if wrapper_belongs_to(wrapper_path, to_dir):
-                            write_bytes_atomic(wrapper_path, desired_wrapper_content.encode("utf-8"), mode=0o755)
-                    else:
+                    journal = {
+                        "schema_version": 1,
+                        "op": "back",
+                        "phase": "publishing",
+                        "tx_id": tx_id,
+                        "to_dir": str(to_dir),
+                        "wrapper_path": str(wrapper_path),
+                        "alt_wrapper_path": str(target_wrapper) if target_wrapper != wrapper_path else None,
+                        "alt_wrapper_existed": alt_wrapper_existed,
+                        "store_dir": restored_store,
+                        "had_manifest": True,
+                        "previous_manifest": manifest,
+                        "previous_wrapper_existed": prev_wrapper_existed,
+                        "saved_files": saved,
+                        "temp_files": temp_files,
+                        "desired_manifest": desired_manifest,
+                    }
+                    write_json_atomic(to_dir / JOURNAL_NAME, journal)
+                    if on_boundary:
+                        on_boundary("after_journal")
+
+                    copy_to_staged(to_dir / saved["helio"]["rec_name"], bak_h, mode=0o755)
+                    replace_binary_atomic(bak_h, to_dir / "helio.old")
+                    if on_boundary:
+                        on_boundary("after_backup_helio")
+
+                    copy_to_staged(to_dir / saved["helio.exe"]["rec_name"], bak_e, mode=0o755)
+                    replace_binary_atomic(bak_e, to_dir / "helio.exe.old")
+                    if on_boundary:
+                        on_boundary("after_backup_exe")
+
+                    replace_binary_atomic(stage_helio, to_dir / "helio")
+                    if on_boundary:
+                        on_boundary("after_helio")
+
+                    replace_binary_atomic(stage_exe, to_dir / "helio.exe")
+                    if on_boundary:
+                        on_boundary("after_helio_exe")
+
+                    if desired_wrapper_content is not None:
                         target_wrapper.parent.mkdir(parents=True, exist_ok=True)
                         write_bytes_atomic(target_wrapper, desired_wrapper_content.encode("utf-8"), mode=0o755)
-                        if on_boundary:
-                            on_boundary("after_target_wrapper")
-                        if wrapper_belongs_to(wrapper_path, to_dir):
-                            wrapper_path.unlink()
-                            fsync_dir(wrapper_path.parent)
-                if on_boundary:
-                    on_boundary("after_wrapper")
+                        if target_wrapper != wrapper_path:
+                            if on_boundary:
+                                on_boundary("after_target_wrapper")
+                            if wrapper_belongs_to(wrapper_path, to_dir):
+                                wrapper_path.unlink()
+                                fsync_dir(wrapper_path.parent)
+                    if on_boundary:
+                        on_boundary("after_wrapper")
 
-                write_json_atomic(to_dir / MANIFEST_NAME, desired_manifest)
-                if on_boundary:
-                    on_boundary("after_manifest")
+                    write_json_atomic(to_dir / MANIFEST_NAME, desired_manifest)
+                    if on_boundary:
+                        on_boundary("after_manifest")
 
-                (to_dir / JOURNAL_NAME).unlink()
-                _cleanup_temp_files(to_dir, temp_files, tx_id)
-                return desired_manifest
-            except BaseException as exc:
-                if getattr(exc, "_leave_journal_for_test", False):
+                    _cleanup_temp_files(to_dir, temp_files, tx_id)
+                    (to_dir / JOURNAL_NAME).unlink()
+                    fsync_dir(to_dir)
+                    return desired_manifest
+                except BaseException as exc:
+                    if getattr(exc, "_leave_journal_for_test", False):
+                        raise
+                    with contextlib.suppress(InstallError, OSError):
+                        recover_if_needed(to_dir, wrapper_path)
                     raise
-                with contextlib.suppress(InstallError, OSError):
-                    recover_if_needed(to_dir, wrapper_path)
-                raise
     finally:
         _restore_signal_handlers(prev_handlers)
 
@@ -1272,93 +1310,93 @@ def remove(
                     return True
         return False
 
-    # Also lock the manifest's recorded wrapper directory if it differs from wrapper_path.
-    lock_wrappers = [wrapper_path]
-    with contextlib.suppress(InstallError):
-        peek = read_manifest(to_dir)
-        if peek and isinstance(peek.get("current"), dict) and isinstance(peek["current"].get("wrapper"), str):
-            lock_wrappers.append(_normalize_wrapper_path(Path(peek["current"]["wrapper"])))
-
     prev_handlers = _install_signal_handlers()
     try:
-        with acquire_ordered_locks(to_dir, *lock_wrappers):
-            recovered = recover_if_needed(to_dir, wrapper_path)
-            manifest = read_manifest(to_dir)
-            recorded_wrapper: Path | None = None
-            if manifest and isinstance(manifest["current"].get("wrapper"), str):
-                rw = _normalize_wrapper_path(Path(manifest["current"]["wrapper"]))
-                if rw != wrapper_path:
-                    recorded_wrapper = rw
+        # Acquire destination lock FIRST, then inspect manifest under that lock to discover all wrapper dirs.
+        with acquire_lock(to_dir / LOCK_NAME, blocking=False):
+            lock_wrappers = [wrapper_path]
+            with contextlib.suppress(InstallError):
+                peek = read_manifest(to_dir)
+                if peek and isinstance(peek.get("current"), dict) and isinstance(peek["current"].get("wrapper"), str):
+                    lock_wrappers.append(_normalize_wrapper_path(Path(peek["current"]["wrapper"])))
+            with acquire_wrapper_locks(to_dir, *lock_wrappers):
+                recovered = recover_if_needed(to_dir, wrapper_path)
+                manifest = read_manifest(to_dir)
+                recorded_wrapper: Path | None = None
+                if manifest and isinstance(manifest["current"].get("wrapper"), str):
+                    rw = _normalize_wrapper_path(Path(manifest["current"]["wrapper"]))
+                    if rw != wrapper_path:
+                        recorded_wrapper = rw
 
-            any_owned = any((to_dir / n).exists() for n in BINARY_NAMES + BACKUP_NAMES + (MANIFEST_NAME,))
-            wrapper_owned = wrapper_belongs_to(wrapper_path, to_dir)
-            recorded_wrapper_owned = recorded_wrapper is not None and wrapper_belongs_to(recorded_wrapper, to_dir)
-            if not any_owned and not wrapper_owned and not recorded_wrapper_owned:
-                return recovered
+                any_owned = any((to_dir / n).exists() for n in BINARY_NAMES + BACKUP_NAMES + (MANIFEST_NAME,))
+                wrapper_owned = wrapper_belongs_to(wrapper_path, to_dir)
+                recorded_wrapper_owned = recorded_wrapper is not None and wrapper_belongs_to(recorded_wrapper, to_dir)
+                if not any_owned and not wrapper_owned and not recorded_wrapper_owned:
+                    return recovered
 
-            verify_destination_ownership(to_dir, manifest)
+                verify_destination_ownership(to_dir, manifest)
 
-            expected_hashes: dict[str, str] = {}
-            for name in BINARY_NAMES + BACKUP_NAMES + (MANIFEST_NAME,):
-                p = to_dir / name
-                if p.exists():
-                    expected_hashes[name] = sha256_file(p)
-
-            journal = {
-                "schema_version": 1,
-                "op": "remove",
-                "phase": "publishing",
-                "tx_id": secrets.token_hex(6),
-                "to_dir": str(to_dir),
-                "wrapper_path": str(wrapper_path),
-                "alt_wrapper_path": str(recorded_wrapper) if recorded_wrapper_owned else None,
-                "store_dir": "",
-                "had_manifest": manifest is not None,
-                "previous_manifest": manifest,
-                "previous_wrapper_existed": wrapper_owned,
-                "saved_files": {},
-                "temp_files": [],
-                "expected_hashes": expected_hashes,
-                "desired_manifest": None,
-            }
-            write_json_atomic(to_dir / JOURNAL_NAME, journal)
-            if on_boundary:
-                on_boundary("after_journal")
-
-            try:
-                if wrapper_owned:
-                    wrapper_path.unlink()
-                    fsync_dir(wrapper_path.parent)
-                if recorded_wrapper_owned and recorded_wrapper is not None:
-                    recorded_wrapper.unlink()
-                    fsync_dir(recorded_wrapper.parent)
-                if on_boundary:
-                    on_boundary("after_wrapper")
-
-                for name in BINARY_NAMES + BACKUP_NAMES:
+                expected_hashes: dict[str, str] = {}
+                for name in BINARY_NAMES + BACKUP_NAMES + (MANIFEST_NAME,):
                     p = to_dir / name
-                    if p.exists() and not p.is_symlink():
-                        p.unlink()
+                    if p.exists():
+                        expected_hashes[name] = sha256_file(p)
+
+                journal = {
+                    "schema_version": 1,
+                    "op": "remove",
+                    "phase": "publishing",
+                    "tx_id": secrets.token_hex(6),
+                    "to_dir": str(to_dir),
+                    "wrapper_path": str(wrapper_path),
+                    "alt_wrapper_path": str(recorded_wrapper) if recorded_wrapper_owned else None,
+                    "store_dir": "",
+                    "had_manifest": manifest is not None,
+                    "previous_manifest": manifest,
+                    "previous_wrapper_existed": wrapper_owned,
+                    "saved_files": {},
+                    "temp_files": [],
+                    "expected_hashes": expected_hashes,
+                    "desired_manifest": None,
+                }
+                write_json_atomic(to_dir / JOURNAL_NAME, journal)
+                if on_boundary:
+                    on_boundary("after_journal")
+
+                try:
+                    if wrapper_owned:
+                        wrapper_path.unlink()
+                        fsync_dir(wrapper_path.parent)
+                    if recorded_wrapper_owned and recorded_wrapper is not None:
+                        recorded_wrapper.unlink()
+                        fsync_dir(recorded_wrapper.parent)
+                    if on_boundary:
+                        on_boundary("after_wrapper")
+
+                    for name in BINARY_NAMES + BACKUP_NAMES:
+                        p = to_dir / name
+                        if p.exists() and not p.is_symlink():
+                            p.unlink()
+                            fsync_dir(to_dir)
+                        if on_boundary:
+                            on_boundary(f"after_unlink_{name.replace('.', '_')}")
+
+                    mp = to_dir / MANIFEST_NAME
+                    if mp.exists() and not mp.is_symlink():
+                        mp.unlink()
                         fsync_dir(to_dir)
                     if on_boundary:
-                        on_boundary(f"after_unlink_{name.replace('.', '_')}")
+                        on_boundary("after_manifest")
 
-                mp = to_dir / MANIFEST_NAME
-                if mp.exists() and not mp.is_symlink():
-                    mp.unlink()
+                    (to_dir / JOURNAL_NAME).unlink()
                     fsync_dir(to_dir)
-                if on_boundary:
-                    on_boundary("after_manifest")
-
-                (to_dir / JOURNAL_NAME).unlink()
-                fsync_dir(to_dir)
-                return True
-            except BaseException as exc:
-                if getattr(exc, "_leave_journal_for_test", False):
+                    return True
+                except BaseException as exc:
+                    if getattr(exc, "_leave_journal_for_test", False):
+                        raise
+                    with contextlib.suppress(InstallError, OSError):
+                        recover_if_needed(to_dir, wrapper_path)
                     raise
-                with contextlib.suppress(InstallError, OSError):
-                    recover_if_needed(to_dir, wrapper_path)
-                raise
     finally:
         _restore_signal_handlers(prev_handlers)
 

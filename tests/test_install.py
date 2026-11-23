@@ -299,8 +299,37 @@ class TestQuickInstaller(unittest.TestCase):
             self.assertEqual(code, 3)
             self.assertIn("unreadable binary", "\n".join(lines))
 
-            # Modified live binary -> --back refuses with exit 2 and leaves live+backups unchanged.
+            # Missing execute bit on helio or wrapper -> status returns exit 3.
+            os.chmod(to_dir / "helio", 0o644)
+            code, lines = self.mod.status(to_dir=to_dir, wrapper_path=wrap_b)
+            self.assertEqual(code, 3)
+            self.assertIn("not executable", "\n".join(lines))
+            os.chmod(to_dir / "helio", 0o755)
+
+            os.chmod(wrap_b, 0o644)
+            code, lines = self.mod.status(to_dir=to_dir, wrapper_path=wrap_b)
+            self.assertEqual(code, 3)
+            self.assertIn("not executable", "\n".join(lines))
+            os.chmod(wrap_b, 0o755)
+
+            # Live binary hash mismatch -> status returns exit 3 naming helio.
             saved_b = (to_dir / "helio").read_bytes()
+            (to_dir / "helio").write_bytes(saved_b + b"X")
+            code, lines = self.mod.status(to_dir=to_dir, wrapper_path=wrap_b)
+            self.assertEqual(code, 3)
+            self.assertIn("modified binary", "\n".join(lines))
+            (to_dir / "helio").write_bytes(saved_b)
+
+            # Corrupt backup helio.old -> --back refuses with exit 2 leaving live pair intact.
+            saved_old = (to_dir / "helio.old").read_bytes()
+            (to_dir / "helio.old").write_bytes(b"corrupt")
+            with self.assertRaises(self.mod.InstallError) as ctx:
+                self.mod.go_back(to_dir=to_dir, wrapper_path=wrap_b)
+            self.assertEqual(ctx.exception.code, 2)
+            self.assertEqual(self.mod.sha256_file(to_dir / "helio"), self.mod.sha256_file(b_h))
+            (to_dir / "helio.old").write_bytes(saved_old)
+
+            # Modified live binary -> --back refuses with exit 2 and leaves live+backups unchanged.
             (to_dir / "helio").write_bytes(b"foreign live replacement")
             with self.assertRaises(self.mod.InstallError) as ctx:
                 self.mod.go_back(to_dir=to_dir, wrapper_path=wrap_b)
@@ -308,6 +337,17 @@ class TestQuickInstaller(unittest.TestCase):
             self.assertEqual((to_dir / "helio").read_bytes(), b"foreign live replacement")
             self.assertEqual(self.mod.sha256_file(to_dir / "helio.old"), self.mod.sha256_file(a_h))
             (to_dir / "helio").write_bytes(saved_b)
+
+            # Missing shared wrapper on a two-generation installation: --back recreates the wrapper cleanly!
+            shared_dir = root / "shared_wrap_back"
+            shared_wrap = root / "sw_home" / "helio"
+            self.mod.install(repo=repo, to_dir=shared_dir, store_dir=store_a, wrapper_path=shared_wrap, prebuilt=(a_h, a_e))
+            self.mod.install(repo=repo, to_dir=shared_dir, store_dir=store_a, wrapper_path=shared_wrap, prebuilt=(b_h, b_e))
+            shared_wrap.unlink()
+            self.mod.go_back(to_dir=shared_dir, wrapper_path=shared_wrap)
+            self.assertTrue(shared_wrap.is_file())
+            code, _ = self.mod.status(to_dir=shared_dir, wrapper_path=shared_wrap)
+            self.assertEqual(code, 0)
 
             # If another destination took wrap_a, --back refuses with exit 2 without clobbering it.
             other_dir = root / "other_bin"
@@ -444,7 +484,7 @@ class TestQuickInstaller(unittest.TestCase):
                 self.mod.recover_if_needed(ext_dir, ext_wrap)
             self.assertEqual(ctx.exception.code, 2)
 
-            # 5. Committed branch refuses to discard snapshots if wrapper is missing.
+            # 5. Committed branch refuses to discard snapshots if wrapper is missing OR points to wrong store.
             comm_dir = root / "comm_check"
             comm_wrap = root / "cw" / "helio"
             self.mod.install(repo=repo, to_dir=comm_dir, store_dir=store, wrapper_path=comm_wrap, prebuilt=(a_h, a_e))
@@ -455,11 +495,36 @@ class TestQuickInstaller(unittest.TestCase):
 
             with self.assertRaises(SimulatedCrash):
                 self.mod.install(repo=repo, to_dir=comm_dir, store_dir=store, wrapper_path=comm_wrap, prebuilt=(b_h, b_e), on_boundary=crash_after_manifest)
-            comm_wrap.unlink()
+            # Wrong store in wrapper for same destination -> committed branch refuses to discard snapshots.
+            comm_wrap.write_text(self.mod.render_wrapper(comm_dir, root / "wrong_store"), encoding="utf-8")
             with self.assertRaises(self.mod.InstallError) as ctx:
                 self.mod.recover_if_needed(comm_dir, comm_wrap)
             self.assertEqual(ctx.exception.code, 3)
             self.assertTrue((comm_dir / self.mod.JOURNAL_NAME).exists())
+
+            # 6. Hand-crafted foreign remove journal with matching SHA-256 of an unrelated file is refused.
+            frem_dir = root / "foreign_rem_hash"
+            frem_dir.mkdir()
+            unrelated_helio = frem_dir / "helio"
+            unrelated_helio.write_text("unrelated user script\n", encoding="utf-8")
+            (frem_dir / self.mod.JOURNAL_NAME).write_text(
+                json.dumps({
+                    "schema_version": 1,
+                    "op": "remove",
+                    "phase": "publishing",
+                    "tx_id": "abcdef012345",
+                    "to_dir": str(frem_dir.resolve()),
+                    "wrapper_path": str((root / "frw" / "helio").resolve()),
+                    "saved_files": {},
+                    "temp_files": [],
+                    "expected_hashes": {"helio": self.mod.sha256_file(unrelated_helio)},
+                }),
+                encoding="utf-8",
+            )
+            with self.assertRaises(self.mod.InstallError) as ctx:
+                self.mod.recover_if_needed(frem_dir, root / "frw" / "helio")
+            self.assertEqual(ctx.exception.code, 2)
+            self.assertEqual(unrelated_helio.read_text(encoding="utf-8"), "unrelated user script\n")
 
     def test_legacy_adoption_symlinks_collisions_and_locks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -608,6 +673,12 @@ class TestQuickInstaller(unittest.TestCase):
                 active_wrap = wrap_a if boundary == "after_manifest" else wrap_b
                 code, lines = self.mod.status(to_dir=to_dir, wrapper_path=active_wrap)
                 self.assertEqual(code, 0, f"back {boundary}: {lines}")
+                # Verify wrap_a keeps store_a (never overwritten with store_b!) and wrap_b keeps store_b when rolled back.
+                self.assertEqual(wrap_a.read_text(encoding="utf-8"), self.mod.render_wrapper(to_dir, store_a))
+                if boundary == "after_manifest":
+                    self.assertFalse(wrap_b.exists())
+                else:
+                    self.assertEqual(wrap_b.read_text(encoding="utf-8"), self.mod.render_wrapper(to_dir, store_b))
                 exp_cur_h, exp_cur_e = (a_h, a_e) if boundary == "after_manifest" else (b_h, b_e)
                 exp_old_h, exp_old_e = (b_h, b_e) if boundary == "after_manifest" else (a_h, a_e)
                 self.assertEqual(self.mod.sha256_file(to_dir / "helio"), self.mod.sha256_file(exp_cur_h))
@@ -784,6 +855,10 @@ class TestQuickInstaller(unittest.TestCase):
                 wt.join(timeout=35)
                 holder.terminate()
                 holder.wait(timeout=10)
+                if holder.stdout:
+                    holder.stdout.close()
+                if holder.stderr:
+                    holder.stderr.close()
             self.assertEqual(win_failures, [])
             self.assertGreater(overlap_calls, 0)
             code, _ = self.mod.status(to_dir=to_dir, wrapper_path=wrapper)
