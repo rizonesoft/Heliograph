@@ -14,7 +14,7 @@ int racer(int count, char **args) {
     store s = {.folder = args[1]};
     int won = 0;
     for (int i = 3; i < count; i++) {
-        s_result result = store_take(&s, args[i], args[2]);
+        s_result result = store_take(&s, args[i], (actor){args[2], ""});
         if (result == S_OK) won++;
         else if (result != S_REFUSED) return 102;
     }

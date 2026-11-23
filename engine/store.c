@@ -116,6 +116,14 @@ static void cut(const char *value) {
     if (*at) *at = 0;
 }
 
+static const char *const kinds[] = {"request", "handoff", "answer", "finding", "headsup", NULL};
+static const char *const urgencies[] = {"now", "next", "whenever", NULL};
+
+static bool one_of(const char *value, const char *const *list) {
+    for (; *list; list++) if (same(value, *list)) return true;
+    return false;
+}
+
 s_result store_message(store *s, const char *id, message *out) {
     *out = (message){0};
     if (!id_ok(id)) return say(s, S_REFUSED, "that is not a message id");
@@ -137,11 +145,14 @@ s_result store_message(store *s, const char *id, message *out) {
         return say(s, S_DAMAGED, "the message has no body");
     }
     data[split + 1] = 0;
+    uint64_t body = 0;
+    for (const char *d = field(data, "length"); *d >= '0' && *d <= '9' && body < MOST_FILE; d++) body = body * 10 + (uint64_t)(*d - '0');
     *out = (message){data, field(data, "id"), field(data, "time"), field(data, "from"), field(data, "to"), field(data, "kind"),
                      field(data, "about"), field(data, "urgency"), field(data, "re"), field(data, "subject"), data + split + 2};
     const char *all[] = {out->id, out->time, out->from, out->to, out->kind, out->about, out->urgency, out->re, out->subject};
     for (size_t i = 0; i < sizeof all / sizeof *all; i++) if (*all[i]) cut(all[i]);
-    if (!same(out->id, id) || !address_ok(out->from, false) || !address_ok(out->to, true) || !*out->subject) {
+    if (!same(out->id, id) || !address_ok(out->from, false) || !address_ok(out->to, true) || !*out->subject
+        || !one_of(out->kind, kinds) || !one_of(out->urgency, urgencies) || !*out->body || len(out->body) != body) {
         message_free(out);
         return say(s, S_DAMAGED, "the message is not what its name says");
     }
@@ -200,10 +211,6 @@ static s_result make(store *s, const char *id, const char *event, const char *da
     return result == P_OK ? S_OK : say(s, S_DAMAGED, "the store cannot be written");
 }
 
-static void numbered(text *out, const char *event, unsigned n) {
-    add(out, event), add(out, "."), add_number(out, n, 4);
-}
-
 /* Read from the disk and not from the listing, because others write meanwhile. */
 static s_result event_of(store *s, const char *id, const char *event, char **data) {
     text at = {0};
@@ -214,45 +221,41 @@ static s_result event_of(store *s, const char *id, const char *event, char **dat
     return result == P_OK ? S_OK : result == P_MISSING ? S_NOTHING : say(s, S_DAMAGED, "an event cannot be read");
 }
 
-/* The turn a job is in: one more than the times it was released. */
-static s_result turn(store *s, const char *id, unsigned *n, char **taken) {
-    *taken = NULL;
-    for (*n = 0; *n < 1000; ++*n) {
-        text name = {0};
-        numbered(&name, "release", *n);
-        char *data = NULL;
-        s_result result = name.failed ? S_DAMAGED : event_of(s, id, name.data, &data);
-        text_free(&name);
-        if (result == S_OK) {
-            p_free(data);
-            continue;
-        }
-        if (result != S_NOTHING) return result;
-        numbered(&name, "take", *n);
-        result = name.failed ? S_DAMAGED : event_of(s, id, name.data, taken);
-        text_free(&name);
-        return result == S_NOTHING ? S_OK : result;
-    }
-    return say(s, S_DAMAGED, "the job was released too often");
+static bool keep(char *to, size_t room, const char *value) {
+    size_t n = 0;
+    while (value[n] && value[n] != '\n') n++;
+    if (n >= room) return false;
+    memcpy(to, value, n);
+    to[n] = 0;
+    return true;
 }
 
-s_result store_state(store *s, const char *id, job_state *state, char **taker) {
-    char *data = NULL;
-    *taker = NULL;
-    s_result result = event_of(s, id, "end", &data);
-    if (result == S_OK) *state = same(field(data, "state"), "done") || starts(field(data, "state"), "done\n") ? DONE : REFUSED;
-    else if (result != S_NOTHING) return result;
-    else {
-        unsigned n;
-        if ((result = turn(s, id, &n, &data)) != S_OK) return result;
-        *state = data ? TAKEN : OPEN;
-        if (!data) return S_OK;
+static void link_name(text *out, unsigned n) { add(out, "link."), add_number(out, n, 4); }
+
+/* Replays the chain from the disk, because others write meanwhile. */
+s_result store_job(store *s, const char *id, job *out) {
+    *out = (job){.state = OPEN};
+    for (; out->links < MOST_LINKS; out->links++) {
+        text name = {0};
+        link_name(&name, out->links);
+        char *data = NULL, what[16], by[72], session[72], end[8];
+        s_result result = name.failed ? say(s, S_DAMAGED, "out of memory") : event_of(s, id, name.data, &data);
+        text_free(&name);
+        if (result == S_NOTHING) return S_OK;
+        if (result != S_OK) return result;
+        bool good = keep(what, sizeof what, field(data, "state")) && keep(by, sizeof by, field(data, "by")) && address_ok(by, false)
+                    && keep(session, sizeof session, field(data, "session")) && keep(end, sizeof end, field(data, "end")) && same(end, "yes");
+        p_free(data);
+        bool was = out->state == TAKEN;
+        if (good && same(what, "taken") && out->state == OPEN) out->state = TAKEN;
+        else if (good && same(what, "released") && was) out->state = OPEN;
+        else if (good && same(what, "done") && was) out->state = DONE;
+        else if (good && same(what, "refused") && (was || out->state == OPEN)) out->state = REFUSED;
+        else return say(s, S_DAMAGED, "a step of this job is damaged");
+        keep(out->by, sizeof out->by, out->state == OPEN ? "" : by);
+        keep(out->session, sizeof out->session, out->state == OPEN ? "" : session);
     }
-    const char *by = field(data, "by");
-    cut(by);
-    *taker = copy(by, len(by));
-    p_free(data);
-    return *taker ? S_OK : say(s, S_DAMAGED, "out of memory");
+    return S_OK;
 }
 
 static bool secret(const char *t) {
@@ -276,7 +279,7 @@ static bool secret(const char *t) {
 
 /* Without control characters or marks that turn text around, so a message
    cannot drive a terminal. A line stays one line when one_line is set. */
-static void clean(text *out, const char *in, bool one_line) {
+void clean(text *out, const char *in, bool one_line) {
     for (const unsigned char *at = (const unsigned char *)in; *at;) {
         if (*at == '\n' || *at == '\t') {
             add(out, one_line ? " " : *at == '\n' ? "\n" : "\t");
@@ -293,19 +296,48 @@ static void clean(text *out, const char *in, bool one_line) {
     }
 }
 
-static bool one_of(const char *value, const char *const *list) {
-    for (; *list; list++) if (same(value, *list)) return true;
-    return false;
+static void fresh(text *id, uint64_t now) {
+    uint64_t mixed = p_tick();
+    add_number(id, now, 16), add(id, "-");
+    for (int shift = 20; shift >= 0; shift -= 4) add_bytes(id, &"0123456789abcdef"[mixed >> (shift + 24) & 15], 1);
 }
 
-s_result store_post(store *s, const message *m, text *id) {
-    static const char *const kinds[] = {"request", "handoff", "answer", "finding", "headsup", NULL}, *const urgencies[] = {"now", "next", "whenever", NULL};
+/* The id that this sender's key stands for: made once, so a retry finds it. */
+static s_result reserve(store *s, const message *m, const char *key, text *id) {
+    if (len(key) > 100) return say(s, S_REFUSED, "the key is too long");
+    text whole = {0}, name = {0}, line = {0};
+    clean(&line, key, true);
+    add(&whole, m->from), add(&whole, " "), add(&whole, m->to), add(&whole, " "), add(&whole, line.data ? line.data : "");
+    uint64_t hash = 14695981039346656037ull;
+    for (const char *at = whole.data ? whole.data : ""; *at; at++) hash = (hash ^ (unsigned char)*at) * 1099511628211ull;
+    add(&name, "key."), add_number(&name, hash, 20);
+    add(&whole, "\n"), add(&whole, id->data);
+    s_result result = S_DAMAGED;
+    char *data = NULL;
+    if (whole.failed || name.failed || line.failed) result = say(s, S_DAMAGED, "out of memory");
+    else if ((result = make(s, "key", name.data, whole.data)) == S_NOTHING && (result = event_of(s, "key", name.data, &data)) == S_OK) {
+        size_t n = 0;
+        while (data[n] && data[n] != '\n') n++;
+        bool mine = data[n] && id_ok(data + n + 1);
+        for (size_t i = 0; mine && i <= n; i++) mine = data[i] == whole.data[i];
+        if (mine) {
+            text_free(id);
+            add(id, data + n + 1);
+            result = id->failed ? say(s, S_DAMAGED, "out of memory") : S_OK;
+        } else {
+            result = say(s, S_REFUSED, "that key is in use: choose another");
+        }
+    }
+    p_free(data), text_free(&whole), text_free(&name), text_free(&line);
+    return result;
+}
+
+s_result store_post(store *s, const message *m, const char *key, text *id) {
     if (!address_ok(m->from, false)) return say(s, S_REFUSED, "say who you are: --as project/lane");
     if (!address_ok(m->to, true)) return say(s, S_REFUSED, "the reader is project/lane, or project/all");
     if (!one_of(m->kind, kinds)) return say(s, S_REFUSED, "the kind is request, handoff, answer, finding or headsup");
     if (!one_of(m->urgency, urgencies)) return say(s, S_REFUSED, "the urgency is now, next or whenever");
     if (len(m->subject) > 120 || len(m->about) > 1000 || len(m->body) > MOST_BODY) return say(s, S_REFUSED, "the message is too long");
-    if (secret(m->subject) || secret(m->body) || secret(m->about)) return say(s, S_REFUSED, "this looks like it contains a secret, so it was not sent");
     if (*m->re) {
         message other;
         s_result result = store_message(s, m->re, &other);
@@ -317,122 +349,127 @@ s_result store_post(store *s, const message *m, text *id) {
     s_result result = S_REFUSED;
     bool blank = true;
     for (const char *p = subject.data ? subject.data : ""; *p; p++) blank = blank && *p == ' ';
-    if (blank || !body.data || !body.length) {
+    if (subject.failed || about.failed || body.failed) {
+        result = say(s, S_DAMAGED, "out of memory");
+    } else if (blank || !body.length) {
         s->why = "a message needs a subject and a body";
+    } else if (secret(subject.data) || secret(body.data) || secret(about.data ? about.data : "")) {
+        s->why = "this looks like it contains a secret, so it was not sent";
     } else {
-        uint64_t now = p_now(), mixed = p_tick();
-        add_number(id, now, 16), add(id, "-");
-        for (int shift = 20; shift >= 0; shift -= 4) add_bytes(id, &"0123456789abcdef"[mixed >> (shift + 24) & 15], 1);
-        add(&out, "id: "), add(&out, id->data ? id->data : ""), add(&out, "\ntime: "), add_time(&out, now);
-        add(&out, "\nfrom: "), add(&out, m->from), add(&out, "\nto: "), add(&out, m->to), add(&out, "\nkind: "), add(&out, m->kind);
-        add(&out, "\nabout: "), add(&out, about.data ? about.data : ""), add(&out, "\nurgency: "), add(&out, m->urgency);
-        add(&out, "\nre: "), add(&out, m->re), add(&out, "\nsubject: "), add(&out, subject.data), add(&out, "\n\n"), add(&out, body.data);
-        result = out.failed || id->failed || body.failed ? say(s, S_DAMAGED, "out of memory") : make(s, id->data, "post", out.data);
-        if (result == S_NOTHING) result = say(s, S_DAMAGED, "two messages got one id: send it again");
+        uint64_t now = p_now();
+        fresh(id, now);
+        result = id->failed ? say(s, S_DAMAGED, "out of memory") : *key ? reserve(s, m, key, id) : S_OK;
+        if (result == S_OK) {
+            add(&out, "id: "), add(&out, id->data), add(&out, "\ntime: "), add_time(&out, now);
+            add(&out, "\nfrom: "), add(&out, m->from), add(&out, "\nto: "), add(&out, m->to), add(&out, "\nkind: "), add(&out, m->kind);
+            add(&out, "\nabout: "), add(&out, about.data ? about.data : ""), add(&out, "\nurgency: "), add(&out, m->urgency);
+            add(&out, "\nre: "), add(&out, m->re), add(&out, "\nlength: "), add_number(&out, body.length, 0);
+            add(&out, "\nsubject: "), add(&out, subject.data), add(&out, "\n\n"), add(&out, body.data);
+            result = out.failed ? say(s, S_DAMAGED, "out of memory") : make(s, id->data, "post", out.data);
+            if (result == S_NOTHING) result = *key ? S_OK : say(s, S_DAMAGED, "two messages got one id: send it again");
+        }
     }
     text_free(&subject), text_free(&about), text_free(&body), text_free(&out);
     return result;
 }
 
-static s_result stamped(store *s, const char *id, const char *event, const char *me, const char *state, const char *note) {
-    text out = {0}, line = {0};
-    clean(&line, note, true);
-    add(&out, "by: "), add(&out, me), add(&out, "\ntime: "), add_time(&out, p_now()), add(&out, "\nstate: "), add(&out, state);
-    add(&out, "\nnote: "), add(&out, line.data ? line.data : ""), add(&out, "\n");
-    s_result result = out.failed || line.failed ? say(s, S_DAMAGED, "out of memory") : make(s, id, event, out.data);
-    text_free(&out), text_free(&line);
-    return result;
-}
-
-/* A job that this lane may act on. */
-static s_result job(store *s, const char *id, const char *me, message *m) {
-    if (!address_ok(me, false)) return say(s, S_REFUSED, "say who you are: --as project/lane");
-    s_result result = store_message(s, id, m);
-    if (result == S_OK && !is_job(m)) {
-        message_free(m);
-        result = say(s, S_REFUSED, "only a request or a handoff can be taken");
+/* Adds one link. S_NOTHING when someone else made that link first. */
+static s_result add_link(store *s, const char *id, const job *now, actor me, const char *state, const char *note) {
+    if (now->links >= MOST_LINKS - 2 && !same(state, "done") && !same(state, "refused")) return say(s, S_REFUSED, "this job changed hands too often: close it and ask again");
+    text out = {0}, line = {0}, name = {0}, session = {0};
+    clean(&line, note, true), clean(&session, me.session, true), link_name(&name, now->links);
+    s_result result;
+    if (line.length > MOST_NOTE || session.length > 64) result = say(s, S_REFUSED, "the note or the session name is too long");
+    else if (secret(line.data ? line.data : "")) result = say(s, S_REFUSED, "the note looks like it contains a secret");
+    else {
+        add(&out, "by: "), add(&out, me.lane), add(&out, "\ntime: "), add_time(&out, p_now()), add(&out, "\nsession: "), add(&out, session.data ? session.data : "");
+        add(&out, "\nstate: "), add(&out, state), add(&out, "\nnote: "), add(&out, line.data ? line.data : ""), add(&out, "\nend: yes\n");
+        bool full = out.failed || line.failed || name.failed || session.failed;
+        result = full ? say(s, S_DAMAGED, "out of memory") : make(s, id, name.data, out.data);
     }
+    text_free(&out), text_free(&line), text_free(&name), text_free(&session);
     return result;
 }
 
-s_result store_take(store *s, const char *id, const char *me) {
+static bool owns(const char *lane, const message *m) {
+    size_t n = len(lane);
+    if (n <= 6 || !same(lane + n - 6, "/owner")) return false;
+    const char *sides[] = {m->to, m->from};
+    for (int side = 0; side < 2; side++) {
+        bool equal = true;
+        for (size_t i = 0; i <= n - 6 && equal; i++) equal = lane[i] == sides[side][i];
+        if (equal) return true;
+    }
+    return false;
+}
+
+typedef enum { TAKE, RELEASE, FINISH, REFUSE } change;
+
+static const char *objection(const message *m, const job *now, actor me, change what) {
+    bool taker = now->state == TAKEN && same(now->by, me.lane) && (!*now->session || !*me.session || same(now->session, me.session));
+    if (now->state == DONE || now->state == REFUSED) return "it is already closed";
+    switch (what) {
+    case TAKE: return now->state == TAKEN ? "it is already taken" : is_for(m, me.lane) ? NULL : "it is not for you";
+    case RELEASE: return now->state != TAKEN ? "it is not taken" : taker || owns(me.lane, m) ? NULL : "someone else took it";
+    case FINISH: return now->state != TAKEN ? "take it first" : taker ? NULL : "someone else took it";
+    default: return taker || same(m->from, me.lane) || owns(me.lane, m) || (now->state == OPEN && is_for(m, me.lane)) ? NULL : "it is not yours to refuse";
+    }
+}
+
+static s_result change_job(store *s, const char *id, actor me, change what, const char *note) {
+    static const char *const states[] = {"taken", "released", "done", "refused"};
+    if (!address_ok(me.lane, false)) return say(s, S_REFUSED, "say who you are: --as project/lane");
     message m;
-    s_result result = job(s, id, me, &m);
+    s_result result = store_message(s, id, &m);
     if (result != S_OK) return result;
-    job_state state;
-    char *taker = NULL;
-    unsigned n;
-    char *taken = NULL;
-    if (!is_for(&m, me)) result = say(s, S_REFUSED, "it is not for you");
-    else if ((result = store_state(s, id, &state, &taker)) != S_OK) {}
-    else if (state != OPEN) result = say(s, S_REFUSED, state == TAKEN ? "it is already taken" : "it is already closed");
-    else if ((result = turn(s, id, &n, &taken)) == S_OK) {
-        if (taken) {
-            result = say(s, S_REFUSED, "it is already taken");
-        } else {
-            text event = {0};
-            numbered(&event, "take", n);
-            result = event.failed ? S_DAMAGED : stamped(s, id, event.data, me, "taken", "");
-            if (result == S_NOTHING) result = say(s, S_REFUSED, "it is already taken");
-            text_free(&event);
-        }
+    if (!is_job(&m)) result = say(s, S_REFUSED, "only a request or a handoff can be taken");
+    while (result == S_OK) {
+        job now;
+        if ((result = store_job(s, id, &now)) != S_OK) break;
+        const char *why = objection(&m, &now, me, what);
+        result = why ? say(s, S_REFUSED, why) : add_link(s, id, &now, me, states[what], note);
+        if (result != S_NOTHING) break;
+        result = S_OK; /* the chain grew: decide again from the new end */
     }
-    p_free(taker), p_free(taken), message_free(&m);
+    message_free(&m);
     return result;
 }
 
-static bool is_owner(const char *me) {
-    size_t n = len(me);
-    return n > 6 && same(me + n - 6, "/owner");
-}
-
-s_result store_release(store *s, const char *id, const char *me) {
-    message m;
-    s_result result = job(s, id, me, &m);
-    if (result != S_OK) return result;
-    job_state state;
-    char *taker = NULL, *taken = NULL;
-    unsigned n;
-    if ((result = store_state(s, id, &state, &taker)) == S_OK) {
-        if (state != TAKEN) result = say(s, S_REFUSED, "it is not taken");
-        else if (!same(taker, me) && !is_owner(me)) result = say(s, S_REFUSED, "someone else took it");
-        else if ((result = turn(s, id, &n, &taken)) == S_OK) {
-            text event = {0};
-            numbered(&event, "release", n);
-            result = event.failed ? S_DAMAGED : stamped(s, id, event.data, me, "released", "");
-            if (result == S_NOTHING) result = say(s, S_REFUSED, "it was released meanwhile");
-            text_free(&event);
-        }
-    }
-    p_free(taker), p_free(taken), message_free(&m);
-    return result;
-}
-
-s_result store_end(store *s, const char *id, const char *me, bool done, const char *note) {
-    message m;
-    s_result result = job(s, id, me, &m);
-    if (result != S_OK) return result;
-    job_state state;
-    char *taker = NULL;
-    if ((result = store_state(s, id, &state, &taker)) == S_OK) {
-        bool mine = state == TAKEN && same(taker, me);
-        if (state == DONE || state == REFUSED) result = say(s, S_REFUSED, "it is already closed");
-        else if (done && !mine) result = say(s, S_REFUSED, state == TAKEN ? "someone else took it" : "take it first");
-        else if (!done && !mine && !same(m.from, me) && !is_owner(me) && !(state == OPEN && is_for(&m, me))) result = say(s, S_REFUSED, "it is not yours to refuse");
-        else {
-            result = stamped(s, id, "end", me, done ? "done" : "refused", note);
-            if (result == S_NOTHING) result = say(s, S_REFUSED, "it was closed meanwhile");
-        }
-    }
-    p_free(taker), message_free(&m);
-    return result;
-}
+s_result store_take(store *s, const char *id, actor me) { return change_job(s, id, me, TAKE, ""); }
+s_result store_release(store *s, const char *id, actor me) { return change_job(s, id, me, RELEASE, ""); }
+s_result store_end(store *s, const char *id, actor me, bool done, const char *note) { return change_job(s, id, me, done ? FINISH : REFUSE, note); }
 
 s_result store_seen(store *s, const char *id, const char *me) {
     if (!address_ok(me, false)) return say(s, S_REFUSED, "say who you are: --as project/lane");
     text event = {0};
     seen_name(&event, me);
-    s_result result = event.failed ? S_DAMAGED : stamped(s, id, event.data, me, "seen", "");
+    s_result result = event.failed ? say(s, S_DAMAGED, "out of memory") : make(s, id, event.data, "seen\n");
     text_free(&event);
     return result == S_NOTHING ? S_OK : result;
+}
+
+s_result store_check(store *s, text *report) {
+    s_result all = S_OK;
+    for (size_t i = 0; i < s->count; i++) {
+        const char *name = s->names[i], *dot = name;
+        while (*dot && *dot != '.') dot++;
+        char *id = copy(name, (size_t)(dot - name));
+        const char *why = NULL;
+        message m = {0};
+        job now;
+        if (!id) return say(s, S_DAMAGED, "out of memory");
+        if (same(id, "key")) {}
+        else if (store_message(s, id, &m) != S_OK) why = s->why;
+        else if (same(dot, ".post") && is_job(&m) && store_job(s, id, &now) != S_OK) why = s->why;
+        if (why) {
+            text line = {0};
+            clean(&line, name, true);
+            add(report, line.data ? line.data : "?"), add(report, ": "), add(report, why), add(report, "\n");
+            text_free(&line);
+            all = say(s, S_DAMAGED, "the store has damage");
+        }
+        message_free(&m);
+        p_free(id);
+    }
+    return report->failed ? say(s, S_DAMAGED, "out of memory") : all;
 }

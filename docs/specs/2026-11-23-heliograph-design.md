@@ -30,8 +30,10 @@ Agent sessions on this machine (Claude, Codex, Antigravity, on Windows and in WS
 ## How is nothing lost or done twice?
 
 - The store is `D:\ImpossibleOS\Heliograph-signals`, outside every repository. The old `mail` folder is brought in.
-- Every event is its own file that is never changed: posted, seen, taken, released, done, refused. A file is written under a temporary name, flushed, then renamed. The state of a message is worked out from its events, so there is no database to damage.
-- Taking a job creates one file that can be created only once. Exactly one session wins, on either side.
+- A message is one file, made once. A job also has one numbered chain of steps: taken, released, done, refused. Each step is a file that can be made only once, and it is decided from the steps before it. When another session made that step first, it is decided again. So every change has one place in one order, on either side. (The first build had a file per kind of change, and a review found that two of them could be valid at once.)
+- A file is written under a temporary name, flushed, then given its name, and the folder is flushed too. A step or message that is cut short or out of order is reported as damaged and never guessed.
+- A lane may have several sessions after each other. When the taker named its session, only that session may finish the job.
+- Sending with a key can be repeated safely: the key stands for one message.
 - A taker that has shown no sign of life for a set time is reported. The job is never handed to someone else by itself: `helio release` does that.
 - Sizes and counts are limited, and done messages are archived by month.
 
