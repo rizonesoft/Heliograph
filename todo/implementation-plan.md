@@ -18,7 +18,7 @@ Sections: 3 | Checklist items: 19
 
 ### Phase 2: The right reader
 
-Sections: 7 | Checklist items: 35
+Sections: 7 | Checklist items: 37
 
 | Status | Reference   | Deliverable                            | Needs | Items |
 | ------ | ----------- | -------------------------------------- | ----- | ----- |
@@ -28,7 +28,7 @@ Sections: 7 | Checklist items: 35
 | [ ]    | D01 T01 §7  | Projects kept apart in log and show    | none  | 4     |
 | [ ]    | D01 T01 §8  | Mark for landed work                   | none  | 5     |
 | [ ]    | D01 T01 §9  | Fixed marks around every shown message | none  | 4     |
-| [ ]    | D01 T01 §14 | Unowned paths kept to their repository | none  | 6     |
+| [ ]    | D01 T01 §14 | Unowned paths kept to their repository | none  | 8     |
 
 ### Phase 3: Scripts and queues
 
@@ -43,4 +43,4 @@ Sections: 4 | Checklist items: 19
 
 Progress: 0/14 verified sections, 3 ready to run now.
 
-Checklist: 0/73 items completed (includes Commit items).
+Checklist: 0/75 items completed (includes Commit items).

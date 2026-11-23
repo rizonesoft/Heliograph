@@ -181,12 +181,14 @@ def main():
         if not (resources / "fonts" / name).is_file():
             parser.error(f"{resources} does not have the font {name}")
     png.mkdir(exist_ok=True)
+    kit, pictures, record = ico(), {}, {}
     for size in SMALL + LARGE:
-        subprocess.run(["rsvg-convert", "-w", str(size), source(size), "-o", png / f"icon-{size}.png"], check=True, timeout=60)
-    kit = ico()
-    drawn = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted((BRAND / "icon").glob("icon*.svg"))}
-    kit.write_atomic(png / "rendered-from.json", (json.dumps(drawn, indent=2) + "\n").encode())  # a test compares it, so a drawing is not left unrendered
-    kit.write_atomic(BRAND / "icon.ico", kit.pack_ico([(s, (png / f"icon-{s}.png").read_bytes()) for s in (*SMALL, 48, 64, 256)]))
+        drawing = source(size).read_bytes()  # what is recorded is what was rendered
+        pictures[size] = subprocess.run(["rsvg-convert", "-w", str(size)], input=drawing, capture_output=True, check=True, timeout=60).stdout
+        kit.write_atomic(png / f"icon-{size}.png", pictures[size])
+        record[f"icon-{size}.png"] = {"drawing": source(size).name, "drawing_sha256": hashlib.sha256(drawing).hexdigest(), "sha256": hashlib.sha256(pictures[size]).hexdigest()}
+    kit.write_atomic(BRAND / "icon.ico", kit.pack_ico([(s, pictures[s]) for s in (*SMALL, 48, 64, 256)]))
+    kit.write_atomic(png / "rendered.json", (json.dumps(record, indent=2) + "\n").encode())  # a test compares it with what is here
     with tempfile.TemporaryDirectory() as folder:
         def shot(name, body, width, height, scale, trim):
             html, out = Path(folder, "page.html"), BRAND / f"{name}.png"

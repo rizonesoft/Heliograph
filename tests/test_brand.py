@@ -66,13 +66,18 @@ class Brand(unittest.TestCase):
             self.assertEqual({e.tag.split("}")[1] for e in elements} - allowed, set(), path.name)
             self.assertEqual({name for e in elements for name in e.attrib} - ATTRIBUTES, set(), path.name)
             paints = [v for e in elements for n, v in e.attrib.items() if n in ("fill", "stroke", "stop-color")]
-            self.assertEqual([v for v in paints if not re.fullmatch(r"none|currentColor|#[0-9A-F]{6}|url\(#[\w-]+\)", v)], [], path.name)
+            self.assertEqual([v for v in paints if not re.fullmatch(r"none|currentColor|#[0-9A-Fa-f]{6}|url\(#[\w-]+\)", v)], [], path.name)
             used = {v[5:-1] for e in elements for v in e.attrib.values() if v.startswith("url(#")}
             self.assertEqual(used, {e.get("id") for e in elements if e.get("id")}, path.name)
 
-    def test_the_pictures_were_rendered_from_these_drawings(self):
-        drawn = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted((BRAND / "icon").glob("icon*.svg"))}
-        self.assertEqual(json.loads((BRAND / "png/rendered-from.json").read_text(encoding="utf-8")), drawn, "run tools/brand.py")
+    def test_each_picture_is_the_one_rendered_from_its_drawing(self):
+        def digest(path):
+            return hashlib.sha256(path.read_bytes()).hexdigest()
+        record = json.loads((BRAND / "png/rendered.json").read_text(encoding="utf-8"))
+        self.assertEqual(set(record), {p.name for p in (BRAND / "png").glob("*.png")})
+        self.assertEqual({r["drawing"] for r in record.values()}, {p.name for p in (BRAND / "icon").glob("icon*.svg")})
+        for name, r in record.items():
+            self.assertEqual((r["drawing_sha256"], r["sha256"]), (digest(BRAND / "icon" / r["drawing"]), digest(BRAND / "png" / name)), f"{name}: run tools/brand.py")
 
     def test_the_icon_file_has_every_size(self):
         self.assertEqual([size for size, _ in images()], [16, 20, 24, 32, 48, 64, 256])

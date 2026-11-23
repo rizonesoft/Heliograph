@@ -336,10 +336,12 @@ A path that no lane owns goes to whoever works in that repository, and to the ow
 1. Store the repository as the reader in `engine/store.c`. Done when: a message without it is read as before.
 2. Send and show it in `engine/helio.c`. Done when: the three cases of the design are tested.
 
-- [ ] Write and read `repository:` in `store_post` and `store_message` of `engine/store.c`, beside the reader of §6. Done when: old messages pass `helio check` and a name that is a path is refused. Cheaper substitute: one message for each lane.
+- [ ] Read `repository: <name>` from `helio.conf` in `place_open` of `engine/place.c`: the name is the identity, so Windows and WSL agree on one checkout. Done when: both spell it alike, two repositories of one project differ, a path is refused, and without the line an unowned path goes to the project as before. Cheaper substitute: the name of the folder.
+- [ ] Write and read `repository:` in `store_post` and `store_message` of `engine/store.c`, beside the reader of §6. Done when: old messages pass `helio check`. Cheaper substitute: one message for each lane.
+- [ ] Write the actor's repository into each step in `add_link` and read it in `store_job` of `engine/store.c`, as the session is. Done when: `helio check` accepts a take after its session has ended, a step without it still counts for a message without a repository, and one that names another repository is damage. Cheaper substitute: checking the live actor alone.
 - [ ] Give the repository from the sessions of §4 in `place_busy` of `engine/place.c`, in place of one yes or no for the project. Done when: a lane seen only in another repository of the project does not count. Cheaper substitute: the project.
 - [ ] Choose the reader in `reader` of `engine/helio.c`: the lane that owns the path, else this repository, else the owner. Done when: each of the three is chosen in a test. Cheaper substitute: the owner whenever no lane owns it.
-- [ ] Compare the caller's repository in `is_for` and `objection` of `engine/store.c`. Done when: two lanes of the repository both see the one job and one of them takes it, and a lane of another repository neither sees nor takes it. Cheaper substitute: hiding it in the inbox alone.
+- [ ] Compare the actor's repository in `is_for` and `objection` of `engine/store.c`. Done when: two lanes of the repository both see the one job and one of them takes it, and a lane of another repository neither sees nor takes it. Cheaper substitute: hiding it in the inbox alone.
 - [ ] Replace `test_an_unowned_path_goes_to_whoever_works_there` in `tests/test_helio.py` with the three cases, its lane announced from inside the repository. Done when: it fails with the old `reader`. Cheaper substitute: keeping the project-wide expectation.
 - [ ] Commit: `routing: an unowned path stays in its repository`
 

@@ -1,0 +1,52 @@
+{
+  "icon-16.png": {
+    "drawing": "icon-16.svg",
+    "drawing_sha256": "4316522f2358f9c75d187b10aa462f3172c315d66c402a3298c634be5afaa4dd",
+    "sha256": "1ae00c1ccad5cc74b0e6c96c7b9f969ccd57324aa1cf01d385fee5c36a936353"
+  },
+  "icon-20.png": {
+    "drawing": "icon-20.svg",
+    "drawing_sha256": "f9a1794c884bd7f3caa745b3ba8298002d389c3d8aa7831a3aa16febd6fb86c1",
+    "sha256": "80f20bda97d4f6ea7d83c653e555dc4a5fce1e0560b4740c675f50fffdba8713"
+  },
+  "icon-24.png": {
+    "drawing": "icon-24.svg",
+    "drawing_sha256": "0956229951e57acff760b4806c4d9ffd15de67d28e2be25f60da1a330b1a94ad",
+    "sha256": "83614e6a93b4127bcbdadfa4627beb00a64d428e8f04a6b1f460428457ba6834"
+  },
+  "icon-32.png": {
+    "drawing": "icon-32.svg",
+    "drawing_sha256": "14fbf3d910eb6f3ef5eec52d2258037f37e16f8f7bc21989024ac0aa17a9461b",
+    "sha256": "d030e1a9ef4ece7f94d922db21258528c193f661ad4a1cb5aa46e5ed882474bc"
+  },
+  "icon-48.png": {
+    "drawing": "icon.svg",
+    "drawing_sha256": "5da7ad57b37f75b0b8f251d8311bb406d79443b128c80a6cb004ff385a860384",
+    "sha256": "2c9089400ab2b1fe2391874805903bfc8b655443b5aebaf201b3830de41a400e"
+  },
+  "icon-64.png": {
+    "drawing": "icon.svg",
+    "drawing_sha256": "5da7ad57b37f75b0b8f251d8311bb406d79443b128c80a6cb004ff385a860384",
+    "sha256": "7088a6163313230d045db48a51f5303a53be5228636be69a4b2d59f37f1a6a96"
+  },
+  "icon-72.png": {
+    "drawing": "icon.svg",
+    "drawing_sha256": "5da7ad57b37f75b0b8f251d8311bb406d79443b128c80a6cb004ff385a860384",
+    "sha256": "e1acbb19c52f94cc4b6e507c40a994441808e58b79cd19b3de077c72d95d00e1"
+  },
+  "icon-96.png": {
+    "drawing": "icon.svg",
+    "drawing_sha256": "5da7ad57b37f75b0b8f251d8311bb406d79443b128c80a6cb004ff385a860384",
+    "sha256": "73ca13ad2d6100737753057085a8646d8dbf58b25ec4bf1cd9f2d1a98f816bcb"
+  },
+  "icon-128.png": {
+    "drawing": "icon.svg",
+    "drawing_sha256": "5da7ad57b37f75b0b8f251d8311bb406d79443b128c80a6cb004ff385a860384",
+    "sha256": "530acbcd8259937d2087b49611c07709ba6d4dc5f3643d5850c1cb28d6a1809c"
+  },
+  "icon-256.png": {
+    "drawing": "icon.svg",
+    "drawing_sha256": "5da7ad57b37f75b0b8f251d8311bb406d79443b128c80a6cb004ff385a860384",
+    "sha256": "d877508290a72a5574109f98ae8f7307b33bc4b8886e2e3b1372b8f676437e83"
+  }
+}
