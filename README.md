@@ -10,7 +10,7 @@ Status: messages, jobs, routing by path, the Claude hook, overdue jobs, overlap 
 helio help
 ```
 
-Say who you are with `--as project/lane` or `HELIO_AS`, and where the store is with `--store` or `HELIO_STORE`. On this machine it is `D:\ImpossibleOS\Heliograph-signals`. Make a store with `helio init`.
+Say who you are with `--as project/lane` or `HELIO_AS`, and where the store is with `--store` or `HELIO_STORE`. On this machine it is `~/ImpossibleOS/Heliograph-signals` in WSL. Make a store with `helio init`.
 
 Exit codes: 0 done, 1 nothing, 2 refused, 3 something failed or is damaged, and what was asked may have happened. Send with `--key` to repeat a send safely. `helio check` examines the store.
 

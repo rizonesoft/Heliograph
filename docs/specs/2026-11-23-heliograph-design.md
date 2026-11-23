@@ -29,7 +29,7 @@ Agent sessions on this machine (Claude, Codex, Antigravity, on Windows and in WS
 
 ## How is nothing lost or done twice?
 
-- The store is `D:\ImpossibleOS\Heliograph-signals`, outside every repository. The old `mail` folder is brought in.
+- The store is `~/ImpossibleOS/Heliograph-signals` in WSL, outside every repository; Windows reaches it through `\\wsl.localhost`. The old `mail` folder is brought in.
 - A message is one file, made once. A job also has one numbered chain of steps: taken, released, done, refused. Each step is a file that can be made only once, and it is decided from the steps before it. When another session made that step first, it is decided again. So every change has one place in one order, on either side. (The first build had a file per kind of change, and a review found that two of them could be valid at once.)
 - A file is written under a temporary name, flushed, then given its name, and the folder is flushed too. A step or message that is cut short or out of order is reported as damaged and never guessed.
 - A lane may have several sessions after each other. When the taker named its session, only that session may finish the job.
@@ -73,7 +73,7 @@ helio hook <agent> <event>
 
 - The sender's name is not proof: any program running as the user can write to the store.
 - Two builds share one core: a Windows program on Impossible SDK and a native Linux program for WSL. WSL's bridge to Windows hung for 10 seconds and failed in one call of eight on 2026-11-23, so a WSL session never uses it.
-- On the `D:` mount Linux cannot rename without replacing, so it makes a file once with a hard link. Windows uses a rename that refuses to replace. Raced on 2026-11-23: 2,000 jobs, two Linux and one Windows racer, one winner each.
+- On the `D:` mount Linux cannot rename without replacing, so it makes a file once with a hard link. Windows uses a rename that refuses to replace. Raced on 2026-11-23 on `D:` and on WSL's own disk, with Windows and Linux meeting in the middle: one winner for every job.
 - What OS `TODO-08` §55 plans as its own queue folder is replaced by `helio take`; that section is changed in the OS when Heliograph works.
 
 ## In what order?

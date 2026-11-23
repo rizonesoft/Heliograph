@@ -11,8 +11,6 @@ from pathlib import Path
 BUILD = Path(os.environ["IMPOSSIBLE_BUILD"])
 ON_WINDOWS = os.name == "nt"
 WSL = "microsoft" in platform.release().lower()
-# The real store is on a Windows drive, which both systems reach, so the tests use one too.
-WSL_STORE = "/mnt/d/ImpossibleOS" if os.path.isdir("/mnt/d/ImpossibleOS") else "/mnt/c/Windows/Temp"
 SUFFIX = ".exe" if ON_WINDOWS else ""
 PROGRAM, RACER = ((BUILD if ON_WINDOWS else BUILD / "linux") / (name + SUFFIX) for name in ("helio", "racer"))
 
@@ -29,7 +27,7 @@ def run(folder, *arguments, me="os/main", body="", cwd=None):
 
 class Base(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(dir=None if ON_WINDOWS or not WSL else WSL_STORE)
+        self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.store = Path(self.temp.name)
         put((self.store / "helio.conf"), "project: os\n")  # so that the one of this repository is not found
@@ -213,7 +211,9 @@ class Jobs(Base):
 
     def race(self, racers, jobs=40):
         ids = [self.send(to="os/all") for _ in range(jobs)]
-        started = [subprocess.Popen([program, store, f"os/lane-{n}", *ids]) for n, (program, store) in enumerate(racers)]
+        # Windows starts from the other end, because Linux is done before it would meet it.
+        started = [subprocess.Popen([program, store, f"os/lane-{n}", *(ids[::-1] if program.endswith(".exe") and not ON_WINDOWS else ids)])
+                   for n, (program, store) in enumerate(racers)]
         try:
             for _ in range(300):
                 if len(list(self.store.glob("ready.*"))) == len(racers):
@@ -225,6 +225,7 @@ class Jobs(Base):
             for p in started:
                 p.kill()
         self.assertEqual(sum(won), jobs, won)
+        self.assertGreater(sum(n > 0 for n in won), 1, won)  # otherwise nobody met anybody
         self.assertEqual(self.helio("log", me=None).stdout.decode().count("request taken by"), jobs)
 
     def test_many_sessions_take_each_job_once(self):
@@ -233,7 +234,7 @@ class Jobs(Base):
     @unittest.skipUnless(WSL, "needs WSL")
     def test_windows_and_linux_take_each_job_once(self):
         windows = subprocess.run(["wslpath", "-w", str(self.store)], capture_output=True, text=True, check=True, timeout=30).stdout.strip()
-        self.race([(str(BUILD / "racer.exe"), windows)] * 2 + [(str(RACER), str(self.store))] * 2)
+        self.race([(str(BUILD / "racer.exe"), windows)] * 2 + [(str(RACER), str(self.store))], jobs=200)
 
     def test_messages_sent_together_all_arrive(self):
         with ThreadPoolExecutor(8) as pool:
