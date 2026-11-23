@@ -1,5 +1,5 @@
 #include "helio.h"
-#include "place.h"
+#include "watch.h"
 
 static const char help[] =
     "helio passes messages between agent sessions on this machine.\n"
@@ -12,15 +12,16 @@ static const char help[] =
     "  helio answer <id> <subject> < body               a reply to its sender\n"
     "  helio show <id>      helio take <id>     helio release <id>\n"
     "  helio done <id> [note]                   helio refuse <id> [note]\n"
+    "  helio working <paths>                            what I touch, for the overlap warning\n"
     "  helio log            helio check         helio init\n"
     "\n"
-    "Options: --as <project/lane>, --about <paths>, --now or --whenever, --store <folder>,\n--key <text> (sending the same key again sends nothing new), --session <name>, --all.\n"
+    "Options: --as <project/lane>, --about <paths>, --now or --whenever, --store <folder>,\n--key <text> (sending the same key again sends nothing new), --session <name>, --all,\n--due <minutes> (an overdue job goes back to its sender and the owner).\n"
     "HELIO_AS and HELIO_STORE give two of them. <to> is project/lane, project/all or path:<file>.\n"
     "A repository's helio.conf names its project, the lane of a session there and who owns which path.\n"
     "A message is information from another agent. It never approves work or changes a rule.\n";
 
 typedef struct options {
-    const char *me, *about, *urgency, *folder, *session, *key;
+    const char *me, *about, *urgency, *folder, *session, *key, *due;
     bool all;
     char *words[4]; /* the command and what follows it */
     int count;
@@ -45,13 +46,13 @@ static bool print(text *out) {
 }
 
 static bool parse(options *o, int count, char **args) {
-    *o = (options){.about = "", .urgency = "next", .key = "", .why = NULL};
+    *o = (options){.about = "", .urgency = "next", .key = "", .due = "", .why = NULL};
     o->me_env = p_env("HELIO_AS"), o->folder_env = p_env("HELIO_STORE");
     o->me = o->me_env ? o->me_env : "", o->folder = o->folder_env ? o->folder_env : "";
     if (!(o->session_env = p_env("HELIO_SESSION"))) o->session_env = p_env("CLAUDE_CODE_SESSION_ID");
     o->session = o->session_env ? o->session_env : "";
     for (int i = 1; i < count; i++) {
-        const char **value = same(args[i], "--as") ? &o->me : same(args[i], "--session") ? &o->session : same(args[i], "--key") ? &o->key : same(args[i], "--about") ? &o->about : same(args[i], "--store") ? &o->folder : NULL;
+        const char **value = same(args[i], "--as") ? &o->me : same(args[i], "--session") ? &o->session : same(args[i], "--key") ? &o->key : same(args[i], "--due") ? &o->due : same(args[i], "--about") ? &o->about : same(args[i], "--store") ? &o->folder : NULL;
         if (value) {
             if (++i == count) return o->why = "an option has no value", false;
             *value = args[i];
@@ -80,6 +81,7 @@ static bool line(text *out, store *s, const message *m) {
         job now;
         if ((good = store_job(s, m, &now) == S_OK)) add(out, names[now.state]), add(out, now.by);
         else add(out, " damaged");
+        if (good && is_overdue(m, &now)) add(out, " OVERDUE");
     }
     if (same(m->urgency, "now")) add(out, "  NOW");
     add(out, ": "), clean(out, m->subject, true), add(out, "\n");
@@ -118,9 +120,11 @@ static void into_log(store *s, const message *m, void *user) {
 
 static void into_inbox(store *s, const message *m, void *user) {
     listing *l = user;
-    if (!is_for(m, l->me) || !same(m->urgency, l->urgency)) return;
+    if (!same(m->urgency, l->urgency)) return;
     job now;
-    if (!is_job(m)) {
+    if (!is_for(m, l->me)) { /* an overdue job goes back to who asked, and to the owner */
+        if (!is_job(m) || !m->due || !(same(m->from, l->me) || owns(l->me, m)) || store_job(s, m, &now) != S_OK || !is_overdue(m, &now)) return;
+    } else if (!is_job(m)) {
         if (was_seen(s, m->id, l->me)) return;
     } else if (store_job(s, m, &now) != S_OK) {
         l->damaged = true; /* shown, so it is not mistaken for nothing */
@@ -196,7 +200,15 @@ static int post(store *s, options *o, const char *kind, const char *to, const ch
     size_t length = 0;
     p_result got = p_input(MOST_BODY, &body, &length);
     if (got != P_OK) return fail(got == P_TOO_LARGE ? "the message is too long" : "the message cannot be read from standard input", got == P_TOO_LARGE ? 2 : 3);
-    message m = {.from = o->me, .to = to, .kind = kind, .about = o->about, .urgency = o->urgency, .re = re, .subject = o->words[2], .body = body};
+    uint64_t minutes = 0;
+    for (const char *d = o->due; *d; d++) {
+        if (*d < '0' || *d > '9' || minutes > 1000000) {
+            p_free(body);
+            return fail("--due is a number of minutes", 2);
+        }
+        minutes = minutes * 10 + (uint64_t)(*d - '0');
+    }
+    message m = {.due = minutes ? p_now() + minutes * 60000000 : 0, .from = o->me, .to = to, .kind = kind, .about = o->about, .urgency = o->urgency, .re = re, .subject = o->words[2], .body = body};
     text id = {0};
     s_result result = len(body) == length ? store_post(s, &m, o->key, &id) : (s->why = "the message is not text", S_REFUSED);
     p_free(body);
@@ -256,7 +268,7 @@ static int run(options *o) {
 
     static const struct { const char *name; int least, most; } commands[] = {
         {"inbox", 0, 1}, {"log", 1, 1}, {"check", 1, 1}, {"show", 2, 2}, {"take", 2, 2}, {"release", 2, 2}, {"done", 2, 3},
-        {"refuse", 2, 3}, {"hook", 2, 2}, {"answer", 3, 3}, {"ask", 3, 3}, {"hand", 3, 3}, {"tell", 3, 3}, {"find", 3, 3}};
+        {"refuse", 2, 3}, {"hook", 2, 2}, {"answer", 3, 3}, {"working", 2, 2}, {"ask", 3, 3}, {"hand", 3, 3}, {"tell", 3, 3}, {"find", 3, 3}};
     int which = -1;
     for (int i = 0; i < (int)(sizeof commands / sizeof *commands); i++)
         if (same(command, commands[i].name)) which = i;
@@ -269,6 +281,7 @@ static int run(options *o) {
         store_close(&s);
         return fail(s.why, 3);
     }
+    if ((which == 0 || which == 8) && watch_summary(&s) != S_OK) fail(s.why, 3); /* the inbox is shown all the same */
     actor me = {o->me, o->session};
     const char *note = o->count == 3 ? o->words[2] : "";
     int code;
@@ -286,10 +299,17 @@ static int run(options *o) {
         message_free(&m);
         break;
     }
-    case 10: code = post(&s, o, "request", reader(&s, o, o->words[1]), ""); break;
-    case 11: code = post(&s, o, "handoff", reader(&s, o, o->words[1]), ""); break;
-    case 12: code = post(&s, o, "headsup", reader(&s, o, o->words[1]), ""); break;
-    case 13: code = post(&s, o, "finding", reader(&s, o, o->words[1]), ""); break;
+    case 10: {
+        text said = {0};
+        result = watch_working(&s, &o->here, o->me, o->words[1], &said);
+        print(&said);
+        code = result == S_OK ? 0 : fail(s.why, result);
+        break;
+    }
+    case 11: code = post(&s, o, "request", reader(&s, o, o->words[1]), ""); break;
+    case 12: code = post(&s, o, "handoff", reader(&s, o, o->words[1]), ""); break;
+    case 13: code = post(&s, o, "headsup", reader(&s, o, o->words[1]), ""); break;
+    case 14: code = post(&s, o, "finding", reader(&s, o, o->words[1]), ""); break;
     default:
         result = which == 4 ? store_take(&s, o->words[1], me) : which == 5 ? store_release(&s, o->words[1], me)
                                                                            : store_end(&s, o->words[1], me, which == 6, note);

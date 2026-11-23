@@ -11,6 +11,7 @@ typedef enum { OPEN, TAKEN, DONE, REFUSED } job_state;
 typedef struct message {
     char *file; /* owns the strings below */
     const char *id, *time, *from, *to, *kind, *about, *urgency, *re, *subject, *body;
+    uint64_t due; /* microseconds since 1970, or 0 */
 } message;
 
 typedef struct store {
@@ -31,6 +32,7 @@ typedef struct job {
     job_state state;
     unsigned links;
     char by[72], session[72]; /* the taker, or who closed it */
+    uint64_t when;            /* of the last step */
 } job;
 
 bool address_ok(const char *address, bool may_be_all); /* project/lane, or project/all */
@@ -45,6 +47,7 @@ s_result store_take(store *s, const char *id, actor me);
 s_result store_release(store *s, const char *id, actor me);
 s_result store_end(store *s, const char *id, actor me, bool done, const char *note);
 s_result store_seen(store *s, const char *id, const char *me);
+bool owns(const char *lane, const message *m); /* the owner of a project on either side */
 s_result store_check(store *s, text *report); /* S_DAMAGED when anything is wrong */
 
 bool is_job(const message *m);

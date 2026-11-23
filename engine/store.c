@@ -158,11 +158,14 @@ s_result store_message(store *s, const char *id, message *out) {
     uint64_t body = 0;
     for (const char *d = field(data, "length"); *d >= '0' && *d <= '9' && body < MOST_FILE; d++) body = body * 10 + (uint64_t)(*d - '0');
     *out = (message){data, field(data, "id"), field(data, "time"), field(data, "from"), field(data, "to"), field(data, "kind"),
-                     field(data, "about"), field(data, "urgency"), field(data, "re"), field(data, "subject"), data + split + 2};
+                     field(data, "about"), field(data, "urgency"), field(data, "re"), field(data, "subject"), data + split + 2, 0};
+    const char *due = field(data, "due");
+    for (int digits = 0; *due >= '0' && *due <= '9' && digits < 17; digits++) out->due = out->due * 10 + (uint64_t)(*due++ - '0');
+    bool due_ok = !*due || *due == '\n';
     const char *all[] = {out->id, out->time, out->from, out->to, out->kind, out->about, out->urgency, out->re, out->subject};
     for (size_t i = 0; i < sizeof all / sizeof *all; i++) if (*all[i]) cut(all[i]);
     if (!same(out->id, id) || !address_ok(out->from, false) || !address_ok(out->to, true) || !*out->subject
-        || !time_ok(out->time) || (*out->re && !id_ok(out->re)) || !one_of(out->kind, kinds) || !one_of(out->urgency, urgencies) || !*out->body || len(out->body) != body) {
+        || !due_ok || !time_ok(out->time) || (*out->re && !id_ok(out->re)) || !one_of(out->kind, kinds) || !one_of(out->urgency, urgencies) || !*out->body || len(out->body) != body) {
         message_free(out);
         return say(s, S_DAMAGED, "the message is not what its name says");
     }
@@ -258,7 +261,6 @@ static void copy_to(char *to, const char *from) { memcpy(to, from, len(from) + 1
 
 static void link_name(text *out, unsigned n) { add(out, "link."), add_number(out, n, 4); }
 
-static bool owns(const char *lane, const message *m);
 static const char *objection(const message *m, const job *now, actor me, change what);
 
 /* A later step on the disk means that the one after the last we read is lost. */
@@ -290,17 +292,19 @@ s_result store_job(store *s, const message *m, job *out) {
     for (; out->links < MOST_LINKS; out->links++) {
         text name = {0};
         link_name(&name, out->links);
-        char *data = NULL, what[16], by[72], session[72], end[8];
+        char *data = NULL, what[16], by[72], session[72], end[8], when[24];
         s_result result = name.failed ? say(s, S_DAMAGED, "out of memory") : event_of(s, m->id, name.data, &data);
         text_free(&name);
         if (result == S_NOTHING) return gap(s, m->id, out->links) ? say(s, S_DAMAGED, "a step of this job is missing") : S_OK;
         if (result != S_OK) return result;
         bool good = keep(what, sizeof what, data, "state") && keep(by, sizeof by, data, "by") && address_ok(by, false)
-                    && keep(session, sizeof session, data, "session") && keep(end, sizeof end, data, "end") && same(end, "yes");
+                    && keep(session, sizeof session, data, "session") && keep(when, sizeof when, data, "at") && keep(end, sizeof end, data, "end") && same(end, "yes");
         p_free(data);
         int step = 0;
         while (good && step < 4 && !same(what, states[step])) step++;
         if (!good || step == 4 || objection(m, out, (actor){by, session}, (change)step)) return say(s, S_DAMAGED, "a step of this job is damaged");
+        out->when = 0;
+        for (const char *d = when; *d >= '0' && *d <= '9'; d++) out->when = out->when * 10 + (uint64_t)(*d - '0');
         out->state = after[step];
         bool open = out->state == OPEN;
         copy_to(out->by, open ? "" : by), copy_to(out->session, open ? "" : session);
@@ -414,7 +418,9 @@ s_result store_post(store *s, const message *m, const char *key, text *id) {
             add(&out, "id: "), add(&out, id->data), add(&out, "\ntime: "), add_time(&out, now);
             add(&out, "\nfrom: "), add(&out, m->from), add(&out, "\nto: "), add(&out, m->to), add(&out, "\nkind: "), add(&out, m->kind);
             add(&out, "\nabout: "), add(&out, about.data ? about.data : ""), add(&out, "\nurgency: "), add(&out, m->urgency);
-            add(&out, "\nre: "), add(&out, m->re), add(&out, "\nlength: "), add_number(&out, body.length, 0);
+            add(&out, "\nre: "), add(&out, m->re), add(&out, "\ndue: ");
+            if (m->due) add_number(&out, m->due, 0);
+            add(&out, "\nlength: "), add_number(&out, body.length, 0);
             add(&out, "\nsubject: "), add(&out, subject.data), add(&out, "\n\n"), add(&out, body.data);
             result = out.failed ? say(s, S_DAMAGED, "out of memory") : make(s, id->data, "post", out.data);
             if (result == S_NOTHING && *key) {
@@ -441,7 +447,7 @@ static s_result add_link(store *s, const char *id, const job *now, actor me, con
     if (line.length > MOST_NOTE || session.length > 64) result = say(s, S_REFUSED, "the note or the session name is too long");
     else if (secret(line.data ? line.data : "")) result = say(s, S_REFUSED, "the note looks like it contains a secret");
     else {
-        add(&out, "by: "), add(&out, me.lane), add(&out, "\ntime: "), add_time(&out, p_now()), add(&out, "\nsession: "), add(&out, session.data ? session.data : "");
+        add(&out, "by: "), add(&out, me.lane), add(&out, "\ntime: "), add_time(&out, p_now()), add(&out, "\nat: "), add_number(&out, p_now(), 0), add(&out, "\nsession: "), add(&out, session.data ? session.data : "");
         add(&out, "\nstate: "), add(&out, state), add(&out, "\nnote: "), add(&out, line.data ? line.data : ""), add(&out, "\nend: yes\n");
         bool full = out.failed || line.failed || name.failed || session.failed;
         result = full ? say(s, S_DAMAGED, "out of memory") : make(s, id, name.data, out.data);
@@ -450,7 +456,7 @@ static s_result add_link(store *s, const char *id, const job *now, actor me, con
     return result;
 }
 
-static bool owns(const char *lane, const message *m) {
+bool owns(const char *lane, const message *m) {
     size_t n = len(lane);
     if (n <= 6 || !same(lane + n - 6, "/owner")) return false;
     const char *sides[] = {m->to, m->from};

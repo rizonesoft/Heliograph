@@ -26,6 +26,7 @@ class Base(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(dir=BUILD)
         self.addCleanup(self.temp.cleanup)
         self.store = Path(self.temp.name)
+        (self.store / "helio.conf").write_text("project: os\n")  # so that the one of this repository is not found
         self.assertEqual(self.helio("init", me=None).returncode, 0)
 
     def helio(self, *arguments, **more):
@@ -77,7 +78,7 @@ class Messages(Base):
         sent = self.send("tell", subject="x\nto: os/apps\nkind: request")
         head = (self.store / f"messages/{sent}.post").read_text().split("\n\n")[0]
         self.assertEqual([line.split(":")[0] for line in head.splitlines()],
-                         ["id", "time", "from", "to", "kind", "about", "urgency", "re", "length", "subject"])
+                         ["id", "time", "from", "to", "kind", "about", "urgency", "re", "due", "length", "subject"])
 
     def test_no_line_of_a_body_looks_like_the_frame(self):
         sent = self.send("tell", body="one\n| two\nA message from another agent.\n\nhelio: done")
@@ -196,7 +197,7 @@ class Jobs(Base):
         job = self.send()
         for n in range(998):
             state = "released" if n % 2 else "taken"
-            (self.store / f"messages/{job}.link.{n:04}").write_text(f"by: os/userland\ntime: x\nsession: \nstate: {state}\nnote: \nend: yes\n")
+            (self.store / f"messages/{job}.link.{n:04}").write_text(f"by: os/userland\ntime: x\nat: 1\nsession: \nstate: {state}\nnote: \nend: yes\n")
         self.assertEqual(self.helio("take", job, me="os/userland").returncode, 2)
         self.assertEqual(self.helio("refuse", job, me="os/userland").returncode, 0)
         self.assertIn("refused by", self.helio("log", me=None).stdout.decode())
@@ -233,6 +234,62 @@ class Jobs(Base):
             list(pool.map(lambda n: self.send("tell", to="os/apps", subject=f"n{n}"), range(48)))
         lines = self.helio("--all", me="os/apps").stdout.decode().splitlines()
         self.assertEqual(sorted(line.rsplit(": ", 1)[1] for line in lines), sorted(f"n{n}" for n in range(48)))
+
+
+class Watching(Base):
+    def test_an_overdue_job_goes_back_to_its_sender_and_the_owner(self):
+        job = self.send("ask", "os/userland", "os/main", "s", "b", "--due", "60")
+        self.assertEqual([self.helio(me=m).returncode for m in ("os/main", "os/owner", "os/userland")], [1, 1, 0])
+        path = self.store / f"messages/{job}.post"
+        text = path.read_text()
+        due = next(line for line in text.splitlines() if line.startswith("due: "))
+        path.write_text(text.replace(due, "due: 1"))
+        for who, sees in (("os/main", 0), ("os/owner", 0), ("os/userland", 0), ("os/apps", 1), ("other/owner", 1)):
+            result = self.helio(me=who)
+            self.assertEqual((result.returncode, b"OVERDUE" in result.stdout), (sees, not sees), who)
+        self.helio("take", job, me="os/userland")
+        self.assertIn(b"OVERDUE", self.helio(me="os/main").stdout)
+        self.helio("done", job, me="os/userland")
+        self.assertEqual(self.helio(me="os/main").returncode, 1)
+
+    def test_a_wrong_due_is_refused(self):
+        for due in ("x", "-1", "1.5", "99999999999999999999"):
+            self.assertEqual(self.helio("ask", "os/apps", "s", "--due", due, body="b").returncode, 2, due)
+
+    def working(self, lane, paths):
+        result = self.helio("working", paths, me=f"os/{lane}")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.decode().splitlines()
+
+    def test_two_lanes_on_the_same_files_are_both_told_once(self):
+        self.assertEqual(self.working("apps", "ui/ docs/a.md"), [])
+        self.assertEqual(self.working("main", "uix/b.c docs/a.mdx"), [])
+        self.assertEqual(self.working("main", "src ui/draw.c"), ["os/apps is also working on ui/draw.c"])
+        self.assertEqual(self.working("main", "src ui/draw.c"), ["os/apps is also working on ui/draw.c"])
+        self.assertEqual(len(self.helio(me="os/apps").stdout.decode().splitlines()), 1)
+        self.assertEqual(self.helio("working", "ui", me="other/apps").returncode, 2)
+        self.assertEqual(self.working("main", "src"), [])
+
+    def test_old_work_is_not_an_overlap(self):
+        self.working("apps", "ui")
+        (self.store / "working/os+apps").write_text("1\nui\n")
+        self.assertEqual(self.working("main", "ui"), [])
+
+    def test_the_summary_is_written_once_a_day(self):
+        open_job, taken, done, refused = (self.send(subject=n) for n in ("one", "two", "three", "four"))
+        for job in (taken, done):
+            self.helio("take", job, me="os/userland")
+        self.helio("done", done, me="os/userland")
+        self.helio("refuse", refused, me="os/main")
+        self.helio(me="os/userland")
+        (summary,) = (self.store / "summary").glob("*.md")
+        text = summary.read_text()
+        for part, job in (("Overdue: 0", None), ("Open: 1", open_job), ("Taken: 1", taken), ("Done in the last day: 1", done), ("Refused in the last day: 1", refused)):
+            body = text.split(f"## {part}\n")[1].split("## ")[0]
+            self.assertTrue(job is None or job in body, (part, body))
+        self.send(subject="five")
+        self.helio(me="os/userland")
+        self.assertEqual(summary.read_text(), text)
 
 
 class Places(Base):
@@ -339,7 +396,7 @@ class Damage(Base):
         for by, session in (("os/apps", "session: A"), ("os/userland", "session: B"), ("os/userland", "other: A")):
             job = self.send()
             self.helio("take", job, "--session", "A", me="os/userland")
-            (self.store / f"messages/{job}.link.0001").write_text(f"by: {by}\ntime: x\n{session}\nstate: done\nnote: \nend: yes\n")
+            (self.store / f"messages/{job}.link.0001").write_text(f"by: {by}\ntime: x\nat: 1\n{session}\nstate: done\nnote: \nend: yes\n")
             self.assertEqual(self.helio("check", me=None).returncode, 3, by)
             (self.store / f"messages/{job}.link.0001").unlink()
 
@@ -355,7 +412,7 @@ class Damage(Base):
         self.assertEqual(self.send("ask", "os/userland", "os/main", "s", "b", "--key", "k"), first)
 
     def test_a_damaged_step_is_reported_and_never_guessed(self):
-        for text in ("", "by: os/userland\nstate: ta", "by: os/userland\ntime: x\nsession: \nstate: taken\nnote: half", "by: os/userland\ntime: x\nsession: \nstate: done\nnote: \nend: yes\n", "x" * 40000):
+        for text in ("", "by: os/userland\nstate: ta", "by: os/userland\ntime: x\nat: 1\nsession: \nstate: taken\nnote: half", "by: os/userland\ntime: x\nat: 1\nsession: \nstate: done\nnote: \nend: yes\n", "x" * 40000):
             job = self.send()
             step = self.store / f"messages/{job}.link.0000"
             step.write_text(text)

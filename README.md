@@ -2,7 +2,7 @@
 
 Passes messages and jobs between agent sessions on one machine, on Windows and in WSL. A job is taken once, however many sessions try. No service, no network, no model calls. Design: [docs/specs/2026-11-23-heliograph-design.md](docs/specs/2026-11-23-heliograph-design.md).
 
-Status: step 1 works (messages, jobs, the store). Routing by path, delivery through hooks, reminders and the summary are not built.
+Status: messages, jobs, routing by path, the Claude hook, overdue jobs, overlap warnings and the daily summary work. Codex and Antigravity read with `helio` between sections. Nothing runs between calls, so a reminder appears when someone next works.
 
 ## Use
 
