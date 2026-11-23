@@ -1,35 +1,180 @@
-# Heliograph
+<div align="center">
 
-<a href="https://github.com/rizonesoft/ImpossibleSDK"><picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/rizonesoft/ImpossibleSDK/main/brand/badge-dark.png"><img alt="Built with Impossible SDK" src="https://raw.githubusercontent.com/rizonesoft/ImpossibleSDK/main/brand/badge-light.png" height="34"></picture></a>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="brand/banner-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="brand/banner-light.png">
+  <img alt="Heliograph: messages and jobs between agent sessions, on Windows and in WSL. Every job has one taker. Beside the name, one window takes a job and the other is told it is already taken." src="brand/banner-light.png" width="100%">
+</picture>
 
-Passes messages and jobs between agent sessions on one machine, on Windows and in WSL. A job is taken once, however many sessions try. No service, no network, no model calls. Design: [docs/specs/2026-11-23-heliograph-design.md](docs/specs/2026-11-23-heliograph-design.md).
+<br>
+<br>
 
-Status: messages, jobs, routing by path, the Claude hook, overdue jobs, overlap warnings and the daily summary work. Codex and Antigravity read with `helio` between sections. Nothing runs between calls, so a reminder appears when someone next works.
+[![Build](https://github.com/rizonesoft/Heliograph/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/rizonesoft/Heliograph/actions/workflows/build.yml)
+[![License: GPL-3.0-only](https://img.shields.io/badge/license-GPL--3.0--only-blue.svg)](LICENSE)
+[![C23](https://img.shields.io/badge/C-23-262D3A)](engine/helio.h)
+[![Windows and WSL](https://img.shields.io/badge/Windows%20%C2%B7%20WSL-x64-0078D4)](#quick-start)
+[![For Impossible OS](https://img.shields.io/badge/for-Impossible%20OS-1B6FE0)](https://github.com/rizonesoft/impossible-os)
 
-## Use
+[Design](docs/specs/2026-11-23-heliograph-design.md) · [Roadmap](todo/implementation-plan.md) · [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md) · [Impossible SDK](https://github.com/rizonesoft/ImpossibleSDK)
+
+</div>
+
+Heliograph passes messages and jobs between agent sessions on one machine: Claude, Codex and Antigravity, on Windows and in WSL. A job is taken once, however many sessions try. There is no service, no network and no model call: only a program of about 1,600 lines and a folder of files.
+
+> [!NOTE]
+> **Status: early, no release yet.** What is marked ✅ below is built and tested. What the design still asks for is in the [roadmap](todo/implementation-plan.md).
+
+## Contents
+
+- [Why does it exist?](#why-does-it-exist)
+- [What works today?](#what-works-today)
+- [Quick start](#quick-start)
+- [How do I use it?](#how-do-i-use-it)
+- [How does a job get only one taker?](#how-does-a-job-get-only-one-taker)
+- [Who gets a message?](#who-gets-a-message)
+- [Repository layout](#repository-layout)
+- [FAQ](#faq)
+- [License](#license)
+
+## Why does it exist?
+
+Several sessions work on one machine at the same time, and a person used to carry the messages between them.
+
+- **Nothing is lost.** A message is one file, written under a temporary name, flushed, then given its name.
+- **Nothing is done twice.** A job has one numbered chain of steps, and each step can be made only once.
+- **Nobody is flooded.** At most 5 messages and 2,000 characters are shown at once, urgent first.
+- **A message is information, never permission.** It approves no work and changes no rule, and text that looks like a secret is refused.
+
+## What works today?
+
+Legend: ✅ works · 📋 planned
+
+| Area | Status | What you get |
+| --- | :---: | --- |
+| Messages and jobs | ✅ | Ask, hand over, tell, find and answer; take, release, finish or refuse a job |
+| One taker for each job | ✅ | Raced from Windows and Linux at once in [the tests](tests/test_helio.py) |
+| Routing by path | ✅ | [`helio.conf`](engine/place.h) says who owns which path |
+| Claude Code hook | ✅ | New messages at the start of a session and with each prompt |
+| Codex and Antigravity | ✅ | They run `helio` between sections of their work |
+| Due times, overlap warnings, daily summary | ✅ | Looked at by each call, with nothing running in between |
+| Archive by month, expiry | 📋 | [§1 to §3 and §12](todo/01-heliograph/TODO-01-heliograph.md) |
+| Silent takers, messages for one session | 📋 | [§4 to §6](todo/01-heliograph/TODO-01-heliograph.md) |
+| Projects kept apart, landed work, fixed marks | 📋 | [§7 to §9](todo/01-heliograph/TODO-01-heliograph.md) |
+| JSON, taking the next job as a queue | 📋 | [§10 and §11](todo/01-heliograph/TODO-01-heliograph.md) |
+
+## Quick start
+
+Windows or WSL on 64-bit x86, with Python 3.12 or newer, and Git. In WSL the command is `python3`, and a C compiler with C23 (GCC 14 or newer) builds the Linux program.
 
 ```
-helio help
+git clone https://github.com/rizonesoft/ImpossibleSDK.git
+git clone https://github.com/rizonesoft/Heliograph.git
+python ImpossibleSDK/tools/bootstrap.py           # the pinned toolchain, once per machine
+python ImpossibleSDK/tools/app_build.py Heliograph
 ```
 
-Say who you are with `--as project/lane` or `HELIO_AS`, and where the store is with `--store` or `HELIO_STORE`. On this machine it is `~/ImpossibleOS/Heliograph-signals` in WSL. Make a store with `helio init`.
+It builds with the SDK commit in [`sdk.json`](sdk.json), also when the SDK has moved on, and runs the tests. From WSL it makes `helio.exe` for Windows and `linux/helio` for WSL in `build/linux`.
 
-Exit codes: 0 done, 1 nothing, 2 refused, 3 something failed or is damaged, and what was asked may have happened. Send with `--key` to repeat a send safely. `helio check` examines the store.
+## How do I use it?
 
-## Build
+Say where the store is with `HELIO_STORE` (or `--store`) and who you are with `HELIO_AS` (or `--as`), then make a store once with `helio init`.
 
 ```
-python3 ../ImpossibleSDK/tools/app_build.py .
+$ export HELIO_STORE=~/signals
+$ helio init
+$ helio ask impossible/all "Check the archive rule" --now --as impossible/main < note.txt
+1795472530719051-5faf73
+$ helio --as impossible/apps
+1795472530719051-5faf73  2026-11-23T22:22:10Z  impossible/main to impossible/all  request open  NOW: Check the archive rule
+$ helio take 1795472530719051-5faf73 --as impossible/apps
+$ helio take 1795472530719051-5faf73 --as impossible/userland
+helio: it is already taken
 ```
 
-It uses the SDK commit in `sdk.json`, also when the SDK has moved on. From WSL it builds `helio.exe` for Windows and `linux/helio` for WSL. `engine/` calls neither system; `src/plat_*.c` do.
+| Command | What it does |
+| --- | --- |
+| `helio` | Shows my inbox: new messages and open jobs |
+| `helio ask`, `hand` | Sends a job, or work I pass on |
+| `helio tell`, `find`, `answer` | Sends a heads-up, something I found, or a reply |
+| `helio show <id>` | Shows one message and marks it seen |
+| `helio take`, `release`, `done`, `refuse` `<id>` | Moves a job on |
+| `helio working <paths>` | Says what I touch, and warns when someone else touches it |
+| `helio log`, `check`, `help` | Shows everything, examines the store, or lists every option |
 
-## Limits
+Exit codes: 0 done, 1 nothing, 2 refused, 3 something failed or is damaged, and what was asked may have happened. Send with `--key` to repeat a send safely.
 
-The sender name is not proof: any program running as you can write to the store.
+## How does a job get only one taker?
+
+```mermaid
+flowchart LR
+    A["Session on Windows"] -- "helio take" --> L{"Who makes step 0 first?"}
+    B["Session in WSL"] -- "helio take" --> L
+    L -- "first" --> W["The job is yours"]
+    L -- "second" --> R["It is already taken"]
+```
+
+Every change to a job is the next file in its chain, decided from the steps before it. A file can be made once, on Windows by a rename that refuses to replace and on Linux by a hard link. Whoever loses that race reads the chain again and decides again. A step that is cut short or out of order is reported as damaged and never guessed.
+
+## Who gets a message?
+
+A message goes to `project/lane`, to `project/all`, or to `path:<file>`. A path goes to the lane that owns it in `helio.conf`, to whoever works in that repository when no lane does, and to the owner when nobody is there.
+
+```
+project: impossible
+lane: apps
+path: ui/ userland
+```
+
+## Repository layout
+
+| Path | Contents |
+| --- | --- |
+| `engine/` | The store, the jobs, routing and the commands. It calls no system function |
+| `src/` | Windows and Linux, each in one file, and the program's entry |
+| `tests/` | What must stay true, with a racer for both systems |
+| `brand/`, `tools/` | The [identity](brand/README.md) and the script that renders it |
+| `todo/`, `docs/` | The work list, the design, and how it is worked on |
+
+## FAQ
+
+<details>
+<summary><strong>Does anything run in the background?</strong></summary>
+
+No. Each call looks, so a reminder appears when someone next works.
+
+</details>
+
+<details>
+<summary><strong>Can a message make an agent do something?</strong></summary>
+
+It should not. Every message says that it is information from another agent, and the body stands behind bars. A session still works by its own rules and its owner's word.
+
+</details>
+
+<details>
+<summary><strong>Is the sender's name proof?</strong></summary>
+
+No. Any program running as you can write to the store.
+
+</details>
+
+<details>
+<summary><strong>Why two programs and not one?</strong></summary>
+
+WSL's bridge to Windows was slow and sometimes failed when it was measured, so a WSL session uses a native Linux program. Both share one engine and one store.
+
+</details>
+
+## Contributing
+
+Start with [CONTRIBUTING.md](CONTRIBUTING.md). Report a security problem privately as [SECURITY.md](SECURITY.md) says, and follow the [code of conduct](CODE_OF_CONDUCT.md).
 
 ## License
 
 GPL-3.0-only. See [LICENSE](LICENSE).
 
-Made for the sessions that build [Impossible OS](https://github.com/rizonesoft/impossible-os), with [Impossible SDK](https://github.com/rizonesoft/ImpossibleSDK).
+<a href="https://github.com/rizonesoft/ImpossibleSDK"><picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/rizonesoft/ImpossibleSDK/main/brand/badge-dark.png"><img alt="Built with Impossible SDK" src="https://raw.githubusercontent.com/rizonesoft/ImpossibleSDK/main/brand/badge-light.png" height="34"></picture></a>
+
+<div align="center">
+<sub>Made in the open by <a href="https://rizonetech.com">Rizonetech (Pty) Ltd</a> · for the sessions that build <a href="https://github.com/rizonesoft/impossible-os">Impossible OS</a></sub>
+</div>

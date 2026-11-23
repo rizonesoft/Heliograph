@@ -5,7 +5,8 @@ include_directories(engine)
 set(STORE engine/base.c engine/store.c)
 set(CORE ${STORE} engine/place.c engine/watch.c engine/helio.c)
 
-impossible_add_program(helio CONSOLE TIER 0 SOURCES src/main.c src/plat_windows.c ${CORE})
+impossible_add_program(helio CONSOLE TIER 0 SOURCES src/main.c src/plat_windows.c src/helio.rc ${CORE})
+set_source_files_properties(src/helio.rc PROPERTIES OBJECT_DEPENDS "${CMAKE_SOURCE_DIR}/brand/icon.ico")
 impossible_add_program(racer CONSOLE TIER 0 SOURCES tests/racer.c tests/racer_windows.c src/plat_windows.c ${STORE})
 
 # WSL sessions use the native program, so they never wait for WSL's bridge to Windows.

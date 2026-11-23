@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: The kit it is built with
+    url: https://github.com/rizonesoft/ImpossibleSDK/issues
+    about: A problem of Impossible SDK belongs there
+  - name: Security
+    url: https://github.com/rizonesoft/Heliograph/security/advisories/new
+    about: Report a security problem privately
