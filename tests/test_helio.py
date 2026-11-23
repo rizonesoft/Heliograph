@@ -248,7 +248,7 @@ class Damage(Base):
             (self.store / f"messages/{name}.post").unlink()
 
     def test_a_damaged_step_is_reported_and_never_guessed(self):
-        for text in ("", "by: os/userland\nstate: ta", "by: os/userland\ntime: x\nsession: \nstate: done\nnote: \nend: yes\n", "x" * 40000):
+        for text in ("", "by: os/userland\nstate: ta", "by: os/userland\ntime: x\nsession: \nstate: taken\nnote: half", "by: os/userland\ntime: x\nsession: \nstate: done\nnote: \nend: yes\n", "x" * 40000):
             job = self.send()
             step = self.store / f"messages/{job}.link.0000"
             step.write_text(text)
