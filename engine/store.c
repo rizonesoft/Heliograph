@@ -30,11 +30,8 @@ static bool id_ok(const char *id) {
 }
 
 static bool time_ok(const char *t) {
-    static const char shape[] = "0000-00-00T00:00:00Z";
-    size_t i = 0;
-    for (; shape[i]; i++)
-        if (shape[i] == '0' ? t[i] < '0' || t[i] > '9' : t[i] != shape[i]) return false;
-    return !t[i];
+    uint64_t when;
+    return read_time(t, &when);
 }
 
 static void path(const store *s, text *out, const char *id, const char *event) {
@@ -298,13 +295,11 @@ s_result store_job(store *s, const message *m, job *out) {
         if (result == S_NOTHING) return gap(s, m->id, out->links) ? say(s, S_DAMAGED, "a step of this job is missing") : S_OK;
         if (result != S_OK) return result;
         bool good = keep(what, sizeof what, data, "state") && keep(by, sizeof by, data, "by") && address_ok(by, false)
-                    && keep(session, sizeof session, data, "session") && keep(when, sizeof when, data, "at") && keep(end, sizeof end, data, "end") && same(end, "yes");
+                    && keep(session, sizeof session, data, "session") && keep(when, sizeof when, data, "time") && read_time(when, &out->when) && keep(end, sizeof end, data, "end") && same(end, "yes");
         p_free(data);
         int step = 0;
         while (good && step < 4 && !same(what, states[step])) step++;
         if (!good || step == 4 || objection(m, out, (actor){by, session}, (change)step)) return say(s, S_DAMAGED, "a step of this job is damaged");
-        out->when = 0;
-        for (const char *d = when; *d >= '0' && *d <= '9'; d++) out->when = out->when * 10 + (uint64_t)(*d - '0');
         out->state = after[step];
         bool open = out->state == OPEN;
         copy_to(out->by, open ? "" : by), copy_to(out->session, open ? "" : session);
@@ -447,7 +442,7 @@ static s_result add_link(store *s, const char *id, const job *now, actor me, con
     if (line.length > MOST_NOTE || session.length > 64) result = say(s, S_REFUSED, "the note or the session name is too long");
     else if (secret(line.data ? line.data : "")) result = say(s, S_REFUSED, "the note looks like it contains a secret");
     else {
-        add(&out, "by: "), add(&out, me.lane), add(&out, "\ntime: "), add_time(&out, p_now()), add(&out, "\nat: "), add_number(&out, p_now(), 0), add(&out, "\nsession: "), add(&out, session.data ? session.data : "");
+        add(&out, "by: "), add(&out, me.lane), add(&out, "\ntime: "), add_time(&out, p_now()), add(&out, "\nsession: "), add(&out, session.data ? session.data : "");
         add(&out, "\nstate: "), add(&out, state), add(&out, "\nnote: "), add(&out, line.data ? line.data : ""), add(&out, "\nend: yes\n");
         bool full = out.failed || line.failed || name.failed || session.failed;
         result = full ? say(s, S_DAMAGED, "out of memory") : make(s, id, name.data, out.data);

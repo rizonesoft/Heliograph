@@ -71,3 +71,26 @@ void add_time(text *t, uint64_t microseconds) {
     add_number(t, doy - (153 * mp + 2) / 5 + 1, 2), add(t, "T"), add_number(t, rest / 3600, 2), add(t, ":");
     add_number(t, rest / 60 % 60, 2), add(t, ":"), add_number(t, rest % 60, 2), add(t, "Z");
 }
+
+bool read_time(const char *t, uint64_t *microseconds) {
+    static const char shape[] = "0000-00-00T00:00:00Z";
+    uint64_t part[6] = {0};
+    int at = 0;
+    for (int i = 0; shape[i]; i++) {
+        if (shape[i] == '0') {
+            if (t[i] < '0' || t[i] > '9') return false;
+            part[at] = part[at] * 10 + (uint64_t)(t[i] - '0');
+        } else if (t[i] != shape[i]) {
+            return false;
+        } else {
+            at++;
+        }
+    }
+    uint64_t y = part[0], m = part[1], d = part[2];
+    if (t[20] || y < 1970 || m < 1 || m > 12 || d < 1 || d > 31 || part[3] > 23 || part[4] > 59 || part[5] > 60) return false;
+    y -= m <= 2;
+    uint64_t era = y / 400, yoe = y - era * 400, doy = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
+    uint64_t days = era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719468;
+    *microseconds = (days * 86400 + part[3] * 3600 + part[4] * 60 + part[5]) * 1000000;
+    return true;
+}

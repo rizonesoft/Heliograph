@@ -14,6 +14,23 @@ static const char *word(const char *at, const char **from, size_t *n) {
     return at;
 }
 
+/* The same place has one spelling: forward slashes, none twice, no "." steps. */
+static void spell(text *out, const char *in) {
+    bool start = true;
+    for (const char *c = in; *c;) {
+        bool slash = *c == '/' || *c == '\\';
+        if (start && *c == '.' && (c[1] == '/' || c[1] == '\\')) {
+            c += 2;
+        } else if (slash && out->length && out->data[out->length - 1] == '/') {
+            c++;
+        } else {
+            add_bytes(out, slash ? "/" : c, 1);
+            start = slash || *c == ' ';
+            c++;
+        }
+    }
+}
+
 /* One is the other, or a folder above it. A trailing slash changes nothing. */
 static bool meet(const char *a, size_t n, const char *b, size_t m) {
     while (n && a[n - 1] == '/') n--;
@@ -44,15 +61,21 @@ static bool other_lane(void *user, const char *name) {
     add(&path, l->s->folder), add(&path, "/working/"), add(&path, name);
     char *data = NULL;
     size_t length;
-    if (!them.failed && !path.failed && !same(them.data, l->me) && p_read(path.data, MOST_PATHS + 64, &data, &length) == P_OK) {
+    p_result got = P_MISSING;
+    if (them.failed || path.failed) got = P_FAILED;
+    else if (!same(them.data, l->me)) got = p_read(path.data, MOST_PATHS + 64, &data, &length);
+    if (got != P_OK && got != P_MISSING) l->s->why = "what another lane is working on cannot be read", l->result = S_DAMAGED;
+    if (got == P_OK) {
         uint64_t when = 0;
         const char *at = data;
         for (; *at >= '0' && *at <= '9'; at++) when = when * 10 + (uint64_t)(*at - '0');
         if (*at == '\n' && when + 4ull * 3600 * 1000000 > l->now && overlap(l->paths, at + 1, &which)) {
             add(l->said, them.data), add(l->said, " is also working on "), add(l->said, which.data ? which.data : "?"), add(l->said, "\n");
-            add(&key, "overlap "), add_number(&key, l->now / 86400000000ull, 0), add(&key, " "), add(&key, which.data ? which.data : "");
+            add(&key, "overlap "), add_number(&key, l->now / 86400000000ull, 0), add(&key, " ");
+            uint64_t hash = 14695981039346656037ull; /* a key is short and a path need not be */
+            for (const char *c = which.data ? which.data : ""; *c; c++) hash = (hash ^ (unsigned char)*c) * 1099511628211ull;
+            add_number(&key, hash, 20);
             add(&body, l->me), add(&body, " started to work on "), add(&body, which.data ? which.data : "?"), add(&body, ", which you said you are working on.");
-            if (key.data && key.length > 100) key.data[key.length = 100] = 0;
             message m = {.from = l->me, .to = them.data, .kind = "headsup", .about = which.data ? which.data : "", .urgency = "now", .re = "",
                          .subject = "We are working on the same files", .body = body.data ? body.data : ""};
             s_result sent = key.failed || body.failed || which.failed ? S_DAMAGED : store_post(l->s, &m, key.data, &id);
@@ -66,8 +89,9 @@ static bool other_lane(void *user, const char *name) {
 
 s_result watch_working(store *s, const place *p, const char *me, const char *paths, text *said) {
     if (!p->found) return s->why = "there is no helio.conf here, so the paths have no project", S_REFUSED;
-    text line = {0}, folder = {0}, path = {0}, data = {0}, unique = {0};
-    clean(&line, paths, true);
+    text line = {0}, folder = {0}, path = {0}, data = {0}, unique = {0}, unspelled = {0};
+    clean(&unspelled, paths, true);
+    spell(&line, unspelled.data ? unspelled.data : "");
     s_result result = S_OK;
     size_t n = len(p->project);
     if (line.length > MOST_PATHS) s->why = "that is too many paths", result = S_REFUSED;
@@ -77,7 +101,7 @@ s_result watch_working(store *s, const place *p, const char *me, const char *pat
         add(&path, folder.data ? folder.data : ""), add(&path, "/");
         for (const char *c = me; *c; c++) add_bytes(&path, *c == '/' ? "+" : c, 1);
         add_number(&data, p_now(), 0), add(&data, "\n"), add(&data, line.data ? line.data : ""), add(&data, "\n"), add_number(&unique, p_tick(), 0);
-        bool full = line.failed || folder.failed || path.failed || data.failed || unique.failed;
+        bool full = unspelled.failed || line.failed || folder.failed || path.failed || data.failed || unique.failed;
         if (full || p_folder(folder.data) != P_OK || p_write(path.data, data.data, data.length, true, unique.data) != P_OK)
             s->why = "the store cannot be written", result = S_DAMAGED;
         else {
@@ -86,7 +110,7 @@ s_result watch_working(store *s, const place *p, const char *me, const char *pat
             else result = l.result;
         }
     }
-    text_free(&line), text_free(&folder), text_free(&path), text_free(&data), text_free(&unique);
+    text_free(&line), text_free(&folder), text_free(&path), text_free(&data), text_free(&unique), text_free(&unspelled);
     return result;
 }
 
@@ -101,8 +125,9 @@ s_result watch_summary(store *s) {
     char *there = NULL;
     size_t length;
     s_result result = S_OK;
-    if (full) result = S_DAMAGED;
-    else if (p_read(path.data, 1 << 20, &there, &length) == P_MISSING) {
+    p_result got = full ? P_FAILED : p_read(path.data, 1 << 20, &there, &length);
+    if (got != P_OK && got != P_MISSING) result = S_DAMAGED;
+    else if (got == P_MISSING) {
         static const char *const titles[] = {"Overdue", "Open", "Taken", "Done in the last day", "Refused in the last day"};
         text parts[5] = {0}, out = {0};
         unsigned counts[5] = {0}, damaged = 0;

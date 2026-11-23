@@ -201,7 +201,7 @@ class Jobs(Base):
         job = self.send()
         for n in range(998):
             state = "released" if n % 2 else "taken"
-            put((self.store / f"messages/{job}.link.{n:04}"), f"by: os/userland\ntime: x\nat: 1\nsession: \nstate: {state}\nnote: \nend: yes\n")
+            put((self.store / f"messages/{job}.link.{n:04}"), f"by: os/userland\ntime: 2026-11-23T12:00:00Z\nsession: \nstate: {state}\nnote: \nend: yes\n")
         self.assertEqual(self.helio("take", job, me="os/userland").returncode, 2)
         self.assertEqual(self.helio("refuse", job, me="os/userland").returncode, 0)
         self.assertIn("refused by", self.helio("log", me=None).stdout.decode())
@@ -256,6 +256,24 @@ class Watching(Base):
         self.helio("done", job, me="os/userland")
         self.assertEqual(self.helio(me="os/main").returncode, 1)
 
+    def test_the_owner_sees_an_overdue_job_that_someone_else_took(self):
+        job = self.send("ask", "os/all", "os/main", "s", "b", "--due", "0")  # due at once
+        self.helio("take", job, me="os/apps")
+        self.assertEqual([(m, b"OVERDUE" in self.helio(me=m).stdout) for m in ("os/owner", "os/main", "os/apps", "os/neon-a")],
+                         [("os/owner", True), ("os/main", True), ("os/apps", True), ("os/neon-a", False)])
+
+    def test_a_step_as_the_first_version_wrote_it_still_counts(self):
+        job = self.send()
+        put(self.store / f"messages/{job}.link.0000", "by: os/userland\ntime: 2026-11-23T12:00:00Z\nsession: \nstate: taken\nnote: \nend: yes\n")
+        self.assertEqual(self.helio("done", job, me="os/userland").returncode, 0)
+
+    def test_a_step_with_a_wrong_time_is_damage(self):
+        for time_said in ("invalid", "", "2026-13-01T00:00:00Z", "2026-11-23T12:00:00Zx", "2026-11-23T25:00:00Z"):
+            job = self.send()
+            put(self.store / f"messages/{job}.link.0000", f"by: os/userland\ntime: {time_said}\nsession: \nstate: taken\nnote: \nend: yes\n")
+            self.assertEqual(self.helio("check", me=None).returncode, 3, time_said)
+            (self.store / f"messages/{job}.link.0000").unlink()
+
     def test_a_wrong_due_is_refused(self):
         for due in ("x", "-1", "1.5", "99999999999999999999"):
             self.assertEqual(self.helio("ask", "os/apps", "s", "--due", due, body="b").returncode, 2, due)
@@ -272,7 +290,21 @@ class Watching(Base):
         self.assertEqual(self.working("main", "src ui/draw.c"), ["os/apps is also working on ui/draw.c"])
         self.assertEqual(len(self.helio(me="os/apps").stdout.decode().splitlines()), 1)
         self.assertEqual(self.helio("working", "ui", me="other/apps").returncode, 2)
+        for spelled in ("./ui/x.c", "ui//x.c", "ui\\x.c", "./ui/./x.c"):
+            self.assertEqual(self.working("main", spelled), ["os/apps is also working on ui/x.c"], spelled)
         self.assertEqual(self.working("main", "src"), [])
+
+    def test_two_long_paths_are_two_warnings(self):
+        self.working("apps", "src")
+        for name in ("one.c", "two.c"):
+            self.working("main", f"src/{'a' * 90}/{name}")
+        self.assertEqual(len(self.helio(me="os/apps").stdout.decode().splitlines()), 2)
+
+    def test_what_cannot_be_read_is_not_taken_for_nothing(self):
+        (self.store / "working/os+apps").mkdir(parents=True)
+        self.assertEqual(self.helio("working", "ui", me="os/main").returncode, 3)
+        (self.store / f"summary/{time.strftime('%Y-%m-%d', time.gmtime())}.md").mkdir(parents=True)
+        self.assertIn(b"summary cannot be written", self.helio(me="os/main").stderr)
 
     def test_old_work_is_not_an_overlap(self):
         self.working("apps", "ui")
@@ -400,7 +432,7 @@ class Damage(Base):
         for by, session in (("os/apps", "session: A"), ("os/userland", "session: B"), ("os/userland", "other: A")):
             job = self.send()
             self.helio("take", job, "--session", "A", me="os/userland")
-            put((self.store / f"messages/{job}.link.0001"), f"by: {by}\ntime: x\nat: 1\n{session}\nstate: done\nnote: \nend: yes\n")
+            put((self.store / f"messages/{job}.link.0001"), f"by: {by}\ntime: 2026-11-23T12:00:00Z\n{session}\nstate: done\nnote: \nend: yes\n")
             self.assertEqual(self.helio("check", me=None).returncode, 3, by)
             (self.store / f"messages/{job}.link.0001").unlink()
 
@@ -416,7 +448,7 @@ class Damage(Base):
         self.assertEqual(self.send("ask", "os/userland", "os/main", "s", "b", "--key", "k"), first)
 
     def test_a_damaged_step_is_reported_and_never_guessed(self):
-        for text in ("", "by: os/userland\nstate: ta", "by: os/userland\ntime: x\nat: 1\nsession: \nstate: taken\nnote: half", "by: os/userland\ntime: x\nat: 1\nsession: \nstate: done\nnote: \nend: yes\n", "x" * 40000):
+        for text in ("", "by: os/userland\nstate: ta", "by: os/userland\ntime: 2026-11-23T12:00:00Z\nsession: \nstate: taken\nnote: half", "by: os/userland\ntime: 2026-11-23T12:00:00Z\nsession: \nstate: done\nnote: \nend: yes\n", "x" * 40000):
             job = self.send()
             step = self.store / f"messages/{job}.link.0000"
             put(step, text)

@@ -14,4 +14,6 @@ int compare(const char *a, const char *b);
 char *copy(const char *s, size_t length);
 /* "2026-11-23T15:17:28Z" */
 void add_time(text *t, uint64_t microseconds);
+/* The opposite, or false when it is not such a time. */
+bool read_time(const char *t, uint64_t *microseconds);
 void *memcpy(void *restrict to, const void *restrict from, size_t bytes);

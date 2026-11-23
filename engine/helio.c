@@ -122,13 +122,14 @@ static void into_inbox(store *s, const message *m, void *user) {
     listing *l = user;
     if (!same(m->urgency, l->urgency)) return;
     job now;
-    if (!is_for(m, l->me)) { /* an overdue job goes back to who asked, and to the owner */
-        if (!is_job(m) || !m->due || !(same(m->from, l->me) || owns(l->me, m)) || store_job(s, m, &now) != S_OK || !is_overdue(m, &now)) return;
-    } else if (!is_job(m)) {
+    bool mine = is_for(m, l->me);
+    bool back = is_job(m) && m->due && (same(m->from, l->me) || owns(l->me, m)); /* an overdue job goes to who asked and to the owner */
+    if (!mine && !back) return;
+    if (!is_job(m)) {
         if (was_seen(s, m->id, l->me)) return;
     } else if (store_job(s, m, &now) != S_OK) {
         l->damaged = true; /* shown, so it is not mistaken for nothing */
-    } else if (now.state != OPEN && !(now.state == TAKEN && same(now.by, l->me))) {
+    } else if (!(back && is_overdue(m, &now)) && !(mine && (now.state == OPEN || (now.state == TAKEN && same(now.by, l->me))))) {
         return;
     }
     text one = {0};
@@ -208,7 +209,7 @@ static int post(store *s, options *o, const char *kind, const char *to, const ch
         }
         minutes = minutes * 10 + (uint64_t)(*d - '0');
     }
-    message m = {.due = minutes ? p_now() + minutes * 60000000 : 0, .from = o->me, .to = to, .kind = kind, .about = o->about, .urgency = o->urgency, .re = re, .subject = o->words[2], .body = body};
+    message m = {.due = *o->due ? p_now() + minutes * 60000000 : 0, .from = o->me, .to = to, .kind = kind, .about = o->about, .urgency = o->urgency, .re = re, .subject = o->words[2], .body = body};
     text id = {0};
     s_result result = len(body) == length ? store_post(s, &m, o->key, &id) : (s->why = "the message is not text", S_REFUSED);
     p_free(body);
