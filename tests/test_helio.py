@@ -11,6 +11,8 @@ from pathlib import Path
 BUILD = Path(os.environ["IMPOSSIBLE_BUILD"])
 ON_WINDOWS = os.name == "nt"
 WSL = "microsoft" in platform.release().lower()
+# The real store is on a Windows drive, which both systems reach, so the tests use one too.
+WSL_STORE = "/mnt/d/ImpossibleOS" if os.path.isdir("/mnt/d/ImpossibleOS") else "/mnt/c/Windows/Temp"
 SUFFIX = ".exe" if ON_WINDOWS else ""
 PROGRAM, RACER = ((BUILD if ON_WINDOWS else BUILD / "linux") / (name + SUFFIX) for name in ("helio", "racer"))
 
@@ -27,7 +29,7 @@ def run(folder, *arguments, me="os/main", body="", cwd=None):
 
 class Base(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(dir=BUILD)
+        self.temp = tempfile.TemporaryDirectory(dir=None if ON_WINDOWS or not WSL else WSL_STORE)
         self.addCleanup(self.temp.cleanup)
         self.store = Path(self.temp.name)
         put((self.store / "helio.conf"), "project: os\n")  # so that the one of this repository is not found
