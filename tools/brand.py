@@ -8,8 +8,8 @@ Needs rsvg-convert, ImageMagick, fontTools and a Chromium (CHROME, or Playwright
 are read from the checkout's resources; --font is Plus Jakarta Sans (OFL), the variable file of Google Fonts.
 """
 import argparse
+import importlib.util
 import os
-import struct
 import subprocess
 import tempfile
 from pathlib import Path
@@ -90,13 +90,12 @@ def mark(light, height):
     return picture(path, round(w * height / h, 1), height)
 
 
-def icon_file(pngs):
-    """icon.ico from PNG pictures, (size, bytes) each."""
-    head, at = struct.pack("<HHH", 0, 1, len(pngs)), 6 + 16 * len(pngs)
-    for size, data in pngs:
-        head += struct.pack("<BBBBHHII", size % 256, size % 256, 0, 0, 1, 32, len(data), at)
-        at += len(data)
-    return head + b"".join(data for _, data in pngs)
+def ico():
+    """The kit's own ICO writer, so the icon and the launchers that read it agree."""
+    spec = importlib.util.spec_from_file_location("campaign_icon", ROOT / "scripts/campaign-icon.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def theme(light):
@@ -182,7 +181,8 @@ def main():
     png.mkdir(exist_ok=True)
     for size in SMALL + LARGE:
         subprocess.run(["rsvg-convert", "-w", str(size), source(size), "-o", png / f"icon-{size}.png"], check=True, timeout=60)
-    (BRAND / "icon.ico").write_bytes(icon_file([(s, (png / f"icon-{s}.png").read_bytes()) for s in (*SMALL, 48, 64, 256)]))
+    kit = ico()
+    kit.write_atomic(BRAND / "icon.ico", kit.pack_ico([(s, (png / f"icon-{s}.png").read_bytes()) for s in (*SMALL, 48, 64, 256)]))
     with tempfile.TemporaryDirectory() as folder:
         def shot(name, body, width, height, scale, trim):
             html, out = Path(folder, "page.html"), BRAND / f"{name}.png"

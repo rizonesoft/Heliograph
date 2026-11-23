@@ -18,11 +18,11 @@ Sections: 3 | Checklist items: 19
 
 ### Phase 2: The right reader
 
-Sections: 6 | Checklist items: 29
+Sections: 6 | Checklist items: 30
 
 | Status | Reference  | Deliverable                            | Needs | Items |
 | ------ | ---------- | -------------------------------------- | ----- | ----- |
-| [ ]    | D01 T01 §4 | Sessions announced by every call       | none  | 5     |
+| [ ]    | D01 T01 §4 | Sessions announced by every call       | none  | 6     |
 | [ ]    | D01 T01 §5 | Report of a silent taker               | none  | 6     |
 | [ ]    | D01 T01 §6 | Messages for one session               | none  | 5     |
 | [ ]    | D01 T01 §7 | Projects kept apart in log and show    | none  | 4     |
@@ -42,4 +42,4 @@ Sections: 4 | Checklist items: 19
 
 Progress: 0/13 verified sections, 3 ready to run now.
 
-Checklist: 0/67 items completed (includes Commit items).
+Checklist: 0/68 items completed (includes Commit items).

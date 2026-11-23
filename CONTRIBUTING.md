@@ -7,7 +7,6 @@ Thank you for looking at Heliograph. It is early, so a good bug report or a smal
 Put [Impossible SDK](https://github.com/rizonesoft/ImpossibleSDK) beside this folder, then:
 
 ```
-python ../ImpossibleSDK/tools/bootstrap.py
 python ../ImpossibleSDK/tools/app_build.py .
 ```
 

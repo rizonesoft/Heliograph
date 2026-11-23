@@ -7,6 +7,8 @@ from pathlib import Path
 
 BRAND = Path(__file__).resolve().parents[1] / "brand"
 RT_ICON, RT_GROUP_ICON = 3, 14
+ATTRIBUTES = {"viewBox", "width", "height", "id", "x", "y", "x1", "y1", "x2", "y2", "cx", "cy", "r", "rx", "d", "offset", "gradientUnits",
+              "fill", "fill-opacity", "stroke", "stroke-width", "stroke-opacity", "stroke-linecap", "stroke-linejoin", "stop-color", "stop-opacity"}
 
 
 def images():
@@ -59,13 +61,15 @@ class Brand(unittest.TestCase):
         for path in icons:
             elements = list(ET.parse(path).iter())
             self.assertEqual({e.tag.split("}")[1] for e in elements} - allowed, set(), path.name)
-            names = {name for e in elements for name in e.attrib}
-            self.assertEqual({n for n in names if n in ("style", "class", "href") or n.startswith(("on", "{"))}, set(), path.name)
+            self.assertEqual({name for e in elements for name in e.attrib} - ATTRIBUTES, set(), path.name)
+            self.assertEqual([v for e in elements for v in e.attrib.values() if "url(" in v and not v.startswith("url(#")], [], path.name)
             used = {v[5:-1] for e in elements for v in e.attrib.values() if v.startswith("url(#")}
             self.assertEqual(used, {e.get("id") for e in elements if e.get("id")}, path.name)
 
     def test_the_icon_file_has_every_size(self):
         self.assertEqual([size for size, _ in images()], [16, 20, 24, 32, 48, 64, 256])
+        for size, picture in images():
+            self.assertEqual(picture, (BRAND / f"png/icon-{size}.png").read_bytes(), size)
 
     def test_windows_finds_the_icon_in_the_program(self):
         found = resources((Path(os.environ["IMPOSSIBLE_BUILD"]) / "helio.exe").read_bytes())

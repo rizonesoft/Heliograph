@@ -10,7 +10,7 @@ title: "TODO-01 -- Heliograph"
 
 > **Goal:** Heliograph does all that its approved design says: the store stays small, a silent taker is reported, every command can be read by a script, and a driver can use it as its queue.
 
-> **Current state:** Measured 2026-11-24 at `438d434`. Messages, jobs with one taker, routing by path, the Claude hook, overdue jobs, overlap warnings and the daily summary work and are tested in `tests/test_helio.py`; they get no section here. Missing: archiving (`engine/store.c` says "archive it" and there is no such command), expiry, sign-of-life reports, messages for one session, project privacy in `log` and `show`, fixed marks around inbox and log lines, a mark for landed work, `--json`, `hello`, `summary`, and `take` without an id. The design's command list also differs from the program's. `tools/mail.py`, which the design says to remove, is in neither this repository, Impossible SDK nor the history of the local Impossible OS clone.
+> **Current state:** Measured 2026-11-24 at `438d434`. Messages, jobs with one taker, routing by path, the Claude hook, overdue jobs, overlap warnings and the daily summary work and are tested in `tests/test_helio.py`; they get no section here. Missing: archiving (`engine/store.c` says "archive it" and there is no such command), expiry, sign-of-life reports, messages for one session, project privacy in `log` and `show`, fixed marks around inbox and log lines, a mark for landed work, an unowned path sent to its repository only, `--json`, `hello`, `summary`, and `take` without an id. The design's command list also differs from the program's. `tools/mail.py`, which the design says to remove, is in neither this repository, Impossible SDK nor the history of the local Impossible OS clone.
 
 ## Inputs
 
@@ -131,6 +131,7 @@ Only the Claude hook announces a session, and it records a time alone. Codex and
 - [ ] Keep one file for each session of a lane in `engine/place.c`. Done when: two sessions of one lane do not overwrite each other. Cheaper substitute: one for the lane.
 - [ ] Add `hello <agent>` to the commands in `engine/helio.c`, and use it in the hook. Done when: an unknown agent exits 2 and the three known ones are stored. Cheaper substitute: the hook only.
 - [ ] Announce the lane on every other call in `engine/helio.c` without failing it. Done when: an unwritable `sessions` leaves the command's exit code unchanged and says why. Cheaper substitute: ignoring it.
+- [ ] Send an unowned path to the lanes that said hello from that repository in `place_busy` of `engine/place.c` (design, "How does it find the reader?"; today it goes to the whole project). Done when: a lane of another repository of the project does not get it. Cheaper substitute: the whole project.
 - [ ] Commit: `sessions: every call is a sign of life`
 
 **Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.

@@ -52,10 +52,10 @@ Legend: ✅ works · 📋 planned
 | Area | Status | What you get |
 | --- | :---: | --- |
 | Messages and jobs | ✅ | Ask, hand over, tell, find and answer; take, release, finish or refuse a job |
-| One taker for each job | ✅ | Raced from Windows and Linux at once by [the tests](tests/test_helio.py) when they run in WSL |
+| One taker for each job | ✅ | [Raced](tests/test_helio.py) from Windows and Linux at once, when tested in WSL |
 | Routing by path | ✅ | [`helio.conf`](engine/place.h) says who owns which path |
 | Claude Code hook | ✅ | New messages at the start of a session and with each prompt |
-| Codex and Antigravity | ✅ | They run `helio` between sections of their work |
+| Codex and Antigravity | ✅ | They run `helio` between sections of an unattended run |
 | Due times, overlap warnings | ✅ | Shown by the inbox and by `helio working` |
 | Daily summary | ✅ | Written by the first inbox or hook of the day |
 | Archive by month, expiry | 📋 | [§1 to §3 and §12](todo/01-heliograph/TODO-01-heliograph.md) |
@@ -70,11 +70,10 @@ Windows or WSL on 64-bit x86, with Python 3.12 or newer, and Git. In WSL the com
 ```
 git clone https://github.com/rizonesoft/ImpossibleSDK.git
 git clone https://github.com/rizonesoft/Heliograph.git
-python ImpossibleSDK/tools/bootstrap.py           # the pinned toolchain, once per machine
 python ImpossibleSDK/tools/app_build.py Heliograph
 ```
 
-It builds with the SDK commit in [`sdk.json`](sdk.json), also when the SDK has moved on, and runs the tests. From WSL it makes `helio.exe` for Windows and `linux/helio` for WSL in `build/linux`; on Windows it makes `helio.exe` in `build/windows`. Put the one you need in a folder on your `PATH`.
+It installs the pinned toolchain once per machine, builds with the SDK commit in [`sdk.json`](sdk.json), also when the SDK has moved on, and runs the tests. From WSL it makes `helio.exe` for Windows and `linux/helio` for WSL in `build/linux`; on Windows it makes `helio.exe` in `build/windows`. Put the one you need in a folder on your `PATH`.
 
 ## How do I use it?
 
@@ -118,7 +117,7 @@ Every change to a job is the next file in its chain, decided from the steps befo
 
 ## Who gets a message?
 
-A message goes to `project/lane`, to `project/all`, or to `path:<file>`. A path goes to the lane that owns it in `helio.conf`, to whoever works in that repository when no lane does, and to the owner when nobody is there.
+A message goes to `project/lane`, to `project/all`, or to `path:<file>`. A path goes to the lane that owns it in `helio.conf`, to everyone in the project when another lane was there in the last half hour, and to the owner when nobody was.
 
 ```
 project: impossible
