@@ -77,10 +77,11 @@ python3 Heliograph/tools/install.py
 Check what is installed, restore the previous pair, or remove the installation (leaving the store untouched):
 
 ```
-python3 tools/install.py --status
-python3 tools/install.py --back
-python3 tools/install.py --remove
-python3 tools/install.py --to /custom/bin --store /custom/store --status
+python3 Heliograph/tools/install.py --status
+python3 Heliograph/tools/install.py --back
+python3 Heliograph/tools/install.py --remove
+python3 Heliograph/tools/install.py --to /custom/bin --store /custom/store
+python3 Heliograph/tools/install.py --to /custom/bin --status
 ```
 
 To build and test without installing, run `python ImpossibleSDK/tools/app_build.py Heliograph` (or `python3` in WSL). It installs the pinned toolchain once per machine, builds with the SDK commit in [`sdk.json`](sdk.json), also when the SDK has moved on, and runs the tests. From WSL it makes `helio.exe` for Windows and `linux/helio` for WSL in `build/linux`; on Windows it makes `helio.exe` in `build/windows`.
