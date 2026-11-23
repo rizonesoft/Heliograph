@@ -10,7 +10,7 @@ title: "TODO-01 -- Heliograph"
 
 > **Goal:** Heliograph does all that its approved design says: the store stays small, a silent taker is reported, every command can be read by a script, and a driver can use it as its queue.
 
-> **Current state:** Measured 2026-11-24 at `438d434`. Messages, jobs with one taker, routing by path, the Claude hook, overdue jobs, overlap warnings and the daily summary work and are tested in `tests/test_helio.py`; they get no section here. Missing: archiving (`engine/store.c` says "archive it" and there is no such command), expiry, sign-of-life reports, messages for one session, project privacy in `log` and `show`, fixed marks around inbox and log lines, a mark for landed work, an unowned path sent to its repository only, `--json`, `hello`, `summary`, and `take` without an id. The design's command list also differs from the program's. `tools/mail.py`, which the design says to remove, is in neither this repository, Impossible SDK nor the history of the local Impossible OS clone.
+> **Current state:** Measured 2026-11-24 at `438d434`. Messages, jobs with one taker, routing to the lane that owns a path, the Claude hook, overdue jobs, overlap warnings and the daily summary work and are tested in `tests/test_helio.py`; they get no section here. Missing: archiving (`engine/store.c` says "archive it" and there is no such command), expiry, sign-of-life reports, messages for one session, project privacy in `log` and `show`, fixed marks around inbox and log lines, a mark for landed work, an unowned path sent to its repository only, `--json`, `hello`, `summary`, and `take` without an id. The design's command list also differs from the program's. `tools/mail.py`, which the design says to remove, is in neither this repository, Impossible SDK nor the history of the local Impossible OS clone.
 
 ## Inputs
 
@@ -45,7 +45,8 @@ title: "TODO-01 -- Heliograph"
 | 10 | §10 | JSON output on every command | §3, §5, §6, §8, §9 | [ ] |
 | 11 | §11 | Take the next job as a queue | §10 | [ ] |
 | 12 | §12 | Expiry of seen heads-ups and findings | §3, §4 | [ ] |
-| 13 | §13 | Design and help that match the program | §11, §12 | [ ] |
+| 13 | §13 | Design and help that match the program | §11, §12, §14 | [ ] |
+| 14 | §14 | Unowned paths kept to their repository | §4, §6 | [ ] |
 
 ## 1. Steps that notice an archived job
 
@@ -131,7 +132,6 @@ Only the Claude hook announces a session, and it records a time alone. Codex and
 - [ ] Keep one file for each session of a lane in `engine/place.c`. Done when: two sessions of one lane do not overwrite each other. Cheaper substitute: one for the lane.
 - [ ] Add `hello <agent>` to the commands in `engine/helio.c`, and use it in the hook. Done when: an unknown agent exits 2 and the three known ones are stored. Cheaper substitute: the hook only.
 - [ ] Announce the lane on every other call in `engine/helio.c` without failing it. Done when: an unwritable `sessions` leaves the command's exit code unchanged and says why. Cheaper substitute: ignoring it.
-- [ ] Send an unowned path to the lanes that said hello from that repository in `place_busy` of `engine/place.c` (design, "How does it find the reader?"; today it goes to the whole project). Done when: a lane of another repository of the project does not get it. Cheaper substitute: the whole project.
 - [ ] Commit: `sessions: every call is a sign of life`
 
 **Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
@@ -320,6 +320,28 @@ The design lists `send` where the program has `hand` and `find`, and still lists
 - [ ] State the new commands, times and limits in `README.md`, and the archive folder. Done when: the Status line is true of the program. Cheaper substitute: the help alone.
 - [ ] Compare the commands in the help of `engine/helio.c`, `README.md` and the design in `tests/test_helio.py`. Done when: a planted extra command fails it. Cheaper substitute: reading them.
 - [ ] Commit: `docs: the design matches the program`
+
+**Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
+
+## 14. Unowned paths kept to their repository
+
+A path that no lane owns goes to whoever works in that repository, and to the owner when nobody is there (design, "How does it find the reader?"). Today `reader` in `engine/helio.c` sends it to the whole project when any lane of the project was seen in the last half hour, and a test asks for that.
+
+**Phase:** 2
+**Needs:** none
+**Surface:** no
+
+**Build order:**
+
+1. Store the repository as the reader in `engine/store.c`. Done when: a message without it is read as before.
+2. Send and show it in `engine/helio.c`. Done when: the three cases of the design are tested.
+
+- [ ] Write and read `repository:` in `store_post` and `store_message` of `engine/store.c`, beside the reader of §6. Done when: old messages pass `helio check` and a name that is a path is refused. Cheaper substitute: one message for each lane.
+- [ ] Give the repository from the sessions of §4 in `place_busy` of `engine/place.c`, in place of one yes or no for the project. Done when: a lane seen only in another repository of the project does not count. Cheaper substitute: the project.
+- [ ] Choose the reader in `reader` of `engine/helio.c`: the lane that owns the path, else this repository, else the owner. Done when: each of the three is chosen in a test. Cheaper substitute: the owner whenever no lane owns it.
+- [ ] Compare the caller's repository in `is_for` and `objection` of `engine/store.c`. Done when: two lanes of the repository both see the one job and one of them takes it, and a lane of another repository neither sees nor takes it. Cheaper substitute: hiding it in the inbox alone.
+- [ ] Replace `test_an_unowned_path_goes_to_whoever_works_there` in `tests/test_helio.py` with the three cases, its lane announced from inside the repository. Done when: it fails with the old `reader`. Cheaper substitute: keeping the project-wide expectation.
+- [ ] Commit: `routing: an unowned path stays in its repository`
 
 **Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
 

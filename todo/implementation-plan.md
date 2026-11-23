@@ -18,16 +18,17 @@ Sections: 3 | Checklist items: 19
 
 ### Phase 2: The right reader
 
-Sections: 6 | Checklist items: 30
+Sections: 7 | Checklist items: 35
 
-| Status | Reference  | Deliverable                            | Needs | Items |
-| ------ | ---------- | -------------------------------------- | ----- | ----- |
-| [ ]    | D01 T01 §4 | Sessions announced by every call       | none  | 6     |
-| [ ]    | D01 T01 §5 | Report of a silent taker               | none  | 6     |
-| [ ]    | D01 T01 §6 | Messages for one session               | none  | 5     |
-| [ ]    | D01 T01 §7 | Projects kept apart in log and show    | none  | 4     |
-| [ ]    | D01 T01 §8 | Mark for landed work                   | none  | 5     |
-| [ ]    | D01 T01 §9 | Fixed marks around every shown message | none  | 4     |
+| Status | Reference   | Deliverable                            | Needs | Items |
+| ------ | ----------- | -------------------------------------- | ----- | ----- |
+| [ ]    | D01 T01 §4  | Sessions announced by every call       | none  | 5     |
+| [ ]    | D01 T01 §5  | Report of a silent taker               | none  | 6     |
+| [ ]    | D01 T01 §6  | Messages for one session               | none  | 5     |
+| [ ]    | D01 T01 §7  | Projects kept apart in log and show    | none  | 4     |
+| [ ]    | D01 T01 §8  | Mark for landed work                   | none  | 5     |
+| [ ]    | D01 T01 §9  | Fixed marks around every shown message | none  | 4     |
+| [ ]    | D01 T01 §14 | Unowned paths kept to their repository | none  | 6     |
 
 ### Phase 3: Scripts and queues
 
@@ -40,6 +41,6 @@ Sections: 4 | Checklist items: 19
 | [ ]    | D01 T01 §12 | Expiry of seen heads-ups and findings  | none  | 4     |
 | [ ]    | D01 T01 §13 | Design and help that match the program | none  | 4     |
 
-Progress: 0/13 verified sections, 3 ready to run now.
+Progress: 0/14 verified sections, 3 ready to run now.
 
-Checklist: 0/68 items completed (includes Commit items).
+Checklist: 0/73 items completed (includes Commit items).

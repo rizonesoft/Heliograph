@@ -1,5 +1,8 @@
 """The icons are what Windows and Impossible OS can use, and helio.exe shows them."""
+import hashlib
+import json
 import os
+import re
 import struct
 import unittest
 import xml.etree.ElementTree as ET
@@ -62,9 +65,14 @@ class Brand(unittest.TestCase):
             elements = list(ET.parse(path).iter())
             self.assertEqual({e.tag.split("}")[1] for e in elements} - allowed, set(), path.name)
             self.assertEqual({name for e in elements for name in e.attrib} - ATTRIBUTES, set(), path.name)
-            self.assertEqual([v for e in elements for v in e.attrib.values() if "url(" in v and not v.startswith("url(#")], [], path.name)
+            paints = [v for e in elements for n, v in e.attrib.items() if n in ("fill", "stroke", "stop-color")]
+            self.assertEqual([v for v in paints if not re.fullmatch(r"none|currentColor|#[0-9A-F]{6}|url\(#[\w-]+\)", v)], [], path.name)
             used = {v[5:-1] for e in elements for v in e.attrib.values() if v.startswith("url(#")}
             self.assertEqual(used, {e.get("id") for e in elements if e.get("id")}, path.name)
+
+    def test_the_pictures_were_rendered_from_these_drawings(self):
+        drawn = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted((BRAND / "icon").glob("icon*.svg"))}
+        self.assertEqual(json.loads((BRAND / "png/rendered-from.json").read_text(encoding="utf-8")), drawn, "run tools/brand.py")
 
     def test_the_icon_file_has_every_size(self):
         self.assertEqual([size for size, _ in images()], [16, 20, 24, 32, 48, 64, 256])

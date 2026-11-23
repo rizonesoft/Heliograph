@@ -8,7 +8,9 @@ Needs rsvg-convert, ImageMagick, fontTools and a Chromium (CHROME, or Playwright
 are read from the checkout's resources; --font is Plus Jakarta Sans (OFL), the variable file of Google Fonts.
 """
 import argparse
+import hashlib
 import importlib.util
+import json
 import os
 import subprocess
 import tempfile
@@ -182,6 +184,8 @@ def main():
     for size in SMALL + LARGE:
         subprocess.run(["rsvg-convert", "-w", str(size), source(size), "-o", png / f"icon-{size}.png"], check=True, timeout=60)
     kit = ico()
+    drawn = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted((BRAND / "icon").glob("icon*.svg"))}
+    kit.write_atomic(png / "rendered-from.json", (json.dumps(drawn, indent=2) + "\n").encode())  # a test compares it, so a drawing is not left unrendered
     kit.write_atomic(BRAND / "icon.ico", kit.pack_ico([(s, (png / f"icon-{s}.png").read_bytes()) for s in (*SMALL, 48, 64, 256)]))
     with tempfile.TemporaryDirectory() as folder:
         def shot(name, body, width, height, scale, trim):
