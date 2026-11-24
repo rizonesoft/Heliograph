@@ -389,7 +389,9 @@ One command takes a checkout to a working `helio` in WSL. It records what it ins
 
 ## 16. Installer for Windows sessions
 
-> **Started:** 2026-11-24T01:48Z
+> **Started:** 2026-11-24T03:00Z
+
+**Corrected 2026-11-24:** re-planned with `todo-graph.py replan` (Chain 2); the build first began at 2026-11-24T01:48Z; its prior review chain is kept as `docs/reviews/01-heliograph/D01-T01-s16-chain1.md`. Chain 2 fixes the final two defects (using `HELIO_DEFAULT_STORE` in `engine/helio.c` so the offline-WSL diagnostic applies only to the installed default store with zero batch argv parsing, and pre-recording retired digests in the journal before recovery renames) and drops unshipped pre-stamp draft `list[str]` compatibility so `retired` is always a `dict[str, str]` mapping filename to verified SHA-256 digest and `helio_cmd_text` is persisted for rollback.
 
 A Windows session has no `helio` on its `PATH`, so its hook finds nothing. The installer gives it one that uses the store in WSL. It is worked on in WSL: the Windows half runs through Windows' own Python, as `tools/prove.py` of Impossible SDK does.
 
