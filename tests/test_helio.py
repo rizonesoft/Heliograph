@@ -736,6 +736,24 @@ class ArchivingGuards(Base):
                     proc7.kill()
             self.assertEqual(proc7.returncode, 3, stderr7)
             self.assertEqual(list(msgs.iterdir()), [], "failed publication flush must leave zero orphan seen mark")
+            for name in ("paused.seen", "resume.seen"):
+                (self.store / name).unlink(missing_ok=True)
+
+            # Case 8 (Linux): failed publication flush on a LIVE (non-archived) job preserves the live link
+            # and still surfaces exit 3 (never erasing an accepted live publication!).
+            job8 = self.send()
+            proc8 = self.start_pause("take", "write", "os/userland", job8)
+            try:
+                self.wait_for(self.store / "paused.write")
+                msgs.chmod(0o300)
+                put(self.store / "resume.write", "go")
+                _, stderr8 = proc8.communicate(timeout=30)
+            finally:
+                msgs.chmod(0o700)
+                if proc8.poll() is None:
+                    proc8.kill()
+            self.assertEqual(proc8.returncode, 3, stderr8)
+            self.assertTrue((msgs / f"{job8}.link.0000").exists(), "failed flush on a live post must NOT erase the live link")
 
     def test_store_seen_second_look_removes_orphan_seen_mark(self):
         msg = self.send("tell", to="os/userland")

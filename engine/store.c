@@ -215,15 +215,28 @@ bool was_seen(store *s, const char *id, const char *me) {
     return found;
 }
 
-static s_result make(store *s, const char *id, const char *event, const char *data) {
+static s_result make_ex(store *s, const char *id, const char *event, const char *data, bool *published) {
+    if (published) *published = false;
     text at = {0}, unique = {0};
     path(s, &at, id, event);
     add_number(&unique, p_tick(), 0);
     p_result result = at.failed || unique.failed ? P_FAILED : p_write(at.data, data, len(data), false, unique.data);
     text_free(&at);
     text_free(&unique);
+    if (result == P_OK) {
+        if (published) *published = true;
+        return S_OK;
+    }
+    if (result == P_UNFLUSHED) {
+        if (published) *published = true;
+        return say(s, S_DAMAGED, "the store cannot be flushed");
+    }
     if (result == P_EXISTS) return say(s, S_NOTHING, "it is already there");
-    return result == P_OK ? S_OK : say(s, S_DAMAGED, "the store cannot be written");
+    return say(s, S_DAMAGED, "the store cannot be written");
+}
+
+static s_result make(store *s, const char *id, const char *event, const char *data) {
+    return make_ex(s, id, event, data, NULL);
 }
 
 /* Read from the disk and not from the listing, because others write meanwhile. */
@@ -459,7 +472,8 @@ s_result store_post(store *s, const message *m, const char *key, text *id) {
 }
 
 /* Adds one link. S_NOTHING when someone else made that link first. */
-static s_result add_link(store *s, const char *id, const job *now, actor me, const char *state, const char *note) {
+static s_result add_link(store *s, const char *id, const job *now, actor me, const char *state, const char *note, bool *published) {
+    if (published) *published = false;
     if (now->links >= MOST_LINKS - 2 && !same(state, "done") && !same(state, "refused")) return say(s, S_REFUSED, "this job changed hands too often: close it and ask again");
     text out = {0}, line = {0}, name = {0}, session = {0};
     clean(&line, note, true), clean(&session, me.session, true), link_name(&name, now->links);
@@ -470,7 +484,7 @@ static s_result add_link(store *s, const char *id, const job *now, actor me, con
         add(&out, "by: "), add(&out, me.lane), add(&out, "\ntime: "), add_time(&out, p_now()), add(&out, "\nsession: "), add(&out, session.data ? session.data : "");
         add(&out, "\nstate: "), add(&out, state), add(&out, "\nnote: "), add(&out, line.data ? line.data : ""), add(&out, "\nend: yes\n");
         bool full = out.failed || line.failed || name.failed || session.failed;
-        result = full ? say(s, S_DAMAGED, "out of memory") : make(s, id, name.data, out.data);
+        result = full ? say(s, S_DAMAGED, "out of memory") : make_ex(s, id, name.data, out.data, published);
     }
     text_free(&out), text_free(&line), text_free(&name), text_free(&session);
     return result;
@@ -520,18 +534,23 @@ static s_result change_job(store *s, const char *id, actor me, change what, cons
             result = say(s, S_REFUSED, why);
         } else {
             if (s->pause) s->pause(s->pause_user, "write");
-            result = add_link(s, id, &now, me, states[what], note);
-            if (result == S_OK) {
+            bool published = false;
+            result = add_link(s, id, &now, me, states[what], note, &published);
+            if (published) {
                 if (s->pause) s->pause(s->pause_user, "after-write");
+                const char *write_why = s->why;
                 s_result live = live_post(s, id);
                 if (live == S_REFUSED) {
                     text name = {0};
                     link_name(&name, now.links);
                     s_result rm = name.failed ? say(s, S_DAMAGED, "out of memory") : remove_event(s, id, name.data);
                     text_free(&name);
-                    result = rm == S_OK ? say(s, S_REFUSED, "it was archived") : rm;
+                    if (result == S_OK) result = rm == S_OK ? say(s, S_REFUSED, "it was archived") : rm;
+                    else if (rm == S_OK) s->why = write_why;
                 } else if (live != S_OK) {
                     result = live;
+                } else if (result != S_OK) {
+                    s->why = write_why;
                 }
             }
         }
@@ -552,15 +571,20 @@ s_result store_seen(store *s, const char *id, const char *me) {
     seen_name(&event, me);
     if (event.failed) return text_free(&event), say(s, S_DAMAGED, "out of memory");
     if (s->pause) s->pause(s->pause_user, "seen");
-    s_result result = make(s, id, event.data, SEEN);
-    if (result == S_OK) {
+    bool published = false;
+    s_result result = make_ex(s, id, event.data, SEEN, &published);
+    if (published) {
         if (s->pause) s->pause(s->pause_user, "after-seen");
+        const char *write_why = s->why;
         s_result live = live_post(s, id);
         if (live == S_REFUSED) {
             s_result rm = remove_event(s, id, event.data);
-            result = rm == S_OK ? say(s, S_REFUSED, "it was archived") : rm;
+            if (result == S_OK) result = rm == S_OK ? say(s, S_REFUSED, "it was archived") : rm;
+            else if (rm == S_OK) s->why = write_why;
         } else if (live != S_OK) {
             result = live;
+        } else if (result != S_OK) {
+            s->why = write_why;
         }
     } else if (result == S_NOTHING) {
         result = live_post(s, id);

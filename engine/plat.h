@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-typedef enum { P_OK, P_EXISTS, P_MISSING, P_TOO_LARGE, P_FAILED } p_result;
+typedef enum { P_OK, P_EXISTS, P_MISSING, P_TOO_LARGE, P_FAILED, P_UNFLUSHED } p_result;
 
 void *p_alloc(size_t bytes); /* zeroed */
 void p_free(void *memory);
