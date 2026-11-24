@@ -431,6 +431,19 @@ def _find_winning_helio_sh(reg_key: str, win_to: Path) -> Path | None:
     return None
 
 
+def _annotate_shadowing(manifest: dict[str, Any], reg_key: str, dest: Path) -> dict[str, Any]:
+    winner = _find_winning_helio(reg_key, dest)
+    winner_sh = _find_winning_helio_sh(reg_key, dest)
+    out = dict(manifest)
+    if winner is None:
+        out["shadowed_by"] = "none (.CMD missing from PATHEXT)"
+    elif winner != (dest / WIN_CMD_NAME).resolve():
+        out["shadowed_by"] = str(winner)
+    elif winner_sh is not None and winner_sh != (dest / WIN_SH_NAME).resolve():
+        out["shadowed_by"] = str(winner_sh)
+    return out
+
+
 def _store_needs_init(store_path: str) -> bool:
     """Return True if store_path is reachable on Windows and lacks an initialized messages/ directory."""
     if os.name != "nt":
@@ -914,18 +927,7 @@ def win_install(
                         if remaining_retired != prev_retired or not isinstance(existing.get("retired"), dict):
                             result_manifest["retired"] = dict(remaining_retired)
                             _write_json_atomic(dest / WIN_MANIFEST_NAME, result_manifest)
-                        winner = _find_winning_helio(reg_key, dest)
-                        winner_sh = _find_winning_helio_sh(reg_key, dest)
-                        if winner is None:
-                            result_manifest = dict(result_manifest)
-                            result_manifest["shadowed_by"] = "none (.CMD missing from PATHEXT)"
-                        elif winner != (dest / WIN_CMD_NAME).resolve():
-                            result_manifest = dict(result_manifest)
-                            result_manifest["shadowed_by"] = str(winner)
-                        elif winner_sh is not None and winner_sh != (dest / WIN_SH_NAME).resolve():
-                            result_manifest = dict(result_manifest)
-                            result_manifest["shadowed_by"] = str(winner_sh)
-                        return result_manifest
+                        return _annotate_shadowing(result_manifest, reg_key, dest)
 
             tx_id = secrets.token_hex(6)
             temp_files = [
@@ -1069,11 +1071,7 @@ def win_install(
                         _write_json_atomic(dest / WIN_MANIFEST_NAME, result_manifest)
                     _cleanup_win_temps(dest, temp_files, tx_id)
                     (dest / WIN_JOURNAL_NAME).unlink()
-                    winner = _find_winning_helio(reg_key, dest)
-                    if winner is not None and winner != (dest / WIN_CMD_NAME).resolve():
-                        result_manifest = dict(result_manifest)
-                        result_manifest["shadowed_by"] = str(winner)
-                    return result_manifest
+                    return _annotate_shadowing(result_manifest, reg_key, dest)
 
                 desired_manifest: dict[str, Any] = {
                     "schema_version": 1,
@@ -1160,16 +1158,7 @@ def win_install(
 
                 _cleanup_win_temps(dest, temp_files, tx_id)
                 (dest / WIN_JOURNAL_NAME).unlink()
-                out_manifest = dict(desired_manifest)
-                winner = _find_winning_helio(reg_key, dest)
-                winner_sh = _find_winning_helio_sh(reg_key, dest)
-                if winner is None:
-                    out_manifest["shadowed_by"] = "none (.CMD missing from PATHEXT)"
-                elif winner != (dest / WIN_CMD_NAME).resolve():
-                    out_manifest["shadowed_by"] = str(winner)
-                elif winner_sh is not None and winner_sh != (dest / WIN_SH_NAME).resolve():
-                    out_manifest["shadowed_by"] = str(winner_sh)
-                return out_manifest
+                return _annotate_shadowing(desired_manifest, reg_key, dest)
             except BaseException as exc:
                 _handle_win_failure(exc, dest, reg_key)
                 raise

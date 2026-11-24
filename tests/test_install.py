@@ -2387,6 +2387,8 @@ class TestWindowsInstaller(unittest.TestCase):
                 with winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_key, 0, winreg.KEY_SET_VALUE) as k:
                     winreg.SetValueEx(k, "Path", 0, orig_rk, f"{sh_shadow_dir};{orig_rp}")
                 try:
+                    # Also delete uni_store so we exercise the store-restoring identical-reinstall return path!
+                    shutil.rmtree(uni_store)
                     m_sh_shadow = self.win_mod.win_install(
                         source_exe=self.helio_exe,
                         source_sha256=exe_sha,
@@ -2395,6 +2397,7 @@ class TestWindowsInstaller(unittest.TestCase):
                         win_to=win_to,
                         reg_key=reg_key,
                     )
+                    self.assertTrue((uni_store / "messages").is_dir())
                     self.assertEqual(Path(m_sh_shadow["shadowed_by"]).resolve(), sh_shadow_file.resolve())
                     code_shs, lines_shs = self.win_mod.win_status(win_to=win_to, reg_key=reg_key)
                     self.assertEqual(code_shs, 3, lines_shs)
@@ -2402,6 +2405,18 @@ class TestWindowsInstaller(unittest.TestCase):
                 finally:
                     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_key, 0, winreg.KEY_SET_VALUE) as k:
                         winreg.SetValueEx(k, "Path", 0, orig_rk, orig_rp)
+                # Store-restoring identical reinstall when PATHEXT omits .CMD ALSO reports shadowed_by!
+                shutil.rmtree(uni_store)
+                with mock.patch.dict(os.environ, {"PATHEXT": ".COM;.EXE;.BAT"}):
+                    m_pe_reinit = self.win_mod.win_install(
+                        source_exe=self.helio_exe,
+                        source_sha256=exe_sha,
+                        store_path=str(uni_store),
+                        commit="c" * 40,
+                        win_to=win_to,
+                        reg_key=reg_key,
+                    )
+                    self.assertIn("PATHEXT", m_pe_reinit.get("shadowed_by", ""))
                 code_sh_ok, lines_sh_ok = self.win_mod.win_status(win_to=win_to, reg_key=reg_key)
                 self.assertEqual(code_sh_ok, 0, lines_sh_ok)
         finally:
