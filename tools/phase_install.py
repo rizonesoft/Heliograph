@@ -57,49 +57,58 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
     if not isinstance(data, dict) or not isinstance(data.get("phases"), dict):
         _fail(f"malformed plan payload from todo-graph.py query plan in {repo}")
 
-    # Require configured `origin` and resolve authoritative remote `refs/heads/main` so unpushed receipts are always detected
-    # and unrelated local commits or remote advances never falsely reopen an already-published phase!
-    rem_url = subprocess.run(
-        ["git", "-C", str(repo), "config", "--get", "remote.origin.url"],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if rem_url.returncode != 0 or not rem_url.stdout.strip():
-        _fail(f"cannot verify origin/main publication in {repo}: remote 'origin' is not configured")
-    ls_rem = subprocess.run(
-        ["git", "-C", str(repo), "ls-remote", "origin", "refs/heads/main"],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if ls_rem.returncode != 0:
-        _fail(f"cannot query origin refs/heads/main in {repo}: {(ls_rem.stderr or ls_rem.stdout).strip()}")
-    rem_lines = [ln.strip() for ln in ls_rem.stdout.splitlines() if ln.strip()]
-    if not rem_lines:
-        _fail(f"cannot verify origin/main publication in {repo}: origin has no refs/heads/main")
-    rem_sha = rem_lines[0].split()[0]
+    # Defer querying `origin` until at least one phase is locally all-verified and closed (not parked) so an
+    # offline session starting with open work is never blocked, while any closed phase still fails exit 3 if
+    # `origin/main` publication cannot be verified.
+    rem_sha_cache: str | None = None
 
-    # Ensure rem_sha is locally readable for `git ls-tree` / `git show` (handles remote advances without touching HEAD).
-    has_obj = subprocess.run(
-        ["git", "-C", str(repo), "cat-file", "-e", f"{rem_sha}^{{commit}}"],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if has_obj.returncode != 0:
-        fetch_res = subprocess.run(
-            ["git", "-C", str(repo), "fetch", "--no-tags", "--quiet", "origin", "refs/heads/main"],
+    def _resolve_origin_main_sha() -> str:
+        nonlocal rem_sha_cache
+        if rem_sha_cache is not None:
+            return rem_sha_cache
+        rem_url = subprocess.run(
+            ["git", "-C", str(repo), "config", "--get", "remote.origin.url"],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             check=False,
         )
-        if fetch_res.returncode != 0:
-            _fail(f"cannot fetch origin refs/heads/main in {repo}: {(fetch_res.stderr or fetch_res.stdout).strip()}")
+        if rem_url.returncode != 0 or not rem_url.stdout.strip():
+            _fail(f"cannot verify origin/main publication in {repo}: remote 'origin' is not configured")
+        ls_rem = subprocess.run(
+            ["git", "-C", str(repo), "ls-remote", "origin", "refs/heads/main"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if ls_rem.returncode != 0:
+            _fail(f"cannot query origin refs/heads/main in {repo}: {(ls_rem.stderr or ls_rem.stdout).strip()}")
+        rem_lines = [ln.strip() for ln in ls_rem.stdout.splitlines() if ln.strip()]
+        if not rem_lines:
+            _fail(f"cannot verify origin/main publication in {repo}: origin has no refs/heads/main")
+        sha = rem_lines[0].split()[0]
+
+        # Ensure sha is locally readable for `git ls-tree` / `git show` (handles remote advances without touching HEAD).
+        has_obj = subprocess.run(
+            ["git", "-C", str(repo), "cat-file", "-e", f"{sha}^{{commit}}"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if has_obj.returncode != 0:
+            fetch_res = subprocess.run(
+                ["git", "-C", str(repo), "fetch", "--no-tags", "--quiet", "origin", "refs/heads/main"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if fetch_res.returncode != 0:
+                _fail(f"cannot fetch origin refs/heads/main in {repo}: {(fetch_res.stderr or fetch_res.stdout).strip()}")
+        rem_sha_cache = sha
+        return sha
 
     def _scan_run_files(commit_ref: str, pnum: int) -> tuple[bool, bool, str | None, list[str], int, str, list[str]]:
         ls_r = subprocess.run(
@@ -172,6 +181,7 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
         head_closed, head_parked, head_installed_sha, head_files, head_co_cnt, head_co_file, head_co_lines = _scan_run_files("HEAD", pnum)
         if not head_closed or head_parked:
             continue
+        rem_sha = _resolve_origin_main_sha()
         rem_closed, rem_parked, rem_installed_sha, _rem_files, rem_co_cnt, rem_co_file, rem_co_lines = _scan_run_files(rem_sha, pnum)
         rem_settled = False
         if rem_closed and not rem_parked and bool(rem_installed_sha):

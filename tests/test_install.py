@@ -5134,10 +5134,23 @@ class TestPhaseInstaller(unittest.TestCase):
                 r4 = subprocess.run([sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"], env=env, capture_output=True, text=True)
                 self.assertEqual(r4.returncode, 1, r4.stdout + r4.stderr)
                 self.assertEqual(json.loads(r4.stdout), [0])
-                # Removing `origin` remote must fail with exit 3 (never silently report [] / exit 0)!
+                # Removing `origin` remote must fail with exit 3 when a closed phase needs publication check!
                 subprocess.run(["git", "-C", str(checkout), "remote", "remove", "origin"], check=True, capture_output=True)
                 r_norem = subprocess.run([sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"], env=env, capture_output=True, text=True)
                 self.assertEqual(r_norem.returncode, 3, r_norem.stdout + r_norem.stderr)
+                # Offline/no-origin checkout with NO locally closed verified phase (e.g. PARKED phase) MUST return [] (exit 0)
+                # without querying `origin` (item 37)!
+                run_file.write_text(run_file.read_text(encoding="utf-8") + "\nPARKED waiting on operator\n", encoding="utf-8")
+                subprocess.run(["git", "-C", str(checkout), "add", str(run_file)], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(checkout), "commit", "-m", "park phase 0"], check=True, capture_output=True)
+                r_offline_open = subprocess.run(
+                    [sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"],
+                    env={**env, "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "protocol.allow", "GIT_CONFIG_VALUE_0": "never"},
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(r_offline_open.returncode, 0, r_offline_open.stdout + r_offline_open.stderr)
+                self.assertEqual(json.loads(r_offline_open.stdout), [])
                 self.phase_mod._run_win_cli(self.python_exe, install_py_win, ["--remove", "--to", win_to, "--reg-key", reg_key])
         finally:
             self._delete_reg_key(reg_key)
