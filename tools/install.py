@@ -99,20 +99,23 @@ def _normalize_wrapper_path(path: Path) -> Path:
 
 def _redact_url(url: str) -> str:
     parsed = urlsplit(url)
-    if parsed.username is None and parsed.password is None:
-        return url
     host = parsed.hostname or ""
     if ":" in host:
         host = f"[{host}]"
-    netloc = f"***@{host}" + (f":{parsed.port}" if parsed.port is not None else "")
-    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+    if parsed.username is not None or parsed.password is not None:
+        netloc = f"***@{host}" + (f":{parsed.port}" if parsed.port is not None else "")
+    else:
+        netloc = parsed.netloc
+    query = "***" if parsed.query else ""
+    fragment = "***" if parsed.fragment else ""
+    return urlunsplit((parsed.scheme, netloc, parsed.path, query, fragment))
 
 
 def _validate_sdk_url(url: str) -> None:
     parsed = urlsplit(url)
-    if parsed.username is not None or parsed.password is not None:
+    if parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment:
         raise InstallError(
-            f"refusing SDK URL with embedded credentials ({_redact_url(url)}); use a git credential helper or SSH",
+            f"refusing SDK URL with embedded credentials or query parameters ({_redact_url(url)}); use a git credential helper or SSH",
             code=2,
         )
 
@@ -453,7 +456,7 @@ def _is_valid_tx_temp_name(name: str, tx_id: str) -> bool:
     if not isinstance(name, str) or "/" in name or "\\" in name:
         return False
     for base in BINARY_NAMES + BACKUP_NAMES:
-        if name in (f".{base}.{tx_id}.stage", f".{base}.{tx_id}.rec"):
+        if name in (f".{base}.{tx_id}.stage", f".{base}.{tx_id}.rec", f".{base}.{tx_id}.restore"):
             return True
     return False
 
@@ -664,10 +667,10 @@ def _verify_published_set(to_dir: Path, manifest: dict[str, Any]) -> bool:
             return False
         if isinstance(s_raw, str) and s_raw:
             try:
-                actual_wrapper = wp.read_text(encoding="utf-8")
+                actual_wrapper = wp.read_bytes()
             except OSError:
                 return False
-            if actual_wrapper != render_wrapper(to_dir, Path(s_raw)):
+            if actual_wrapper != render_wrapper(to_dir, Path(s_raw)).encode("utf-8"):
                 return False
     return True
 
@@ -743,11 +746,6 @@ def recover_if_needed(to_dir: Path, wrapper_path: Path, *, allow_superseded_wrap
             if p.exists():
                 p.unlink()
         wrappers_to_clean: list[Path] = [wrapper_path]
-        for key in ("alt_wrapper_path",):
-            if isinstance(journal.get(key), str):
-                wp = _normalize_wrapper_path(Path(journal[key]))
-                if wp not in wrappers_to_clean:
-                    wrappers_to_clean.append(wp)
         for rw in journal.get("remove_wrappers", []):
             wp = _normalize_wrapper_path(Path(rw))
             if wp not in wrappers_to_clean:
@@ -818,6 +816,8 @@ def recover_if_needed(to_dir: Path, wrapper_path: Path, *, allow_superseded_wrap
                 if not _is_independently_owned_reserved_file(rec_path, name):
                     raise InstallError(f"recovery refusing unowned snapshot {rec_path}: not a Heliograph artifact", code=2)
                 staged_restore = to_dir / f".{name}.{tx_id}.restore"
+                if staged_restore.exists() or staged_restore.is_symlink():
+                    staged_restore.unlink()
                 copy_to_staged(rec_path, staged_restore, mode=0o755)
                 replace_binary_atomic(staged_restore, target)
             else:
@@ -911,10 +911,11 @@ def _planned_temp_names(tx_id: str) -> list[str]:
     for base in BINARY_NAMES + BACKUP_NAMES:
         names.append(f".{base}.{tx_id}.rec")
         names.append(f".{base}.{tx_id}.stage")
+        names.append(f".{base}.{tx_id}.restore")
     return names
 
 
-def git_provenance_snapshot(repo: Path) -> tuple[str, bool, str]:
+def git_provenance_snapshot(repo: Path) -> tuple[str, bool, str, str]:
     rev = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True)
     if rev.returncode != 0:
         raise InstallError(f"cannot read git HEAD in {repo}: {rev.stderr.strip()}", code=2)
@@ -924,11 +925,26 @@ def git_provenance_snapshot(repo: Path) -> tuple[str, bool, str]:
         raise InstallError(f"cannot read git status in {repo}: {st.stderr.strip()}", code=2)
     status_text = st.stdout
     dirty = bool(status_text.strip())
-    return commit, dirty, status_text
+    diff = subprocess.run(["git", "-C", str(repo), "diff", "HEAD"], capture_output=True)
+    if diff.returncode != 0:
+        raise InstallError(f"cannot read git diff in {repo}", code=2)
+    h = hashlib.sha256(diff.stdout)
+    untracked = subprocess.run(
+        ["git", "-C", str(repo), "ls-files", "--others", "--exclude-standard", "-z"],
+        capture_output=True,
+    )
+    if untracked.returncode == 0:
+        for rel_b in sorted(x for x in untracked.stdout.split(b"\x00") if x):
+            p = repo / rel_b.decode("utf-8", errors="surrogateescape")
+            h.update(rel_b + b"\x00")
+            if p.is_file() and not p.is_symlink():
+                h.update(sha256_file(p).encode("ascii"))
+    diff_sha = h.hexdigest()
+    return commit, dirty, status_text, diff_sha
 
 
 def git_provenance(repo: Path) -> tuple[str, bool]:
-    commit, dirty, _ = git_provenance_snapshot(repo)
+    commit, dirty, _, _ = git_provenance_snapshot(repo)
     return commit, dirty
 
 
@@ -950,7 +966,9 @@ def ensure_sdk_and_build(repo: Path, sdk_url: str, stage_dir: Path) -> tuple[Pat
         bosun = shutil.which("bosun")
         if bosun and not os.environ.get("HELIO_NO_BOSUN"):
             cmd = [bosun, "run", "--", *cmd]
-        build = subprocess.run(cmd, check=False)
+        build_env = dict(os.environ)
+        build_env["HELIO_INSTALL_BUILD_ACTIVE"] = "1"
+        build = subprocess.run(cmd, env=build_env, check=False)
         if build.returncode != 0:
             raise InstallError(f"build/test failed (exit {build.returncode}); nothing was installed", code=build.returncode)
 
@@ -1088,9 +1106,9 @@ def install(
                     wrap_kind, wrap_target = parse_wrapper_ownership(wrapper_path)
                     if wrap_kind == "foreign":
                         raise InstallError(f"refusing unowned wrapper at {wrapper_path}", code=2)
-                    if wrap_kind == "managed" and wrap_target != str(to_dir):
+                    if wrap_kind in ("managed", "legacy") and wrap_target != str(to_dir):
                         raise InstallError(
-                            f"refusing wrapper {wrapper_path}: already managed for {wrap_target} "
+                            f"refusing wrapper {wrapper_path}: already bound to {wrap_target} "
                             "(use --wrapper or remove that installation first)",
                             code=2,
                         )
@@ -1311,6 +1329,11 @@ def status(*, to_dir: Path, wrapper_path: Path) -> tuple[int, list[str]]:
                 else:
                     if actual != prev.get(key):
                         problems.append(f"modified backup: {p} (recorded {str(prev.get(key, ''))[:12]}, actual {actual[:12]})")
+    else:
+        for name in BACKUP_NAMES:
+            p = to_dir / name
+            if p.exists() or p.is_symlink():
+                problems.append(f"unexpected backup file with no previous generation recorded: {p}")
 
     recorded_wrapper = (
         _normalize_wrapper_path(Path(cur["wrapper"]))
@@ -1329,11 +1352,11 @@ def status(*, to_dir: Path, wrapper_path: Path) -> tuple[int, list[str]]:
         problems.append(f"not executable: {wrapper_path}")
     elif cur.get("store"):
         try:
-            actual_wrapper = wrapper_path.read_text(encoding="utf-8")
+            actual_wrapper = wrapper_path.read_bytes()
         except OSError as exc:
             problems.append(f"unreadable wrapper: {wrapper_path} ({exc})")
         else:
-            expected_wrapper = render_wrapper(to_dir, Path(cur["store"]))
+            expected_wrapper = render_wrapper(to_dir, Path(cur["store"])).encode("utf-8")
             if actual_wrapper != expected_wrapper:
                 problems.append(f"wrapper content or store mismatch: {wrapper_path} (expected store {cur['store']})")
 
@@ -1379,16 +1402,10 @@ def go_back(
 
                 verify_destination_ownership(to_dir, manifest, require_live=True)
 
-                for name, key in (("helio.old", "helio_sha256"), ("helio.exe.old", "helio_exe_sha256")):
+                for name in BACKUP_NAMES:
                     p = to_dir / name
                     if p.is_symlink() or not p.is_file():
                         raise InstallError(f"cannot roll back: backup {p} is missing or not a regular file", code=2)
-                    actual = sha256_file(p)
-                    if actual != previous[key]:
-                        raise InstallError(
-                            f"cannot roll back: backup {p} hash mismatch (expected {previous[key][:12]}, actual {actual[:12]})",
-                            code=2,
-                        )
 
                 cur = manifest["current"]
                 target_wrapper = _normalize_wrapper_path(Path(previous["wrapper"])) if previous.get("wrapper") else wrapper_path
@@ -1518,6 +1535,9 @@ def go_back(
                                     on_boundary(f"after_unlink_old_wrapper_{idx}")
                     if on_boundary:
                         on_boundary("after_wrapper")
+
+                    if restored_store:
+                        _ensure_store_ready(to_dir / "helio", Path(restored_store))
 
                     write_json_atomic(to_dir / MANIFEST_NAME, desired_manifest)
                     if on_boundary:

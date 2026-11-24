@@ -1200,7 +1200,9 @@ class TestQuickInstaller(unittest.TestCase):
             self.assertGreater(completed, 0)
 
     def test_held_windows_exe_concurrent_caller_during_publication(self) -> None:
-        is_wsl = Path("/proc/sys/fs/binfmt_misc/WSLInterop").exists()
+        import platform
+
+        is_wsl = "microsoft" in platform.release().lower()
         if not (shutil.which("python.exe") and shutil.which("wslpath")):
             if is_wsl:
                 self.fail("WSL detected but python.exe or wslpath is unavailable for required Windows replacement proof")
@@ -1256,9 +1258,11 @@ class TestQuickInstaller(unittest.TestCase):
 
             def wait_for_overlap(stage: str) -> None:
                 if stage == "after_helio":
+                    # Open the overlap window right before replace_binary_atomic(stage_exe, helio.exe)
+                    # without waiting here, so win_caller actively races the Windows replacement itself.
                     in_pub_window.set()
-                    self.assertTrue(overlap_proved.wait(timeout=15), "no Windows caller completed during publication window")
                 elif stage == "after_helio_exe":
+                    self.assertTrue(overlap_proved.wait(timeout=15), "no Windows caller completed during Windows replacement window")
                     in_pub_window.clear()
 
             wt = threading.Thread(target=win_caller)
@@ -1443,15 +1447,118 @@ class TestQuickInstaller(unittest.TestCase):
                 clean_wrap = clean_home / ".local" / "bin" / "helio"
                 self.mod.install(repo=repo, to_dir=clean_to, store_dir=clean_store, wrapper_path=clean_wrap, prebuilt=(a_h, a_e))
                 login_res = subprocess.run(
-                    ["env", "-i", f"HOME={clean_home}", "PATH=/usr/bin:/bin", "bash", "-lc", "helio check"],
+                    [
+                        "env",
+                        "-i",
+                        f"HOME={clean_home}",
+                        "PATH=/usr/bin:/bin",
+                        "bash",
+                        "-lc",
+                        "command -v helio && helio check && helio tell demo/lane clean-home-msg --as demo/sender <<< body && helio inbox --as demo/lane",
+                    ],
                     capture_output=True,
                     text=True,
                 )
                 self.assertEqual(login_res.returncode, 0, login_res.stderr)
+                self.assertEqual(login_res.stdout.splitlines()[0].strip(), str(clean_wrap.resolve()))
+                self.assertIn("clean-home-msg", login_res.stdout)
+
+            # 7. Round 1 regressions: stale .restore cleanup, cross-destination legacy wrapper refusal,
+            #    SDK URL query redaction, CRLF wrapper rejection, --back missing store recovery,
+            #    already-dirty source drift, and stray helio.old with previous=None.
+            # 7a. Stale .restore file from interrupted recovery does not cause EEXIST and is cleaned up.
+            rest_dir = root / "stale_restore"
+            rest_wrap = root / "stale_restore_w" / "helio"
+            self.mod.install(repo=repo, to_dir=rest_dir, store_dir=s1, wrapper_path=rest_wrap, prebuilt=(a_h, a_e))
+
+            def crash_after_helio_r(stage: str) -> None:
+                if stage == "after_helio":
+                    raise SimulatedCrash(stage)
+
+            with self.assertRaises(SimulatedCrash):
+                self.mod.install(repo=repo, to_dir=rest_dir, store_dir=s2, wrapper_path=rest_wrap, prebuilt=(b_h, b_e), on_boundary=crash_after_helio_r)
+            j_rest = json.loads((rest_dir / self.mod.JOURNAL_NAME).read_text(encoding="utf-8"))
+            stale_restore = rest_dir / f".helio.{j_rest['tx_id']}.restore"
+            stale_restore.write_bytes(b"interrupted-restore-temp")
+            self.assertTrue(self.mod.recover_if_needed(rest_dir, rest_wrap))
+            self.assertFalse(stale_restore.exists())
+
+            # 7b. Cross-destination legacy wrapper is refused without overwriting it.
+            leg_other_dir = root / "leg_other_dest"
+            leg_other_dir.mkdir()
+            leg_wrap = root / "leg_shared_wrap" / "helio"
+            leg_wrap.parent.mkdir(parents=True, exist_ok=True)
+            leg_wrap.write_text(
+                f"#!/bin/sh\n# Heliograph with this machine's store.\n"
+                f'HELIO_STORE="${{HELIO_STORE:-{s1}}}" exec "{leg_other_dir}/helio" "$@"\n',
+                encoding="utf-8",
+            )
+            os.chmod(leg_wrap, 0o755)
+            with self.assertRaises(self.mod.InstallError) as ctx:
+                self.mod.install(repo=repo, to_dir=root / "leg_new_dest", store_dir=s2, wrapper_path=leg_wrap, prebuilt=(a_h, a_e))
+            self.assertEqual(ctx.exception.code, 2)
+            self.assertIn(str(leg_other_dir.resolve()), str(ctx.exception))
+
+            # 7c. SDK URL with query token is refused and redacted.
+            with self.assertRaises(self.mod.InstallError) as ctx:
+                self.mod._validate_sdk_url("https://example.invalid/sdk?token=SUPERSECRET")
+            self.assertEqual(ctx.exception.code, 2)
+            self.assertNotIn("SUPERSECRET", str(ctx.exception))
+
+            # 7d. CRLF-edited wrapper fails status with exit 3.
+            crlf_dir = root / "crlf_dir"
+            crlf_wrap = root / "crlf_w" / "helio"
+            self.mod.install(repo=repo, to_dir=crlf_dir, store_dir=s1, wrapper_path=crlf_wrap, prebuilt=(a_h, a_e))
+            crlf_bytes = crlf_wrap.read_bytes().replace(b"\n", b"\r\n")
+            crlf_wrap.write_bytes(crlf_bytes)
+            os.chmod(crlf_wrap, 0o755)
+            code, lines = self.mod.status(to_dir=crlf_dir, wrapper_path=crlf_wrap)
+            self.assertEqual(code, 3, lines)
+
+            # 7e. Stray helio.old when manifest records previous=None fails status with exit 3 naming helio.old.
+            stray_dir = root / "stray_old_dir"
+            stray_wrap = root / "stray_old_w" / "helio"
+            self.mod.install(repo=repo, to_dir=stray_dir, store_dir=s1, wrapper_path=stray_wrap, prebuilt=(a_h, a_e))
+            shutil.copy2(a_h, stray_dir / "helio.old")
+            code, lines = self.mod.status(to_dir=stray_dir, wrapper_path=stray_wrap)
+            self.assertEqual(code, 3)
+            self.assertTrue(any("helio.old" in line for line in lines), lines)
+
+            # 7f. --back when previous generation's store was removed re-initializes it so immediate status returns 0.
+            back_store_dir = root / "back_missing_store"
+            back_wrap = root / "back_ms_w" / "helio"
+            ms1, ms2 = root / "ms_store1", root / "ms_store2"
+            self.mod.install(repo=repo, to_dir=back_store_dir, store_dir=ms1, wrapper_path=back_wrap, prebuilt=(a_h, a_e))
+            self.mod.install(repo=repo, to_dir=back_store_dir, store_dir=ms2, wrapper_path=back_wrap, prebuilt=(b_h, b_e))
+            shutil.rmtree(ms1)
+            self.mod.go_back(to_dir=back_store_dir, wrapper_path=back_wrap)
+            code, lines = self.mod.status(to_dir=back_store_dir, wrapper_path=back_wrap)
+            self.assertEqual(code, 0, lines)
+
+            # 7g. Already-dirty tracked file edited AGAIN during build is refused with exit 3.
+            dirty_ws = root / "dirty_drift_ws"
+            dirty_repo = dirty_ws / "Heliograph"
+            init_git_repo(dirty_repo)
+            (dirty_repo / "README.md").write_text("already dirty before build\n", encoding="utf-8")
+            dirty_sdk = dirty_ws / "ImpossibleSDK" / "tools"
+            dirty_sdk.mkdir(parents=True)
+            (dirty_sdk / "app_build.py").write_text(
+                "import pathlib, shutil, sys\n"
+                "repo = pathlib.Path(sys.argv[1])\n"
+                "(repo / 'README.md').write_text('edited again during build\\n', encoding='utf-8')\n"
+                "(repo / 'build' / 'linux' / 'linux').mkdir(parents=True, exist_ok=True)\n"
+                f"shutil.copy2({str(a_h)!r}, repo / 'build' / 'linux' / 'linux' / 'helio')\n"
+                f"shutil.copy2({str(a_e)!r}, repo / 'build' / 'linux' / 'helio.exe')\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(self.mod.InstallError) as ctx:
+                self.mod.install(repo=dirty_repo, to_dir=root / "dd_bin", store_dir=root / "dd_store", wrapper_path=root / "dd_w" / "helio")
+            self.assertEqual(ctx.exception.code, 3)
+            self.assertIn("source tree changed", str(ctx.exception))
 
     def test_real_checkout_pinned_sdk_install_and_roundtrip(self) -> None:
-        if os.environ.get("HELIO_INSTALL_TEST_INNER") == "1":
-            self.skipTest("inner nested test run; real-SDK install already exercised by outer test")
+        if os.environ.get("HELIO_INSTALL_BUILD_ACTIVE") == "1":
+            self.skipTest("already inside tools/install.py build; skipping nested self-install")
         sdk_build = REPO.parent / "ImpossibleSDK" / "tools" / "app_build.py"
         if not sdk_build.is_file():
             self.skipTest("pinned ImpossibleSDK checkout not present beside repo")
@@ -1461,7 +1568,6 @@ class TestQuickInstaller(unittest.TestCase):
             store_dir = root / "real_store"
             wrapper = root / "real_home" / ".local" / "bin" / "helio"
             env = dict(os.environ)
-            env["HELIO_INSTALL_TEST_INNER"] = "1"
             env["HELIO_NO_BOSUN"] = "1"
             res = subprocess.run(
                 [
