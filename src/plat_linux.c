@@ -35,9 +35,20 @@ static p_result all(int file, size_t most, char **data, size_t *length) {
     return P_OK;
 }
 
+static bool passing_linux(int attempt, int err) {
+    if (attempt >= 20 || (err != EACCES && err != EBUSY)) return false;
+    struct timespec ts = {0, 1000000};
+    nanosleep(&ts, NULL);
+    return true;
+}
+
 p_result p_read(const char *path, size_t most, char **data, size_t *length) {
     struct stat info;
-    int file = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK); /* never a pipe, a link or a device */
+    int file = -1;
+    for (int attempt = 0;; attempt++) {
+        file = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK); /* never a pipe, a link or a device */
+        if (file >= 0 || !passing_linux(attempt, errno)) break;
+    }
     if (file < 0) return why();
     p_result result = fstat(file, &info) || !S_ISREG(info.st_mode) ? P_FAILED : all(file, most, data, length);
     close(file);
@@ -97,7 +108,10 @@ p_result p_write(const char *path, const char *data, size_t length, bool replace
 }
 
 p_result p_remove(const char *path) {
-    if (unlink(path)) return why();
+    for (int attempt = 0;; attempt++) {
+        if (!unlink(path)) break;
+        if (!passing_linux(attempt, errno)) return why();
+    }
     return settle(path) ? P_OK : P_FAILED;
 }
 
@@ -105,7 +119,11 @@ p_result p_sync(const char *path) {
 #ifdef HELIO_TEST_HOOKS
     if (plat_fail_flush || plat_fail_sync) return P_FAILED;
 #endif
-    int file = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    int file = -1;
+    for (int attempt = 0;; attempt++) {
+        file = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        if (file >= 0 || !passing_linux(attempt, errno)) break;
+    }
     if (file < 0) return why();
     struct stat info;
     bool good = !fstat(file, &info) && S_ISREG(info.st_mode) && !fsync(file);
