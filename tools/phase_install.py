@@ -1120,11 +1120,11 @@ def _rollback_phase_journal(
     if on_boundary:
         on_boundary("after_rollback_marker_end")
 
+    _sweep_phase_journal_temps(to_dir, tx_id, install_mod)
     jp = to_dir / PHASE_JOURNAL_NAME
     if jp.exists():
         jp.unlink()
         install_mod.fsync_dir(to_dir)
-    _sweep_phase_journal_temps(to_dir, tx_id, install_mod)
 
 
 _REQUIRED_PHASE_JOURNAL_KEYS = (
@@ -1269,9 +1269,9 @@ def _recover_pending_phase_journal(
             j_tx,
             install_mod=install_mod,
         )
+        _sweep_phase_journal_temps(to_dir, j_tx, install_mod)
         jp.unlink()
         install_mod.fsync_dir(to_dir)
-        _sweep_phase_journal_temps(to_dir, j_tx, install_mod)
         return None
     if state == "notifying":
         # Idempotently release any stranded Windows marker.
@@ -1294,9 +1294,9 @@ def _recover_pending_phase_journal(
             install_mod=install_mod,
             on_boundary=on_boundary,
         )
+        _sweep_phase_journal_temps(to_dir, j_tx, install_mod)
         jp.unlink()
         install_mod.fsync_dir(to_dir)
-        _sweep_phase_journal_temps(to_dir, j_tx, install_mod)
         return {
             "phase": int(journal["phase"]),
             "commit": str(journal["commit"]),
@@ -1749,11 +1749,11 @@ def run_phase_install(
                 install_mod=install_mod,
                 on_boundary=on_boundary,
             )
+            _sweep_phase_journal_temps(to_dir, tx_id, install_mod)
             jp = to_dir / PHASE_JOURNAL_NAME
             if jp.exists():
                 jp.unlink()
                 install_mod.fsync_dir(to_dir)
-            _sweep_phase_journal_temps(to_dir, tx_id, install_mod)
 
             return {
                 "phase": phase,

@@ -158,7 +158,10 @@ def write_bytes_atomic(path: Path, data: bytes, mode: int | None = None, *, tx_i
 
 def write_json_atomic(path: Path, payload: dict[str, Any], *, tx_id: str | None = None) -> None:
     raw = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    write_bytes_atomic(path, raw, mode=0o644, tx_id=tx_id)
+    if tx_id is None:
+        write_bytes_atomic(path, raw, mode=0o644)
+    else:
+        write_bytes_atomic(path, raw, mode=0o644, tx_id=tx_id)
 
 
 def copy_to_staged(src: Path, dst: Path, mode: int = 0o755) -> None:
