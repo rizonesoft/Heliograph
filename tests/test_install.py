@@ -2021,7 +2021,7 @@ class TestWindowsInstaller(unittest.TestCase):
                 self.assertEqual(r_tell.returncode, 0, r_tell.stdout + r_tell.stderr)
                 msg_id = r_tell.stdout.strip().splitlines()[-1].strip()
                 r_show = subprocess.run(
-                    ["cmd.exe", "/c", "helio", "show", msg_id],
+                    ["cmd.exe", "/c", "helio", "show", msg_id, "--as", "demo/stdin"],
                     cwd=str(outside_cwd),
                     env=base_env,
                     capture_output=True,
