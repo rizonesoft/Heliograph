@@ -1300,12 +1300,11 @@ class TestQuickInstaller(unittest.TestCase):
             real_os_remove = os.remove
             real_os_rename = os.rename
             real_os_replace = os.replace
-            in_exe_replace = False
             saw_atomic_replace = False
 
             def _probe_exe_during_gap(op_name: str, path_arg: object) -> None:
-                if in_exe_replace and Path(os.fspath(path_arg)).resolve() == exe_target:
-                    # Non-atomic removal/rename-away of helio.exe creates a gap; probe by name right now.
+                if Path(os.fspath(path_arg)).resolve() == exe_target:
+                    # Non-atomic removal/rename-away of helio.exe anywhere in install() creates a gap; probe by name right now.
                     try:
                         r = subprocess.run(
                             [str(to_dir / "helio.exe"), "help"],
@@ -1317,7 +1316,7 @@ class TestQuickInstaller(unittest.TestCase):
                         detail = f"probe rc={r.returncode}"
                     except OSError as exc:
                         detail = f"probe raised {type(exc).__name__}: {exc}"
-                    win_failures.append(f"non-atomic {op_name} of helio.exe during replacement ({detail})")
+                    win_failures.append(f"non-atomic {op_name} of helio.exe during install ({detail})")
 
             def _spy_unlink(p, *args, **kwargs):
                 res = real_os_unlink(p, *args, **kwargs)
@@ -1335,24 +1334,13 @@ class TestQuickInstaller(unittest.TestCase):
                 return res
 
             def _spy_replace(src, dst, *args, **kwargs):
+                nonlocal saw_atomic_replace
                 res = real_os_replace(src, dst, *args, **kwargs)
-                if Path(os.fspath(dst)).resolve() != exe_target:
+                if Path(os.fspath(dst)).resolve() == exe_target:
+                    saw_atomic_replace = True
+                else:
                     _probe_exe_during_gap("replace-away", src)
                 return res
-
-            real_replace_atomic = self.mod.replace_binary_atomic
-
-            def _wrapped_replace(staged: Path, target: Path) -> None:
-                nonlocal in_exe_replace, saw_atomic_replace
-                if target.resolve() == exe_target:
-                    in_exe_replace = True
-                    try:
-                        real_replace_atomic(staged, target)
-                        saw_atomic_replace = True
-                    finally:
-                        in_exe_replace = False
-                else:
-                    real_replace_atomic(staged, target)
 
             try:
                 assert holder.stdout is not None
@@ -1360,7 +1348,6 @@ class TestQuickInstaller(unittest.TestCase):
                 wt.start()
                 try:
                     with (
-                        mock.patch.object(self.mod, "replace_binary_atomic", side_effect=_wrapped_replace),
                         mock.patch("os.unlink", side_effect=_spy_unlink),
                         mock.patch("os.remove", side_effect=_spy_remove),
                         mock.patch("os.rename", side_effect=_spy_rename),
