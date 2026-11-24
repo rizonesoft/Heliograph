@@ -942,8 +942,8 @@ def git_provenance_snapshot(repo: Path) -> tuple[str, bool, str, str]:
             if p.is_file():
                 try:
                     h.update(sha256_file(p).encode("ascii"))
-                except OSError:
-                    h.update(b"UNREADABLE")
+                except OSError as exc:
+                    raise InstallError(f"cannot read build input {p} for provenance verification: {exc}", code=3) from exc
     diff_sha = h.hexdigest()
     return commit, dirty, status_text, diff_sha
 

@@ -1240,18 +1240,19 @@ class TestQuickInstaller(unittest.TestCase):
                 nonlocal overlap_calls
                 while not win_stop.is_set():
                     during = in_pub_window.is_set()
-                    if during:
-                        caller_in_flight.set()
                     try:
-                        r = subprocess.run(
+                        proc = subprocess.Popen(
                             [str(to_dir / "helio.exe"), "help"],
                             stdin=subprocess.DEVNULL,
-                            capture_output=True,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
                             text=True,
-                            timeout=30,
                         )
-                        if r.returncode != 0:
-                            win_failures.append(f"rc={r.returncode} stderr={r.stderr}")
+                        if during:
+                            caller_in_flight.set()
+                        _out, err = proc.communicate(timeout=30)
+                        if proc.returncode != 0:
+                            win_failures.append(f"rc={proc.returncode} stderr={err}")
                         elif during:
                             overlap_calls += 1
                     except (OSError, subprocess.SubprocessError) as exc:
@@ -1437,44 +1438,34 @@ class TestQuickInstaller(unittest.TestCase):
             code, _ = self.mod.status(to_dir=oserr_dir, wrapper_path=oserr_wrap)
             self.assertEqual(code, 0)
 
-            # 6. Clean home with standard login profile finds `helio` by name in a fresh login shell without test-injected PATH.
-            #    Verify wrapper identity FIRST before invoking any write command so nothing can ever write outside clean_store.
+            # 6. Clean home with system /etc/skel/.profile finds `helio` by name in one fresh login shell
+            #    without test-injected PATH, verifying wrapper identity and unset HELIO_STORE BEFORE any write.
             clean_home = root / "clean_home"
             clean_home.mkdir()
             skel_profile = Path("/etc/skel/.profile")
-            if skel_profile.is_file():
-                shutil.copy2(skel_profile, clean_home / ".profile")
-            else:
-                (clean_home / ".profile").write_text(
-                    'if [ -d "$HOME/.local/bin" ]; then PATH="$HOME/.local/bin:$PATH"; fi\n',
-                    encoding="utf-8",
-                )
+            self.assertTrue(skel_profile.is_file(), "/etc/skel/.profile is required for clean-home login shell proof")
+            shutil.copy2(skel_profile, clean_home / ".profile")
             clean_to = root / "clean_to"
             clean_store = root / "clean_store"
             clean_wrap = clean_home / ".local" / "bin" / "helio"
             self.mod.install(repo=repo, to_dir=clean_to, store_dir=clean_store, wrapper_path=clean_wrap, prebuilt=(a_h, a_e))
-            which_res = subprocess.run(
-                ["env", "-i", f"HOME={clean_home}", "PATH=/usr/bin:/bin", "bash", "-lc", "command -v helio"],
-                capture_output=True,
-                text=True,
+            expected_wrap = str(clean_wrap.resolve())
+            before_msgs = set((clean_store / "messages").iterdir())
+            login_script = (
+                f'resolved="$(command -v helio)" || exit 11; '
+                f'[ "$resolved" = {expected_wrap!r} ] || exit 12; '
+                f'[ -z "${{HELIO_STORE:-}}" ] || exit 13; '
+                f'helio check && helio tell demo/lane clean-home-msg --as demo/sender <<< body && helio inbox --as demo/lane'
             )
-            self.assertEqual(which_res.returncode, 0, which_res.stderr)
-            self.assertEqual(which_res.stdout.strip(), str(clean_wrap.resolve()))
             login_res = subprocess.run(
-                [
-                    "env",
-                    "-i",
-                    f"HOME={clean_home}",
-                    "PATH=/usr/bin:/bin",
-                    "bash",
-                    "-lc",
-                    "helio check && helio tell demo/lane clean-home-msg --as demo/sender <<< body && helio inbox --as demo/lane",
-                ],
+                ["env", "-i", f"HOME={clean_home}", "PATH=/usr/bin:/bin", "bash", "-lc", login_script],
                 capture_output=True,
                 text=True,
             )
-            self.assertEqual(login_res.returncode, 0, login_res.stderr)
+            self.assertEqual(login_res.returncode, 0, login_res.stdout + login_res.stderr)
             self.assertIn("clean-home-msg", login_res.stdout)
+            after_msgs = set((clean_store / "messages").iterdir())
+            self.assertGreater(len(after_msgs), len(before_msgs), "message was not written to temporary clean_store")
 
             # 7. Round 1 regressions: stale .restore cleanup, cross-destination legacy wrapper refusal,
             #    SDK URL query redaction, CRLF wrapper rejection, --back missing store recovery,
@@ -1591,6 +1582,21 @@ class TestQuickInstaller(unittest.TestCase):
                 self.mod.install(repo=sym_repo, to_dir=root / "sym_bin", store_dir=root / "sym_store", wrapper_path=root / "sym_w" / "helio")
             self.assertEqual(ctx.exception.code, 3)
             self.assertIn("source tree changed", str(ctx.exception))
+
+            # 7i. Unreadable untracked file refuses provenance verification with exit 3 instead of matching a constant.
+            if os.geteuid() != 0:
+                unr_repo = root / "unr_repo"
+                init_git_repo(unr_repo)
+                unr_file = unr_repo / "secret_unreadable.h"
+                unr_file.write_text("#define X 1\n", encoding="utf-8")
+                os.chmod(unr_file, 0o000)
+                try:
+                    with self.assertRaises(self.mod.InstallError) as ctx:
+                        self.mod.git_provenance_snapshot(unr_repo)
+                    self.assertEqual(ctx.exception.code, 3)
+                    self.assertIn("cannot read build input", str(ctx.exception))
+                finally:
+                    os.chmod(unr_file, 0o644)
 
     def test_real_checkout_pinned_sdk_install_and_roundtrip(self) -> None:
         if os.environ.get("HELIO_INSTALL_BUILD_ACTIVE") == "1":
