@@ -42,19 +42,18 @@ static bool settle_win(const char *path) {
         copy[dlen] = 0;
         dir_utf8 = copy;
     }
+    bool is_unc = dir_utf8[0] == '\\' && dir_utf8[1] == '\\';
     wchar_t *wide = im_wide(dir_utf8);
     im_free(copy);
     if (!wide) return false;
     HANDLE dir = CreateFileW(wide, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
-    DWORD open_err = dir == INVALID_HANDLE_VALUE ? GetLastError() : 0;
     im_free(wide);
-    if (dir == INVALID_HANDLE_VALUE) {
-        return open_err == ERROR_ACCESS_DENIED || open_err == ERROR_INVALID_FUNCTION || open_err == ERROR_NOT_SUPPORTED || open_err == ERROR_INVALID_PARAMETER;
-    }
+    if (dir == INVALID_HANDLE_VALUE) return false;
     bool ok = FlushFileBuffers(dir) != 0;
     DWORD err = ok ? 0 : GetLastError();
     CloseHandle(dir);
-    return ok || err == ERROR_ACCESS_DENIED || err == ERROR_INVALID_FUNCTION || err == ERROR_NOT_SUPPORTED || err == ERROR_INVALID_PARAMETER;
+    /* WORKAROUND: Windows 9p/UNC redirectors do not implement IRP_MJ_FLUSH_BUFFERS on directory handles; local NTFS requires strict FlushFileBuffers success. */
+    return ok || (is_unc && (err == ERROR_INVALID_FUNCTION || err == ERROR_NOT_SUPPORTED));
 }
 
 p_result p_remove(const char *path) {
@@ -82,17 +81,17 @@ static bool sync_dir_win(const char *path) {
 #ifdef HELIO_TEST_HOOKS
     if (plat_fail_flush) return false;
 #endif
+    bool is_unc = path[0] == '\\' && path[1] == '\\';
     wchar_t *wide = im_wide(path);
     if (!wide) return false;
     HANDLE dir = CreateFileW(wide, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
-    DWORD open_err = dir == INVALID_HANDLE_VALUE ? GetLastError() : 0;
     im_free(wide);
-    if (dir == INVALID_HANDLE_VALUE)
-        return open_err == ERROR_ACCESS_DENIED || open_err == ERROR_INVALID_FUNCTION || open_err == ERROR_NOT_SUPPORTED || open_err == ERROR_INVALID_PARAMETER;
+    if (dir == INVALID_HANDLE_VALUE) return false;
     bool ok = FlushFileBuffers(dir) != 0;
     DWORD err = ok ? 0 : GetLastError();
     CloseHandle(dir);
-    return ok || err == ERROR_ACCESS_DENIED || err == ERROR_INVALID_FUNCTION || err == ERROR_NOT_SUPPORTED || err == ERROR_INVALID_PARAMETER;
+    /* WORKAROUND: Windows 9p/UNC redirectors do not implement IRP_MJ_FLUSH_BUFFERS on directory handles; local NTFS requires strict FlushFileBuffers success. */
+    return ok || (is_unc && (err == ERROR_INVALID_FUNCTION || err == ERROR_NOT_SUPPORTED));
 }
 
 p_result p_sync(const char *path) {

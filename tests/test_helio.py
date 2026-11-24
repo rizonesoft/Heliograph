@@ -1266,6 +1266,27 @@ class Archive(Base):
                 os.symlink(st / "messages", st / "archive/2025-02")
                 self.assertEqual(run(st, "archive", me=None).returncode, 3)
                 self.assertTrue((st / f"messages/{jsym}.post").exists())
+        # 5b. Recovery when archived terminal links already exist MUST preserve live post if a live seen mark conflicts!
+        with tempfile.TemporaryDirectory() as tmp:
+            st = Path(tmp)
+            put(st / "helio.conf", "project: os\n")
+            self.assertEqual(run(st, "init", me=None).returncode, 0)
+            jrec = f"{feb_us + 88:016d}-a00088"
+            post_body = f"id: {jrec}\ntime: 2025-02-15T00:00:00Z\nfrom: os/main\nto: os/userland\nkind: request\nabout: \nurgency: next\nre: \ndue: \nlength: 4\nsubject: rec\n\nbody"
+            link0 = "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: taken\nnote: \nend: yes\n"
+            link1 = "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: done\nnote: ok\nend: yes\n"
+            put(st / f"messages/{jrec}.post", post_body)
+            put(st / f"messages/{jrec}.link.0000", link0)
+            put(st / f"messages/{jrec}.link.0001", link1)
+            put(st / f"messages/{jrec}.seen.os~userland", "seen\n")
+            (st / "archive/2025-02").mkdir(parents=True)
+            put(st / f"archive/2025-02/{jrec}.post", post_body)
+            put(st / f"archive/2025-02/{jrec}.link.0000", link0)
+            put(st / f"archive/2025-02/{jrec}.link.0001", link1)
+            put(st / f"archive/2025-02/{jrec}.seen.os~userland", "CONFLICTING SEEN\n")
+            r_rec = run(st, "archive", me=None)
+            self.assertEqual(r_rec.returncode, 3)
+            self.assertTrue((st / f"messages/{jrec}.post").exists(), "live post must stay intact when seen mark conflicts")
         # Normal archive recovers cleanly afterwards.
         self.assertEqual(self.helio("archive", me=None).returncode, 0)
         self.assertFalse((self.store / f"messages/{job2}.post").exists())
@@ -1367,6 +1388,51 @@ class Archive(Base):
         self.assertEqual(proc_c.returncode, 0, err_c)
         self.assertEqual(out_c.decode().strip(), job_c)
 
+        # P1 race 4 (in-flight taker passed pre-check BEFORE archival, then killed retry republishes post):
+        # taker MUST refuse (exit 2) on post-publish archive check and roll back its link.0000!
+        job_inf = self.make_aged_closed_job(closed_iso="2025-04-15T12:00:00Z", state="done", subject="keyed-inflight", key="k-inf-1")
+        # Temporarily remove links so an in-flight taker can pass pre-check while open, then restore terminal links & archive!
+        l0_txt = (self.store / f"messages/{job_inf}.link.0000").read_text()
+        l1_txt = (self.store / f"messages/{job_inf}.link.0001").read_text()
+        (self.store / f"messages/{job_inf}.link.0000").unlink()
+        (self.store / f"messages/{job_inf}.link.0001").unlink()
+        proc_t = subprocess.Popen(
+            [str(RACER), "--pause", "take", "write", str(self.store), "os/userland", job_inf],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=self.store,
+            env=clean,
+        )
+        try:
+            self.wait_for(self.store / "paused.write")
+            # Restore terminal links and archive completely while taker is paused right before add_link!
+            put(self.store / f"messages/{job_inf}.link.0000", l0_txt)
+            put(self.store / f"messages/{job_inf}.link.0001", l1_txt)
+            self.assertEqual(self.helio("archive", me=None).returncode, 0)
+            # Simulate a killed keyed retry leaving a duplicate live post while archived terminal job exists!
+            arch_post = next((self.store / "archive").glob(f"*/{job_inf}.post"))
+            put(self.store / f"messages/{job_inf}.post", arch_post.read_text())
+            put(self.store / "resume.write", "go")
+            _, err_t = proc_t.communicate(timeout=30)
+        finally:
+            if proc_t.poll() is None:
+                proc_t.kill()
+        self.assertEqual(proc_t.returncode, 2, err_t)
+        self.assertIn(b"archived", err_t)
+        self.assertFalse((self.store / f"messages/{job_inf}.link.0000").exists(), "rolled-back take must leave no link.0000")
+        self.assertEqual(self.helio("archive", me=None).returncode, 0)
+        for name in ("paused.write", "resume.write"):
+            (self.store / name).unlink(missing_ok=True)
+
+        # P2 regression (in-progress partial archive must NOT cause healthy live job mutation to report damaged!):
+        live_part = self.send(to="os/userland", subject="partial-archive-live")
+        (self.store / "archive/2025-02").mkdir(parents=True, exist_ok=True)
+        put(self.store / f"archive/2025-02/{live_part}.post", (self.store / f"messages/{live_part}.post").read_text())
+        take_part = self.helio("take", live_part, me="os/userland")
+        self.assertEqual(take_part.returncode, 0, take_part.stderr)
+        (self.store / f"archive/2025-02/{live_part}.post").unlink()
+
     def test_daily_200_limit_hook_first_concurrent_archive_and_overfull_recovery(self):
         # Create 201 eligible closed jobs + 1 open job.
         feb_us = 1739577600_000_000
@@ -1406,12 +1472,12 @@ class Archive(Base):
         self.assertEqual(len(list((self.store / "archive/2025-02").glob("*.post"))), 201)
         self.assertTrue((self.store / f"messages/{open_job}.post").exists())
 
-        # Interrupted inbox mid-batch + stale claim takeover MUST NOT exceed 200 total!
+        # Interrupted inbox mid-batch + TWO concurrent recovering inboxes MUST NOT exceed 200 total!
         with tempfile.TemporaryDirectory() as tmp:
             st = Path(tmp)
             put(st / "helio.conf", "project: os\n")
             self.assertEqual(run(st, "init", me=None).returncode, 0)
-            for i in range(205):
+            for i in range(210):
                 j = f"{feb_us + 900 + i:016d}-d{i:05x}"
                 put(st / f"messages/{j}.post", f"id: {j}\ntime: 2025-02-15T00:00:00Z\nfrom: os/main\nto: os/userland\nkind: request\nabout: \nurgency: next\nre: \ndue: \nlength: 4\nsubject: d\n\nbody")
                 put(st / f"messages/{j}.link.0000", "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: taken\nnote: \nend: yes\n")
@@ -1431,15 +1497,35 @@ class Archive(Base):
             finally:
                 if p_int.poll() is None:
                     p_int.kill()
-            # Backdate .claiming timestamp so next inbox takes over the stale claim with its pre-debited budget!
-            claims = list((st / "summary").glob("*.claiming"))
-            self.assertEqual(len(claims), 1)
-            _, prev_spent = claims[0].read_text().strip().split()
-            put(claims[0], f"1 {prev_spent}\n")
-            self.assertIn(run(st, "inbox", me="os/userland").returncode, (0, 1))
+            # Two simultaneous recovering inboxes race for remaining slots: total moved across ALL runs MUST be <= 200!
+            with ThreadPoolExecutor(2) as pool:
+                rec_codes = list(pool.map(lambda _: run(st, "inbox", me="os/userland").returncode, range(2)))
+            for rc in rec_codes:
+                self.assertIn(rc, (0, 1))
             moved_total = len(list((st / "archive/2025-02").glob("*.post")))
-            self.assertLessEqual(moved_total, 200, f"interrupted + resumed daily archive exceeded 200: {moved_total}")
+            self.assertLessEqual(moved_total, 200, f"interrupted + concurrent recovery exceeded 200: {moved_total}")
             self.assertGreater(moved_total, 0)
+
+        # Two truly simultaneous fresh inboxes on 210 eligible jobs MUST NOT exceed 200 total!
+        with tempfile.TemporaryDirectory() as tmp:
+            st = Path(tmp)
+            put(st / "helio.conf", "project: os\n")
+            self.assertEqual(run(st, "init", me=None).returncode, 0)
+            for i in range(210):
+                j = f"{feb_us + 2000 + i:016d}-e{i:05x}"
+                put(st / f"messages/{j}.post", f"id: {j}\ntime: 2025-02-15T00:00:00Z\nfrom: os/main\nto: os/userland\nkind: request\nabout: \nurgency: next\nre: \ndue: \nlength: 4\nsubject: e\n\nbody")
+                put(st / f"messages/{j}.link.0000", "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: taken\nnote: \nend: yes\n")
+                put(st / f"messages/{j}.link.0001", "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: done\nnote: ok\nend: yes\n")
+            with ThreadPoolExecutor(3) as pool:
+                sim_codes = list(pool.map(lambda _: run(st, "inbox", me="os/userland").returncode, range(3)))
+            for rc in sim_codes:
+                self.assertIn(rc, (0, 1))
+            moved_sim = len(list((st / "archive/2025-02").glob("*.post")))
+            self.assertLessEqual(moved_sim, 200, f"simultaneous inboxes exceeded 200: {moved_sim}")
+            self.assertGreater(moved_sim, 0)
+            # A subsequent inbox on the same date MUST NOT move any more jobs!
+            self.assertIn(run(st, "inbox", me="os/userland").returncode, (0, 1))
+            self.assertEqual(len(list((st / "archive/2025-02").glob("*.post"))), moved_sim)
 
         # Overfull-store recovery via --max-names: inbox refuses, archive drains, inbox recovers!
         with tempfile.TemporaryDirectory() as tmp:
@@ -1482,18 +1568,22 @@ class Archive(Base):
     @unittest.skipUnless(WSL, "needs WSL")
     def test_windows_and_linux_archive_race_1000_rounds(self):
         feb_us = 1739577600_000_000
-        old_ids = [self.make_aged_closed_job(created_us=feb_us + i, closed_iso="2025-04-15T12:00:00Z", state="done", subject=f"arch-{i}") for i in range(100)]
+        old_ids = [self.make_aged_closed_job(created_us=feb_us + i, closed_iso="2025-04-15T12:00:00Z", state="done", subject=f"arch-{i}") for i in range(1000)]
         live_ids = [self.send(to="os/all", subject=f"live-{i}") for i in range(20)]
-        all_ids = old_ids + live_ids
         win_store = subprocess.run(["wslpath", "-w", str(self.store)], capture_output=True, text=True, check=True, timeout=30).stdout.strip()
         win_racer = str(BUILD / "racer.exe")
         lin_racer = str(RACER)
-        # 2 archivers (limit=1 per round: Windows 200 rounds + Linux 800 rounds = 1000 rounds total) + 2 takers.
+        # 2 archivers (limit=1 per round: Windows 200 rounds + Linux 800 rounds = 1,000 real moves across 1,000 rounds),
+        # 2 concurrent readers (Windows 200 rounds + Linux 800 rounds = 1,000 visibility rounds verifying every live control),
+        # and 2 racing takers (Windows + Linux) over live controls + sample eligible old jobs.
+        take_ids = old_ids[:40] + live_ids
         procs = [
-            subprocess.Popen([win_racer, "--archive-loop", win_store, "200"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
-            subprocess.Popen([lin_racer, "--archive-loop", str(self.store), "800"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
-            subprocess.Popen([win_racer, win_store, "os/win-taker", *all_ids[::-1]], stdin=subprocess.DEVNULL),
-            subprocess.Popen([lin_racer, str(self.store), "os/lin-taker", *all_ids], stdin=subprocess.DEVNULL),
+            subprocess.Popen([win_racer, "--archive-loop", win_store, "300"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
+            subprocess.Popen([lin_racer, "--archive-loop", str(self.store), "1000"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
+            subprocess.Popen([win_racer, "--read-loop", win_store, "200", *live_ids], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
+            subprocess.Popen([lin_racer, "--read-loop", str(self.store), "800", *live_ids], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
+            subprocess.Popen([win_racer, win_store, "os/win-taker", *take_ids[::-1]], stdin=subprocess.DEVNULL),
+            subprocess.Popen([lin_racer, str(self.store), "os/lin-taker", *take_ids], stdin=subprocess.DEVNULL),
         ]
         try:
             for _ in range(300):
@@ -1501,19 +1591,16 @@ class Archive(Base):
                     break
                 time.sleep(0.05)
             put(self.store / "go", "x")
-            # Run concurrent readers while archivers and takers race, verifying every live control stays visible!
-            reader_errors = []
-            for _ in range(10):
-                r = self.helio("log", me=None)
-                out_txt = r.stdout.decode()
-                if r.returncode != 0 or any(lid not in out_txt for lid in live_ids) or "damaged" in out_txt.lower():
-                    reader_errors.append((r.returncode, r.stderr))
-            _, arch_win_err = procs[0].communicate(timeout=120)
-            _, arch_lin_err = procs[1].communicate(timeout=120)
+            _, arch_win_err = procs[0].communicate(timeout=180)
+            _, arch_lin_err = procs[1].communicate(timeout=180)
+            _, read_win_err = procs[2].communicate(timeout=180)
+            _, read_lin_err = procs[3].communicate(timeout=180)
             arch_win_rc = procs[0].returncode
             arch_lin_rc = procs[1].returncode
-            win_won = procs[2].wait(120)
-            lin_won = procs[3].wait(120)
+            read_win_rc = procs[2].returncode
+            read_lin_rc = procs[3].returncode
+            win_won = procs[4].wait(180)
+            lin_won = procs[5].wait(180)
         finally:
             for p in procs:
                 if p.poll() is None:
@@ -1523,16 +1610,17 @@ class Archive(Base):
                     p.stdout.close()
                 if p.stderr:
                     p.stderr.close()
-        self.assertEqual(reader_errors, [])
         self.assertEqual(arch_win_rc, 0, arch_win_err)
         self.assertEqual(arch_lin_rc, 0, arch_lin_err)
+        self.assertEqual(read_win_rc, 0, read_win_err)
+        self.assertEqual(read_lin_rc, 0, read_lin_err)
         # Every live control job taken exactly once (per-job check, not aggregate!) and zero eligible old jobs taken!
         self.assertEqual(win_won + lin_won, len(live_ids), (win_won, lin_won))
         for lid in live_ids:
             self.assertTrue((self.store / f"messages/{lid}.post").exists(), lid)
             links = sorted(self.store.glob(f"messages/{lid}.link.*"))
             self.assertEqual([p.name for p in links], [f"{lid}.link.0000"], lid)
-        # Every eligible old job moved to archive/2025-02 with its complete terminal chain and gone from messages/.
+        # Every one of the 1,000 eligible old jobs moved to archive/2025-02 with its complete terminal chain and gone from messages/.
         arch_dir = self.store / "archive/2025-02"
         for oid in old_ids:
             self.assertFalse((self.store / f"messages/{oid}.post").exists(), oid)

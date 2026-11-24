@@ -68,7 +68,7 @@ static bool settle(const char *path) {
     }
     int file = open(folder, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (file < 0) return false;
-    bool good = !fsync(file) || errno == EINVAL || errno == ENOTSUP; /* a mount that cannot */
+    bool good = !fsync(file);
     close(file);
     return good;
 }

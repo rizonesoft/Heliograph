@@ -1,7 +1,6 @@
 #include "archive.h"
 
 static const uint64_t ARCHIVE_AGE_US = 30ull * 86400ull * 1000000ull;
-static const uint64_t CLAIM_STALE_US = 60ull * 1000000ull;
 static const char ARCHIVE_SEEN[] = "seen\n";
 
 bool archive_month(const char *id, char out[8]) {
@@ -509,8 +508,9 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
         add_report(report, it->id, "the message cannot be read");
         return S_DAMAGED;
     }
-    /* If an archived terminal copy ALREADY exists (e.g. a killed keyed retry left a duplicate live post),
-       verify bytes match and sweep the duplicate live post without reopening the job! */
+    /* If an archived terminal copy ALREADY exists (e.g. a killed keyed retry left a duplicate live post,
+       or an earlier archive run stopped after publishing terminal links), verify and flush the archived post,
+       every live step, and every live seen mark BEFORE removing the live post. */
     unsigned existing_links = 0;
     if (archive_has_terminal_job(folder, it->id, &existing_links) == S_OK) {
         if (!ensure_archive_month(folder, it->month)) {
@@ -539,6 +539,46 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
             return S_DAMAGED;
         }
         text_free(&dst_post);
+        /* Verify, copy, and flush every remaining live step BEFORE unlinking the live post. */
+        for (size_t i = 0; i < it->links.count; i++) {
+            text src = {0}, dst = {0};
+            live_path(folder, &src, it->id, it->links.items[i]);
+            arch_path(folder, it->month, &dst, it->id, it->links.items[i]);
+            s_result cr = (src.failed || dst.failed) ? S_DAMAGED : copy_durable(src.data, dst.data, &why);
+            text_free(&src), text_free(&dst);
+            if (cr == S_DAMAGED) {
+                text_free(&post_p);
+                add_report(report, it->id, why ? why : "an archive step cannot be preserved");
+                return S_DAMAGED;
+            }
+        }
+        /* Validate, copy, and flush every remaining live seen mark BEFORE unlinking the live post. */
+        for (size_t i = 0; i < it->seen.count; i++) {
+            text src = {0}, dst = {0};
+            live_path(folder, &src, it->id, it->seen.items[i]);
+            char *sd = NULL;
+            size_t sl = 0;
+            p_result sr = src.failed ? P_FAILED : p_read(src.data, MOST_FILE, &sd, &sl);
+            if (sr == P_MISSING) {
+                text_free(&src);
+                continue;
+            }
+            bool ok_seen = sr == P_OK && sl == len(ARCHIVE_SEEN) && same(sd, ARCHIVE_SEEN);
+            p_free(sd);
+            if (!ok_seen) {
+                text_free(&src), text_free(&post_p);
+                add_report(report, it->id, "a seen mark is damaged");
+                return S_DAMAGED;
+            }
+            arch_path(folder, it->month, &dst, it->id, it->seen.items[i]);
+            s_result cr = dst.failed ? S_DAMAGED : copy_durable(src.data, dst.data, &why);
+            text_free(&src), text_free(&dst);
+            if (cr == S_DAMAGED) {
+                text_free(&post_p);
+                add_report(report, it->id, why ? why : "a seen mark cannot be preserved");
+                return S_DAMAGED;
+            }
+        }
         p_result rm_post = p_remove(post_p.data);
         text_free(&post_p);
         if (rm_post != P_OK && rm_post != P_MISSING) {
@@ -791,133 +831,83 @@ s_result archive_store(const char *folder, size_t limit, size_t *moved, text *re
     return (total_moved > 0 || total_peer > 0) ? S_OK : S_NOTHING;
 }
 
-static bool parse_claim(const char *data, uint64_t *ts, size_t *done) {
-    uint64_t t = 0;
-    size_t d = 0;
-    const char *p = data;
-    if (*p < '0' || *p > '9') return false;
-    while (*p >= '0' && *p <= '9') t = t * 10 + (uint64_t)(*p++ - '0');
-    if (*p != ' ') return false;
-    p++;
-    if (*p < '0' || *p > '9') return false;
-    while (*p >= '0' && *p <= '9') d = d * 10 + (size_t)(*p++ - '0');
-    *ts = t, *done = d;
-    return true;
-}
-
 s_result archive_daily(const char *folder, text *report, void (*pause)(void *user, const char *stage), void *pause_user) {
     uint64_t now = p_now();
-    text day = {0}, sdir = {0}, mark = {0}, claim = {0}, unique = {0};
+    text day = {0}, sdir = {0}, mark = {0}, unique = {0};
     add_time(&day, now);
     if (day.data) day.data[day.length = 10] = 0;
     add(&sdir, folder), add(&sdir, "/summary");
     add(&mark, sdir.data ? sdir.data : ""), add(&mark, "/"), add(&mark, day.data ? day.data : ""), add(&mark, ".archived");
-    add(&claim, sdir.data ? sdir.data : ""), add(&claim, "/"), add(&claim, day.data ? day.data : ""), add(&claim, ".claiming");
     add_number(&unique, p_tick(), 0);
-    bool full = day.failed || sdir.failed || mark.failed || claim.failed || unique.failed;
+    bool full = day.failed || sdir.failed || mark.failed || unique.failed;
     char *there = NULL;
     size_t tlen = 0;
     p_result got = full ? P_FAILED : p_read(mark.data, 64, &there, &tlen);
     p_free(there);
     if (got == P_OK) {
-        text_free(&day), text_free(&sdir), text_free(&mark), text_free(&claim), text_free(&unique);
+        text_free(&day), text_free(&sdir), text_free(&mark), text_free(&unique);
         return S_OK;
     }
     if (got != P_MISSING) {
-        text_free(&day), text_free(&sdir), text_free(&mark), text_free(&claim), text_free(&unique);
+        text_free(&day), text_free(&sdir), text_free(&mark), text_free(&unique);
         return S_DAMAGED;
     }
     if (p_folder(sdir.data) != P_OK) {
-        text_free(&day), text_free(&sdir), text_free(&mark), text_free(&claim), text_free(&unique);
+        text_free(&day), text_free(&sdir), text_free(&mark), text_free(&unique);
         return S_DAMAGED;
     }
 
-    /* Claim today's 200-job pass so concurrent inboxes do not exceed 200 and stale crashes resume cleanly. */
+    /* Partition today's 200-job budget into 10 immutable exclusive-create slots of 20 jobs each
+       (summary/<YYYY-MM-DD>.slot.0 .. slot.9). Because slots are created with overwrite=false and never
+       deleted on the same date, at most 10 slots x 20 = 200 jobs can ever be moved across all concurrent
+       starts, crashes, and recoveries on this date. */
     if (pause) pause(pause_user, "before-daily-claim");
-    size_t prior_done = 0;
-    text cbody = {0};
-    add_number(&cbody, now, 0), add(&cbody, " 0\n");
-    p_result cw = cbody.failed ? P_FAILED : p_write(claim.data, cbody.data, cbody.length, false, unique.data);
-    text_free(&cbody);
-    if (cw == P_EXISTS) {
-        char *cdata = NULL;
-        size_t clen = 0;
-        p_result cr = p_read(claim.data, 128, &cdata, &clen);
-        uint64_t cts = 0;
-        size_t cdone = 0;
-        bool parsed = cr == P_OK && parse_claim(cdata, &cts, &cdone);
-        p_free(cdata);
-        if (cr == P_MISSING) {
-            text_free(&day), text_free(&sdir), text_free(&mark), text_free(&claim), text_free(&unique);
-            return S_OK;
-        }
-        if (parsed && cts <= now && now - cts < CLAIM_STALE_US) {
-            text_free(&day), text_free(&sdir), text_free(&mark), text_free(&claim), text_free(&unique);
-            return S_OK;
-        }
-        prior_done = parsed ? cdone : 0;
-        text take_body = {0};
-        add_number(&take_body, now, 0), add(&take_body, " "), add_number(&take_body, (uint64_t)prior_done, 0), add(&take_body, "\n");
-        p_result rw = take_body.failed ? P_FAILED : p_write(claim.data, take_body.data, take_body.length, true, unique.data);
-        text_free(&take_body);
-        if (rw != P_OK) {
-            text_free(&day), text_free(&sdir), text_free(&mark), text_free(&claim), text_free(&unique);
-            return S_DAMAGED;
-        }
-    } else if (cw != P_OK) {
-        text_free(&day), text_free(&sdir), text_free(&mark), text_free(&claim), text_free(&unique);
-        return S_DAMAGED;
-    }
-
-    /* Re-check .archived AFTER acquiring .claiming so a peer that just finished and removed its claim
-       never lets us start a second 200-job pass on the same date! */
-    char *recheck = NULL;
-    size_t rlen = 0;
-    p_result rgot = p_read(mark.data, 64, &recheck, &rlen);
-    p_free(recheck);
-    if (rgot == P_OK) {
-        p_remove(claim.data);
-        text_free(&day), text_free(&sdir), text_free(&mark), text_free(&claim), text_free(&unique);
-        return S_OK;
-    }
-    if (rgot != P_MISSING) {
-        text_free(&day), text_free(&sdir), text_free(&mark), text_free(&claim), text_free(&unique);
-        return S_DAMAGED;
-    }
-
-    /* Pre-debit chunks (up to 20 per chunk) durably in .claiming BEFORE moving so a kill at ANY moment
-       never allows a stale takeover to exceed 200 distinct automatic moves for the date! */
-    size_t spent = prior_done;
+    size_t spent = 0;
     s_result res = S_OK;
-    while (spent < 200) {
-        size_t chunk = 200 - spent;
-        if (chunk > 20) chunk = 20;
-        /* Pre-debit the chunk durably BEFORE touching live posts! */
-        text pre = {0};
-        add_number(&pre, p_now(), 0), add(&pre, " "), add_number(&pre, (uint64_t)(spent + chunk), 0), add(&pre, "\n");
-        p_result pw = pre.failed ? P_FAILED : p_write(claim.data, pre.data, pre.length, true, unique.data);
-        text_free(&pre);
-        if (pw != P_OK) {
+    bool exhausted = false;
+    for (unsigned slot = 0; slot < 10; slot++) {
+        text sp = {0}, sbody = {0};
+        add(&sp, sdir.data), add(&sp, "/"), add(&sp, day.data), add(&sp, ".slot."), add_number(&sp, slot, 0);
+        add_number(&sbody, p_now(), 0), add(&sbody, "\n");
+        p_result sw = (sp.failed || sbody.failed) ? P_FAILED : p_write(sp.data, sbody.data, sbody.length, false, unique.data);
+        text_free(&sp), text_free(&sbody);
+        if (sw == P_EXISTS) continue;
+        if (sw != P_OK) {
+            res = S_DAMAGED;
+            break;
+        }
+        /* Re-check .archived after claiming a slot so a peer that already finished the day stops us before moving. */
+        char *recheck = NULL;
+        size_t rlen = 0;
+        p_result rgot = p_read(mark.data, 64, &recheck, &rlen);
+        p_free(recheck);
+        if (rgot == P_OK) {
+            exhausted = true;
+            break;
+        }
+        if (rgot != P_MISSING) {
             res = S_DAMAGED;
             break;
         }
         size_t moved = 0;
-        s_result ar = archive_store(folder, chunk, &moved, report, pause, pause_user);
+        s_result ar = archive_store(folder, 20, &moved, report, pause, pause_user);
         spent += moved;
         if (ar == S_DAMAGED) {
             res = S_DAMAGED;
             break;
         }
-        if (ar == S_NOTHING || moved < chunk) break;
+        if (ar == S_NOTHING) {
+            exhausted = true;
+            break;
+        }
     }
-    if (res == S_OK) {
+    if (res == S_OK && (exhausted || spent > 0)) {
         text body = {0};
         add_number(&body, (uint64_t)spent, 0), add(&body, "\n");
         p_result wr = body.failed ? P_FAILED : p_write(mark.data, body.data, body.length, false, unique.data);
         text_free(&body);
         if (wr != P_OK && wr != P_EXISTS) res = S_DAMAGED;
-        else p_remove(claim.data);
     }
-    text_free(&day), text_free(&sdir), text_free(&mark), text_free(&claim), text_free(&unique);
+    text_free(&day), text_free(&sdir), text_free(&mark), text_free(&unique);
     return res;
 }

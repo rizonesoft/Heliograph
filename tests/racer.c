@@ -144,6 +144,39 @@ int racer(int count, char **args) {
         }
         return 0;
     }
+    if (count >= 5 && same(args[1], "--read-loop")) {
+        const char *folder = args[2];
+        int rounds = 0;
+        for (const char *p = args[3]; *p >= '0' && *p <= '9'; p++) rounds = rounds * 10 + (*p - '0');
+        text ready = {0}, go = {0};
+        add(&ready, folder), add(&ready, "/ready."), add_number(&ready, p_tick(), 0);
+        add(&go, folder), add(&go, "/go");
+        if (p_write(ready.data, "x", 1, false, "r") != P_OK) return 100;
+        char *gdata = NULL;
+        size_t glen = 0;
+        for (uint64_t until = p_now() + 30000000; p_read(go.data, 9, &gdata, &glen) != P_OK;)
+            if (p_now() > until) return 101;
+        p_free(gdata);
+        text_free(&ready), text_free(&go);
+        for (int i = 0; i < rounds; i++) {
+            store s = {0};
+            if (store_open(&s, folder) != S_OK) {
+                store_close(&s);
+                return 3;
+            }
+            for (int k = 4; k < count; k++) {
+                message m = {0};
+                s_result mr = store_message(&s, args[k], &m);
+                if (mr != S_OK) {
+                    store_close(&s);
+                    return 4;
+                }
+                message_free(&m);
+            }
+            store_close(&s);
+        }
+        return 0;
+    }
     if (count >= 2 && same(args[1], "--pause")) return run_pause(count, args);
     if (count >= 4 && same(args[1], "--pause-cli")) {
         pause_ctx ctx = {args[3], args[2]};

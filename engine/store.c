@@ -587,10 +587,10 @@ static s_result change_job(store *s, const char *id, actor me, change what, cons
     if (result != S_OK) return result;
     if (!is_job(&m)) result = say(s, S_REFUSED, "only a request or a handoff can be taken");
     if (result == S_OK) {
-        /* Refuse immediately if an archived terminal copy already exists (even if a killed keyed retry left a duplicate live post). */
-        s_result ar = archive_has_terminal_job(s->folder, id, NULL);
-        if (ar == S_OK) result = say(s, S_REFUSED, "it was archived");
-        else if (ar == S_DAMAGED) result = say(s, S_DAMAGED, "an archived job is damaged");
+        /* Refuse immediately if an archived terminal copy already exists (even if a killed keyed retry left a duplicate live post).
+           Ignore S_DAMAGED here: an ordinary concurrent or interrupted archive that has only copied the post so far must not fail a healthy live job. */
+        if (archive_has_terminal_job(s->folder, id, NULL) == S_OK)
+            result = say(s, S_REFUSED, "it was archived");
     }
     unsigned before = MOST_LINKS + 1;
     while (result == S_OK) {
@@ -612,7 +612,8 @@ static s_result change_job(store *s, const char *id, actor me, change what, cons
                 if (s->pause) s->pause(s->pause_user, "after-write");
                 const char *write_why = s->why;
                 s_result live = live_post(s, id);
-                if (live == S_REFUSED) {
+                bool archived = live == S_REFUSED || archive_has_terminal_job(s->folder, id, NULL) == S_OK;
+                if (archived) {
                     text name = {0};
                     link_name(&name, now.links);
                     s_result rm = name.failed ? say(s, S_DAMAGED, "out of memory") : remove_event(s, id, name.data);
