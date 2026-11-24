@@ -420,7 +420,9 @@ A Windows session has no `helio` on its `PATH`, so its hook finds nothing. The i
 
 ## 17. Installed program replaced after a tested phase
 
-> **Started:** 2026-11-24T04:31Z
+> **Started:** 2026-11-24T13:44Z
+
+**Corrected 2026-11-24:** re-planned with `todo-graph.py replan` (Chain 2); the build first began at 2026-11-24T04:31Z; its review chain is kept as `docs/reviews/01-heliograph/D01-T01-s17-chain1.md`. Clarified the shipped `schema_version: 2` phase-journal contract: `tools/phase_install.py` is first introduced in this section, so `phase.journal.json` accepts only `schema_version: 2` with `managed_by: "heliograph-phase-installer"` and all required bound fields (`tx_id`, `proved_wsl_sha`, `proved_win_sha`, `win_store`, paths, booleans), refusing any unshipped pre-stamp draft (`schema_version: 1`) or foreign/incomplete record with exit code 2. Every Windows publication and rollback requires an active `.phase-active.json` lock-token marker matching `tx_id` (enforced atomically inside Windows' destination lock via `--phase-tx` with `require_active=True`), terminal states (`notifying` on success and `rolled_back` on rollback) are persisted durably before releasing `.phase-active.json`, recovery checks healthy Windows status (`0` existing, `1` absent) before treating Windows as restored, and remote `origin/main` verification uses a single atomic `git ls-remote origin refs/heads/main` call.
 
 When a phase is closed and everything is tested, the program that the sessions use becomes the tested one, without anybody asking. It is never replaced by anything else.
 
