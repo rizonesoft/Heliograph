@@ -521,8 +521,7 @@ def _discover_lock_wrappers(to_dir: Path, wrapper_path: Path) -> list[Path]:
 def _validate_journal_paths(journal: Any, to_dir: Path, wrapper_path: Path) -> dict[str, Any]:
     if not isinstance(journal, dict):
         raise InstallError("corrupt or foreign install journal: not a JSON object", code=2)
-    sv = journal.get("schema_version")
-    if sv not in (1, 2):
+    if journal.get("schema_version") != 2:
         raise InstallError("unrecognized install journal schema", code=2)
     allowed_keys = {
         "schema_version",
@@ -541,14 +540,6 @@ def _validate_journal_paths(journal: Any, to_dir: Path, wrapper_path: Path) -> d
         "expected_hashes",
         "desired_manifest",
     }
-    if sv == 1:
-        allowed_keys |= {
-            "previous_wrapper_existed",
-            "alt_wrapper_path",
-            "alt_wrapper_existed",
-            "prev_current_wrapper_path",
-            "prev_current_wrapper_existed",
-        }
     unknown_keys = set(journal) - allowed_keys
     if unknown_keys:
         raise InstallError(f"corrupt or foreign install journal: unknown keys {sorted(unknown_keys)}", code=2)
@@ -589,13 +580,6 @@ def _validate_journal_paths(journal: Any, to_dir: Path, wrapper_path: Path) -> d
             rec = prev_m.get(section)
             if isinstance(rec, dict) and isinstance(rec.get("wrapper"), str) and rec["wrapper"]:
                 allowed_manifest_wrappers.add(_normalize_wrapper_path(Path(rec["wrapper"])))
-
-    if sv == 1:
-        for wkey in ("alt_wrapper_path", "prev_current_wrapper_path"):
-            wval = journal.get(wkey)
-            if wval is not None:
-                if op not in ("back", "remove") or _normalize_wrapper_path(Path(str(wval))) not in allowed_manifest_wrappers:
-                    raise InstallError(f"journal {wkey} is not bound to a recorded manifest wrapper", code=2)
 
     pre_wrappers = journal.get("pre_wrappers")
     if pre_wrappers is not None:
@@ -769,7 +753,10 @@ def recover_if_needed(to_dir: Path, wrapper_path: Path, *, allow_superseded_wrap
         fsync_dir(to_dir)
         return True
 
-    # Verify manifest ownership before rolling it back: if it exists, it must equal previous_manifest or desired_manifest.
+    # Verify manifest ownership before rolling back: install/back never deletes installed.json,
+    # so had_manifest=True with no on-disk manifest is a foreign/corrupt journal.
+    if journal.get("had_manifest") and current_manifest is None:
+        raise InstallError(f"recovery refusing journal claiming had_manifest=True when {manifest_file} is absent", code=2)
     if current_manifest is not None and current_manifest != prev_manifest and current_manifest != desired_manifest:
         raise InstallError(f"recovery refusing to overwrite externally modified {manifest_file}", code=2)
 
@@ -833,47 +820,8 @@ def recover_if_needed(to_dir: Path, wrapper_path: Path, *, allow_superseded_wrap
             ):
                 raise InstallError(f"recovery refusing to write manifest: {p} does not match verified Heliograph binary", code=2)
 
-    # Restore every touched wrapper once from the deduplicated pre_wrappers map (with v1 fallback).
-    pre_wrappers: dict[str, str | None]
-    if "pre_wrappers" in journal and isinstance(journal["pre_wrappers"], dict):
-        pre_wrappers = journal["pre_wrappers"]
-    else:
-        # Seamless recovery for v1 journals written before pre_wrappers existed.
-        pre_wrappers = {}
-        prev_cur = prev_manifest.get("current") if isinstance(prev_manifest, dict) and isinstance(prev_manifest.get("current"), dict) else None
-        prev_prev = prev_manifest.get("previous") if isinstance(prev_manifest, dict) and isinstance(prev_manifest.get("previous"), dict) else None
-        prev_store = prev_cur.get("store") if prev_cur else None
-        alt_store = prev_prev.get("store") if prev_prev else None
-        prev_cur_wrap = (
-            _normalize_wrapper_path(Path(prev_cur["wrapper"]))
-            if prev_cur and isinstance(prev_cur.get("wrapper"), str) and prev_cur["wrapper"]
-            else None
-        )
-        prev_prev_wrap = (
-            _normalize_wrapper_path(Path(prev_prev["wrapper"]))
-            if prev_prev and isinstance(prev_prev.get("wrapper"), str) and prev_prev["wrapper"]
-            else None
-        )
-        if journal.get("previous_wrapper_existed"):
-            if prev_cur_wrap is not None and wrapper_path == prev_cur_wrap and prev_store:
-                pre_wrappers[str(wrapper_path)] = prev_store
-            elif prev_prev_wrap is not None and wrapper_path == prev_prev_wrap and alt_store:
-                pre_wrappers[str(wrapper_path)] = alt_store
-            elif prev_store:
-                pre_wrappers[str(wrapper_path)] = prev_store
-            else:
-                raise InstallError(
-                    "cannot recover v1 legacy-adoption journal without recorded pre-transaction wrapper store",
-                    code=2,
-                )
-        else:
-            pre_wrappers[str(wrapper_path)] = None
-        if isinstance(journal.get("alt_wrapper_path"), str):
-            aw = str(_normalize_wrapper_path(Path(journal["alt_wrapper_path"])))
-            pre_wrappers[aw] = alt_store if journal.get("alt_wrapper_existed") else None
-        if isinstance(journal.get("prev_current_wrapper_path"), str):
-            pcw = str(_normalize_wrapper_path(Path(journal["prev_current_wrapper_path"])))
-            pre_wrappers[pcw] = prev_store if journal.get("prev_current_wrapper_existed") else None
+    # Restore every touched wrapper once from the deduplicated pre_wrappers map.
+    pre_wrappers: dict[str, str | None] = journal.get("pre_wrappers") or {}
 
     # When had_manifest is False, never allow a journal to create a new external directory or wrapper:
     # only an already-owned wrapper at the caller's own wrapper_path may be restored or unlinked.
@@ -1097,7 +1045,7 @@ def install(
 
                     # Write staging journal BEFORE creating any .rec/.stage files so even SIGKILL during staging leaves zero leaks.
                     staging_journal = {
-                        "schema_version": 1,
+                        "schema_version": 2,
                         "op": "install",
                         "phase": "staging",
                         "tx_id": tx_id,
@@ -1355,7 +1303,7 @@ def go_back(
                 tx_id = secrets.token_hex(6)
                 temp_files = _planned_temp_names(tx_id)
                 staging_journal = {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "op": "back",
                     "phase": "staging",
                     "tx_id": tx_id,
@@ -1540,7 +1488,7 @@ def remove(
                         expected_hashes[name] = sha256_file(p)
 
                 journal = {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "op": "remove",
                     "phase": "publishing",
                     "tx_id": secrets.token_hex(6),
@@ -1550,7 +1498,6 @@ def remove(
                     "store_dir": "",
                     "had_manifest": manifest is not None,
                     "previous_manifest": manifest,
-                    "previous_wrapper_existed": wrapper_path in owned_wrappers,
                     "saved_files": {},
                     "temp_files": [],
                     "expected_hashes": expected_hashes,

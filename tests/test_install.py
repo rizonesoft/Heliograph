@@ -606,15 +606,17 @@ class TestQuickInstaller(unittest.TestCase):
                 if wb != wa:
                     self.assertFalse(wb.exists(), case_name)
 
-            # 7b. Foreign rollback journal in a directory with NO manifest cannot publish a foreign installed.json,
-            #     and a foreign journal naming an EXISTING external dir creates NO lock file there.
+            # 7b. Foreign rollback journal in a destination with GENUINE binaries and NO manifest cannot publish
+            #     a foreign installed.json, create an external wrapper, or create an external lock/directory.
             fman_dir = root / "foreign_manifest_pub"
             fman_dir.mkdir()
+            make_distinct_binary(self.helio_bin, fman_dir / "helio", b"gen_legacy")
+            make_distinct_binary(self.helio_exe, fman_dir / "helio.exe", b"gen_legacy")
             existing_ext_dir = root / "existing_ext_dir"
             existing_ext_dir.mkdir()
             (fman_dir / self.mod.JOURNAL_NAME).write_text(
                 json.dumps({
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "op": "back",
                     "phase": "publishing",
                     "tx_id": "abcdef012345",
@@ -625,8 +627,8 @@ class TestQuickInstaller(unittest.TestCase):
                         "schema_version": 1,
                         "current": {
                             "commit": "a" * 40,
-                            "helio_sha256": "0" * 64,
-                            "helio_exe_sha256": "0" * 64,
+                            "helio_sha256": self.mod.sha256_file(fman_dir / "helio"),
+                            "helio_exe_sha256": self.mod.sha256_file(fman_dir / "helio.exe"),
                             "store": str(store),
                             "wrapper": str(existing_ext_dir / "helio"),
                         },
