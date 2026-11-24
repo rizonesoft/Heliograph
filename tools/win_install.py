@@ -1007,8 +1007,8 @@ def win_phase_restore_prev(*, win_to: Path | None, tx_id: str, pre_previous: dic
         _write_json_atomic(dest / WIN_MANIFEST_NAME, manifest)
 
 
-def win_phase_cleanup_prev(*, win_to: Path | None, tx_id: str) -> None:
-    """Remove only this transaction's temporary previous-generation snapshot file under dest lock + active marker."""
+def win_phase_cleanup_prev(*, win_to: Path | None, tx_id: str, expected_sha: str = "") -> None:
+    """Remove only this transaction's temporary previous-generation snapshot file under dest lock + active marker + digest check."""
     dest = (win_to or default_win_to_dir()).resolve()
     if not dest.is_dir():
         return
@@ -1018,6 +1018,8 @@ def win_phase_cleanup_prev(*, win_to: Path | None, tx_id: str) -> None:
             return
         _check_win_phase_marker(dest, tx_id, require_active=True)
         if snap_exe.is_file() and not _is_reparse_or_symlink(snap_exe):
+            if expected_sha and sha256_file(snap_exe) != expected_sha:
+                return
             snap_exe.unlink()
 
 

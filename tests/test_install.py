@@ -4636,6 +4636,30 @@ class TestPhaseInstaller(unittest.TestCase):
                     self._delete_reg_key(sole_reg_key)
                     self._cleanup_win_parent(sole_win_to)
 
+                # Verify cleanup_prev never deletes a pre-existing foreign file whose digest differs from expected_sha!
+                self.phase_mod._win_phase_marker_call(
+                    self.python_exe, win_install_py_win, "begin", win_to, reg_key, "aa11bb22cc33", phase=0, commit=a_commit, install_mod=self.mod
+                )
+                foreign_snap_code = (
+                    "import pathlib, sys\n"
+                    "p = pathlib.Path(sys.argv[1]) / 'bin' / '.phase-prev-aa11bb22cc33.helio.exe.old'\n"
+                    "p.write_bytes(b'FOREIGN_USER_FILE')\n"
+                )
+                subprocess.run([self.python_exe, "-B", "-c", foreign_snap_code, win_to], check=True, stdin=subprocess.DEVNULL)
+                self.phase_mod._win_phase_marker_call(
+                    self.python_exe, win_install_py_win, "cleanup_prev", win_to, reg_key, "aa11bb22cc33", payload_json=a_e_sha, install_mod=self.mod
+                )
+                check_snap_code = (
+                    "import pathlib, sys\n"
+                    "p = pathlib.Path(sys.argv[1]) / 'bin' / '.phase-prev-aa11bb22cc33.helio.exe.old'\n"
+                    "assert p.read_bytes() == b'FOREIGN_USER_FILE'\n"
+                    "p.unlink()\n"
+                )
+                subprocess.run([self.python_exe, "-B", "-c", check_snap_code, win_to], check=True, stdin=subprocess.DEVNULL)
+                self.phase_mod._win_phase_marker_call(
+                    self.python_exe, win_install_py_win, "end", win_to, reg_key, "aa11bb22cc33", install_mod=self.mod
+                )
+
                 self.phase_mod._run_win_cli(self.python_exe, install_py_win, ["--remove", "--to", win_to, "--reg-key", reg_key])
         finally:
             self._delete_reg_key(reg_key)
@@ -4724,6 +4748,13 @@ class TestPhaseInstaller(unittest.TestCase):
                 r3 = subprocess.run([sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"], env=env, capture_output=True, text=True)
                 self.assertEqual(r3.returncode, 0, r3.stdout + r3.stderr)
                 self.assertEqual(json.loads(r3.stdout), [])
+                # An unrelated local commit does NOT reopen an already-published phase!
+                (checkout / "unrelated.txt").write_text("unrelated\n", encoding="utf-8")
+                subprocess.run(["git", "-C", str(checkout), "add", "unrelated.txt"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(checkout), "commit", "-m", "unrelated local commit"], check=True, capture_output=True)
+                r_unrel = subprocess.run([sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"], env=env, capture_output=True, text=True)
+                self.assertEqual(r_unrel.returncode, 0, r_unrel.stdout + r_unrel.stderr)
+                self.assertEqual(json.loads(r_unrel.stdout), [])
                 # A newer `## Closeout` after an older `Installed commit:` supersedes it -> returns [0] (exit 1)!
                 run_file.write_text(run_file.read_text(encoding="utf-8") + "\n## Closeout run=reopened\n\nRe-closed.\n", encoding="utf-8")
                 subprocess.run(["git", "-C", str(checkout), "add", str(run_file)], check=True, capture_output=True)
@@ -4732,6 +4763,10 @@ class TestPhaseInstaller(unittest.TestCase):
                 r4 = subprocess.run([sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"], env=env, capture_output=True, text=True)
                 self.assertEqual(r4.returncode, 1, r4.stdout + r4.stderr)
                 self.assertEqual(json.loads(r4.stdout), [0])
+                # Removing `origin` remote must fail with exit 3 (never silently report [] / exit 0)!
+                subprocess.run(["git", "-C", str(checkout), "remote", "remove", "origin"], check=True, capture_output=True)
+                r_norem = subprocess.run([sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"], env=env, capture_output=True, text=True)
+                self.assertEqual(r_norem.returncode, 3, r_norem.stdout + r_norem.stderr)
                 self.phase_mod._run_win_cli(self.python_exe, install_py_win, ["--remove", "--to", win_to, "--reg-key", reg_key])
         finally:
             self._delete_reg_key(reg_key)
@@ -4784,11 +4819,11 @@ class TestPhaseInstaller(unittest.TestCase):
                     "                ).stdout.strip().splitlines()[-1]\n"
                     "                ids.append(out)\n"
                     "            win_st = subprocess.check_output(['wslpath', '-w', str(st)], text=True).strip()\n"
-                    "            p_l = subprocess.Popen([str(linux_r), str(st), 'impossible/lin', *ids], stdin=subprocess.DEVNULL)\n"
-                    "            p_w1 = subprocess.Popen([str(win_r), win_st, 'impossible/win1', *ids[::-1]], stdin=subprocess.DEVNULL)\n"
-                    "            p_w2 = subprocess.Popen([str(win_r), win_st, 'impossible/win2', *ids[::-1]], stdin=subprocess.DEVNULL)\n"
-                    "            procs = (p_l, p_w1, p_w2)\n"
+                    "            procs = []\n"
                     "            try:\n"
+                    "                procs.append(subprocess.Popen([str(linux_r), str(st), 'impossible/lin', *ids], stdin=subprocess.DEVNULL))\n"
+                    "                procs.append(subprocess.Popen([str(win_r), win_st, 'impossible/win1', *ids[::-1]], stdin=subprocess.DEVNULL))\n"
+                    "                procs.append(subprocess.Popen([str(win_r), win_st, 'impossible/win2', *ids[::-1]], stdin=subprocess.DEVNULL))\n"
                     "                for _ in range(300):\n"
                     "                    if len(list(st.glob('ready.*'))) == len(procs):\n"
                     "                        break\n"

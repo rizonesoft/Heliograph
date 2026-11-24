@@ -32,7 +32,7 @@ RACE_TEST_NAME = "test_windows_and_linux_take_each_job_once"
 
 
 def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = None) -> list[int]:
-    """Return sorted phase numbers that are all-verified and closed in committed HEAD docs/phase-runs/ but lack a committed Installed commit receipt after their latest Closeout."""
+    """Return sorted phase numbers that are all-verified and closed in committed HEAD docs/phase-runs/ but lack a pushed Installed commit receipt on origin/main after their latest Closeout."""
     def _fail(msg: str) -> None:
         if install_mod is not None:
             raise install_mod.InstallError(msg, code=3)
@@ -55,19 +55,8 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
     if not isinstance(data, dict) or not isinstance(data.get("phases"), dict):
         _fail(f"malformed plan payload from todo-graph.py query plan in {repo}")
 
-    ls_res = subprocess.run(
-        ["git", "-C", str(repo), "ls-tree", "-r", "--name-only", "HEAD", "docs/phase-runs"],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if ls_res.returncode != 0:
-        _fail(f"cannot read committed docs/phase-runs from HEAD in {repo}: {(ls_res.stderr or ls_res.stdout).strip()}")
-    committed_run_paths = sorted(p.strip() for p in ls_res.stdout.splitlines() if p.strip())
-
-    # Check whether local HEAD is pushed to `origin/main` so a local-only receipt commit is still reported pending!
-    head_pushed = True
+    # Require configured `origin` and resolve authoritative remote `refs/heads/main` so unpushed receipts are always detected
+    # and unrelated local commits or remote advances never falsely reopen an already-published phase!
     rem_url = subprocess.run(
         ["git", "-C", str(repo), "config", "--get", "remote.origin.url"],
         stdin=subprocess.DEVNULL,
@@ -75,37 +64,76 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
         text=True,
         check=False,
     )
-    if rem_url.returncode == 0 and rem_url.stdout.strip():
-        head_res = subprocess.run(
-            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+    if rem_url.returncode != 0 or not rem_url.stdout.strip():
+        _fail(f"cannot verify origin/main publication in {repo}: remote 'origin' is not configured")
+    ls_rem = subprocess.run(
+        ["git", "-C", str(repo), "ls-remote", "origin", "refs/heads/main"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if ls_rem.returncode != 0:
+        _fail(f"cannot query origin refs/heads/main in {repo}: {(ls_rem.stderr or ls_rem.stdout).strip()}")
+    rem_lines = [ln.strip() for ln in ls_rem.stdout.splitlines() if ln.strip()]
+    if not rem_lines:
+        _fail(f"cannot verify origin/main publication in {repo}: origin has no refs/heads/main")
+    rem_sha = rem_lines[0].split()[0]
+
+    # Ensure rem_sha is locally readable for `git ls-tree` / `git show` (handles remote advances without touching HEAD).
+    has_obj = subprocess.run(
+        ["git", "-C", str(repo), "cat-file", "-e", f"{rem_sha}^{{commit}}"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if has_obj.returncode != 0:
+        fetch_res = subprocess.run(
+            ["git", "-C", str(repo), "fetch", "--no-tags", "--quiet", "origin", "refs/heads/main"],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             check=False,
         )
-        ls_rem = subprocess.run(
-            ["git", "-C", str(repo), "ls-remote", "origin", "refs/heads/main"],
+        if fetch_res.returncode != 0:
+            _fail(f"cannot fetch origin refs/heads/main in {repo}: {(fetch_res.stderr or fetch_res.stdout).strip()}")
+
+    def _scan_run_files(commit_ref: str, pnum: int) -> tuple[bool, bool, bool]:
+        ls_r = subprocess.run(
+            ["git", "-C", str(repo), "ls-tree", "-r", "--name-only", commit_ref, "docs/phase-runs"],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             check=False,
         )
-        if head_res.returncode != 0 or ls_rem.returncode != 0:
-            _fail(f"cannot verify origin/main push state in {repo}")
-        head_sha = head_res.stdout.strip()
-        rem_lines = [ln.strip() for ln in ls_rem.stdout.splitlines() if ln.strip()]
-        rem_sha = rem_lines[0].split()[0] if rem_lines else ""
-        if not rem_sha:
-            head_pushed = False
-        elif rem_sha != head_sha:
-            anc = subprocess.run(
-                ["git", "-C", str(repo), "merge-base", "--is-ancestor", head_sha, rem_sha],
+        if ls_r.returncode != 0:
+            _fail(f"cannot read docs/phase-runs from {commit_ref} in {repo}: {(ls_r.stderr or ls_r.stdout).strip()}")
+        suffix = f"-phase-{pnum}.md"
+        phase_files = sorted(p.strip() for p in ls_r.stdout.splitlines() if p.strip().endswith(suffix))
+        has_closeout = False
+        has_open_park = False
+        has_installed = False
+        for rp in phase_files:
+            show_r = subprocess.run(
+                ["git", "-C", str(repo), "show", f"{commit_ref}:{rp}"],
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
                 check=False,
             )
-            head_pushed = anc.returncode == 0
+            if show_r.returncode != 0:
+                _fail(f"cannot read {rp} from {commit_ref}: {(show_r.stderr or show_r.stdout).strip()}")
+            for line in show_r.stdout.splitlines():
+                if line.startswith("## Closeout"):
+                    has_closeout = True
+                    has_open_park = False
+                    has_installed = False
+                elif line.startswith("PARKED "):
+                    has_open_park = True
+                elif has_closeout and not has_open_park and re.search(r"Installed commit:\s*`?[0-9a-f]{40}`?", line):
+                    has_installed = True
+        return has_closeout, has_open_park, has_installed
 
     pending: list[int] = []
     declared_phases = data["phases"]
@@ -118,34 +146,14 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
         p_sections = [s for s in sections if isinstance(s, dict) and s.get("phase") == pnum]
         if not p_sections or not all(s.get("status") == "verified" for s in p_sections):
             continue
-        suffix = f"-phase-{pnum}.md"
-        phase_files = [rp for rp in committed_run_paths if rp.endswith(suffix)]
-        if not phase_files:
+        head_closed, head_parked, head_installed = _scan_run_files("HEAD", pnum)
+        if not head_closed or head_parked:
             continue
-        has_closeout = False
-        has_open_park = False
-        has_installed_commit = False
-        for rp in phase_files:
-            show_res = subprocess.run(
-                ["git", "-C", str(repo), "show", f"HEAD:{rp}"],
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if show_res.returncode != 0:
-                _fail(f"cannot read committed {rp} from HEAD: {(show_res.stderr or show_res.stdout).strip()}")
-            for line in show_res.stdout.splitlines():
-                if line.startswith("## Closeout"):
-                    has_closeout = True
-                    has_open_park = False
-                    # A new Closeout supersedes any earlier installation receipt!
-                    has_installed_commit = False
-                elif line.startswith("PARKED "):
-                    has_open_park = True
-                elif has_closeout and not has_open_park and re.search(r"Installed commit:\s*`?[0-9a-f]{40}`?", line):
-                    has_installed_commit = True
-        if has_closeout and not has_open_park and (not has_installed_commit or not head_pushed):
+        if not head_installed:
+            pending.append(pnum)
+            continue
+        rem_closed, rem_parked, rem_installed = _scan_run_files(rem_sha, pnum)
+        if not (rem_closed and not rem_parked and rem_installed):
             pending.append(pnum)
     return sorted(pending)
 
@@ -482,7 +490,7 @@ def _win_phase_marker_call(
         "    elif action == 'restore_prev':\n"
         "        mod.win_phase_restore_prev(win_to=win_to, tx_id=tx_id, pre_previous=json.loads(payload))\n"
         "    elif action == 'cleanup_prev':\n"
-        "        mod.win_phase_cleanup_prev(win_to=win_to, tx_id=tx_id)\n"
+        "        mod.win_phase_cleanup_prev(win_to=win_to, tx_id=tx_id, expected_sha=payload)\n"
         "except mod.WinInstallError as exc:\n"
         "    print(str(exc), file=sys.stderr)\n"
         "    sys.exit(exc.code)\n"
@@ -1014,7 +1022,10 @@ def _rollback_phase_journal(
     install_mod.write_json_atomic(to_dir / PHASE_JOURNAL_NAME, journal)
     _cleanup_wsl_previous(to_dir, tx_id, install_mod)
     if journal.get("win_prev_snapshotted"):
-        _win_phase_marker_call(python_exe, win_install_py_win, "cleanup_prev", win_to_raw, reg_key, tx_id, install_mod=install_mod)
+        prev_sha = str((journal.get("win_pre_previous") or {}).get("helio_exe_sha256") or "")
+        _win_phase_marker_call(
+            python_exe, win_install_py_win, "cleanup_prev", win_to_raw, reg_key, tx_id, payload_json=prev_sha, install_mod=install_mod
+        )
 
     if tx_id:
         try:
@@ -1165,8 +1176,9 @@ def _recover_pending_phase_journal(
         # Rollback already completed durably; clean any remaining tx-scoped snapshot, release marker, and unlink journal.
         _cleanup_wsl_previous(to_dir, j_tx, install_mod)
         if journal.get("win_prev_snapshotted"):
+            prev_sha = str((journal.get("win_pre_previous") or {}).get("helio_exe_sha256") or "")
             _win_phase_marker_call(
-                python_exe, win_install_py_win, "cleanup_prev", journal.get("win_to_arg"), str(journal["reg_key"]), j_tx, install_mod=install_mod
+                python_exe, win_install_py_win, "cleanup_prev", journal.get("win_to_arg"), str(journal["reg_key"]), j_tx, payload_json=prev_sha, install_mod=install_mod
             )
         _win_phase_marker_call(
             python_exe,
@@ -1184,8 +1196,9 @@ def _recover_pending_phase_journal(
         # Clean any remaining tx-scoped snapshot and idempotently release any stranded Windows marker.
         _cleanup_wsl_previous(to_dir, j_tx, install_mod)
         if journal.get("win_prev_snapshotted"):
+            prev_sha = str((journal.get("win_pre_previous") or {}).get("helio_exe_sha256") or "")
             _win_phase_marker_call(
-                python_exe, win_install_py_win, "cleanup_prev", journal.get("win_to_arg"), str(journal["reg_key"]), j_tx, install_mod=install_mod
+                python_exe, win_install_py_win, "cleanup_prev", journal.get("win_to_arg"), str(journal["reg_key"]), j_tx, payload_json=prev_sha, install_mod=install_mod
             )
         _win_phase_marker_call(
             python_exe,
@@ -1642,7 +1655,10 @@ def run_phase_install(
             # never re-enters rollback; retrying resumes cleanly from `phase_state == "notifying"`.
             _cleanup_wsl_previous(to_dir, tx_id, install_mod)
             if journal.get("win_prev_snapshotted"):
-                _win_phase_marker_call(python_exe, win_install_py_win, "cleanup_prev", win_to_raw, reg_key, tx_id, install_mod=install_mod)
+                prev_sha = str((journal.get("win_pre_previous") or {}).get("helio_exe_sha256") or "")
+                _win_phase_marker_call(
+                    python_exe, win_install_py_win, "cleanup_prev", win_to_raw, reg_key, tx_id, payload_json=prev_sha, install_mod=install_mod
+                )
             _win_phase_marker_call(python_exe, win_install_py_win, "end", win_to_raw, reg_key, tx_id, install_mod=install_mod)
 
             # Post-verification notification: if this fails, keep `phase_state == "notifying"` so retry only re-sends.
