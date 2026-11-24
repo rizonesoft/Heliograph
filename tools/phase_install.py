@@ -250,8 +250,9 @@ def _probe_win_state(
         "st_code, st_lines = mod.win_status(win_to=win_to, reg_key=reg_key)\n"
         "exe_p = dest / mod.WIN_BIN_SUBDIR / mod.WIN_EXE_NAME\n"
         "exe_sha = mod.sha256_file(exe_p) if exe_p.is_file() else ''\n"
+        "marker_tx = mod.read_win_phase_marker_tx(dest) if dest.is_dir() else None\n"
         "print(json.dumps({'dest': str(dest), 'manifest': manifest, 'status_code': st_code, "
-        "'status_lines': st_lines, 'exe_sha': exe_sha}))\n"
+        "'status_lines': st_lines, 'exe_sha': exe_sha, 'phase_marker_tx': marker_tx}))\n"
     )
     res = _run([python_exe, "-B", "-c", code, win_install_py_win, win_to_raw or "", reg_key], timeout=60, install_mod=install_mod)
     if res.returncode != 0:
@@ -294,7 +295,7 @@ def _win_phase_marker_call(
         "    elif action == 'end':\n"
         "        mod.win_phase_end(win_to=win_to, tx_id=tx_id)\n"
         "    elif action == 'recover':\n"
-        "        mod.win_recover(win_to=win_to, reg_key=reg_key)\n"
+        "        mod.win_recover(win_to=win_to, reg_key=reg_key, phase_tx_id=tx_id or None)\n"
         "except mod.WinInstallError as exc:\n"
         "    print(str(exc), file=sys.stderr)\n"
         "    sys.exit(exc.code)\n"
@@ -635,22 +636,28 @@ def _rollback_phase_journal(
     errors: list[str] = []
 
     if journal.get("win_changed"):
-        # Recover any interrupted inner Windows transaction FIRST (actually calling `win_recover`, NOT `--status`!)
-        # so an interrupted publication of C over B restores B cleanly instead of `--back` double-rolling back to A!
+        # Only recover/mutate Windows while this transaction STILL holds `.phase-active.json` for `tx_id`!
+        # If the marker is absent (e.g. an upgraded `rolling_back` journal that already released it),
+        # never invoke `win_recover`, `--back`, or `--remove` against a potentially later writer's install.
         try:
-            _win_phase_marker_call(
-                python_exe,
-                win_install_py_win,
-                "recover",
-                win_to_raw,
-                reg_key,
-                tx_id,
-                install_mod=install_mod,
-            )
             cur_win = _probe_win_state(python_exe, win_install_py_win, win_to_raw, reg_key, install_mod=install_mod)
+            marker_held = bool(tx_id and cur_win.get("phase_marker_tx") == tx_id)
+            if marker_held:
+                _win_phase_marker_call(
+                    python_exe,
+                    win_install_py_win,
+                    "recover",
+                    win_to_raw,
+                    reg_key,
+                    tx_id,
+                    install_mod=install_mod,
+                )
+                cur_win = _probe_win_state(python_exe, win_install_py_win, win_to_raw, reg_key, install_mod=install_mod)
+                marker_held = bool(tx_id and cur_win.get("phase_marker_tx") == tx_id)
         except Exception as exc:
             errors.append(f"Windows rollback recovery/probe failed: {exc}")
             cur_win = None
+            marker_held = False
         if cur_win is not None:
             cur_win_m = cur_win.get("manifest") or {}
             cur_win_c = cur_win_m.get("current") or {}
@@ -664,12 +671,15 @@ def _rollback_phase_journal(
                 else (cur_win.get("manifest") is None and not cur_win.get("exe_sha"))
             )
             if not win_already_restored:
-                # Verify the live Windows manifest belongs to THIS phase commit, binary, and store before --back or --remove!
-                # Derive expected_win_store from journal["store"] when absent (e.g., upgrading from an older schema-2 journal).
+                # Require BOTH active Windows phase marker ownership (`marker_held`) AND exact commit/digest/store match.
                 win_mod = install_mod._load_win_install()
                 expected_win_sha = str(journal.get("proved_win_sha") or "")
                 expected_win_store = str(journal.get("win_store") or win_mod.wsl_to_windows_path(Path(journal["store"])))
-                if (
+                if not marker_held:
+                    errors.append(
+                        f"refusing Windows rollback: active phase marker for {tx_id or '?'} is not held on Windows destination"
+                    )
+                elif (
                     not expected_win_sha
                     or not expected_win_store
                     or cur_win_c.get("commit") != journal.get("commit")

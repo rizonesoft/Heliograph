@@ -869,9 +869,14 @@ def _handle_win_failure(exc: BaseException, win_to: Path, reg_key: str) -> None:
     raise exc
 
 
-def _check_win_phase_marker(dest: Path, phase_tx_id: str | None) -> None:
+def _check_win_phase_marker(dest: Path, phase_tx_id: str | None, *, require_active: bool = False) -> None:
     mp = dest / WIN_PHASE_MARKER_NAME
     if not mp.exists() and not _is_reparse_or_symlink(mp):
+        if require_active and phase_tx_id is not None:
+            raise WinInstallError(
+                f"refusing Windows phase operation: active phase marker for {phase_tx_id} is missing on {dest}",
+                code=3,
+            )
         return
     if _is_reparse_or_symlink(mp):
         raise WinInstallError(f"refusing symlink phase marker at {mp}", code=2)
@@ -890,12 +895,26 @@ def _check_win_phase_marker(dest: Path, phase_tx_id: str | None) -> None:
         )
 
 
+def read_win_phase_marker_tx(dest: Path) -> str | None:
+    """Return active phase tx_id on dest if a valid managed marker exists, else None."""
+    mp = dest / WIN_PHASE_MARKER_NAME
+    if not mp.exists() or _is_reparse_or_symlink(mp):
+        return None
+    try:
+        data = json.loads(mp.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if isinstance(data, dict) and data.get("managed_by") == "heliograph-phase-installer" and isinstance(data.get("tx_id"), str):
+        return data["tx_id"]
+    return None
+
+
 def win_phase_begin(*, win_to: Path | None, reg_key: str, tx_id: str, phase: int, commit: str) -> Path:
     """Acquire exclusive phase ownership on a Windows destination."""
     dest = (win_to or default_win_to_dir()).resolve()
     dest.mkdir(parents=True, exist_ok=True)
     with acquire_win_lock(_dest_lock_path(dest), blocking=False):
-        _check_win_phase_marker(dest, tx_id)
+        _check_win_phase_marker(dest, tx_id, require_active=False)
         _write_json_atomic(
             dest / WIN_PHASE_MARKER_NAME,
             {
@@ -929,12 +948,14 @@ def win_phase_end(*, win_to: Path | None, tx_id: str) -> None:
                 raise WinInstallError(f"cannot remove Windows phase marker at {mp}: {exc}", code=3) from exc
 
 
-def win_recover(*, win_to: Path | None = None, reg_key: str = DEFAULT_REG_KEY) -> bool:
+def win_recover(*, win_to: Path | None = None, reg_key: str = DEFAULT_REG_KEY, phase_tx_id: str | None = None) -> bool:
     """Acquire destination & registry locks and recover any pending inner Windows install/back/remove journal."""
     dest = (win_to or default_win_to_dir()).resolve()
     if not dest.is_dir():
         return False
     with acquire_win_lock(_dest_lock_path(dest), blocking=False):
+        if phase_tx_id is not None:
+            _check_win_phase_marker(dest, phase_tx_id, require_active=True)
         with acquire_win_lock(_reg_lock_path(reg_key), blocking=True):
             return recover_win_if_needed(dest, reg_key)
 
@@ -971,7 +992,7 @@ def win_install(
 
     with acquire_win_lock(_dest_lock_path(dest), blocking=False):
         with acquire_win_lock(_reg_lock_path(reg_key), blocking=True):
-            _check_win_phase_marker(dest, phase_tx_id)
+            _check_win_phase_marker(dest, phase_tx_id, require_active=(phase_tx_id is not None))
             recover_win_if_needed(dest, reg_key)
             existing = read_win_manifest(dest)
             if existing is not None and str(existing.get("reg_key", reg_key)).lower() != reg_key.lower():
@@ -1360,7 +1381,7 @@ def win_back(
 
     with acquire_win_lock(_dest_lock_path(dest), blocking=False):
         with acquire_win_lock(_reg_lock_path(reg_key), blocking=True):
-            _check_win_phase_marker(dest, phase_tx_id)
+            _check_win_phase_marker(dest, phase_tx_id, require_active=(phase_tx_id is not None))
             recover_win_if_needed(dest, reg_key)
             manifest = read_win_manifest(dest)
             if manifest is None:
@@ -1553,7 +1574,7 @@ def win_remove(
     removed_any = False
     with acquire_win_lock(_dest_lock_path(dest), blocking=False):
         with acquire_win_lock(_reg_lock_path(reg_key), blocking=True):
-            _check_win_phase_marker(dest, phase_tx_id)
+            _check_win_phase_marker(dest, phase_tx_id, require_active=(phase_tx_id is not None))
             recovered = recover_win_if_needed(dest, reg_key)
             manifest = read_win_manifest(dest)
             owned_rels = [
