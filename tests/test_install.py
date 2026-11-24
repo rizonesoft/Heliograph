@@ -349,8 +349,9 @@ class TestQuickInstaller(unittest.TestCase):
             code, _ = self.mod.status(to_dir=shared_dir, wrapper_path=shared_wrap)
             self.assertEqual(code, 0)
 
-            # If another destination took wrap_a, --back refuses with exit 2 without clobbering it.
+            # If wrap_a was vacated and another destination claimed it, --back refuses with exit 2 without clobbering it.
             other_dir = root / "other_bin"
+            wrap_a.unlink()
             self.mod.install(repo=repo, to_dir=other_dir, store_dir=store_a, wrapper_path=wrap_a, prebuilt=(c_h, c_e))
             with self.assertRaises(self.mod.InstallError) as ctx:
                 self.mod.go_back(to_dir=to_dir, wrapper_path=wrap_b)
@@ -684,13 +685,22 @@ class TestQuickInstaller(unittest.TestCase):
             self.assertTrue(self.mod.recover_if_needed(re_dir, r_wa))
             self.assertEqual(r_wa.read_text(encoding="utf-8"), self.mod.render_wrapper(re_dir, r_sa))
 
-            # 7d. Interrupted --back with a pre-existing third wrapper C (and per-unlink boundary after_unlink_old_wrapper_0).
+            # 7d. Third successive wrapper retires the outgoing first wrapper (no orphan on --remove),
+            #     and interrupted --back with a pre-existing third wrapper C still recovers all three.
             w3_dir = root / "back_preexist_c"
             w3a, w3b, w3c = root / "w3a2" / "helio", root / "w3b2" / "helio", root / "w3c2" / "helio"
             s3a, s3b, s3c = root / "s3a2", root / "s3b2", root / "s3c2"
             self.mod.install(repo=repo, to_dir=w3_dir, store_dir=s3c, wrapper_path=w3c, prebuilt=(a_h, a_e))
             self.mod.install(repo=repo, to_dir=w3_dir, store_dir=s3a, wrapper_path=w3a, prebuilt=(a_h, a_e))
             self.mod.install(repo=repo, to_dir=w3_dir, store_dir=s3b, wrapper_path=w3b, prebuilt=(b_h, b_e))
+            # Outgoing w3c was retired on the 3rd install so at most 2 wrappers remain.
+            self.assertFalse(w3c.exists())
+            self.assertTrue(w3a.exists())
+            self.assertTrue(w3b.exists())
+            # Plant w3c as a pre-existing third managed wrapper to exercise interrupted --back through C.
+            w3c.parent.mkdir(parents=True, exist_ok=True)
+            w3c.write_text(self.mod.render_wrapper(w3_dir, s3c), encoding="utf-8")
+            os.chmod(w3c, 0o755)
 
             def crash_at_unlink_0(stage: str) -> None:
                 if stage == "after_unlink_old_wrapper_0":
@@ -702,6 +712,21 @@ class TestQuickInstaller(unittest.TestCase):
             self.assertEqual(w3a.read_text(encoding="utf-8"), self.mod.render_wrapper(w3_dir, s3a))
             self.assertEqual(w3b.read_text(encoding="utf-8"), self.mod.render_wrapper(w3_dir, s3b))
             self.assertEqual(w3c.read_text(encoding="utf-8"), self.mod.render_wrapper(w3_dir, s3c))
+            # Verify 3-generation install + remove leaves zero owned wrappers and preserves unrelated files.
+            w3_rem_dir = root / "three_gen_remove"
+            w3_rem_dir.mkdir()
+            unrelated_keep = w3_rem_dir / "keep.txt"
+            unrelated_keep.write_text("keep", encoding="utf-8")
+            rw1, rw2, rw3 = root / "rw1" / "helio", root / "rw2" / "helio", root / "rw3" / "helio"
+            self.mod.install(repo=repo, to_dir=w3_rem_dir, store_dir=s3a, wrapper_path=rw1, prebuilt=(a_h, a_e))
+            self.mod.install(repo=repo, to_dir=w3_rem_dir, store_dir=s3b, wrapper_path=rw2, prebuilt=(b_h, b_e))
+            self.mod.install(repo=repo, to_dir=w3_rem_dir, store_dir=s3c, wrapper_path=rw3, prebuilt=(a_h, a_e))
+            self.assertFalse(rw1.exists())
+            self.assertTrue(self.mod.remove(to_dir=w3_rem_dir, wrapper_path=rw3))
+            self.assertFalse(rw1.exists())
+            self.assertFalse(rw2.exists())
+            self.assertFalse(rw3.exists())
+            self.assertEqual(unrelated_keep.read_text(encoding="utf-8"), "keep")
 
             # 7e. Foreign journal with had_manifest=False cannot write an external wrapper or create its parent dir.
             fnom_dir = root / "foreign_no_manifest"
@@ -977,16 +1002,32 @@ class TestQuickInstaller(unittest.TestCase):
 
             with self.assertRaises(SimulatedCrash):
                 self.mod.install(repo=repo, to_dir=dir_a, store_dir=store_dir, wrapper_path=wrapper, prebuilt=(b_h, b_e), on_boundary=crash_after_helio)
+            # While dir_a still owns wrapper, dir_b is refused from taking it over.
+            with self.assertRaises(self.mod.InstallError) as ctx:
+                self.mod.install(repo=repo, to_dir=dir_b, store_dir=store_dir, wrapper_path=wrapper, prebuilt=(b_h, b_e))
+            self.assertEqual(ctx.exception.code, 2)
+            # If wrapper is vacated and dir_b claims it, removing dir_a leaves dir_b's wrapper intact.
+            wrapper.unlink()
             self.mod.install(repo=repo, to_dir=dir_b, store_dir=store_dir, wrapper_path=wrapper, prebuilt=(b_h, b_e))
             self.mod.remove(to_dir=dir_a, wrapper_path=wrapper)
             self.assertTrue(wrapper.is_file())
             self.assertTrue(self.mod.wrapper_belongs_to(wrapper, dir_b))
 
+            # Concurrent installs to two different destinations targeting one vacant wrapper serialize:
+            # exactly one wins the wrapper and the other is refused with exit 2.
+            self.mod.remove(to_dir=dir_b, wrapper_path=wrapper)
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
                 f1 = pool.submit(self.mod.install, repo=repo, to_dir=dir_a, store_dir=store_dir, wrapper_path=wrapper, prebuilt=(a_h, a_e))
                 f2 = pool.submit(self.mod.install, repo=repo, to_dir=dir_b, store_dir=store_dir, wrapper_path=wrapper, prebuilt=(b_h, b_e))
-                f1.result()
-                f2.result()
+                outcomes = []
+                for fut in (f1, f2):
+                    try:
+                        fut.result()
+                        outcomes.append("ok")
+                    except self.mod.InstallError as exc:
+                        self.assertEqual(exc.code, 2)
+                        outcomes.append("refused")
+            self.assertEqual(sorted(outcomes), ["ok", "refused"])
             self.assertTrue(self.mod.wrapper_belongs_to(wrapper, dir_a) or self.mod.wrapper_belongs_to(wrapper, dir_b))
 
     def test_crash_recovery_every_distinct_boundary_two_wrappers_and_store_message(self) -> None:
@@ -1159,8 +1200,11 @@ class TestQuickInstaller(unittest.TestCase):
             self.assertGreater(completed, 0)
 
     def test_held_windows_exe_concurrent_caller_during_publication(self) -> None:
+        is_wsl = Path("/proc/sys/fs/binfmt_misc/WSLInterop").exists()
         if not (shutil.which("python.exe") and shutil.which("wslpath")):
-            self.skipTest("WSL Windows interop (python.exe/wslpath) not available")
+            if is_wsl:
+                self.fail("WSL detected but python.exe or wslpath is unavailable for required Windows replacement proof")
+            self.skipTest("WSL Windows interop (python.exe/wslpath) not available on non-WSL host")
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo = root / "repo"
@@ -1247,6 +1291,211 @@ class TestQuickInstaller(unittest.TestCase):
             self.assertGreater(overlap_calls, 0)
             code, _ = self.mod.status(to_dir=to_dir, wrapper_path=wrapper)
             self.assertEqual(code, 0)
+
+    def test_chain2_hardening_cross_dest_status_drift_partial_legacy_oserror_and_clean_home(self) -> None:
+        import errno as errno_mod
+        import io
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            init_git_repo(repo)
+            a_h, a_e = root / "a_h", root / "a_e"
+            b_h, b_e = root / "b_h", root / "b_e"
+            make_distinct_binary(self.helio_bin, a_h, b"A")
+            make_distinct_binary(self.helio_exe, a_e, b"A")
+            make_distinct_binary(self.helio_bin, b_h, b"B")
+            make_distinct_binary(self.helio_exe, b_e, b"B")
+
+            # 1. Cross-destination wrapper takeover is refused before mutating anything.
+            dir1, dir2 = root / "dest1", root / "dest2"
+            s1, s2 = root / "store1", root / "store2"
+            shared_wrap = root / "shared_bin" / "helio"
+            self.mod.install(repo=repo, to_dir=dir1, store_dir=s1, wrapper_path=shared_wrap, prebuilt=(a_h, a_e))
+            with self.assertRaises(self.mod.InstallError) as ctx:
+                self.mod.install(repo=repo, to_dir=dir2, store_dir=s2, wrapper_path=shared_wrap, prebuilt=(b_h, b_e))
+            self.assertEqual(ctx.exception.code, 2)
+            self.assertIn(str(dir1.resolve()), str(ctx.exception))
+            self.assertEqual(shared_wrap.read_text(encoding="utf-8"), self.mod.render_wrapper(dir1, s1))
+            chk1 = subprocess.run([str(shared_wrap), "check"], capture_output=True, text=True)
+            self.assertEqual(chk1.returncode, 0, chk1.stderr)
+
+            # 2. --status checks exact wrapper store routing, active wrapper path, and previous backup hashes.
+            self.mod.install(repo=repo, to_dir=dir1, store_dir=s2, wrapper_path=shared_wrap, prebuilt=(b_h, b_e))
+            code, _ = self.mod.status(to_dir=dir1, wrapper_path=shared_wrap)
+            self.assertEqual(code, 0)
+
+            # 2a. Wrapper content edited to point at wrong store while keeping target comment.
+            orig_wrap = shared_wrap.read_text(encoding="utf-8")
+            shared_wrap.write_text(self.mod.render_wrapper(dir1, s1), encoding="utf-8")
+            os.chmod(shared_wrap, 0o755)
+            code, lines = self.mod.status(to_dir=dir1, wrapper_path=shared_wrap)
+            self.assertEqual(code, 3)
+            self.assertTrue(any(str(shared_wrap) in line for line in lines), lines)
+            shared_wrap.write_text(orig_wrap, encoding="utf-8")
+            os.chmod(shared_wrap, 0o755)
+
+            # 2b. Status invoked with a different wrapper path than recorded active wrapper.
+            other_wrap = root / "other_bin" / "helio"
+            other_wrap.parent.mkdir(parents=True, exist_ok=True)
+            other_wrap.write_text(orig_wrap, encoding="utf-8")
+            os.chmod(other_wrap, 0o755)
+            code, lines = self.mod.status(to_dir=dir1, wrapper_path=other_wrap)
+            self.assertEqual(code, 3)
+            self.assertTrue(any(str(other_wrap) in line for line in lines), lines)
+
+            # 2c. Corrupt helio.old fails status with exit 3 naming helio.old.
+            old_h_bytes = (dir1 / "helio.old").read_bytes()
+            (dir1 / "helio.old").write_bytes(b"corrupt-old")
+            code, lines = self.mod.status(to_dir=dir1, wrapper_path=shared_wrap)
+            self.assertEqual(code, 3)
+            self.assertTrue(any("helio.old" in line for line in lines), lines)
+            (dir1 / "helio.old").write_bytes(old_h_bytes)
+
+            # 2d. Missing helio.exe.old fails status with exit 3 naming helio.exe.old.
+            old_e_bytes = (dir1 / "helio.exe.old").read_bytes()
+            (dir1 / "helio.exe.old").unlink()
+            code, lines = self.mod.status(to_dir=dir1, wrapper_path=shared_wrap)
+            self.assertEqual(code, 3)
+            self.assertTrue(any("helio.exe.old" in line for line in lines), lines)
+            (dir1 / "helio.exe.old").write_bytes(old_e_bytes)
+            code, _ = self.mod.status(to_dir=dir1, wrapper_path=shared_wrap)
+            self.assertEqual(code, 0)
+
+            # 3. Build-time source drift refuses publication with exit 3 and installs nothing.
+            drift_ws = root / "drift_ws"
+            drift_repo = drift_ws / "Heliograph"
+            init_git_repo(drift_repo)
+            drift_sdk = drift_ws / "ImpossibleSDK" / "tools"
+            drift_sdk.mkdir(parents=True)
+            (drift_sdk / "app_build.py").write_text(
+                "import pathlib, shutil, sys\n"
+                "repo = pathlib.Path(sys.argv[1])\n"
+                "(repo / 'README.md').write_text('drifted during build\\n', encoding='utf-8')\n"
+                "(repo / 'build' / 'linux' / 'linux').mkdir(parents=True, exist_ok=True)\n"
+                f"shutil.copy2({str(a_h)!r}, repo / 'build' / 'linux' / 'linux' / 'helio')\n"
+                f"shutil.copy2({str(a_e)!r}, repo / 'build' / 'linux' / 'helio.exe')\n",
+                encoding="utf-8",
+            )
+            drift_to = root / "drift_bin"
+            drift_wrap = root / "drift_wrap" / "helio"
+            with self.assertRaises(self.mod.InstallError) as ctx:
+                self.mod.install(repo=drift_repo, to_dir=drift_to, store_dir=root / "drift_store", wrapper_path=drift_wrap)
+            self.assertEqual(ctx.exception.code, 3)
+            self.assertIn("source tree changed", str(ctx.exception))
+            self.assertFalse((drift_to / "helio").exists())
+
+            # 4. Partial legacy pair is refused in both directions, naming the missing partner and preserving bytes.
+            part_h_dir = root / "partial_helio_only"
+            part_h_dir.mkdir()
+            shutil.copy2(a_h, part_h_dir / "helio")
+            h_before = (part_h_dir / "helio").read_bytes()
+            with self.assertRaises(self.mod.InstallError) as ctx:
+                self.mod.install(repo=repo, to_dir=part_h_dir, store_dir=s1, wrapper_path=root / "pw1" / "helio", prebuilt=(b_h, b_e))
+            self.assertEqual(ctx.exception.code, 2)
+            self.assertIn("helio.exe", str(ctx.exception))
+            self.assertEqual((part_h_dir / "helio").read_bytes(), h_before)
+
+            part_e_dir = root / "partial_exe_only"
+            part_e_dir.mkdir()
+            shutil.copy2(a_e, part_e_dir / "helio.exe")
+            e_before = (part_e_dir / "helio.exe").read_bytes()
+            with self.assertRaises(self.mod.InstallError) as ctx:
+                self.mod.install(repo=repo, to_dir=part_e_dir, store_dir=s1, wrapper_path=root / "pw2" / "helio", prebuilt=(b_h, b_e))
+            self.assertEqual(ctx.exception.code, 2)
+            self.assertIn("helio", str(ctx.exception))
+            self.assertEqual((part_e_dir / "helio.exe").read_bytes(), e_before)
+
+            # 5. Ordinary OSError during publication gives exit 3 with structured stderr (no traceback), recovers, and retries cleanly.
+            oserr_dir = root / "oserr_dir"
+            oserr_wrap = root / "oserr_wrap" / "helio"
+            self.mod.install(repo=repo, to_dir=oserr_dir, store_dir=s1, wrapper_path=oserr_wrap, prebuilt=(a_h, a_e))
+
+            def fail_enospc(path: Path, data: bytes, mode: int = 0o644) -> None:
+                raise OSError(errno_mod.ENOSPC, "No space left on device", str(path))
+
+            stderr_buf = io.StringIO()
+            with mock.patch.object(self.mod, "write_bytes_atomic", side_effect=fail_enospc):
+                with mock.patch.object(self.mod, "ensure_sdk_and_build", return_value=(b_h, b_e, "a" * 40, False)):
+                    with mock.patch("sys.stderr", stderr_buf):
+                        rc = self.mod.main([
+                            "--to", str(oserr_dir),
+                            "--store", str(s2),
+                            "--wrapper", str(oserr_wrap),
+                        ])
+            self.assertEqual(rc, 3)
+            self.assertNotIn("Traceback", stderr_buf.getvalue())
+            self.assertIn("No space left on device", stderr_buf.getvalue())
+            # Retry after disk condition clears succeeds cleanly.
+            self.mod.install(repo=repo, to_dir=oserr_dir, store_dir=s2, wrapper_path=oserr_wrap, prebuilt=(b_h, b_e))
+            code, _ = self.mod.status(to_dir=oserr_dir, wrapper_path=oserr_wrap)
+            self.assertEqual(code, 0)
+
+            # 6. Clean home with standard /etc/skel/.profile finds `helio` by name in a fresh login shell without test-injected PATH.
+            skel_profile = Path("/etc/skel/.profile")
+            if skel_profile.is_file():
+                clean_home = root / "clean_home"
+                clean_home.mkdir()
+                shutil.copy2(skel_profile, clean_home / ".profile")
+                clean_to = root / "clean_to"
+                clean_store = root / "clean_store"
+                clean_wrap = clean_home / ".local" / "bin" / "helio"
+                self.mod.install(repo=repo, to_dir=clean_to, store_dir=clean_store, wrapper_path=clean_wrap, prebuilt=(a_h, a_e))
+                login_res = subprocess.run(
+                    ["env", "-i", f"HOME={clean_home}", "PATH=/usr/bin:/bin", "bash", "-lc", "helio check"],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(login_res.returncode, 0, login_res.stderr)
+
+    def test_real_checkout_pinned_sdk_install_and_roundtrip(self) -> None:
+        if os.environ.get("HELIO_INSTALL_TEST_INNER") == "1":
+            self.skipTest("inner nested test run; real-SDK install already exercised by outer test")
+        sdk_build = REPO.parent / "ImpossibleSDK" / "tools" / "app_build.py"
+        if not sdk_build.is_file():
+            self.skipTest("pinned ImpossibleSDK checkout not present beside repo")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            to_dir = root / "real_bin"
+            store_dir = root / "real_store"
+            wrapper = root / "real_home" / ".local" / "bin" / "helio"
+            env = dict(os.environ)
+            env["HELIO_INSTALL_TEST_INNER"] = "1"
+            env["HELIO_NO_BOSUN"] = "1"
+            res = subprocess.run(
+                [
+                    sys.executable,
+                    str(INSTALL_SCRIPT),
+                    "--to", str(to_dir),
+                    "--store", str(store_dir),
+                    "--wrapper", str(wrapper),
+                ],
+                cwd=str(REPO),
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+            self.assertEqual(self.mod.sha256_file(to_dir / "helio"), self.mod.sha256_file(self.helio_bin))
+            self.assertEqual(self.mod.sha256_file(to_dir / "helio.exe"), self.mod.sha256_file(self.helio_exe))
+            # Real write + read + check roundtrip through the installed wrapper.
+            tell = subprocess.run(
+                [str(wrapper), "tell", "demo/lane", "real-sdk-install-check", "--as", "demo/sender"],
+                input="hello from real pinned SDK install\n",
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(tell.returncode, 0, tell.stderr)
+            inbox = subprocess.run(
+                [str(wrapper), "inbox", "--as", "demo/lane"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(inbox.returncode, 0, inbox.stderr)
+            self.assertIn("real-sdk-install-check", inbox.stdout)
+            chk = subprocess.run([str(wrapper), "check"], capture_output=True, text=True)
+            self.assertEqual(chk.returncode, 0, chk.stderr)
 
 
 if __name__ == "__main__":

@@ -349,7 +349,20 @@ def verify_destination_ownership(to_dir: Path, manifest: dict[str, Any] | None, 
             if not _is_heliograph_pe(p):
                 raise InstallError(f"refusing unrelated file at {p}: not a Heliograph Windows executable", code=2)
 
-    return (to_dir / "helio").exists() and (to_dir / "helio.exe").exists()
+    has_helio = (to_dir / "helio").exists()
+    has_exe = (to_dir / "helio.exe").exists()
+    if has_helio != has_exe:
+        missing = "helio.exe" if has_helio else "helio"
+        raise InstallError(
+            f"refusing partial legacy installation in {to_dir}: missing {missing}; remove or restore it before installing",
+            code=2,
+        )
+    if not has_helio and not has_exe:
+        raise InstallError(
+            f"refusing partial legacy installation in {to_dir}: backup files present without live binaries",
+            code=2,
+        )
+    return True
 
 
 def _parse_target_line(raw_value: str) -> str:
@@ -901,7 +914,7 @@ def _planned_temp_names(tx_id: str) -> list[str]:
     return names
 
 
-def git_provenance(repo: Path) -> tuple[str, bool]:
+def git_provenance_snapshot(repo: Path) -> tuple[str, bool, str]:
     rev = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True)
     if rev.returncode != 0:
         raise InstallError(f"cannot read git HEAD in {repo}: {rev.stderr.strip()}", code=2)
@@ -909,16 +922,23 @@ def git_provenance(repo: Path) -> tuple[str, bool]:
     st = subprocess.run(["git", "-C", str(repo), "status", "--porcelain"], capture_output=True, text=True)
     if st.returncode != 0:
         raise InstallError(f"cannot read git status in {repo}: {st.stderr.strip()}", code=2)
-    dirty = bool(st.stdout.strip())
+    status_text = st.stdout
+    dirty = bool(status_text.strip())
+    return commit, dirty, status_text
+
+
+def git_provenance(repo: Path) -> tuple[str, bool]:
+    commit, dirty, _ = git_provenance_snapshot(repo)
     return commit, dirty
 
 
-def ensure_sdk_and_build(repo: Path, sdk_url: str, stage_dir: Path) -> tuple[Path, Path]:
+def ensure_sdk_and_build(repo: Path, sdk_url: str, stage_dir: Path) -> tuple[Path, Path, str, bool]:
     """Ensure Impossible SDK exists beside repo, build+test under checkout build lock, and snapshot outputs."""
     _validate_sdk_url(sdk_url)
     sdk_dir = repo.parent / "ImpossibleSDK"
     build_lock = repo / "build" / BUILD_LOCK_NAME
     with acquire_lock(build_lock, blocking=True):
+        prov_before = git_provenance_snapshot(repo)
         if not sdk_dir.exists():
             clone = subprocess.run(["git", "clone", sdk_url, str(sdk_dir)], check=False)
             if clone.returncode != 0:
@@ -943,7 +963,10 @@ def ensure_sdk_and_build(repo: Path, sdk_url: str, stage_dir: Path) -> tuple[Pat
         snap_exe = stage_dir / "helio.exe"
         copy_to_staged(helio_bin, snap_helio, mode=0o755)
         copy_to_staged(helio_exe, snap_exe, mode=0o755)
-        return snap_helio, snap_exe
+        prov_after = git_provenance_snapshot(repo)
+        if prov_after != prov_before:
+            raise InstallError(f"source tree changed during build in {repo}; refusing to publish mismatched provenance", code=3)
+        return snap_helio, snap_exe, prov_before[0], prov_before[1]
 
 
 def _ensure_store_ready(helio_bin: Path, store_dir: Path) -> None:
@@ -989,6 +1012,25 @@ def _restore_signal_handlers(prev: dict[int, Any]) -> None:
             signal.signal(sig, handler)
 
 
+def _handle_op_failure(exc: BaseException, to_dir: Path, wrapper_path: Path) -> None:
+    if getattr(exc, "_leave_journal_for_test", False):
+        raise exc
+    try:
+        recover_if_needed(to_dir, wrapper_path)
+    except (InstallError, OSError) as rec_exc:
+        raise InstallError(
+            f"operation failed ({exc}) and automatic recovery could not finish ({rec_exc}); "
+            f"pending recovery recorded in {to_dir / JOURNAL_NAME}",
+            code=3,
+        ) from exc
+    if isinstance(exc, OSError):
+        raise InstallError(
+            f"filesystem error during operation ({exc.strerror or exc}): {exc.filename or to_dir}",
+            code=3,
+        ) from exc
+    raise exc
+
+
 def install(
     *,
     repo: Path,
@@ -1010,13 +1052,12 @@ def install(
         if wrapper_path == to_dir / name:
             raise InstallError(f"wrapper path {wrapper_path} collides with destination file {to_dir / name}", code=2)
 
-    commit, dirty = git_provenance(repo)
-
     with tempfile.TemporaryDirectory(prefix="helio-install-snap-") as snap_tmp:
         snap_dir = Path(snap_tmp)
         if prebuilt is None:
-            helio_src, helio_exe_src = ensure_sdk_and_build(repo, sdk_url, snap_dir)
+            helio_src, helio_exe_src, commit, dirty = ensure_sdk_and_build(repo, sdk_url, snap_dir)
         else:
+            commit, dirty = git_provenance(repo)
             helio_src, helio_exe_src = prebuilt
             for p in (helio_src, helio_exe_src):
                 if not p.is_file():
@@ -1044,9 +1085,15 @@ def install(
                         require_live=existing_manifest is not None,
                     )
 
-                    wrap_kind, _ = parse_wrapper_ownership(wrapper_path)
+                    wrap_kind, wrap_target = parse_wrapper_ownership(wrapper_path)
                     if wrap_kind == "foreign":
                         raise InstallError(f"refusing unowned wrapper at {wrapper_path}", code=2)
+                    if wrap_kind == "managed" and wrap_target != str(to_dir):
+                        raise InstallError(
+                            f"refusing wrapper {wrapper_path}: already managed for {wrap_target} "
+                            "(use --wrapper or remove that installation first)",
+                            code=2,
+                        )
 
                     prev_wrapper_existed = wrap_kind in ("managed", "legacy")
 
@@ -1077,6 +1124,7 @@ def install(
 
                         rotate_live_to_old = False
                         previous_entry: dict[str, Any] | None = None
+                        retire_wrapper: Path | None = None
                         if existing_manifest is not None:
                             prev_cur = existing_manifest["current"]
                             previous_entry = {
@@ -1089,6 +1137,12 @@ def install(
                                 "wrapper": prev_cur.get("wrapper", str(wrapper_path)),
                             }
                             rotate_live_to_old = True
+                            old_prev = existing_manifest.get("previous")
+                            if isinstance(old_prev, dict) and isinstance(old_prev.get("wrapper"), str) and old_prev["wrapper"]:
+                                cand_retire = _normalize_wrapper_path(Path(old_prev["wrapper"]))
+                                kept_wrappers = {wrapper_path, _normalize_wrapper_path(Path(previous_entry["wrapper"]))}
+                                if cand_retire not in kept_wrappers and wrapper_belongs_to(cand_retire, to_dir):
+                                    retire_wrapper = cand_retire
                         elif adopting_legacy:
                             previous_entry = {
                                 "commit": "legacy",
@@ -1117,6 +1171,9 @@ def install(
                         desired_wrapper = render_wrapper(to_dir, store_dir)
 
                         prev_wrap_store: str | None = parse_wrapper_store(wrapper_path) if prev_wrapper_existed else None
+                        pre_wrappers: dict[str, str | None] = {str(wrapper_path): prev_wrap_store}
+                        if retire_wrapper is not None:
+                            pre_wrappers[str(retire_wrapper)] = parse_wrapper_store(retire_wrapper)
                         journal = {
                             "schema_version": 2,
                             "op": "install",
@@ -1127,7 +1184,7 @@ def install(
                             "store_dir": str(store_dir),
                             "had_manifest": existing_manifest is not None,
                             "previous_manifest": existing_manifest,
-                            "pre_wrappers": {str(wrapper_path): prev_wrap_store},
+                            "pre_wrappers": pre_wrappers,
                             "saved_files": saved,
                             "temp_files": temp_files,
                             "desired_manifest": desired_manifest,
@@ -1158,8 +1215,11 @@ def install(
                         if on_boundary:
                             on_boundary("after_helio_exe")
 
-                        # 3. Publish destination-bound wrapper.
+                        # 3. Publish destination-bound wrapper and retire any outgoing third wrapper.
                         write_bytes_atomic(wrapper_path, desired_wrapper.encode("utf-8"), mode=0o755)
+                        if retire_wrapper is not None and wrapper_belongs_to(retire_wrapper, to_dir):
+                            retire_wrapper.unlink()
+                            fsync_dir(retire_wrapper.parent)
                         if on_boundary:
                             on_boundary("after_wrapper")
 
@@ -1177,10 +1237,7 @@ def install(
                         fsync_dir(to_dir)
                         return desired_manifest
                     except BaseException as exc:
-                        if getattr(exc, "_leave_journal_for_test", False):
-                            raise
-                        with contextlib.suppress(InstallError, OSError):
-                            recover_if_needed(to_dir, wrapper_path)
+                        _handle_op_failure(exc, to_dir, wrapper_path)
                         raise
         finally:
             _restore_signal_handlers(prev_handlers)
@@ -1240,6 +1297,29 @@ def status(*, to_dir: Path, wrapper_path: Path) -> tuple[int, list[str]]:
             if name == "helio" and os.name == "posix" and not os.access(p, os.X_OK):
                 problems.append(f"not executable: {p}")
 
+    prev = manifest.get("previous")
+    if isinstance(prev, dict):
+        for name, key in (("helio.old", "helio_sha256"), ("helio.exe.old", "helio_exe_sha256")):
+            p = to_dir / name
+            if p.is_symlink() or not p.is_file():
+                problems.append(f"missing or invalid backup: {p}")
+            else:
+                try:
+                    actual = sha256_file(p)
+                except OSError as exc:
+                    problems.append(f"unreadable backup: {p} ({exc})")
+                else:
+                    if actual != prev.get(key):
+                        problems.append(f"modified backup: {p} (recorded {str(prev.get(key, ''))[:12]}, actual {actual[:12]})")
+
+    recorded_wrapper = (
+        _normalize_wrapper_path(Path(cur["wrapper"]))
+        if isinstance(cur.get("wrapper"), str) and cur["wrapper"]
+        else wrapper_path
+    )
+    if wrapper_path != recorded_wrapper:
+        problems.append(f"wrapper {wrapper_path} is not the recorded active wrapper {recorded_wrapper}")
+
     if wrapper_path.is_symlink() or not wrapper_path.exists():
         problems.append(f"missing or invalid wrapper: {wrapper_path}")
     elif not wrapper_belongs_to(wrapper_path, to_dir):
@@ -1247,6 +1327,15 @@ def status(*, to_dir: Path, wrapper_path: Path) -> tuple[int, list[str]]:
         problems.append(f"wrapper {wrapper_path} does not point to {to_dir} (state={kind}, target={bound})")
     elif os.name == "posix" and not os.access(wrapper_path, os.X_OK):
         problems.append(f"not executable: {wrapper_path}")
+    elif cur.get("store"):
+        try:
+            actual_wrapper = wrapper_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            problems.append(f"unreadable wrapper: {wrapper_path} ({exc})")
+        else:
+            expected_wrapper = render_wrapper(to_dir, Path(cur["store"]))
+            if actual_wrapper != expected_wrapper:
+                problems.append(f"wrapper content or store mismatch: {wrapper_path} (expected store {cur['store']})")
 
     if cur.get("store"):
         sp = Path(cur["store"])
@@ -1439,10 +1528,7 @@ def go_back(
                     fsync_dir(to_dir)
                     return desired_manifest
                 except BaseException as exc:
-                    if getattr(exc, "_leave_journal_for_test", False):
-                        raise
-                    with contextlib.suppress(InstallError, OSError):
-                        recover_if_needed(to_dir, wrapper_path)
+                    _handle_op_failure(exc, to_dir, wrapper_path)
                     raise
     finally:
         _restore_signal_handlers(prev_handlers)
@@ -1545,10 +1631,7 @@ def remove(
                     fsync_dir(to_dir)
                     return True
                 except BaseException as exc:
-                    if getattr(exc, "_leave_journal_for_test", False):
-                        raise
-                    with contextlib.suppress(InstallError, OSError):
-                        recover_if_needed(to_dir, wrapper_path)
+                    _handle_op_failure(exc, to_dir, wrapper_path)
                     raise
     finally:
         _restore_signal_handlers(prev_handlers)
@@ -1613,6 +1696,10 @@ def main(argv: list[str] | None = None) -> int:
     except InstallError as exc:
         print(f"install.py: {exc}", file=sys.stderr)
         return exc.code
+    except OSError as exc:
+        detail = f": {exc.filename}" if exc.filename else ""
+        print(f"install.py: filesystem error ({exc.strerror or exc}){detail}", file=sys.stderr)
+        return 3
 
 
 if __name__ == "__main__":
