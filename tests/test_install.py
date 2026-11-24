@@ -2460,7 +2460,7 @@ class TestWindowsInstaller(unittest.TestCase):
                             str(uni_store),
                             "--commit",
                             "c" * 40,
-                            "--win-to",
+                            "--to",
                             str(win_to),
                             "--reg-key",
                             reg_key,
