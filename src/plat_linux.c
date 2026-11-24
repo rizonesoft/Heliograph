@@ -90,7 +90,10 @@ p_result p_write(const char *path, const char *data, size_t length, bool replace
     if (good && replace) result = rename(temp, path) ? why() : P_OK;
     else if (good) result = link(temp, path) ? why() : P_OK; /* fails when the name is taken, on D: too */
     if (!(good && replace && result == P_OK)) unlink(temp);
-    if (result == P_OK && !settle(path)) result = P_FAILED;
+    if (result == P_OK && !settle(path)) {
+        if (!replace) unlink(path);
+        result = P_FAILED;
+    }
     return result;
 }
 

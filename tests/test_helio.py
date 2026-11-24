@@ -581,6 +581,25 @@ class ArchivingGuards(Base):
         self.assertEqual(res_gap.returncode, 3, res_gap.stderr)
         self.assertIn("a step of this job is missing", res_gap.stderr)
 
+        # Full-chain (MOST_LINKS=1000) boundary: removing post at the full-chain exit still returns S_REFUSED.
+        job_full = self.send()
+        for n in range(1000):
+            state = "released" if n % 2 else "taken"
+            put(self.store / f"messages/{job_full}.link.{n:04}", f"by: os/userland\ntime: 2026-11-23T12:00:00Z\nsession: \nstate: {state}\nnote: \nend: yes\n")
+        proc_full = self.start_pause("job", "read", "os/userland", job_full)
+        try:
+            self.wait_for(self.store / "paused.read")
+            (self.store / f"messages/{job_full}.post").unlink()
+            put(self.store / "resume.read", "go")
+            _, stderr_full = proc_full.communicate(timeout=30)
+        finally:
+            if proc_full.poll() is None:
+                proc_full.kill()
+        self.assertEqual(proc_full.returncode, 2, stderr_full)
+        self.assertIn("it was archived", stderr_full)
+        for name in ("paused.read", "resume.read"):
+            (self.store / name).unlink(missing_ok=True)
+
     def test_change_job_second_look_removes_orphan_step_and_handles_edge_cases(self):
         # Case 1: post removed between store_job and add_link; link is created then removed cleanly.
         job = self.send()
@@ -676,6 +695,47 @@ class ArchivingGuards(Base):
                     proc5.kill()
             self.assertEqual(proc5.returncode, 3, stderr5)
             self.assertIn("could not be removed", stderr5)
+            for name in ("paused.write", "resume.write", "paused.after-write", "resume.after-write"):
+                (self.store / name).unlink(missing_ok=True)
+
+            # Case 6 (Linux): failed publication flush during add_link leaves zero orphan link and exits 3.
+            for p in list(msgs.iterdir()):
+                if p.is_dir():
+                    p.rmdir()
+                else:
+                    p.unlink()
+            job6 = self.send()
+            proc6 = self.start_pause("take", "write", "os/userland", job6)
+            try:
+                self.wait_for(self.store / "paused.write")
+                (msgs / f"{job6}.post").unlink()
+                msgs.chmod(0o300)
+                put(self.store / "resume.write", "go")
+                _, stderr6 = proc6.communicate(timeout=30)
+            finally:
+                msgs.chmod(0o700)
+                if proc6.poll() is None:
+                    proc6.kill()
+            self.assertEqual(proc6.returncode, 3, stderr6)
+            self.assertEqual(list(msgs.iterdir()), [], "failed publication flush must leave zero orphan link")
+            for name in ("paused.write", "resume.write"):
+                (self.store / name).unlink(missing_ok=True)
+
+            # Case 7 (Linux): failed publication flush during store_seen leaves zero orphan seen mark and exits 3.
+            msg7 = self.send("tell", to="os/userland")
+            proc7 = self.start_pause("seen", "seen", "os/userland", msg7)
+            try:
+                self.wait_for(self.store / "paused.seen")
+                (msgs / f"{msg7}.post").unlink()
+                msgs.chmod(0o300)
+                put(self.store / "resume.seen", "go")
+                _, stderr7 = proc7.communicate(timeout=30)
+            finally:
+                msgs.chmod(0o700)
+                if proc7.poll() is None:
+                    proc7.kill()
+            self.assertEqual(proc7.returncode, 3, stderr7)
+            self.assertEqual(list(msgs.iterdir()), [], "failed publication flush must leave zero orphan seen mark")
 
     def test_store_seen_second_look_removes_orphan_seen_mark(self):
         msg = self.send("tell", to="os/userland")
@@ -851,6 +911,48 @@ class ArchivingGuards(Base):
                 p_chk.kill()
         self.assertEqual(p_chk.returncode, 0, out_c + err_c)
         self.assertEqual(out_c, "")
+        for name in ("paused.read", "resume.read"):
+            (self.store / name).unlink(missing_ok=True)
+
+        # 6b. `helio check` on a seen mark that disappears during archival:
+        #     - when post is also proven gone -> exits 0;
+        #     - when post read fails with IO error (directory) -> exits 3 (never healthy!).
+        m_seen_ok = self.send("tell", to="os/userland")
+        self.assertEqual(self.helio("show", m_seen_ok, me="os/userland").returncode, 0)
+        p_cs_ok = self.start_pause_cli("check-seen", "check", me=None)
+        try:
+            self.wait_for(self.store / "paused.check-seen")
+            (self.store / f"messages/{m_seen_ok}.seen.os+userland").unlink()
+            (self.store / f"messages/{m_seen_ok}.post").unlink()
+            put(self.store / "resume.check-seen", "go")
+            out_cs_ok, err_cs_ok = p_cs_ok.communicate(timeout=30)
+        finally:
+            if p_cs_ok.poll() is None:
+                p_cs_ok.kill()
+        self.assertEqual(p_cs_ok.returncode, 0, out_cs_ok + err_cs_ok)
+        for name in ("paused.check-seen", "resume.check-seen"):
+            (self.store / name).unlink(missing_ok=True)
+
+        m_seen_io = self.send("tell", to="os/userland")
+        self.assertEqual(self.helio("show", m_seen_io, me="os/userland").returncode, 0)
+        p_cs_io = self.start_pause_cli("check-seen", "check", me=None)
+        post_io = self.store / f"messages/{m_seen_io}.post"
+        try:
+            self.wait_for(self.store / "paused.check-seen")
+            (self.store / f"messages/{m_seen_io}.seen.os+userland").unlink()
+            post_io.unlink()
+            post_io.mkdir()
+            put(self.store / "resume.check-seen", "go")
+            out_cs_io, err_cs_io = p_cs_io.communicate(timeout=30)
+        finally:
+            if p_cs_io.poll() is None:
+                p_cs_io.kill()
+            if post_io.is_dir():
+                post_io.rmdir()
+        self.assertEqual(p_cs_io.returncode, 3, out_cs_io + err_cs_io)
+        self.assertIn("cannot be read", out_cs_io + err_cs_io)
+        for name in ("paused.check-seen", "resume.check-seen"):
+            (self.store / name).unlink(missing_ok=True)
 
         # 7. Malformed post name (messages/bad.post) is NOT treated as vanished: log exits 3 and summary counts damage.
         put(self.store / "messages/bad.post", "x")

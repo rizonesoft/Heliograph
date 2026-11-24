@@ -595,10 +595,13 @@ s_result store_check(store *s, text *report) {
                 s_result jr = store_job(s, &m, &now);
                 if (jr != S_OK && jr != S_REFUSED) why = s->why;
             } else if (starts(dot, ".seen.")) {
+                if (s->pause) s->pause(s->pause_user, "check-seen");
                 char *data = NULL;
                 s_result er = event_of(s, id, dot + 1, &data);
                 if (er == S_NOTHING) {
-                    if (live_post(s, id) == S_OK) why = "a seen mark is damaged";
+                    s_result lp = live_post(s, id);
+                    if (lp == S_OK) why = "a seen mark is damaged";
+                    else if (lp != S_REFUSED) why = s->why;
                 } else if (er != S_OK || !same(data, SEEN)) {
                     why = "a seen mark is damaged";
                 }
