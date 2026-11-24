@@ -4734,20 +4734,27 @@ class TestPhaseInstaller(unittest.TestCase):
                     self._delete_reg_key(sole_reg_key)
                     self._cleanup_win_parent(sole_win_to)
 
-                # Also verify `_store_needs_init` propagates PermissionError for BOTH local Windows stores
-                # AND reachable WSL shares (items 24 & 25), returning False ONLY when the WSL root share itself is unreachable!
+                # Also verify `_store_needs_init` propagates PermissionError for local Windows stores,
+                # reachable WSL shares, AND WSL distribution-root ACL denials (items 24, 25, and 28),
+                # returning False ONLY on genuine unreachable-share WinErrors (e.g. WinError 64)!
                 local_store_err_code = (
                     "import importlib.util, pathlib, sys\n"
                     "from unittest import mock\n"
                     "spec = importlib.util.spec_from_file_location('wi', sys.argv[1])\n"
                     "mod = importlib.util.module_from_spec(spec)\n"
                     "spec.loader.exec_module(mod)\n"
-                    "with mock.patch.object(pathlib.Path, 'is_dir', side_effect=OSError(64, 'network name gone')):\n"
+                    "with mock.patch.object(pathlib.Path, 'is_dir', side_effect=OSError(0, 'network name gone', None, 64)):\n"
                     "    assert mod._store_needs_init(r'\\\\wsl.localhost\\NoSuchDistro\\store') is False\n"
                     "    try:\n"
                     "        mod._store_needs_init(r'C:\\LockedLocalStore')\n"
                     "        raise AssertionError('local store OSError must not be swallowed')\n"
                     "    except OSError:\n"
+                    "        pass\n"
+                    "with mock.patch.object(pathlib.Path, 'is_dir', side_effect=PermissionError(13, 'ACL denied at root')):\n"
+                    "    try:\n"
+                    "        mod._store_needs_init(r'\\\\wsl.localhost\\Ubuntu\\home\\u\\store')\n"
+                    "        raise AssertionError('WSL root PermissionError must not be swallowed')\n"
+                    "    except PermissionError:\n"
                     "        pass\n"
                     "def _reachable_root_denied_messages(self):\n"
                     "    if str(self).endswith('messages'):\n"

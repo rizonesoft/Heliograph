@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import errno
 import hashlib
 import json
 import os
@@ -456,8 +457,20 @@ def _annotate_shadowing(manifest: dict[str, Any], reg_key: str, dest: Path) -> d
     return out
 
 
+_WIN_UNREACHABLE_SHARE_ERRORS = frozenset({
+    2,     # ERROR_FILE_NOT_FOUND
+    3,     # ERROR_PATH_NOT_FOUND
+    53,    # ERROR_BAD_NETPATH
+    64,    # ERROR_NETNAME_DELETED
+    67,    # ERROR_BAD_NET_NAME
+    1203,  # ERROR_NO_NET_OR_BAD_PATH
+    1222,  # ERROR_NO_NETWORK
+    1231,  # ERROR_NETWORK_UNREACHABLE
+})
+
+
 def _wsl_share_reachable(store_path: str) -> bool:
-    """Return True if a WSL UNC store_path's distro share is reachable on Windows (handles WinError 64/53/67)."""
+    """Return True if a WSL UNC store_path's distro share is reachable on Windows (false only on unreachable-share WinErrors)."""
     distro = _extract_wsl_distro(store_path)
     if not distro:
         return True
@@ -465,8 +478,12 @@ def _wsl_share_reachable(store_path: str) -> bool:
     prefix = "\\\\wsl.localhost\\" if norm_s.lower().startswith("\\\\wsl.localhost\\") else "\\\\wsl$\\"
     try:
         return Path(prefix + distro).is_dir()
-    except OSError:
-        return False
+    except PermissionError:
+        raise
+    except OSError as exc:
+        if getattr(exc, "winerror", None) in _WIN_UNREACHABLE_SHARE_ERRORS or exc.errno == errno.ENOENT:
+            return False
+        raise
 
 
 def _store_needs_init(store_path: str) -> bool:
