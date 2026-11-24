@@ -4527,12 +4527,15 @@ class TestPhaseInstaller(unittest.TestCase):
 
                 # Plant foreign backup-shaped files (including at the exact tx_id paths that the old
                 # separate-file snapshot mechanism used!) in BOTH WSL `to_dir` AND Windows `win_to\bin\`
-                # BEFORE running the failed-C upgrade + rollback (items 2, 9, and 23).
+                # plus a simulated killed-write `.phase.journal.json.tmp.*` file in `to_dir` BEFORE
+                # running the failed-C upgrade + rollback (items 2, 9, and 23).
                 fixed_tx = "deadbeef1234"
                 wsl_foreign_copy = to_dir / f".phase-prev-{fixed_tx}.helio.old"
                 wsl_foreign_empty = to_dir / f".phase-prev-{fixed_tx}.win.helio.exe.old"
+                wsl_stale_jtmp = to_dir / ".phase.journal.json.tmp.99999.deadbeef"
                 wsl_foreign_copy.write_bytes(a_h.read_bytes())
                 wsl_foreign_empty.write_bytes(b"")
+                wsl_stale_jtmp.write_bytes(b'{"partial": true}')
                 plant_win_foreign = (
                     "import pathlib, sys\n"
                     "b = pathlib.Path(sys.argv[1]) / 'bin'\n"
@@ -4579,9 +4582,11 @@ class TestPhaseInstaller(unittest.TestCase):
                 self.assertIn("planted live verification fault", str(ctx.exception))
 
                 # Verify BOTH WSL and Windows foreign files (including at the exact tx_id paths) survived
-                # capture, publication, and rollback byte-for-byte with ZERO stranded phase-prev files!
+                # capture, publication, and rollback byte-for-byte with ZERO stranded phase-prev or journal tmp files!
                 self.assertEqual(wsl_foreign_copy.read_bytes(), a_h.read_bytes())
                 self.assertEqual(wsl_foreign_empty.read_bytes(), b"")
+                self.assertFalse(wsl_stale_jtmp.exists(), "stale .phase.journal.json.tmp.* must be swept on recovery/rollback")
+                self.assertEqual(list(to_dir.glob(".phase.journal.json.tmp.*")), [])
                 self.assertEqual(
                     sorted(p.name for p in to_dir.iterdir() if "phase-prev" in p.name),
                     sorted([wsl_foreign_copy.name, wsl_foreign_empty.name]),
@@ -4698,19 +4703,29 @@ class TestPhaseInstaller(unittest.TestCase):
                     self._delete_reg_key(sole_reg_key)
                     self._cleanup_win_parent(sole_win_to)
 
-                # Also verify `_store_needs_init` propagates OSError for local Windows stores (item 24)
-                # while returning False for unreachable WSL UNC shares!
+                # Also verify `_store_needs_init` propagates PermissionError for BOTH local Windows stores
+                # AND reachable WSL shares (items 24 & 25), returning False ONLY when the WSL root share itself is unreachable!
                 local_store_err_code = (
                     "import importlib.util, pathlib, sys\n"
                     "from unittest import mock\n"
                     "spec = importlib.util.spec_from_file_location('wi', sys.argv[1])\n"
                     "mod = importlib.util.module_from_spec(spec)\n"
                     "spec.loader.exec_module(mod)\n"
-                    "with mock.patch.object(pathlib.Path, 'is_dir', side_effect=PermissionError('ACL denied')):\n"
+                    "with mock.patch.object(pathlib.Path, 'is_dir', side_effect=OSError(64, 'network name gone')):\n"
                     "    assert mod._store_needs_init(r'\\\\wsl.localhost\\NoSuchDistro\\store') is False\n"
                     "    try:\n"
                     "        mod._store_needs_init(r'C:\\LockedLocalStore')\n"
-                    "        raise AssertionError('local store PermissionError must not be swallowed')\n"
+                    "        raise AssertionError('local store OSError must not be swallowed')\n"
+                    "    except OSError:\n"
+                    "        pass\n"
+                    "def _reachable_root_denied_messages(self):\n"
+                    "    if str(self).endswith('messages'):\n"
+                    "        raise PermissionError('ACL denied on messages')\n"
+                    "    return True\n"
+                    "with mock.patch.object(pathlib.Path, 'is_dir', _reachable_root_denied_messages):\n"
+                    "    try:\n"
+                    "        mod._store_needs_init(r'\\\\wsl.localhost\\Ubuntu\\home\\u\\store')\n"
+                    "        raise AssertionError('reachable WSL share PermissionError on messages must not be swallowed')\n"
                     "    except PermissionError:\n"
                     "        pass\n"
                 )

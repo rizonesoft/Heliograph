@@ -473,13 +473,8 @@ def _store_needs_init(store_path: str) -> bool:
     """Return True if store_path is reachable on Windows and lacks an initialized messages/ directory."""
     if os.name != "nt":
         return False
-    if _extract_wsl_distro(store_path):
-        if not _wsl_share_reachable(store_path):
-            return False
-        try:
-            return not (Path(store_path) / "messages").is_dir()
-        except OSError:
-            return False
+    if not _wsl_share_reachable(store_path):
+        return False
     return not (Path(store_path) / "messages").is_dir()
 
 

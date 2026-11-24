@@ -228,6 +228,17 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
     return sorted(pending)
 
 
+def _sweep_phase_journal_temps(to_dir: Path, install_mod: Any) -> None:
+    """Remove any stale `.phase.journal.json.tmp.*` files left behind by a killed atomic journal write."""
+    removed = False
+    for p in to_dir.glob(f".{PHASE_JOURNAL_NAME}.tmp.*"):
+        if p.is_file() and not p.is_symlink():
+            p.unlink()
+            removed = True
+    if removed:
+        install_mod.fsync_dir(to_dir)
+
+
 def _capture_wsl_previous_b64(to_dir: Path, pre_previous: dict[str, Any], install_mod: Any) -> tuple[str, str]:
     """Read-only capture of helio.old and helio.exe.old as verified base64 strings stored inside phase.journal.json."""
     old_h = to_dir / "helio.old"
@@ -1107,6 +1118,7 @@ def _rollback_phase_journal(
     if jp.exists():
         jp.unlink()
         install_mod.fsync_dir(to_dir)
+    _sweep_phase_journal_temps(to_dir, install_mod)
 
 
 _REQUIRED_PHASE_JOURNAL_KEYS = (
@@ -1253,6 +1265,7 @@ def _recover_pending_phase_journal(
         )
         jp.unlink()
         install_mod.fsync_dir(to_dir)
+        _sweep_phase_journal_temps(to_dir, install_mod)
         return None
     if state == "notifying":
         # Idempotently release any stranded Windows marker.
@@ -1277,6 +1290,7 @@ def _recover_pending_phase_journal(
         )
         jp.unlink()
         install_mod.fsync_dir(to_dir)
+        _sweep_phase_journal_temps(to_dir, install_mod)
         return {
             "phase": int(journal["phase"]),
             "commit": str(journal["commit"]),
@@ -1487,6 +1501,7 @@ def run_phase_install(
                 )
                 if resumed is not None and _resumed_matches_request(resumed, commit):
                     return resumed
+            _sweep_phase_journal_temps(to_dir, install_mod)
 
             # Write durable `acquiring` journal FIRST, THEN acquire the Windows phase marker, THEN probe
             # Windows pre-transaction state under that exclusive marker! This guarantees:
@@ -1733,6 +1748,7 @@ def run_phase_install(
             if jp.exists():
                 jp.unlink()
                 install_mod.fsync_dir(to_dir)
+            _sweep_phase_journal_temps(to_dir, install_mod)
 
             return {
                 "phase": phase,
