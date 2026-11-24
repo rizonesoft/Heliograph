@@ -169,17 +169,36 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
         p_sections = [s for s in sections if isinstance(s, dict) and s.get("phase") == pnum]
         if not p_sections or not all(s.get("status") == "verified" for s in p_sections):
             continue
-        head_closed, head_parked, _head_installed_sha, head_files, _head_co_cnt, _head_co_file, _head_co_lines = _scan_run_files("HEAD", pnum)
+        head_closed, head_parked, head_installed_sha, head_files, head_co_cnt, head_co_file, head_co_lines = _scan_run_files("HEAD", pnum)
         if not head_closed or head_parked:
             continue
-        # Owning-layer Git truth: find the latest commit on HEAD touching this phase's run files.
-        # If that commit is NOT an ancestor of origin/main (`rem_sha`), HEAD has unpushed closeout/receipt edits
-        # (including amended same-heading closeouts or competing receipts) -> ALWAYS pending!
-        # If it IS an ancestor of `rem_sha` (including stale checkouts strictly behind a newer receipted closeout
-        # and unrelated local commits touching other files), `origin/main`'s published receipt settles the phase
-        # ONLY if the receipt's referenced commit is an ancestor of `rem_sha` AND already contained the exact
-        # same closeout count and latest closeout block (preventing a renewed or repeated identical closeout from
-        # inheriting an earlier closeout's installation, while allowing post-receipt CI notes).
+        rem_closed, rem_parked, rem_installed_sha, _rem_files, rem_co_cnt, rem_co_file, rem_co_lines = _scan_run_files(rem_sha, pnum)
+        rem_settled = False
+        if rem_closed and not rem_parked and bool(rem_installed_sha):
+            inst_anc = subprocess.run(
+                ["git", "-C", str(repo), "merge-base", "--is-ancestor", rem_installed_sha, rem_sha],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if inst_anc.returncode == 0:
+                inst_closed, inst_parked, _inst_sha, _inst_files, inst_co_cnt, inst_co_file, inst_co_lines = _scan_run_files(rem_installed_sha, pnum)
+                rem_settled = (
+                    inst_closed
+                    and not inst_parked
+                    and inst_co_cnt == rem_co_cnt
+                    and inst_co_file == rem_co_file
+                    and inst_co_lines == rem_co_lines
+                )
+        if not rem_settled:
+            pending.append(pnum)
+            continue
+        # `origin/main` has a valid published receipt bound to its latest closeout.
+        # If HEAD's last run-file commit is an ancestor of `origin/main` (stale checkouts or unrelated local commits),
+        # the phase is settled. If HEAD has unpushed run-file commits, it stays settled ONLY when HEAD's closeout
+        # count, file, body, and receipt SHA all match `origin/main` (e.g. unpushed post-receipt CI notes);
+        # any unpushed amended closeout or competing receipt remains pending!
         rl = subprocess.run(
             ["git", "-C", str(repo), "rev-list", "-1", "HEAD", "--", *head_files],
             stdin=subprocess.DEVNULL,
@@ -200,31 +219,14 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
         if anc.returncode not in (0, 1):
             _fail(f"cannot compare ancestry for phase {pnum} run files in {repo}: {(anc.stderr or anc.stdout).strip()}")
         if anc.returncode != 0:
-            pending.append(pnum)
-            continue
-        rem_closed, rem_parked, rem_installed_sha, _rem_files, rem_co_cnt, rem_co_file, rem_co_lines = _scan_run_files(rem_sha, pnum)
-        if not (rem_closed and not rem_parked and bool(rem_installed_sha)):
-            pending.append(pnum)
-            continue
-        inst_anc = subprocess.run(
-            ["git", "-C", str(repo), "merge-base", "--is-ancestor", rem_installed_sha, rem_sha],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if inst_anc.returncode != 0:
-            pending.append(pnum)
-            continue
-        inst_closed, inst_parked, _inst_sha, _inst_files, inst_co_cnt, inst_co_file, inst_co_lines = _scan_run_files(rem_installed_sha, pnum)
-        if not (
-            inst_closed
-            and not inst_parked
-            and inst_co_cnt == rem_co_cnt
-            and inst_co_file == rem_co_file
-            and inst_co_lines == rem_co_lines
-        ):
-            pending.append(pnum)
+            same_settled_closeout = (
+                head_installed_sha == rem_installed_sha
+                and head_co_cnt == rem_co_cnt
+                and head_co_file == rem_co_file
+                and head_co_lines == rem_co_lines
+            )
+            if not same_settled_closeout:
+                pending.append(pnum)
     return sorted(pending)
 
 
