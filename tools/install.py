@@ -1703,7 +1703,10 @@ def run_windows_from_wsl(
     if not python_exe or not wslpath_bin:
         raise InstallError("Windows installation from WSL requires python.exe and wslpath on PATH", code=3)
     win_mod = _load_win_install()
-    install_py_win = win_mod.wsl_to_windows_path(Path(__file__).resolve())
+    try:
+        install_py_win = win_mod.wsl_to_windows_path(Path(__file__).resolve())
+    except win_mod.WinInstallError as exc:
+        raise InstallError(str(exc), code=exc.code) from exc
 
     if mode in ("status", "back", "remove"):
         cmd = [python_exe, "-B", install_py_win, "--windows", f"--{mode}", "--reg-key", reg_key]
@@ -1713,24 +1716,36 @@ def run_windows_from_wsl(
         return res.returncode
 
     def_store = repo.parent / "Heliograph-signals"
-    if store_raw:
-        win_store = store_raw if _looks_like_windows_path(store_raw) else win_mod.wsl_to_windows_path(Path(store_raw).resolve())
-    else:
-        win_store = win_mod.wsl_to_windows_path(def_store.resolve())
+    wsl_store_to_init: Path | None = None
+    try:
+        if store_raw:
+            if _looks_like_windows_path(store_raw):
+                win_store = store_raw
+            else:
+                wsl_store_to_init = Path(store_raw).resolve()
+                win_store = win_mod.wsl_to_windows_path(wsl_store_to_init)
+        else:
+            wsl_store_to_init = def_store.resolve()
+            win_store = win_mod.wsl_to_windows_path(wsl_store_to_init)
+    except win_mod.WinInstallError as exc:
+        raise InstallError(str(exc), code=exc.code) from exc
 
     with tempfile.TemporaryDirectory(prefix="helio-win-snap-") as snap_tmp:
         snap_dir = Path(snap_tmp)
         if prebuilt_exe is None:
             helio_src, helio_exe_src, commit, dirty = ensure_sdk_and_build(repo, sdk_url, snap_dir)
-            if not store_raw:
-                _ensure_store_ready(helio_src, def_store.resolve())
+            if wsl_store_to_init is not None:
+                _ensure_store_ready(helio_src, wsl_store_to_init)
         else:
             commit, dirty = git_provenance(repo)
             helio_exe_src = prebuilt_exe
             if not helio_exe_src.is_file():
                 raise InstallError(f"expected Windows executable is missing: {helio_exe_src}", code=3)
         exe_sha = sha256_file(helio_exe_src)
-        win_exe_src = win_mod.wsl_to_windows_path(helio_exe_src)
+        try:
+            win_exe_src = win_mod.wsl_to_windows_path(helio_exe_src)
+        except win_mod.WinInstallError as exc:
+            raise InstallError(str(exc), code=exc.code) from exc
         cmd = [
             python_exe,
             "-B",

@@ -41,14 +41,15 @@ WIN_EXE_NAME = "helio.exe"
 WIN_OLD_EXE_NAME = "helio.exe.old"
 WIN_MANIFEST_NAME = "installed.win.json"
 WIN_JOURNAL_NAME = "install.win.journal.json"
-WIN_LOCK_NAME = ".install.lock"
 WIN_CMD_MARKER = "REM Managed by Heliograph installer"
 DEFAULT_REG_KEY = "Environment"
 HELIO_MARKERS = (b"HELIO_STORE", b"helio passes messages")
 TX_ID_RE = re.compile(r"^[0-9a-f]{12}$")
 WIN_RETIRED_RE = re.compile(r"^\.helio\.exe\.[0-9a-f]{12}\.retired$")
-WIN_RESERVED_ROOT = (WIN_CMD_NAME, WIN_MANIFEST_NAME, WIN_JOURNAL_NAME)
+WIN_RESERVED_ROOT = (WIN_CMD_NAME, WIN_EXE_NAME, WIN_MANIFEST_NAME, WIN_JOURNAL_NAME)
 WIN_RESERVED_BIN = (WIN_EXE_NAME, WIN_OLD_EXE_NAME)
+WIN_ALLOWED_SAVED_KEYS = {WIN_CMD_NAME, f"{WIN_BIN_SUBDIR}/{WIN_EXE_NAME}", f"{WIN_BIN_SUBDIR}/{WIN_OLD_EXE_NAME}"}
+WIN_ALLOWED_EXPECTED_KEYS = WIN_ALLOWED_SAVED_KEYS | {WIN_MANIFEST_NAME}
 BATCH_FORBIDDEN = set('\r\n\x00"%!&|<>^()')
 
 
@@ -162,7 +163,7 @@ def _extract_wsl_distro(store_path: str) -> str | None:
 
 
 def render_win_cmd(default_store: str) -> str:
-    """Render helio.cmd (CRLF) with --store > HELIO_STORE > default_store precedence and WSL check."""
+    """Render helio.cmd (CRLF) forwarding %* directly (no double expansion) with WSL diagnostic."""
     if not default_store or any(ch in BATCH_FORBIDDEN for ch in default_store):
         raise WinInstallError(f"refusing unsafe store path for helio.cmd: {default_store!r}", code=2)
     distro = _extract_wsl_distro(default_store)
@@ -174,24 +175,18 @@ def render_win_cmd(default_store: str) -> str:
         "@echo off",
         WIN_CMD_MARKER,
         "setlocal EnableExtensions",
-        'set "_HELIO_HAS_STORE="',
-        "call :scan_args %*",
-        "if not defined _HELIO_HAS_STORE (",
-        "  if not defined HELIO_STORE (",
-        f'    set "HELIO_STORE={default_store}"',
-        f'    if not exist "{default_store}\\." (',
-        f"      >&2 echo {err_msg}",
-        "      exit /b 3",
-        "    )",
-        "  )",
+        'set "_HELIO_USED_DEFAULT="',
+        "if not defined HELIO_STORE (",
+        f'  set "HELIO_STORE={default_store}"',
+        '  set "_HELIO_USED_DEFAULT=1"',
         ")",
         '"%~dp0bin\\helio.exe" %*',
-        "exit /b %ERRORLEVEL%",
-        ":scan_args",
-        'if "%~1"=="" exit /b 0',
-        'if /I "%~1"=="--store" set "_HELIO_HAS_STORE=1"',
-        "shift",
-        "goto :scan_args",
+        'set "_HELIO_RC=%ERRORLEVEL%"',
+        'if not "%_HELIO_RC%"=="0" if defined _HELIO_USED_DEFAULT if not exist "' + default_store + '\\." (',
+        f"  >&2 echo {err_msg}",
+        "  exit /b 3",
+        ")",
+        "exit /b %_HELIO_RC%",
     ]
     return "\r\n".join(lines) + "\r\n"
 
@@ -203,10 +198,18 @@ def default_win_to_dir() -> Path:
     return Path.home() / "AppData" / "Local" / "Heliograph"
 
 
+def _locks_root() -> Path:
+    return Path(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()) / "Heliograph-locks"
+
+
+def _dest_lock_path(win_to: Path) -> Path:
+    digest = hashlib.sha256(str(win_to.resolve()).lower().encode("utf-8")).hexdigest()[:16]
+    return _locks_root() / f".dest-{digest}.lock"
+
+
 def _reg_lock_path(reg_key: str) -> Path:
     digest = hashlib.sha256(reg_key.strip().lower().encode("utf-8")).hexdigest()[:16]
-    base = Path(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()) / "Heliograph-locks"
-    return base / f".reg-{digest}.lock"
+    return _locks_root() / f".reg-{digest}.lock"
 
 
 @contextlib.contextmanager
@@ -240,12 +243,11 @@ def acquire_win_lock(lock_path: Path, *, blocking: bool, timeout: float = 30.0):
         os.close(fd)
 
 
-def _norm_path_entry(entry: str) -> str:
-    return entry.strip().strip('"').rstrip("\\/").lower()
-
-
-def _split_path_entries(raw: str) -> list[str]:
-    return [part for part in raw.split(";") if part.strip()]
+def _norm_path_entry(entry: str, *, expand_env: bool = True) -> str:
+    cleaned = entry.strip().strip('"')
+    if expand_env and "%" in cleaned:
+        cleaned = os.path.expandvars(cleaned)
+    return cleaned.rstrip("\\/").lower()
 
 
 def broadcast_environment_change() -> bool:
@@ -283,46 +285,60 @@ def read_reg_path(reg_key: str) -> tuple[bool, str, int]:
 
 
 def ensure_reg_path_entry(reg_key: str, folder: Path) -> tuple[bool, bool, int]:
-    """Ensure folder is on HKCU\\<reg_key>\\Path once, preserving all other entries and kind.
+    """Ensure folder is on HKCU\\<reg_key>\\Path once, preserving raw delimiters, % vars and kind.
 
     Returns (added_now, existed_before, original_kind).
     """
     if os.name != "nt" or winreg is None:
         raise WinInstallError("Windows registry operations require Windows Python", code=3)
     folder_str = str(folder.resolve())
-    target_norm = _norm_path_entry(folder_str)
+    target_norm = _norm_path_entry(folder_str, expand_env=False)
     existed, raw_val, val_type = read_reg_path(reg_key)
-    entries = _split_path_entries(raw_val)
-    if any(_norm_path_entry(e) == target_norm for e in entries):
+    expand_existing = val_type == int(winreg.REG_EXPAND_SZ)
+    segments = raw_val.split(";") if raw_val else []
+    if any(seg.strip() and _norm_path_entry(seg, expand_env=expand_existing) == target_norm for seg in segments):
         return False, existed, val_type
-    new_entries = entries + [folder_str]
-    new_val = ";".join(new_entries)
+    if not raw_val:
+        new_val = folder_str
+    elif raw_val.endswith(";"):
+        new_val = raw_val + folder_str
+    else:
+        new_val = raw_val + ";" + folder_str
     write_kind = val_type if existed else int(winreg.REG_EXPAND_SZ)
     with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, reg_key, 0, winreg.KEY_SET_VALUE) as key:
         winreg.SetValueEx(key, "Path", 0, write_kind, new_val)
-    broadcast_environment_change()
+    if not broadcast_environment_change():
+        raise WinInstallError("WM_SETTINGCHANGE environment broadcast failed", code=3)
     return True, existed, val_type
 
 
 def remove_reg_path_entry(reg_key: str, folder: Path, *, path_had_value: bool) -> bool:
-    """Surgically remove only folder from HKCU\\<reg_key>\\Path, preserving intervening edits and kind."""
+    """Surgically remove ONE matching folder entry from HKCU\\<reg_key>\\Path, preserving raw delimiters and kind."""
     if os.name != "nt" or winreg is None:
         raise WinInstallError("Windows registry operations require Windows Python", code=3)
     folder_str = str(folder.resolve())
-    target_norm = _norm_path_entry(folder_str)
+    target_norm = _norm_path_entry(folder_str, expand_env=False)
     existed, raw_val, val_type = read_reg_path(reg_key)
     if not existed:
         return False
-    entries = _split_path_entries(raw_val)
-    remaining = [e for e in entries if _norm_path_entry(e) != target_norm]
-    if len(remaining) == len(entries):
+    expand_existing = val_type == int(winreg.REG_EXPAND_SZ)
+    segments = raw_val.split(";")
+    removed_idx: int | None = None
+    for idx, seg in enumerate(segments):
+        if seg.strip() and _norm_path_entry(seg, expand_env=expand_existing) == target_norm:
+            removed_idx = idx
+            break
+    if removed_idx is None:
         return False
+    remaining = segments[:removed_idx] + segments[removed_idx + 1 :]
+    new_val = ";".join(remaining)
     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_key, 0, winreg.KEY_SET_VALUE) as key:
-        if not remaining and not path_had_value:
+        if not new_val and not path_had_value:
             winreg.DeleteValue(key, "Path")
         else:
-            winreg.SetValueEx(key, "Path", 0, val_type, ";".join(remaining))
-    broadcast_environment_change()
+            winreg.SetValueEx(key, "Path", 0, val_type, new_val)
+    if not broadcast_environment_change():
+        raise WinInstallError("WM_SETTINGCHANGE environment broadcast failed", code=3)
     return True
 
 
@@ -346,6 +362,9 @@ def read_win_manifest(win_to: Path) -> dict[str, Any] | None:
 def _verify_win_ownership(win_to: Path, manifest: dict[str, Any] | None, *, require_live: bool = False) -> None:
     for name in WIN_RESERVED_ROOT:
         _check_regular_or_absent(win_to / name)
+    root_exe = win_to / WIN_EXE_NAME
+    if root_exe.exists() or _is_reparse_or_symlink(root_exe):
+        raise WinInstallError(f"refusing top-level {root_exe} which would shadow {WIN_CMD_NAME} on PATH", code=2)
     bin_dir = win_to / WIN_BIN_SUBDIR
     if _is_reparse_or_symlink(bin_dir):
         raise WinInstallError(f"refusing symlink bin directory: {bin_dir}", code=2)
@@ -355,7 +374,6 @@ def _verify_win_ownership(win_to: Path, manifest: dict[str, Any] | None, *, requ
         _check_regular_or_absent(bin_dir / name)
 
     if manifest is None:
-        # Refuse any pre-existing reserved files when no manifest exists.
         for p in (win_to / WIN_CMD_NAME, bin_dir / WIN_EXE_NAME, bin_dir / WIN_OLD_EXE_NAME):
             if p.exists():
                 raise WinInstallError(f"refusing unowned file at {p} (no {WIN_MANIFEST_NAME})", code=2)
@@ -477,7 +495,39 @@ def _validate_win_journal(journal: Any, win_to: Path, reg_key: str) -> dict[str,
         raise WinInstallError("Windows install journal target mismatch", code=2)
     if str(journal.get("reg_key", "")).lower() != reg_key.lower():
         raise WinInstallError("Windows install journal registry key mismatch", code=2)
+    temp_files = journal.get("temp_files", [])
+    if not isinstance(temp_files, list) or any(not _is_valid_win_temp(t, tx_id) for t in temp_files):
+        raise WinInstallError("Windows install journal temp_files contains invalid entries", code=2)
+    if journal.get("phase") == "staging":
+        return journal
+    expected = journal.get("expected_hashes", {})
+    if not isinstance(expected, dict) or any(k not in WIN_ALLOWED_EXPECTED_KEYS for k in expected):
+        raise WinInstallError("Windows install journal expected_hashes contains disallowed paths", code=2)
+    saved = journal.get("saved_files", {})
+    if not isinstance(saved, dict) or any(k not in WIN_ALLOWED_SAVED_KEYS for k in saved):
+        raise WinInstallError("Windows install journal saved_files contains disallowed paths", code=2)
+    for meta in saved.values():
+        if not isinstance(meta, dict):
+            raise WinInstallError("Windows install journal saved_files entry is invalid", code=2)
+        rec_name = meta.get("rec_name")
+        if rec_name is not None and not _is_valid_win_temp(rec_name, tx_id):
+            raise WinInstallError(f"Windows install journal rec_name is invalid: {rec_name}", code=2)
+    retired = journal.get("retired", [])
+    if not isinstance(retired, list) or any(not isinstance(r, str) or not WIN_RETIRED_RE.fullmatch(r) for r in retired):
+        raise WinInstallError("Windows install journal retired list contains invalid entries", code=2)
     return journal
+
+
+def _desired_win_hashes(desired: dict[str, Any] | None) -> dict[str, str | None]:
+    if not isinstance(desired, dict):
+        return {}
+    cur = desired.get("current") or {}
+    prev = desired.get("previous") or {}
+    return {
+        WIN_CMD_NAME: cur.get("helio_cmd_sha256"),
+        f"{WIN_BIN_SUBDIR}/{WIN_EXE_NAME}": cur.get("helio_exe_sha256"),
+        f"{WIN_BIN_SUBDIR}/{WIN_OLD_EXE_NAME}": prev.get("helio_exe_sha256"),
+    }
 
 
 def recover_win_if_needed(win_to: Path, reg_key: str) -> bool:
@@ -516,7 +566,14 @@ def recover_win_if_needed(win_to: Path, reg_key: str) -> bool:
             p = win_to / rel
             if p.exists():
                 p.unlink()
-        _sweep_retired_exes(win_to / WIN_BIN_SUBDIR, journal.get("retired", []))
+        still_busy = _sweep_retired_exes(win_to / WIN_BIN_SUBDIR, journal.get("retired", []))
+        if still_busy:
+            journal["retired"] = still_busy
+            _write_json_atomic(jp, journal)
+            raise WinInstallError(
+                f"remove recovery paused: retired executable(s) still in use: {', '.join(still_busy)}",
+                code=3,
+            )
         jp.unlink()
         _prune_empty_win_dirs(win_to)
         return True
@@ -526,7 +583,6 @@ def recover_win_if_needed(win_to: Path, reg_key: str) -> bool:
     current_manifest = read_win_manifest(win_to)
 
     if desired is not None and current_manifest == desired:
-        # Commit point reached: ensure Path matches desired state and clean temp files.
         if desired.get("path_added"):
             ensure_reg_path_entry(reg_key, win_to)
         _cleanup_win_temps(win_to, temp_files, tx_id)
@@ -535,9 +591,24 @@ def recover_win_if_needed(win_to: Path, reg_key: str) -> bool:
 
     if journal.get("had_manifest") and current_manifest is None:
         raise WinInstallError(f"recovery refusing journal claiming had_manifest=True when {WIN_MANIFEST_NAME} is absent", code=2)
+    if current_manifest is not None and current_manifest != prev_manifest and current_manifest != desired:
+        raise WinInstallError(f"recovery refusing externally modified {WIN_MANIFEST_NAME}", code=2)
 
-    # Roll back files from .rec snapshots.
     saved: dict[str, dict[str, Any]] = journal.get("saved_files", {})
+    desired_hashes = _desired_win_hashes(desired)
+
+    # Verify live files before rolling back so externally created/edited files are never overwritten or deleted.
+    for rel, meta in saved.items():
+        target = win_to / rel
+        if not target.exists() and not _is_reparse_or_symlink(target):
+            continue
+        _check_regular_or_absent(target)
+        actual = sha256_file(target)
+        allowed = {h for h in (meta.get("sha256"), desired_hashes.get(rel)) if h}
+        if actual not in allowed:
+            raise WinInstallError(f"recovery refusing externally created or modified file at {target}", code=2)
+
+    extra_retired: list[str] = list(journal.get("retired", []))
     for rel, meta in saved.items():
         target = win_to / rel
         if meta.get("existed"):
@@ -551,17 +622,24 @@ def recover_win_if_needed(win_to: Path, reg_key: str) -> bool:
             if restore_tmp.exists():
                 restore_tmp.unlink()
             _copy_to_staged(rec_path, restore_tmp)
-            _replace_win_exe(restore_tmp, target, tx_id)
+            ret = _replace_win_exe(restore_tmp, target, tx_id)
+            if ret and ret not in extra_retired:
+                extra_retired.append(ret)
         else:
             if target.exists():
                 target.unlink()
 
-    # Roll back Path only if this uncommitted install added it.
     if journal.get("path_added_this_tx"):
         remove_reg_path_entry(reg_key, win_to, path_had_value=bool(journal.get("path_had_value", True)))
 
     if journal.get("had_manifest") and isinstance(prev_manifest, dict):
-        _write_json_atomic(win_to / WIN_MANIFEST_NAME, prev_manifest)
+        restored_manifest = dict(prev_manifest)
+        merged_retired = list(restored_manifest.get("retired", []))
+        for r in extra_retired:
+            if r not in merged_retired:
+                merged_retired.append(r)
+        restored_manifest["retired"] = _sweep_retired_exes(win_to / WIN_BIN_SUBDIR, merged_retired)
+        _write_json_atomic(win_to / WIN_MANIFEST_NAME, restored_manifest)
     else:
         mp = win_to / WIN_MANIFEST_NAME
         if mp.exists():
@@ -578,13 +656,9 @@ def _prune_empty_win_dirs(win_to: Path) -> None:
         with contextlib.suppress(OSError):
             if not any(bin_dir.iterdir()):
                 bin_dir.rmdir()
-    # Keep lock file deletion safe; only remove win_to if no user files remain (ignoring .install.lock).
     if win_to.is_dir():
-        entries = [p.name for p in win_to.iterdir() if p.name != WIN_LOCK_NAME]
-        if not entries:
-            with contextlib.suppress(OSError):
-                (win_to / WIN_LOCK_NAME).unlink()
-            with contextlib.suppress(OSError):
+        with contextlib.suppress(OSError):
+            if not any(win_to.iterdir()):
                 win_to.rmdir()
 
 
@@ -616,14 +690,8 @@ def win_install(
     on_boundary: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Install helio.exe into <win_to>\\bin, helio.cmd into <win_to>, and add <win_to> to HKCU\\<reg_key>\\Path."""
-    if not source_exe.is_file() or not _is_heliograph_pe(source_exe):
-        raise WinInstallError(f"source executable is missing or not a Heliograph PE binary: {source_exe}", code=3)
-    actual_sha = sha256_file(source_exe)
-    if source_sha256 is not None and actual_sha != source_sha256:
-        raise WinInstallError(
-            f"source executable hash mismatch for {source_exe}: expected {source_sha256[:12]}, actual {actual_sha[:12]}",
-            code=3,
-        )
+    if not source_exe.is_file():
+        raise WinInstallError(f"source executable is missing: {source_exe}", code=3)
 
     cmd_text = render_win_cmd(store_path)
     cmd_bytes = cmd_text.encode("utf-8")
@@ -634,10 +702,15 @@ def win_install(
     dest.mkdir(parents=True, exist_ok=True)
     bin_dir.mkdir(parents=True, exist_ok=True)
 
-    with acquire_win_lock(dest / WIN_LOCK_NAME, blocking=False):
+    with acquire_win_lock(_dest_lock_path(dest), blocking=False):
         with acquire_win_lock(_reg_lock_path(reg_key), blocking=True):
             recover_win_if_needed(dest, reg_key)
             existing = read_win_manifest(dest)
+            if existing is not None and str(existing.get("reg_key", reg_key)).lower() != reg_key.lower():
+                raise WinInstallError(
+                    f"destination {dest} is managed under registry key HKCU\\{existing['reg_key']}, not HKCU\\{reg_key}",
+                    code=2,
+                )
             _verify_win_ownership(dest, existing, require_live=existing is not None)
 
             prev_retired = list(existing.get("retired", [])) if existing else []
@@ -667,6 +740,18 @@ def win_install(
                 on_boundary("after_staging_journal")
 
             try:
+                # Copy source_exe into our locked staging file FIRST, then verify PE identity & SHA-256 on the staged bytes!
+                stage_exe = bin_dir / f".helio.exe.{tx_id}.stage"
+                _copy_to_staged(source_exe, stage_exe)
+                if not _is_heliograph_pe(stage_exe):
+                    raise WinInstallError(f"staged executable is not a Heliograph PE binary: {source_exe}", code=3)
+                actual_sha = sha256_file(stage_exe)
+                if source_sha256 is not None and actual_sha != source_sha256:
+                    raise WinInstallError(
+                        f"staged executable hash mismatch for {source_exe}: expected {source_sha256[:12]}, actual {actual_sha[:12]}",
+                        code=3,
+                    )
+
                 saved: dict[str, dict[str, Any]] = {}
                 for rel, rec_rel in (
                     (WIN_CMD_NAME, f".helio.cmd.{tx_id}.rec"),
@@ -680,26 +765,38 @@ def win_install(
                     else:
                         saved[rel] = {"existed": False, "rec_name": None, "sha256": None}
 
-                stage_exe = bin_dir / f".helio.exe.{tx_id}.stage"
-                _copy_to_staged(source_exe, stage_exe)
-
                 previous_entry: dict[str, Any] | None = None
                 rotate_old = False
                 if existing is not None:
                     prev_cur = existing["current"]
-                    previous_entry = {
-                        "commit": prev_cur["commit"],
-                        "dirty": bool(prev_cur.get("dirty", False)),
-                        "installed_at": prev_cur.get("installed_at"),
-                        "helio_exe_sha256": prev_cur["helio_exe_sha256"],
-                        "helio_cmd_sha256": prev_cur["helio_cmd_sha256"],
-                        "store": prev_cur["store"],
-                    }
-                    rotate_old = True
+                    same_install = (
+                        prev_cur.get("helio_exe_sha256") == actual_sha
+                        and prev_cur.get("store") == store_path
+                        and prev_cur.get("commit") == commit
+                        and bool(prev_cur.get("dirty", False)) == dirty
+                    )
+                    if same_install:
+                        # Identical reinstall: preserve the previous distinct rollback generation!
+                        previous_entry = existing.get("previous")
+                        rotate_old = False
+                    else:
+                        previous_entry = {
+                            "commit": prev_cur["commit"],
+                            "dirty": bool(prev_cur.get("dirty", False)),
+                            "installed_at": prev_cur.get("installed_at"),
+                            "helio_exe_sha256": prev_cur["helio_exe_sha256"],
+                            "helio_cmd_sha256": prev_cur["helio_cmd_sha256"],
+                            "store": prev_cur["store"],
+                        }
+                        rotate_old = True
 
                 path_existed_before, raw_path_before, path_kind_before = read_reg_path(reg_key)
-                target_norm = _norm_path_entry(str(dest))
-                already_on_path = any(_norm_path_entry(e) == target_norm for e in _split_path_entries(raw_path_before))
+                target_norm = _norm_path_entry(str(dest), expand_env=False)
+                expand_existing = os.name == "nt" and winreg is not None and path_kind_before == int(winreg.REG_EXPAND_SZ)
+                already_on_path = any(
+                    seg.strip() and _norm_path_entry(seg, expand_env=expand_existing) == target_norm
+                    for seg in (raw_path_before.split(";") if raw_path_before else [])
+                )
                 prior_path_added = bool(existing.get("path_added", False)) if existing else False
                 prior_path_had_value = bool(existing.get("path_had_value", path_existed_before)) if existing else path_existed_before
                 path_added_this_tx = not already_on_path
@@ -736,6 +833,7 @@ def win_install(
                     "path_had_value": prior_path_had_value,
                     "saved_files": saved,
                     "temp_files": temp_files,
+                    "retired": list(remaining_retired),
                     "desired_manifest": desired_manifest,
                 }
                 _write_json_atomic(dest / WIN_JOURNAL_NAME, journal)
@@ -752,6 +850,7 @@ def win_install(
                 retired_name = _replace_win_exe(stage_exe, bin_dir / WIN_EXE_NAME, tx_id)
                 if retired_name:
                     desired_manifest["retired"].append(retired_name)
+                    journal["retired"].append(retired_name)
                     journal["desired_manifest"] = desired_manifest
                     _write_json_atomic(dest / WIN_JOURNAL_NAME, journal)
                 if on_boundary:
@@ -779,7 +878,7 @@ def win_install(
 
 
 def win_status(*, win_to: Path | None = None, reg_key: str = DEFAULT_REG_KEY) -> tuple[int, list[str]]:
-    """Verify Windows installation: live/backup hashes, helio.cmd bytes, Path entry, and store reachability."""
+    """Verify Windows installation: live/backup hashes, helio.cmd bytes, Path entry, and initialized store."""
     dest = (win_to or default_win_to_dir()).resolve()
     bin_dir = dest / WIN_BIN_SUBDIR
     lines: list[str] = []
@@ -791,7 +890,7 @@ def win_status(*, win_to: Path | None = None, reg_key: str = DEFAULT_REG_KEY) ->
     if not (dest / WIN_MANIFEST_NAME).exists():
         present = [
             str(p)
-            for p in (dest / WIN_CMD_NAME, bin_dir / WIN_EXE_NAME, bin_dir / WIN_OLD_EXE_NAME)
+            for p in (dest / WIN_CMD_NAME, dest / WIN_EXE_NAME, bin_dir / WIN_EXE_NAME, bin_dir / WIN_OLD_EXE_NAME)
             if p.exists() or _is_reparse_or_symlink(p)
         ]
         if not present:
@@ -812,6 +911,9 @@ def win_status(*, win_to: Path | None = None, reg_key: str = DEFAULT_REG_KEY) ->
     lines.append(f"store: {cur['store']}")
 
     problems: list[str] = []
+    if (dest / WIN_EXE_NAME).exists() or _is_reparse_or_symlink(dest / WIN_EXE_NAME):
+        problems.append(f"unexpected top-level executable shadowing {WIN_CMD_NAME}: {dest / WIN_EXE_NAME}")
+
     exe_p = bin_dir / WIN_EXE_NAME
     if _is_reparse_or_symlink(exe_p) or not exe_p.is_file():
         problems.append(f"missing or invalid executable: {exe_p}")
@@ -836,14 +938,19 @@ def win_status(*, win_to: Path | None = None, reg_key: str = DEFAULT_REG_KEY) ->
     elif old_p.exists() or _is_reparse_or_symlink(old_p):
         problems.append(f"unexpected backup with no previous generation: {old_p}")
 
-    if os.name == "nt":
-        _, raw_path, _ = read_reg_path(reg_key)
-        if not any(_norm_path_entry(e) == _norm_path_entry(str(dest)) for e in _split_path_entries(raw_path)):
+    recorded_reg_key = str(manifest.get("reg_key") or reg_key)
+    if recorded_reg_key.lower() != reg_key.lower():
+        problems.append(f"registry key mismatch: installed under HKCU\\{recorded_reg_key}, checked HKCU\\{reg_key}")
+    elif os.name == "nt":
+        _, raw_path, val_type = read_reg_path(reg_key)
+        expand_existing = winreg is not None and val_type == int(winreg.REG_EXPAND_SZ)
+        target_norm = _norm_path_entry(str(dest), expand_env=False)
+        if not any(seg.strip() and _norm_path_entry(seg, expand_env=expand_existing) == target_norm for seg in (raw_path.split(";") if raw_path else [])):
             problems.append(f"missing from HKCU\\{reg_key}\\Path: {dest}")
 
     store_p = Path(cur["store"])
-    if not store_p.is_dir():
-        problems.append(f"unreachable store: {cur['store']}")
+    if not store_p.is_dir() or not (store_p / "messages").is_dir():
+        problems.append(f"uninitialized or unreachable store: {cur['store']}")
 
     if problems:
         lines.extend(problems)
@@ -864,12 +971,18 @@ def win_back(
     if not dest.is_dir():
         raise WinInstallError(f"cannot roll back: {dest} does not exist", code=2)
 
-    with acquire_win_lock(dest / WIN_LOCK_NAME, blocking=False):
+    with acquire_win_lock(_dest_lock_path(dest), blocking=False):
         with acquire_win_lock(_reg_lock_path(reg_key), blocking=True):
             recover_win_if_needed(dest, reg_key)
             manifest = read_win_manifest(dest)
             if manifest is None:
                 raise WinInstallError(f"cannot roll back: {dest / WIN_MANIFEST_NAME} is missing", code=2)
+            recorded_reg = str(manifest.get("reg_key") or reg_key)
+            if recorded_reg.lower() != reg_key.lower():
+                raise WinInstallError(
+                    f"cannot roll back: destination {dest} is managed under HKCU\\{recorded_reg}, not HKCU\\{reg_key}",
+                    code=2,
+                )
             prev = manifest.get("previous")
             if not isinstance(prev, dict):
                 raise WinInstallError("cannot roll back: no previous Windows installation is recorded", code=2)
@@ -916,6 +1029,7 @@ def win_back(
                     saved[rel] = {"existed": True, "rec_name": rec_rel, "sha256": sha256_file(dest / rec_rel)}
 
                 cur = manifest["current"]
+                swept_retired = _sweep_retired_exes(bin_dir, list(manifest.get("retired", [])))
                 desired_manifest = dict(manifest)
                 desired_manifest["current"] = {
                     "commit": prev["commit"],
@@ -933,7 +1047,7 @@ def win_back(
                     "helio_cmd_sha256": cur["helio_cmd_sha256"],
                     "store": cur["store"],
                 }
-                desired_manifest["retired"] = _sweep_retired_exes(bin_dir, list(manifest.get("retired", [])))
+                desired_manifest["retired"] = list(swept_retired)
 
                 journal = {
                     "schema_version": 2,
@@ -948,6 +1062,7 @@ def win_back(
                     "path_had_value": bool(manifest.get("path_had_value", True)),
                     "saved_files": saved,
                     "temp_files": temp_files,
+                    "retired": list(swept_retired),
                     "desired_manifest": desired_manifest,
                 }
                 _write_json_atomic(dest / WIN_JOURNAL_NAME, journal)
@@ -963,6 +1078,7 @@ def win_back(
                 retired_name = _replace_win_exe(stage_exe, bin_dir / WIN_EXE_NAME, tx_id)
                 if retired_name:
                     desired_manifest["retired"].append(retired_name)
+                    journal["retired"].append(retired_name)
                     journal["desired_manifest"] = desired_manifest
                     _write_json_atomic(dest / WIN_JOURNAL_NAME, journal)
                 if on_boundary:
@@ -997,7 +1113,7 @@ def win_remove(
         return False
 
     removed_any = False
-    with acquire_win_lock(dest / WIN_LOCK_NAME, blocking=False):
+    with acquire_win_lock(_dest_lock_path(dest), blocking=False):
         with acquire_win_lock(_reg_lock_path(reg_key), blocking=True):
             recovered = recover_win_if_needed(dest, reg_key)
             manifest = read_win_manifest(dest)
@@ -1011,6 +1127,13 @@ def win_remove(
                 if any((dest / r).exists() for r in owned_rels):
                     _verify_win_ownership(dest, None)
                 return recovered
+
+            recorded_reg = str(manifest.get("reg_key") or reg_key)
+            if recorded_reg.lower() != reg_key.lower():
+                raise WinInstallError(
+                    f"refusing remove: destination {dest} is managed under HKCU\\{recorded_reg}, not HKCU\\{reg_key}",
+                    code=2,
+                )
 
             _verify_win_ownership(dest, manifest)
             expected: dict[str, str] = {}
@@ -1054,13 +1177,20 @@ def win_remove(
                     if on_boundary:
                         on_boundary(f"after_unlink_{rel.replace('/', '_').replace('.', '_')}")
 
-                _sweep_retired_exes(bin_dir, retired_list)
+                still_busy = _sweep_retired_exes(bin_dir, retired_list)
+                if still_busy:
+                    journal["retired"] = still_busy
+                    _write_json_atomic(dest / WIN_JOURNAL_NAME, journal)
+                    raise WinInstallError(
+                        f"removed active files, but retired executable(s) are still in use: {', '.join(still_busy)}; "
+                        "rerun --windows --remove after they exit",
+                        code=3,
+                    )
                 (dest / WIN_JOURNAL_NAME).unlink()
             except BaseException as exc:
                 _handle_win_failure(exc, dest, reg_key)
                 raise
 
-    # Outside the lock handle so Windows lets us remove .install.lock and empty dest!
     _prune_empty_win_dirs(dest)
     return removed_any or recovered
 
