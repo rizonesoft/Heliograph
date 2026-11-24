@@ -57,6 +57,8 @@ title: "TODO-01 -- Heliograph"
 
 > **Started:** 2026-11-24T19:09Z
 
+**Corrected 2026-11-24:** Incorporated all seven Plan review findings (`docs/reviews/01-heliograph/D01-T01-s01.md`): (1) Build `p_remove` first (before `change_job`), implementing durable file removal + parent-folder flush in `src/plat_linux.c` (`unlink` + `settle` via `fsync(dir_fd)`, tolerating `EINVAL`/`ENOTSUP`) and `src/plat_windows.c` (`DeleteFileW` with transient sharing retry + parent-folder `CreateFileW(FILE_FLAG_BACKUP_SEMANTICS)`/`FlushFileBuffers`, tolerating `ERROR_ACCESS_DENIED`/`ERROR_INVALID_FUNCTION`/`ERROR_NOT_SUPPORTED`/`ERROR_INVALID_PARAMETER`, returning `P_MISSING` on `ERROR_FILE_NOT_FOUND`/`ERROR_PATH_NOT_FOUND` and `P_FAILED` on other errors); exercise both Linux and Windows binaries on existing-file deletion, neighbor preservation, `P_MISSING` on repeat, and observable `P_FAILED` on flush/directory failure. (2) In `store_job`, check the live `<id>.post` via a fresh `live_post` read BEFORE `gap()` decides missing-step damage AND at the full-chain (`MOST_LINKS`) return; distinguish proven `P_MISSING` (`S_REFUSED`, `"it was archived"`, exit 2) from read/IO errors (`P_FAILED`/`P_TOO_LARGE` -> `S_DAMAGED`, exit 3), testing with a populated `store_open` snapshot plus a control where the live post exists and a genuine link gap still exits 3. (3) In `change_job`, remove the newly created step ONLY when THIS call created it (`make` returned `S_OK`, never on `P_EXISTS` collision) AND `live_post` returned proven `P_MISSING` (`S_REFUSED`); treat `p_remove` returning `P_OK` or `P_MISSING` as clean (`S_REFUSED`, `"it was archived"`), and surface any `live_post` IO error or `p_remove` `P_FAILED` as `S_DAMAGED` (exit 3) without deleting a live step; crash-after-link-publication orphan sweep using `archive/<year-month>/<id>.post` is explicitly owned by `§2`. (4) Preserve the distinct `S_REFUSED` (`"it was archived"`) result through all callers (`engine/helio.c`: `show`, `into_inbox`, `into_log`, `line`, hook; `engine/watch.c`: `watch_summary`): direct `show` exits 2 with `"it was archived"` and skips `.seen.*`, while live listings/hooks/summary skip concurrently archived messages without printing `"damaged"`, exiting 3, or counting damage. (5) Apply the same post-write second-look + `p_remove` rollback to `store_seen` so a recipient racing archive removal never leaves an orphan `.seen.*` file. (6) Add two independently synchronized pause points in `tests/racer.c` (using a pure C callback on `struct store` that is `NULL` in production): one before `store_job`'s second look (verifying `S_REFUSED` `"it was archived"` with populated `store_open`), and one between `store_job` and `add_link` plus verification that the link was created and then removed (leaving `messages/` empty), plus a paused `store_seen` race test and exact result/reason checks so reverting either guard fails its corresponding test.
+
 Archiving removes files that `store_job` reads one by one. A reader that holds the post while the steps go away would see an open job and take it again. The rule: archiving removes the post first, and whoever reads or makes a step looks for the post again afterwards.
 
 **Phase:** 1
@@ -65,8 +67,9 @@ Archiving removes files that `store_job` reads one by one. A reader that holds t
 
 **Build order:**
 
-1. Add the second look in `engine/store.c`. Done when: a chain whose post is gone is never reported open.
-2. Cover it in `tests/test_helio.py`. Done when: the test fails with the second look removed.
+1. Add `p_remove` to `engine/plat.h`, `src/plat_linux.c`, and `src/plat_windows.c`. Done when: both platform binaries remove an existing file, preserve a neighbor, return `P_MISSING` on repeat, and return `P_FAILED` when delete or required flush fails.
+2. Add the live-post second look and rollback guards to `store_job`, `change_job`, and `store_seen` in `engine/store.c`, and preserve `S_REFUSED` (`"it was archived"`) through callers in `engine/helio.c` and `engine/watch.c`. Done when: a removed post never reads open or damaged, no orphan link or seen mark survives, and IO/flush errors surface as exit 3.
+3. Cover both independent pause points, populated `store_open` snapshots, seen-mark races, error/collision preservation, and `p_remove` in `tests/racer.c` and `tests/test_helio.py`. Done when: each test fails when its corresponding guard is reverted.
 
 - [ ] Look for the live post again at the end of the chain in `store_job` of `engine/store.c` (design, "How is nothing lost or done twice?"). Done when: a removed post gives "it was archived" and exit code 2, never open. Cheaper substitute: waiting a day before archiving.
 - [ ] Look again after a step is made in `change_job` of `engine/store.c`, and remove the step this call made when the post is gone. Done when: no step without a post is left and the call is refused. Cheaper substitute: looking only before.
@@ -77,6 +80,8 @@ Archiving removes files that `store_job` reads one by one. A reader that holds t
 **Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
 
 ## 2. Move a closed message to its month
+
+**Corrected 2026-11-24:** Per `§1` plan review finding 2, `engine/archive.c` (and `store_check` when an archive copy exists) also recognizes and sweeps any crash-orphaned live `<id>.link.*` or `<id>.seen.*` whose `<id>.post` is already in `archive/<year-month>/`, covering a writer killed between publishing a link and removing it.
 
 A job done or refused for 30 days moves to `archive/<year-month>`. The month comes from the message's own id, so the place needs no index. `helio archive` does it, and the first inbox of the day does at most 200.
 
