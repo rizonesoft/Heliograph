@@ -664,9 +664,15 @@ def _rollback_phase_journal(
                 else (cur_win.get("manifest") is None and not cur_win.get("exe_sha"))
             )
             if not win_already_restored:
-                # Verify the live Windows manifest belongs to THIS phase commit and binary before --back or --remove!
+                # Verify the live Windows manifest belongs to THIS phase commit, binary, and store before --back or --remove!
                 expected_win_sha = str(journal.get("proved_win_sha") or "")
-                if cur_win_c.get("commit") != journal.get("commit") or (expected_win_sha and cur_win.get("exe_sha") != expected_win_sha):
+                expected_win_store = str(journal.get("win_store") or "")
+                if (
+                    not expected_win_sha
+                    or cur_win_c.get("commit") != journal.get("commit")
+                    or cur_win.get("exe_sha") != expected_win_sha
+                    or (expected_win_store and cur_win_c.get("store") != expected_win_store)
+                ):
                     errors.append(
                         f"refusing Windows rollback: live installation ({cur_win_c.get('commit')}) does not match phase publication ({journal.get('commit')})"
                     )
@@ -712,7 +718,7 @@ def _rollback_phase_journal(
                 wsl_already_restored = cur_wsl_m is None and not (to_dir / "helio").exists()
             if not wsl_already_restored:
                 expected_wsl_sha = str(journal.get("proved_wsl_sha") or "")
-                if cur_wsl_c.get("commit") != journal.get("commit") or (expected_wsl_sha and cur_wsl_sha != expected_wsl_sha):
+                if not expected_wsl_sha or cur_wsl_c.get("commit") != journal.get("commit") or cur_wsl_sha != expected_wsl_sha:
                     errors.append(
                         f"refusing WSL rollback: live installation ({cur_wsl_c.get('commit')}) does not match phase publication ({journal.get('commit')})"
                     )
@@ -733,6 +739,11 @@ def _rollback_phase_journal(
     # Keep the Windows phase marker active if rollback had ANY error so no concurrent installer can interleave before retry!
     if errors:
         raise install_mod.InstallError("phase rollback incomplete: " + "; ".join(errors), code=3)
+
+    # Durable commit point for rollback: write `phase_state = "rolled_back"` FIRST while `.phase-active.json`
+    # is still held so a crash before unlinking the WSL journal NEVER re-enters rollback!
+    journal["phase_state"] = "rolled_back"
+    install_mod.write_json_atomic(to_dir / PHASE_JOURNAL_NAME, journal)
 
     if tx_id:
         try:
@@ -755,6 +766,8 @@ _REQUIRED_PHASE_JOURNAL_KEYS = (
     "wrapper",
     "store",
     "reg_key",
+    "proved_wsl_sha",
+    "proved_win_sha",
     "wsl_changed",
     "win_changed",
     "wsl_had_install",
@@ -799,8 +812,12 @@ def _read_and_validate_phase_journal(
     tx_id = journal.get("tx_id")
     if not isinstance(tx_id, str) or not re.fullmatch(r"[0-9a-f]{12}", tx_id):
         raise install_mod.InstallError(f"refusing phase journal with invalid tx_id at {jp}", code=2)
-    if journal.get("phase_state") not in ("acquiring", "planned", "wsl_done", "both_done", "notifying", "rolling_back"):
+    if journal.get("phase_state") not in ("acquiring", "planned", "wsl_done", "both_done", "notifying", "rolling_back", "rolled_back"):
         raise install_mod.InstallError(f"refusing phase journal with invalid state at {jp}", code=2)
+    for dkey in ("proved_wsl_sha", "proved_win_sha"):
+        dval = journal.get(dkey)
+        if not isinstance(dval, str) or not re.fullmatch(r"[0-9a-f]{64}", dval):
+            raise install_mod.InstallError(f"refusing phase journal with invalid {dkey} at {jp}", code=2)
     rec_to = journal.get("wsl_to")
     if not isinstance(rec_to, str) or not rec_to or Path(rec_to).resolve() != to_dir.resolve():
         raise install_mod.InstallError(
@@ -861,6 +878,20 @@ def _recover_pending_phase_journal(
     )
 
     state = journal.get("phase_state")
+    if state == "rolled_back":
+        # Rollback already completed durably; idempotently release any surviving Windows marker and unlink the journal.
+        _win_phase_marker_call(
+            python_exe,
+            win_install_py_win,
+            "end",
+            journal.get("win_to_arg"),
+            str(journal["reg_key"]),
+            str(journal["tx_id"]),
+            install_mod=install_mod,
+        )
+        jp.unlink()
+        install_mod.fsync_dir(to_dir)
+        return None
     if state == "notifying":
         # Idempotently release any stranded Windows phase marker from a crash right after writing `notifying`.
         _win_phase_marker_call(
@@ -1110,6 +1141,7 @@ def run_phase_install(
                 "wsl_to": str(to_dir),
                 "wrapper": str(wrapper_path),
                 "store": str(store_dir),
+                "win_store": win_store,
                 "win_to_arg": win_to_raw,
                 "win_dest": win_to_raw or "",
                 "reg_key": reg_key,

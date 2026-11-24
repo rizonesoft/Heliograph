@@ -3489,8 +3489,12 @@ class TestPhaseInstaller(unittest.TestCase):
                 self.assertFalse((to_dir / self.phase_mod.PHASE_JOURNAL_NAME).exists())
                 self.assertEqual(len(list((store_dir / "messages").glob("*.post"))), 1)
 
-                # Missing wrapper.parent on PATH -> fresh-shell check fails, rolls back both hosts to V2, exits 3, zero new notices!
-                with mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}):
+                # Missing wrapper.parent on PATH (while keeping WSL-to-Windows interop tools on PATH!) ->
+                # reaches post-install fresh-shell check, fails with missing-PATH diagnostic, rolls back both hosts to V2, exits 3, zero new notices!
+                path_without_wrapper = os.pathsep.join(
+                    p for p in os.environ.get("PATH", "").split(os.pathsep) if p and Path(p).resolve() != wrapper.parent.resolve()
+                )
+                with mock.patch.dict(os.environ, {"PATH": path_without_wrapper}):
                     with self.assertRaises(self.mod.InstallError) as ctx_nopath:
                         self.phase_mod.run_phase_install(
                             repo=checkout,
@@ -3504,6 +3508,8 @@ class TestPhaseInstaller(unittest.TestCase):
                             install_mod=self.mod,
                         )
                 self.assertEqual(ctx_nopath.exception.code, 3)
+                self.assertIn("PATH", str(ctx_nopath.exception))
+                self.assertNotIn("interop", str(ctx_nopath.exception).lower())
                 self.assertEqual(self.mod.read_manifest(to_dir)["current"]["commit"], head_sha)
                 self.assertEqual(
                     self.phase_mod._probe_win_state(self.python_exe, win_install_py_win, win_to, reg_key)["manifest"]["current"]["commit"],
@@ -4141,9 +4147,12 @@ class TestPhaseInstaller(unittest.TestCase):
                             "wsl_to": str(to_dir.resolve()),
                             "wrapper": str(wrapper.resolve()),
                             "store": str(store_dir.resolve()),
+                            "win_store": win_store,
                             "win_to_arg": win_c_to,
                             "win_dest": win_c_to,
                             "reg_key": reg_key_c,
+                            "proved_wsl_sha": self.mod.sha256_file(to_dir / "helio"),
+                            "proved_win_sha": v3_e_sha,
                             "wsl_had_install": True,
                             "wsl_pre_helio_sha": self.mod.sha256_file(to_dir / "helio"),
                             "wsl_pre_commit": head_sha,
@@ -4174,6 +4183,43 @@ class TestPhaseInstaller(unittest.TestCase):
                         self.assertEqual(st_after["manifest"]["current"]["commit"], v1_commit, boundary_name)
                         self.assertEqual(st_after["manifest"]["previous"]["commit"], "0" * 40, boundary_name)
                     self.phase_mod._run_win_cli(self.python_exe, install_py_win, ["--remove", "--to", win_c_to, "--reg-key", reg_key_c])
+
+                    # 12. Non-UTF-8 Windows `.phase-active.json` marker returns exit 2 cleanly (never UnicodeDecodeError),
+                    # and a `rolled_back` journal never re-enters rollback!
+                    bad_marker_helper = (
+                        "import pathlib, sys\n"
+                        "d = pathlib.Path(sys.argv[1]); d.mkdir(parents=True, exist_ok=True)\n"
+                        "(d / '.phase-active.json').write_bytes(b'\\xff\\xfeinvalid-utf8')\n"
+                    )
+                    subprocess.run([self.python_exe, "-B", "-c", bad_marker_helper, win_c_to], check=True, stdin=subprocess.DEVNULL)
+                    r_bad_m = self.phase_mod._run_win_cli(
+                        self.python_exe,
+                        install_py_win,
+                        ["--source-exe", self.win_mod.wsl_to_windows_path(v1_e), "--source-sha256", v1_e_sha, "--commit", v1_commit, "--store", win_store, "--to", win_c_to, "--reg-key", reg_key_c],
+                    )
+                    self.assertEqual(r_bad_m.returncode, 2, r_bad_m.stdout + r_bad_m.stderr)
+
+                    rb_done_j = {
+                        **crashed_journal,
+                        "schema_version": 2,
+                        "managed_by": "heliograph-phase-installer",
+                        "phase_state": "rolled_back",
+                        "wsl_changed": True,
+                        "win_changed": True,
+                    }
+                    self.mod.write_json_atomic(to_dir / self.phase_mod.PHASE_JOURNAL_NAME, rb_done_j)
+                    self.phase_mod._recover_pending_phase_journal(
+                        to_dir=to_dir,
+                        wrapper_path=wrapper,
+                        store_dir=store_dir,
+                        win_to_raw=win_to,
+                        reg_key=reg_key,
+                        python_exe=self.python_exe,
+                        install_py_win=install_py_win,
+                        win_install_py_win=win_install_py_win,
+                        install_mod=self.mod,
+                    )
+                    self.assertFalse((to_dir / self.phase_mod.PHASE_JOURNAL_NAME).exists())
                 finally:
                     self._delete_reg_key(reg_key_c)
                     self._cleanup_win_parent(win_c_to)

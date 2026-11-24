@@ -877,8 +877,10 @@ def _check_win_phase_marker(dest: Path, phase_tx_id: str | None) -> None:
         raise WinInstallError(f"refusing symlink phase marker at {mp}", code=2)
     try:
         data = json.loads(mp.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise WinInstallError(f"corrupt Windows phase marker at {mp}: {exc}", code=3) from exc
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise WinInstallError(f"refusing invalid or foreign Windows phase marker at {mp}: {exc}", code=2) from exc
+    except OSError as exc:
+        raise WinInstallError(f"cannot read Windows phase marker at {mp}: {exc}", code=3) from exc
     if not isinstance(data, dict) or data.get("managed_by") != "heliograph-phase-installer":
         raise WinInstallError(f"refusing unowned phase marker at {mp}", code=2)
     if phase_tx_id is None or data.get("tx_id") != phase_tx_id:
@@ -918,10 +920,13 @@ def win_phase_end(*, win_to: Path | None, tx_id: str) -> None:
             return
         try:
             data = json.loads(mp.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise WinInstallError(f"cannot read Windows phase marker at {mp}: {exc}", code=3) from exc
         if isinstance(data, dict) and data.get("managed_by") == "heliograph-phase-installer" and data.get("tx_id") == tx_id:
-            mp.unlink()
+            try:
+                mp.unlink()
+            except OSError as exc:
+                raise WinInstallError(f"cannot remove Windows phase marker at {mp}: {exc}", code=3) from exc
 
 
 def win_recover(*, win_to: Path | None = None, reg_key: str = DEFAULT_REG_KEY) -> bool:
