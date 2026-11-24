@@ -5142,6 +5142,36 @@ class TestPhaseInstaller(unittest.TestCase):
                 r_rf2_del = subprocess.run([sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"], env=env, capture_output=True, text=True)
                 self.assertEqual(r_rf2_del.returncode, 1, r_rf2_del.stdout + r_rf2_del.stderr)
                 self.assertEqual(json.loads(r_rf2_del.stdout), [0])
+                # Recover the unpublished deletion commit via branch (c): push preserving the deletion commit,
+                # run `run_phase_install`, record `Installed commit:` in the surviving run file, and push -> [] (exit 0) (item 39)!
+                subprocess.run(["git", "-C", str(checkout), "pull", "--rebase", "origin", "main"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(checkout), "push", "origin", "main"], check=True, capture_output=True)
+                del_sha = subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip()
+                with mock.patch.dict(os.environ, {"PATH": path_with_wrapper}):
+                    res_del = self.phase_mod.run_phase_install(
+                        repo=checkout,
+                        phase=0,
+                        to_dir=to_dir,
+                        store_dir=store_dir,
+                        wrapper_path=wrapper,
+                        win_to_raw=win_to,
+                        reg_key=reg_key,
+                        sdk_url="unused",
+                        install_mod=self.mod,
+                    )
+                self.assertEqual(res_del["commit"], del_sha)
+                run_file.write_text(run_file.read_text(encoding="utf-8") + f"\nInstalled commit: {del_sha}\n", encoding="utf-8")
+                subprocess.run(["git", "-C", str(checkout), "add", str(run_file)], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(checkout), "commit", "-m", "record installed commit after run-file deletion"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(checkout), "push", "origin", "main"], check=True, capture_output=True)
+                r_rf2_recovered = subprocess.run([sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"], env=env, capture_output=True, text=True)
+                self.assertEqual(r_rf2_recovered.returncode, 0, r_rf2_recovered.stdout + r_rf2_recovered.stderr)
+                self.assertEqual(json.loads(r_rf2_recovered.stdout), [])
+                check_del_preserved = subprocess.run(
+                    ["git", "-C", str(checkout), "cat-file", "-e", "origin/main:docs/phase-runs/2026-11-25-phase-0.md"],
+                    capture_output=True,
+                )
+                self.assertNotEqual(check_del_preserved.returncode, 0, "operator deletion of newer run file must remain preserved on origin/main")
                 # A newer local `## Closeout` committed WITHOUT pushing MUST STILL report [0] (never inherit older remote receipt)!
                 run_file.write_text(run_file.read_text(encoding="utf-8") + "\n## Closeout run=reopened\n\nRe-closed.\n", encoding="utf-8")
                 subprocess.run(["git", "-C", str(checkout), "add", str(run_file)], check=True, capture_output=True)
