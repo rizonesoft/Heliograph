@@ -3566,6 +3566,7 @@ class TestPhaseInstaller(unittest.TestCase):
             self._delete_reg_key(reg_key)
             self._cleanup_win_parent(win_to)
 
+
     def test_previous_program_reads_populated_store_written_by_candidate_and_preserves_keyed_sends(self) -> None:
         with tempfile.TemporaryDirectory(prefix="helio-compat-") as tmp:
             root = Path(tmp)
@@ -3575,30 +3576,40 @@ class TestPhaseInstaller(unittest.TestCase):
             prev_dir = root / "prev"
             prev_dir.mkdir()
 
-            # Build a GENUINE previous engine release from git commit `c4de2fe` (pre-Phase-0 baseline)
-            # so the backward-compatibility test exercises a truly older reader, not a tagged copy of the candidate!
-            prev_src = root / "prev_src"
+            # Build GENUINE previous WSL (`helio`) AND Windows (`helio.exe`) binaries from git commit `c4de2fe`
+            # (pre-Phase-0 baseline) using the pinned ImpossibleSDK build so BOTH hosts exercise a truly older reader!
+            prev_ws = root / "prev_ws"
+            prev_ws.mkdir()
+            real_sdk = REPO.parent / "ImpossibleSDK"
+            self.assertTrue((real_sdk / "tools" / "app_build.py").is_file(), "ImpossibleSDK required to build c4de2fe")
+            os.symlink(real_sdk, prev_ws / "ImpossibleSDK")
+            prev_src = prev_ws / "Heliograph"
             prev_src.mkdir()
-            arch = subprocess.run(["git", "-C", str(REPO), "archive", "c4de2fe", "engine", "src"], capture_output=True, check=True)
-            subprocess.run(["tar", "-x", "-C", str(prev_src)], input=arch.stdout, check=True)
-            prev_h = prev_dir / "helio"
-            cc = shutil.which("cc") or shutil.which("gcc")
-            self.assertIsNotNone(cc, "C compiler required to build baseline c4de2fe engine")
-            c_files = sorted(str(p) for p in (prev_src / "engine").glob("*.c")) + [
-                str(prev_src / "src" / "main_linux.c"),
-                str(prev_src / "src" / "plat_linux.c"),
-            ]
-            subprocess.run(
-                [cc, "-std=c23", "-O2", f"-I{prev_src / 'engine'}", f"-I{prev_src / 'src'}", *c_files, "-o", str(prev_h)],
+            arch = subprocess.run(
+                ["git", "-C", str(REPO), "archive", "c4de2fe", "CMakeLists.txt", "app.json", "sdk.json", "engine", "src", "tests/racer.c", "tests/racer_linux.c", "tests/racer_windows.c"],
+                capture_output=True,
                 check=True,
+            )
+            subprocess.run(["tar", "-x", "-C", str(prev_src)], input=arch.stdout, check=True)
+            (prev_src / "tests" / "test_ok.py").write_text(
+                "import unittest\nclass Ok(unittest.TestCase):\n    def test_ok(self): pass\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                [sys.executable, str(prev_ws / "ImpossibleSDK" / "tools" / "app_build.py"), str(prev_src)],
+                check=True,
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
             )
+            prev_h = prev_dir / "helio"
             prev_e = prev_dir / "helio.exe"
-            make_distinct_binary(self.helio_exe, prev_e, b"PREV_COMPAT_EXE")
+            shutil.copy2(prev_src / "build" / "linux" / "linux" / "helio", prev_h)
+            shutil.copy2(prev_src / "build" / "linux" / "helio.exe", prev_e)
 
             cand_h, cand_e = self.helio_bin, self.helio_exe
             self.assertNotEqual(self.mod.sha256_file(prev_h), self.mod.sha256_file(cand_h))
+            self.assertNotEqual(self.mod.sha256_file(prev_e), self.mod.sha256_file(cand_e))
 
             # Clean env with HELIO_STORE stripped so ambient operator stores are NEVER touched!
             clean_env = {
@@ -3607,81 +3618,138 @@ class TestPhaseInstaller(unittest.TestCase):
                 if k not in ("HELIO_STORE", "HELIO_DEFAULT_STORE", "HELIO_DEFAULT_STORE_HEX", "HELIO_AS")
             }
 
-            # Install genuine previous engine (c4de2fe), then replace with candidate.
-            self.mod.install(
-                repo=REPO,
-                to_dir=to_dir,
-                store_dir=store_dir,
-                wrapper_path=wrapper,
-                prebuilt=(prev_h, prev_e),
-                commit_override="c4de2fe" + "0" * 33,
-                dirty_override=False,
-            )
-            self.mod.install(
-                repo=REPO,
-                to_dir=to_dir,
-                store_dir=store_dir,
-                wrapper_path=wrapper,
-                prebuilt=(cand_h, cand_e),
-                commit_override="b" * 40,
-                dirty_override=False,
-            )
+            # Install genuine previous engine (c4de2fe) on BOTH WSL and Windows, then replace both with candidate.
+            install_py_win = self.win_mod.wsl_to_windows_path(REPO / "tools" / "install.py")
+            win_to = self._win_temp_dir("Helio Compat Win")
+            reg_key = self._new_reg_key()
+            win_store = self.win_mod.wsl_to_windows_path(store_dir)
+            try:
+                self.mod.install(
+                    repo=REPO,
+                    to_dir=to_dir,
+                    store_dir=store_dir,
+                    wrapper_path=wrapper,
+                    prebuilt=(prev_h, prev_e),
+                    commit_override="c4de2fe" + "0" * 33,
+                    dirty_override=False,
+                )
+                self.mod.install(
+                    repo=REPO,
+                    to_dir=to_dir,
+                    store_dir=store_dir,
+                    wrapper_path=wrapper,
+                    prebuilt=(cand_h, cand_e),
+                    commit_override="b" * 40,
+                    dirty_override=False,
+                )
+                for exe_p, cmt in ((prev_e, "c4de2fe" + "0" * 33), (cand_e, "b" * 40)):
+                    rw = self.phase_mod._run_win_cli(
+                        self.python_exe,
+                        install_py_win,
+                        [
+                            "--source-exe",
+                            self.win_mod.wsl_to_windows_path(exe_p),
+                            "--source-sha256",
+                            self.mod.sha256_file(exe_p),
+                            "--commit",
+                            cmt,
+                            "--store",
+                            win_store,
+                            "--to",
+                            win_to,
+                            "--reg-key",
+                            reg_key,
+                        ],
+                    )
+                    self.assertEqual(rw.returncode, 0, rw.stdout + rw.stderr)
 
-            # Candidate populates the store: a heads-up, a taken+done job, and a keyed message.
-            tell_id = subprocess.run(
-                [str(wrapper), "tell", "impossible/all", "compat heads-up", "--as", "impossible/a"],
-                env=clean_env,
-                input="hello from candidate\n",
-                capture_output=True,
-                text=True,
-                check=True,
-            ).stdout.strip().splitlines()[-1]
-            job_id = subprocess.run(
-                [str(wrapper), "ask", "impossible/all", "compat job", "--as", "impossible/a"],
-                env=clean_env,
-                input="job body from candidate\n",
-                capture_output=True,
-                text=True,
-                check=True,
-            ).stdout.strip().splitlines()[-1]
-            subprocess.run([str(wrapper), "take", job_id, "--as", "impossible/b"], env=clean_env, check=True, capture_output=True, text=True)
-            subprocess.run([str(wrapper), "done", job_id, "finished", "--as", "impossible/b"], env=clean_env, check=True, capture_output=True, text=True)
-            keyed_id = subprocess.run(
-                [str(wrapper), "tell", "impossible/all", "compat keyed", "--as", "impossible/a", "--key", "compat-k1"],
-                env=clean_env,
-                input="keyed body\n",
-                capture_output=True,
-                text=True,
-                check=True,
-            ).stdout.strip().splitlines()[-1]
-            msg_count_before = len(list((store_dir / "messages").glob("*.post")))
-            self.assertEqual(msg_count_before, 3)
+                # Candidate populates the store: a heads-up, a taken+done job, and a keyed message.
+                tell_id = subprocess.run(
+                    [str(wrapper), "tell", "impossible/all", "compat heads-up", "--as", "impossible/a"],
+                    env=clean_env,
+                    input="hello from candidate\n",
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout.strip().splitlines()[-1]
+                job_id = subprocess.run(
+                    [str(wrapper), "ask", "impossible/all", "compat job", "--as", "impossible/a"],
+                    env=clean_env,
+                    input="job body from candidate\n",
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout.strip().splitlines()[-1]
+                subprocess.run([str(wrapper), "take", job_id, "--as", "impossible/b"], env=clean_env, check=True, capture_output=True, text=True)
+                subprocess.run([str(wrapper), "done", job_id, "finished", "--as", "impossible/b"], env=clean_env, check=True, capture_output=True, text=True)
+                keyed_id = subprocess.run(
+                    [str(wrapper), "tell", "impossible/all", "compat keyed", "--as", "impossible/a", "--key", "compat-k1"],
+                    env=clean_env,
+                    input="keyed body\n",
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout.strip().splitlines()[-1]
+                msg_count_before = len(list((store_dir / "messages").glob("*.post")))
+                self.assertEqual(msg_count_before, 3)
 
-            # Roll back to genuine previous engine (c4de2fe) and verify `check`, `show`, job state/taker, and keyed-send idempotence!
-            self.mod.go_back(to_dir=to_dir, wrapper_path=wrapper)
-            self.assertEqual(self.mod.sha256_file(to_dir / "helio"), self.mod.sha256_file(prev_h))
+                # Roll back BOTH WSL and Windows to genuine previous engine (c4de2fe)!
+                self.mod.go_back(to_dir=to_dir, wrapper_path=wrapper)
+                self.assertEqual(self.mod.sha256_file(to_dir / "helio"), self.mod.sha256_file(prev_h))
+                rb_win = self.phase_mod._run_win_cli(
+                    self.python_exe, install_py_win, ["--back", "--to", win_to, "--reg-key", reg_key]
+                )
+                self.assertEqual(rb_win.returncode, 0, rb_win.stdout + rb_win.stderr)
+                win_install_py_win = self.win_mod.wsl_to_windows_path(REPO / "tools" / "win_install.py")
+                st_win = self.phase_mod._probe_win_state(self.python_exe, win_install_py_win, win_to, reg_key)
+                self.assertEqual(st_win["exe_sha"], self.mod.sha256_file(prev_e))
 
-            chk = subprocess.run([str(wrapper), "check"], env=clean_env, capture_output=True, text=True)
-            self.assertEqual(chk.returncode, 0, chk.stdout + chk.stderr)
+                # Verify restored WSL c4de2fe reader: check, show, job state/taker, and keyed-send idempotence!
+                chk = subprocess.run([str(wrapper), "check"], env=clean_env, capture_output=True, text=True)
+                self.assertEqual(chk.returncode, 0, chk.stdout + chk.stderr)
+                show_tell = subprocess.run([str(wrapper), "show", tell_id, "--as", "impossible/b"], env=clean_env, capture_output=True, text=True, check=True).stdout
+                self.assertIn("hello from candidate", show_tell)
+                show_job = subprocess.run([str(wrapper), "show", job_id, "--as", "impossible/b"], env=clean_env, capture_output=True, text=True, check=True).stdout
+                self.assertIn("job body from candidate", show_job)
+                self.assertIn("impossible/b", show_job)
+                self.assertIn("done", show_job.lower())
+                retry_keyed_id = subprocess.run(
+                    [str(wrapper), "tell", "impossible/all", "compat keyed", "--as", "impossible/a", "--key", "compat-k1"],
+                    env=clean_env,
+                    input="keyed body\n",
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout.strip().splitlines()[-1]
+                self.assertEqual(retry_keyed_id, keyed_id)
+                self.assertEqual(len(list((store_dir / "messages").glob("*.post"))), msg_count_before)
 
-            show_tell = subprocess.run([str(wrapper), "show", tell_id, "--as", "impossible/b"], env=clean_env, capture_output=True, text=True, check=True).stdout
-            self.assertIn("hello from candidate", show_tell)
+                # Verify restored Windows c4de2fe reader via Windows `helio.cmd` (check, show, job state, keyed-send dedup)!
+                # Note: pre-§16 baseline `c4de2fe` predates `HELIO_DEFAULT_STORE`, so pass `--store <win_store>` via `helio.cmd`.
+                w_chk = self.phase_mod._run_clean_win_helio(self.python_exe, reg_key, ["check", "--store", win_store])
+                self.assertEqual(w_chk.returncode, 0, w_chk.stdout + w_chk.stderr)
+                w_tell = self.phase_mod._run_clean_win_helio(self.python_exe, reg_key, ["show", tell_id, "--as", "impossible/b", "--store", win_store])
+                self.assertEqual(w_tell.returncode, 0, w_tell.stdout + w_tell.stderr)
+                self.assertIn("hello from candidate", w_tell.stdout)
+                w_job = self.phase_mod._run_clean_win_helio(self.python_exe, reg_key, ["show", job_id, "--as", "impossible/b", "--store", win_store])
+                self.assertEqual(w_job.returncode, 0, w_job.stdout + w_job.stderr)
+                self.assertIn("job body from candidate", w_job.stdout)
+                self.assertIn("impossible/b", w_job.stdout)
+                self.assertIn("done", w_job.stdout.lower())
+                w_keyed = self.phase_mod._run_clean_win_helio(
+                    self.python_exe,
+                    reg_key,
+                    ["tell", "impossible/all", "compat keyed", "--as", "impossible/a", "--key", "compat-k1", "--store", win_store],
+                    input_text="keyed body\n",
+                )
+                self.assertEqual(w_keyed.returncode, 0, w_keyed.stdout + w_keyed.stderr)
+                self.assertEqual(w_keyed.stdout.strip().splitlines()[-1], keyed_id)
+                self.assertEqual(len(list((store_dir / "messages").glob("*.post"))), msg_count_before)
 
-            show_job = subprocess.run([str(wrapper), "show", job_id, "--as", "impossible/b"], env=clean_env, capture_output=True, text=True, check=True).stdout
-            self.assertIn("job body from candidate", show_job)
-            self.assertIn("impossible/b", show_job)
-            self.assertIn("done", show_job.lower())
-
-            retry_keyed_id = subprocess.run(
-                [str(wrapper), "tell", "impossible/all", "compat keyed", "--as", "impossible/a", "--key", "compat-k1"],
-                env=clean_env,
-                input="keyed body\n",
-                capture_output=True,
-                text=True,
-                check=True,
-            ).stdout.strip().splitlines()[-1]
-            self.assertEqual(retry_keyed_id, keyed_id)
-            self.assertEqual(len(list((store_dir / "messages").glob("*.post"))), msg_count_before)
+                self.phase_mod._run_win_cli(self.python_exe, install_py_win, ["--remove", "--to", win_to, "--reg-key", reg_key])
+            finally:
+                self._delete_reg_key(reg_key)
+                self._cleanup_win_parent(win_to)
 
     def test_phase_crash_recovery_between_hosts_mid_rollback_and_mixed_host(self) -> None:
         base_plan = {
@@ -3766,8 +3834,8 @@ class TestPhaseInstaller(unittest.TestCase):
                 subprocess.run(["git", "-C", str(checkout), "pull", "--rebase", "origin", "main"], check=True, capture_output=True)
                 head_sha = subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip()
 
-                # 2. Simulate crash BETWEEN WSL install and Windows install using a legacy schema-1 journal
-                # (without `managed_by`, proving upgrade compatibility from schema 1!) -> WSL rolls back to V1!
+                # 2. Simulate crash BETWEEN WSL install and Windows install using a valid schema-2 journal
+                # -> WSL rolls back to V1 and journal is removed!
                 v2_h, v2_e = src_bins / "helio", src_bins / "helio.exe"
                 self.mod.install(
                     repo=checkout,
@@ -3779,7 +3847,8 @@ class TestPhaseInstaller(unittest.TestCase):
                     dirty_override=False,
                 )
                 crashed_journal = {
-                    "schema_version": 1,
+                    "schema_version": 2,
+                    "managed_by": "heliograph-phase-installer",
                     "tx_id": "aabbccddeeff",
                     "phase": 0,
                     "commit": head_sha,
@@ -3787,6 +3856,7 @@ class TestPhaseInstaller(unittest.TestCase):
                     "wsl_to": str(to_dir.resolve()),
                     "wrapper": str(wrapper.resolve()),
                     "store": str(store_dir.resolve()),
+                    "win_store": win_store,
                     "win_to_arg": win_to,
                     "win_dest": win_to,
                     "reg_key": reg_key,
@@ -4294,17 +4364,11 @@ class TestPhaseInstaller(unittest.TestCase):
                     self.assertEqual(st_later["status_code"], 0, st_later["status_lines"])
                     self.assertEqual(st_later["manifest"]["current"]["store"], other_win_store)
 
-                    # 14. Strict lock-token ownership + unblocked retry class regression:
-                    # (a) When an older schema-2 `rolling_back` journal already released `.phase-active.json` before
-                    # crashing and a later ordinary Windows installer published (either different store OR exact same
-                    # release, digest, and store), recovery MUST preserve the later installation untouched AND retire
-                    # `phase.journal.json` so subsequent retries are NOT permanently blocked!
-                    # (b) Direct `--remove --phase-tx` without an active marker is refused inside Windows' dest lock.
-                    # (c) A non-`rolling_back` (`both_done`) schema-2 journal with a missing marker refuses with exit 3.
-                    # (d) Genuine schema-1 journals (no marker) recover BOTH an interrupted inner Windows publication
-                    # (`after_journal`) AND a completed Windows publication (`both_done`, C over B -> restores exact B, A preserved)!
-                    legacy_rb_j = {k: v for k, v in rb_j.items() if k != "win_store"}
-                    legacy_rb_j["phase_state"] = "rolling_back"
+                    # 14. Strict schema-2 lock-token ownership, deterministic repeated missing-marker refusal,
+                    # missing-win_store refusal, and schema-1 refusal tests!
+                    # (a) Repeated recovery against a missing Windows marker (for BOTH different store AND exact same
+                    # release/digest/store) MUST deterministically refuse with exit 3 on TWO consecutive retries
+                    # AND preserve `phase.journal.json` and the later Windows installation untouched!
                     for expected_store in (other_win_store, win_store):
                         if expected_store == win_store:
                             r_same = self.phase_mod._run_win_cli(
@@ -4313,20 +4377,24 @@ class TestPhaseInstaller(unittest.TestCase):
                                 ["--source-exe", self.win_mod.wsl_to_windows_path(v3_e), "--source-sha256", v3_e_sha, "--commit", "3" * 40, "--store", win_store, "--to", win_c_to, "--reg-key", reg_key_c],
                             )
                             self.assertEqual(r_same.returncode, 0, r_same.stdout + r_same.stderr)
-                        self.mod.write_json_atomic(to_dir / self.phase_mod.PHASE_JOURNAL_NAME, legacy_rb_j)
-                        # Recovery preserves the later writer AND retires the journal cleanly (unblocking retries)!
-                        self.phase_mod._recover_pending_phase_journal(
-                            to_dir=to_dir,
-                            wrapper_path=wrapper,
-                            store_dir=store_dir,
-                            win_to_raw=win_c_to,
-                            reg_key=reg_key_c,
-                            python_exe=self.python_exe,
-                            install_py_win=install_py_win,
-                            win_install_py_win=win_install_py_win,
-                            install_mod=self.mod,
-                        )
-                        self.assertFalse((to_dir / self.phase_mod.PHASE_JOURNAL_NAME).exists())
+                        missing_m_j = {**rb_j, "phase_state": "both_done"}
+                        self.mod.write_json_atomic(to_dir / self.phase_mod.PHASE_JOURNAL_NAME, missing_m_j)
+                        for attempt in (1, 2):
+                            with self.assertRaises(self.mod.InstallError) as ctx_mm:
+                                self.phase_mod._recover_pending_phase_journal(
+                                    to_dir=to_dir,
+                                    wrapper_path=wrapper,
+                                    store_dir=store_dir,
+                                    win_to_raw=win_c_to,
+                                    reg_key=reg_key_c,
+                                    python_exe=self.python_exe,
+                                    install_py_win=install_py_win,
+                                    win_install_py_win=win_install_py_win,
+                                    install_mod=self.mod,
+                                )
+                            self.assertEqual(ctx_mm.exception.code, 3, f"attempt {attempt}")
+                            self.assertIn("active phase marker", str(ctx_mm.exception))
+                            self.assertTrue((to_dir / self.phase_mod.PHASE_JOURNAL_NAME).is_file(), f"attempt {attempt}")
                         # Direct `--remove --phase-tx` without an active marker is also refused inside Windows lock!
                         r_no_marker = self.phase_mod._run_win_cli(
                             self.python_exe,
@@ -4337,11 +4405,12 @@ class TestPhaseInstaller(unittest.TestCase):
                         st_still = self.phase_mod._probe_win_state(self.python_exe, win_install_py_win, win_c_to, reg_key_c)
                         self.assertEqual(st_still["status_code"], 0, st_still["status_lines"])
                         self.assertEqual(st_still["manifest"]["current"]["store"], expected_store)
+                        (to_dir / self.phase_mod.PHASE_JOURNAL_NAME).unlink()
 
-                    # (c) Non-rolling_back schema-2 journal (`both_done`) with missing marker refuses with exit 3!
-                    missing_m_j = {**rb_j, "phase_state": "both_done"}
-                    self.mod.write_json_atomic(to_dir / self.phase_mod.PHASE_JOURNAL_NAME, missing_m_j)
-                    with self.assertRaises(self.mod.InstallError) as ctx_mm:
+                    # (b) Schema-2 journal missing required `win_store` -> refused with exit 2 before any mutation!
+                    no_ws_j = {k: v for k, v in rb_j.items() if k != "win_store"}
+                    self.mod.write_json_atomic(to_dir / self.phase_mod.PHASE_JOURNAL_NAME, no_ws_j)
+                    with self.assertRaises(self.mod.InstallError) as ctx_nows:
                         self.phase_mod._recover_pending_phase_journal(
                             to_dir=to_dir,
                             wrapper_path=wrapper,
@@ -4353,94 +4422,303 @@ class TestPhaseInstaller(unittest.TestCase):
                             win_install_py_win=win_install_py_win,
                             install_mod=self.mod,
                         )
-                    self.assertEqual(ctx_mm.exception.code, 3)
-                    self.assertIn("active phase marker", str(ctx_mm.exception))
+                    self.assertEqual(ctx_nows.exception.code, 2)
+                    self.assertTrue((to_dir / self.phase_mod.PHASE_JOURNAL_NAME).is_file())
                     (to_dir / self.phase_mod.PHASE_JOURNAL_NAME).unlink()
-                    self.phase_mod._run_win_cli(self.python_exe, install_py_win, ["--remove", "--to", win_c_to, "--reg-key", reg_key_c])
 
-                    # (d) Genuine schema-1 upgrade recovery (no `.phase-active.json`):
-                    # Install A then B, then test BOTH (i) interrupted inner Windows publication (`after_journal`)
-                    # and (ii) completed Windows publication (`both_done`) of C over B -> both restore exact B with A preserved!
-                    for src_p, sha_p, cmt_p in ((v0_e, v0_e_sha, "0" * 40), (v1_e, v1_e_sha, v1_commit)):
-                        r_s1_ab = self.phase_mod._run_win_cli(
-                            self.python_exe,
-                            install_py_win,
-                            ["--source-exe", self.win_mod.wsl_to_windows_path(src_p), "--source-sha256", sha_p, "--commit", cmt_p, "--store", win_store, "--to", win_c_to, "--reg-key", reg_key_c],
+                    # (c) Unshipped pre-stamp draft `schema_version: 1` journals are refused with exit 2
+                    # leaving journal, Windows marker, and both installations completely untouched!
+                    self.phase_mod._win_phase_marker_call(
+                        self.python_exe, win_install_py_win, "begin", win_c_to, reg_key_c, "111122223333", phase=0, commit="3" * 40, install_mod=self.mod
+                    )
+                    s1_refuse_j = {k: v for k, v in rb_j.items() if k != "managed_by"}
+                    s1_refuse_j["schema_version"] = 1
+                    self.mod.write_json_atomic(to_dir / self.phase_mod.PHASE_JOURNAL_NAME, s1_refuse_j)
+                    wsl_before_s1 = self.mod.sha256_file(to_dir / "helio")
+                    with self.assertRaises(self.mod.InstallError) as ctx_s1:
+                        self.phase_mod._recover_pending_phase_journal(
+                            to_dir=to_dir,
+                            wrapper_path=wrapper,
+                            store_dir=store_dir,
+                            win_to_raw=win_c_to,
+                            reg_key=reg_key_c,
+                            python_exe=self.python_exe,
+                            install_py_win=install_py_win,
+                            win_install_py_win=win_install_py_win,
+                            install_mod=self.mod,
                         )
-                        self.assertEqual(r_s1_ab.returncode, 0, r_s1_ab.stdout + r_s1_ab.stderr)
-                    # (d-i) Schema-1 interrupted at `after_journal` (no marker, B still visible, inner journal pending)
-                    s1_crash_helper = (
-                        "import importlib.util, pathlib, sys\n"
-                        "spec = importlib.util.spec_from_file_location('wi', sys.argv[1])\n"
-                        "mod = importlib.util.module_from_spec(spec)\n"
-                        "spec.loader.exec_module(mod)\n"
-                        "class Crash(BaseException):\n"
-                        "    _leave_journal_for_test = True\n"
-                        "def on_b(b):\n"
-                        "    if b == 'after_journal':\n"
-                        "        raise Crash('boom')\n"
-                        "try:\n"
-                        "    mod.win_install(source_exe=pathlib.Path(sys.argv[2]), source_sha256=sys.argv[3], "
-                        "store_path=sys.argv[4], commit='3'*40, win_to=pathlib.Path(sys.argv[5]), reg_key=sys.argv[6], on_boundary=on_b)\n"
-                        "except Crash:\n"
-                        "    pass\n"
+                    self.assertEqual(ctx_s1.exception.code, 2)
+                    self.assertTrue((to_dir / self.phase_mod.PHASE_JOURNAL_NAME).is_file())
+                    self.assertEqual(self.mod.sha256_file(to_dir / "helio"), wsl_before_s1)
+                    st_s1_untouched = self.phase_mod._probe_win_state(self.python_exe, win_install_py_win, win_c_to, reg_key_c)
+                    self.assertEqual(st_s1_untouched["phase_marker_tx"], "111122223333")
+                    self.assertEqual(st_s1_untouched["exe_sha"], v3_e_sha)
+                    (to_dir / self.phase_mod.PHASE_JOURNAL_NAME).unlink()
+                    self.phase_mod._win_phase_marker_call(
+                        self.python_exe, win_install_py_win, "end", win_c_to, reg_key_c, "111122223333", install_mod=self.mod
                     )
-                    subprocess.run(
-                        [self.python_exe, "-B", "-c", s1_crash_helper, win_install_py_win, self.win_mod.wsl_to_windows_path(v3_e), v3_e_sha, win_store, win_c_to, reg_key_c],
-                        check=True,
-                        stdin=subprocess.DEVNULL,
-                        capture_output=True,
-                    )
-                    s1_win_j = {
-                        k: v for k, v in win_crash_j.items() if k != "managed_by"
-                    }
-                    s1_win_j["schema_version"] = 1
-                    self.mod.write_json_atomic(to_dir / self.phase_mod.PHASE_JOURNAL_NAME, s1_win_j)
-                    self.phase_mod._recover_pending_phase_journal(
-                        to_dir=to_dir,
-                        wrapper_path=wrapper,
-                        store_dir=store_dir,
-                        win_to_raw=win_c_to,
-                        reg_key=reg_key_c,
-                        python_exe=self.python_exe,
-                        install_py_win=install_py_win,
-                        win_install_py_win=win_install_py_win,
-                        install_mod=self.mod,
-                    )
-                    st_s1_int = self.phase_mod._probe_win_state(self.python_exe, win_install_py_win, win_c_to, reg_key_c)
-                    self.assertEqual(st_s1_int["status_code"], 0, st_s1_int["status_lines"])
-                    self.assertEqual(st_s1_int["exe_sha"], v1_e_sha)
-                    self.assertEqual(st_s1_int["manifest"]["previous"]["commit"], "0" * 40)
-                    # (d-ii) Schema-1 completed Windows publication of C over B (`both_done`, no marker) -> rolls back to B!
-                    r_s1_c = self.phase_mod._run_win_cli(
-                        self.python_exe,
-                        install_py_win,
-                        ["--source-exe", self.win_mod.wsl_to_windows_path(v3_e), "--source-sha256", v3_e_sha, "--commit", "3" * 40, "--store", win_store, "--to", win_c_to, "--reg-key", reg_key_c],
-                    )
-                    self.assertEqual(r_s1_c.returncode, 0, r_s1_c.stdout + r_s1_c.stderr)
-                    self.mod.write_json_atomic(to_dir / self.phase_mod.PHASE_JOURNAL_NAME, s1_win_j)
-                    self.phase_mod._recover_pending_phase_journal(
-                        to_dir=to_dir,
-                        wrapper_path=wrapper,
-                        store_dir=store_dir,
-                        win_to_raw=win_c_to,
-                        reg_key=reg_key_c,
-                        python_exe=self.python_exe,
-                        install_py_win=install_py_win,
-                        win_install_py_win=win_install_py_win,
-                        install_mod=self.mod,
-                    )
-                    st_s1_done = self.phase_mod._probe_win_state(self.python_exe, win_install_py_win, win_c_to, reg_key_c)
-                    self.assertEqual(st_s1_done["status_code"], 0, st_s1_done["status_lines"])
-                    self.assertEqual(st_s1_done["exe_sha"], v1_e_sha)
-                    self.assertEqual(st_s1_done["manifest"]["current"]["commit"], v1_commit)
-                    self.assertEqual(st_s1_done["manifest"]["previous"]["commit"], "3" * 40)
                     self.phase_mod._run_win_cli(self.python_exe, install_py_win, ["--remove", "--to", win_c_to, "--reg-key", reg_key_c])
                 finally:
                     self._delete_reg_key(reg_key_c)
                     self._cleanup_win_parent(win_c_to)
 
                 # Clean up Windows installation cleanly
+                self.phase_mod._run_win_cli(self.python_exe, install_py_win, ["--remove", "--to", win_to, "--reg-key", reg_key])
+        finally:
+            self._delete_reg_key(reg_key)
+            self._cleanup_win_parent(win_to)
+
+    def test_failed_phase_restores_both_current_and_previous_generations_on_both_hosts(self) -> None:
+        """A -> B -> failed C restores current=B AND previous=A on both WSL and Windows so ordinary `--back` still restores A."""
+        base_plan = {
+            "phases": {"0": "Phase 0"},
+            "sections": [{"ref": "D01 T01 §15", "phase": 0, "status": "verified"}],
+        }
+        reg_key = self._new_reg_key()
+        win_to = self._win_temp_dir("Helio Prev Gen")
+        try:
+            with tempfile.TemporaryDirectory(prefix="helio-phase-prevgen-") as tmp:
+                root = Path(tmp)
+                checkout, _, _ = self._make_fixture_workspace(root, plan_json=base_plan, bin_tag=b"PREVGEN_C")
+                to_dir = root / "wsl_bin"
+                store_dir = root / "store"
+                wrapper = root / "local" / "helio"
+                install_py_win = self.win_mod.wsl_to_windows_path(REPO / "tools" / "install.py")
+                win_install_py_win = self.win_mod.wsl_to_windows_path(REPO / "tools" / "win_install.py")
+                win_store = self.win_mod.wsl_to_windows_path(store_dir)
+
+                a_h, a_e = self._make_distinct_pair(root / "gen_a", b"GEN_A")
+                b_h, b_e = self._make_distinct_pair(root / "gen_b", b"GEN_B")
+                a_h_sha, a_e_sha = self.mod.sha256_file(a_h), self.mod.sha256_file(a_e)
+                b_h_sha, b_e_sha = self.mod.sha256_file(b_h), self.mod.sha256_file(b_e)
+                a_commit, b_commit = "a" * 40, "b" * 40
+
+                # Install A then B on BOTH WSL and Windows.
+                for hp, ep, cmt in ((a_h, a_e, a_commit), (b_h, b_e, b_commit)):
+                    self.mod.install(
+                        repo=checkout,
+                        to_dir=to_dir,
+                        store_dir=store_dir,
+                        wrapper_path=wrapper,
+                        prebuilt=(hp, ep),
+                        commit_override=cmt,
+                        dirty_override=False,
+                    )
+                    rw = self.phase_mod._run_win_cli(
+                        self.python_exe,
+                        install_py_win,
+                        [
+                            "--source-exe",
+                            self.win_mod.wsl_to_windows_path(ep),
+                            "--source-sha256",
+                            self.mod.sha256_file(ep),
+                            "--commit",
+                            cmt,
+                            "--store",
+                            win_store,
+                            "--to",
+                            win_to,
+                            "--reg-key",
+                            reg_key,
+                        ],
+                    )
+                    self.assertEqual(rw.returncode, 0, rw.stdout + rw.stderr)
+
+                # Run phase C with a planted verification fault -> must roll back BOTH hosts to current=B, previous=A!
+                def fail_verify(_stage: str) -> None:
+                    raise self.mod.InstallError("planted live verification fault", code=3)
+
+                with self.assertRaises(self.mod.InstallError) as ctx:
+                    self.phase_mod.run_phase_install(
+                        repo=checkout,
+                        phase=0,
+                        to_dir=to_dir,
+                        store_dir=store_dir,
+                        wrapper_path=wrapper,
+                        win_to_raw=win_to,
+                        reg_key=reg_key,
+                        sdk_url="unused",
+                        install_mod=self.mod,
+                        on_verify=fail_verify,
+                    )
+                self.assertEqual(ctx.exception.code, 3)
+
+                # Verify WSL has current=B, previous=A, and ordinary `--back` restores A!
+                wsl_m = self.mod.read_manifest(to_dir)
+                self.assertEqual(wsl_m["current"]["commit"], b_commit)
+                self.assertEqual(wsl_m["previous"]["commit"], a_commit)
+                self.assertEqual(self.mod.sha256_file(to_dir / "helio"), b_h_sha)
+                self.assertEqual(self.mod.sha256_file(to_dir / "helio.old"), a_h_sha)
+                self.mod.go_back(to_dir=to_dir, wrapper_path=wrapper)
+                self.assertEqual(self.mod.sha256_file(to_dir / "helio"), a_h_sha)
+                self.assertEqual(self.mod.read_manifest(to_dir)["current"]["commit"], a_commit)
+
+                # Verify Windows has current=B, previous=A, and ordinary `--back` restores A!
+                st_win = self.phase_mod._probe_win_state(self.python_exe, win_install_py_win, win_to, reg_key)
+                self.assertEqual(st_win["status_code"], 0, st_win["status_lines"])
+                self.assertEqual(st_win["exe_sha"], b_e_sha)
+                self.assertEqual(st_win["manifest"]["current"]["commit"], b_commit)
+                self.assertEqual(st_win["manifest"]["previous"]["commit"], a_commit)
+                rb_win = self.phase_mod._run_win_cli(
+                    self.python_exe, install_py_win, ["--back", "--to", win_to, "--reg-key", reg_key]
+                )
+                self.assertEqual(rb_win.returncode, 0, rb_win.stdout + rb_win.stderr)
+                st_win_a = self.phase_mod._probe_win_state(self.python_exe, win_install_py_win, win_to, reg_key)
+                self.assertEqual(st_win_a["status_code"], 0, st_win_a["status_lines"])
+                self.assertEqual(st_win_a["exe_sha"], a_e_sha)
+                self.assertEqual(st_win_a["manifest"]["current"]["commit"], a_commit)
+                self.phase_mod._run_win_cli(self.python_exe, install_py_win, ["--remove", "--to", win_to, "--reg-key", reg_key])
+        finally:
+            self._delete_reg_key(reg_key)
+            self._cleanup_win_parent(win_to)
+
+    def test_pending_phases_and_restart_after_closeout_or_install(self) -> None:
+        """Process-plan skills name --pending-phases, and restart finds closed phases missing their Installed commit receipt."""
+        for rel in (
+            ".agents/skills/process-plan/SKILL.md",
+            ".claude/skills/process-plan/SKILL.md",
+            ".codex/skills/process-plan/SKILL.md",
+            "docs/unattended-prompt.md",
+        ):
+            self.assertIn("--pending-phases", (REPO / rel).read_text(encoding="utf-8"), rel)
+
+        base_plan = {
+            "phases": {"0": "Phase 0"},
+            "sections": [{"ref": "D01 T01 §15", "phase": 0, "status": "verified"}],
+        }
+        reg_key = self._new_reg_key()
+        win_to = self._win_temp_dir("Helio Pending")
+        try:
+            with tempfile.TemporaryDirectory(prefix="helio-phase-pending-") as tmp:
+                root = Path(tmp)
+                checkout, _, _ = self._make_fixture_workspace(root, plan_json=base_plan, bin_tag=b"PENDING_V1")
+                to_dir = root / "wsl_bin"
+                store_dir = root / "store"
+                wrapper = root / "local" / "helio"
+                install_py_win = self.win_mod.wsl_to_windows_path(REPO / "tools" / "install.py")
+                win_install_py_win = self.win_mod.wsl_to_windows_path(REPO / "tools" / "win_install.py")
+                head_sha = subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip()
+
+                # Restart BEFORE install: closed phase lacks `Installed commit:` -> --pending-phases returns [0] (exit 1)!
+                env = {**os.environ, "HELIO_REPO": str(checkout)}
+                r1 = subprocess.run([sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"], env=env, capture_output=True, text=True)
+                self.assertEqual(r1.returncode, 1, r1.stdout + r1.stderr)
+                self.assertEqual(json.loads(r1.stdout), [0])
+
+                # Run installation (now BOTH manifests match HEAD), simulate crash BEFORE recording `Installed commit:`!
+                path_with_wrapper = f"{wrapper.parent}:{os.environ.get('PATH', '')}"
+                with mock.patch.dict(os.environ, {"PATH": path_with_wrapper}):
+                    res = self.phase_mod.run_phase_install(
+                        repo=checkout,
+                        phase=0,
+                        to_dir=to_dir,
+                        store_dir=store_dir,
+                        wrapper_path=wrapper,
+                        win_to_raw=win_to,
+                        reg_key=reg_key,
+                        sdk_url="unused",
+                        install_mod=self.mod,
+                    )
+                self.assertEqual(res["commit"], head_sha)
+                # Restart AFTER install, BEFORE receipt commit: --pending-phases STILL reports [0]!
+                r2 = subprocess.run([sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"], env=env, capture_output=True, text=True)
+                self.assertEqual(r2.returncode, 1)
+                self.assertEqual(json.loads(r2.stdout), [0])
+                # Verify BOTH manifests carry the installed commit!
+                self.assertEqual(self.mod.read_manifest(to_dir)["current"]["commit"], head_sha)
+                st_win = self.phase_mod._probe_win_state(self.python_exe, win_install_py_win, win_to, reg_key)
+                self.assertEqual(st_win["manifest"]["current"]["commit"], head_sha)
+                # Record `Installed commit: <sha>` -> --pending-phases now returns [] (exit 0)!
+                run_file = checkout / "docs" / "phase-runs" / "2026-11-24-phase-0.md"
+                run_file.write_text(run_file.read_text(encoding="utf-8") + f"\nInstalled commit: {head_sha}\n", encoding="utf-8")
+                r3 = subprocess.run([sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"], env=env, capture_output=True, text=True)
+                self.assertEqual(r3.returncode, 0, r3.stdout + r3.stderr)
+                self.assertEqual(json.loads(r3.stdout), [])
+                self.phase_mod._run_win_cli(self.python_exe, install_py_win, ["--remove", "--to", win_to, "--reg-key", reg_key])
+        finally:
+            self._delete_reg_key(reg_key)
+            self._cleanup_win_parent(win_to)
+
+    def test_phase_real_pinned_sdk_nonrecursive_end_to_end(self) -> None:
+        """Exercise one nonrecursive fixture checkout through the REAL pinned ImpossibleSDK app_build.py and prove.py."""
+        if os.environ.get("HELIO_IN_SDK_PHASE_TEST") == "1":
+            self.skipTest("prevent recursion inside nested SDK phase test")
+        real_sdk = REPO.parent / "ImpossibleSDK"
+        if not (real_sdk / "tools" / "app_build.py").is_file() or not (real_sdk / "tools" / "prove.py").is_file():
+            self.skipTest("ImpossibleSDK checkout beside Heliograph is required")
+        reg_key = self._new_reg_key()
+        win_to = self._win_temp_dir("Helio Real SDK")
+        try:
+            with tempfile.TemporaryDirectory(prefix="helio-real-sdk-phase-") as tmp:
+                root = Path(tmp)
+                os.symlink(real_sdk, root / "ImpossibleSDK")
+                checkout = root / "Heliograph"
+                checkout.mkdir()
+                for name in ("CMakeLists.txt", "app.json", "sdk.json", ".gitignore"):
+                    shutil.copy2(REPO / name, checkout / name)
+                for folder in ("engine", "src", "brand"):
+                    if (REPO / folder).is_dir():
+                        shutil.copytree(REPO / folder, checkout / folder)
+                # Minimal nonrecursive test suite with the required cross-host race test name so REAL app_build.py + prove.py run!
+                (checkout / "tests").mkdir()
+                for racer_f in ("racer.c", "racer_linux.c", "racer_windows.c"):
+                    shutil.copy2(REPO / "tests" / racer_f, checkout / "tests" / racer_f)
+                (checkout / "tests" / "test_smoke.py").write_text(
+                    "import os, pathlib, subprocess, unittest\n"
+                    "class Smoke(unittest.TestCase):\n"
+                    "    def test_windows_and_linux_take_each_job_once(self):\n"
+                    "        b = pathlib.Path(os.environ['IMPOSSIBLE_BUILD'])\n"
+                    "        exe = b / 'helio.exe' if os.name == 'nt' else b / 'linux' / 'helio'\n"
+                    "        r = subprocess.run([str(exe), 'help'], capture_output=True, text=True)\n"
+                    "        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)\n",
+                    encoding="utf-8",
+                )
+                (checkout / "scripts").mkdir()
+                (checkout / "scripts" / "todo-graph.py").write_text(
+                    "import json\nprint(json.dumps({'phases': {'0': 'Phase 0'}, 'sections': [{'ref': 'D01 T01 §15', 'phase': 0, 'status': 'verified'}]}))\n",
+                    encoding="utf-8",
+                )
+                (checkout / "docs" / "phase-runs").mkdir(parents=True)
+                (checkout / "docs" / "phase-runs" / "2026-11-24-phase-0.md").write_text(
+                    "# Phase run: Phase 0\n\n## Closeout run=realsdk\n\nAll verified.\n",
+                    encoding="utf-8",
+                )
+                origin = root / "origin.git"
+                subprocess.run(["git", "init", "--bare", "--initial-branch=main", str(origin)], check=True, capture_output=True)
+                subprocess.run(["git", "init", "--initial-branch=main", str(checkout)], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(checkout), "config", "user.name", "Test"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(checkout), "config", "user.email", "t@example.com"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(checkout), "add", "-A"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(checkout), "commit", "-m", "real sdk phase fixture"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(checkout), "remote", "add", "origin", str(origin)], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(checkout), "push", "-u", "origin", "main"], check=True, capture_output=True)
+                head_sha = subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip()
+
+                to_dir = root / "wsl_bin"
+                store_dir = root / "store"
+                wrapper = root / "local" / "helio"
+                install_py_win = self.win_mod.wsl_to_windows_path(REPO / "tools" / "install.py")
+                win_install_py_win = self.win_mod.wsl_to_windows_path(REPO / "tools" / "win_install.py")
+                path_with_wrapper = f"{wrapper.parent}:{os.environ.get('PATH', '')}"
+                with mock.patch.dict(os.environ, {"PATH": path_with_wrapper, "HELIO_IN_SDK_PHASE_TEST": "1"}):
+                    res = self.phase_mod.run_phase_install(
+                        repo=checkout,
+                        phase=0,
+                        to_dir=to_dir,
+                        store_dir=store_dir,
+                        wrapper_path=wrapper,
+                        win_to_raw=win_to,
+                        reg_key=reg_key,
+                        sdk_url="unused",
+                        install_mod=self.mod,
+                    )
+                self.assertEqual(res["commit"], head_sha)
+                built_wsl_sha = self.mod.sha256_file(checkout / "build" / "linux" / "linux" / "helio")
+                built_win_sha = self.mod.sha256_file(checkout / "build" / "linux" / "helio.exe")
+                self.assertEqual(self.mod.sha256_file(to_dir / "helio"), built_wsl_sha)
+                st_win = self.phase_mod._probe_win_state(self.python_exe, win_install_py_win, win_to, reg_key)
+                self.assertEqual(st_win["status_code"], 0, st_win["status_lines"])
+                self.assertEqual(st_win["exe_sha"], built_win_sha)
                 self.phase_mod._run_win_cli(self.python_exe, install_py_win, ["--remove", "--to", win_to, "--reg-key", reg_key])
         finally:
             self._delete_reg_key(reg_key)

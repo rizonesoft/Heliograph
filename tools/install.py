@@ -1834,9 +1834,17 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--back", action="store_true", help="restore the previously installed pair")
     mode.add_argument("--remove", action="store_true", help="remove installer-owned files, leaving the store untouched")
     mode.add_argument("--phase", type=int, default=None, metavar="N", help="replace WSL and Windows programs after phase N is verified and closed")
+    mode.add_argument("--pending-phases", action="store_true", help="list closed phases missing an Installed commit record (JSON; exits 1 if any)")
     args = parser.parse_args(argv)
 
     try:
+        if args.pending_phases:
+            if args.windows or args.win_to is not None:
+                raise InstallError("--pending-phases cannot be combined with --windows or --win-to", code=2)
+            phase_mod = _load_phase_install()
+            pending = phase_mod.find_closed_phases_missing_install(repo)
+            print(json.dumps(pending))
+            return 1 if pending else 0
         if args.phase is not None:
             if args.windows:
                 raise InstallError("--phase replaces both WSL and Windows programs and cannot be combined with --windows", code=2)

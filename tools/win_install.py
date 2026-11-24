@@ -960,6 +960,50 @@ def win_recover(*, win_to: Path | None = None, reg_key: str = DEFAULT_REG_KEY, p
             return recover_win_if_needed(dest, reg_key)
 
 
+WIN_PHASE_PREV_DIR = ".phase-prev-win"
+
+
+def win_phase_snapshot_prev(*, win_to: Path | None, tx_id: str) -> None:
+    """Snapshot bin\\helio.exe.old into .phase-prev-win so failed-phase rollback can restore previous generation A."""
+    dest = (win_to or default_win_to_dir()).resolve()
+    with acquire_win_lock(_dest_lock_path(dest), blocking=False):
+        _check_win_phase_marker(dest, tx_id, require_active=True)
+        old_exe = dest / WIN_BIN_SUBDIR / WIN_OLD_EXE_NAME
+        if not old_exe.is_file() or _is_reparse_or_symlink(old_exe):
+            return
+        snap_dir = dest / WIN_PHASE_PREV_DIR
+        snap_dir.mkdir(parents=True, exist_ok=True)
+        _write_bytes_atomic(snap_dir / WIN_OLD_EXE_NAME, old_exe.read_bytes())
+
+
+def win_phase_restore_prev(*, win_to: Path | None, tx_id: str, pre_previous: dict[str, Any]) -> None:
+    """Restore bin\\helio.exe.old and installed.win.json['previous'] from .phase-prev-win after rollback."""
+    dest = (win_to or default_win_to_dir()).resolve()
+    with acquire_win_lock(_dest_lock_path(dest), blocking=False):
+        _check_win_phase_marker(dest, tx_id, require_active=True)
+        snap_exe = dest / WIN_PHASE_PREV_DIR / WIN_OLD_EXE_NAME
+        if not snap_exe.is_file():
+            raise WinInstallError(f"missing phase previous snapshot at {snap_exe}", code=3)
+        expected_sha = str(pre_previous.get("helio_exe_sha256") or "")
+        if expected_sha and sha256_file(snap_exe) != expected_sha:
+            raise WinInstallError(f"phase previous snapshot hash mismatch at {snap_exe}", code=3)
+        old_exe = dest / WIN_BIN_SUBDIR / WIN_OLD_EXE_NAME
+        _write_bytes_atomic(old_exe, snap_exe.read_bytes())
+        manifest = read_win_manifest(dest)
+        if not isinstance(manifest, dict):
+            raise WinInstallError(f"missing Windows manifest at {dest} when restoring previous generation", code=3)
+        manifest["previous"] = pre_previous
+        _write_json_atomic(dest / WIN_MANIFEST_NAME, manifest)
+
+
+def win_phase_cleanup_prev(*, win_to: Path | None) -> None:
+    """Remove temporary .phase-prev-win directory if present."""
+    dest = (win_to or default_win_to_dir()).resolve()
+    snap_dir = dest / WIN_PHASE_PREV_DIR
+    if snap_dir.is_dir():
+        shutil.rmtree(snap_dir, ignore_errors=True)
+
+
 def win_install(
     *,
     source_exe: Path,
