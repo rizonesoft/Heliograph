@@ -5001,9 +5001,16 @@ class TestPhaseInstaller(unittest.TestCase):
                 r3 = subprocess.run([sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"], env=env, capture_output=True, text=True)
                 self.assertEqual(r3.returncode, 0, r3.stdout + r3.stderr)
                 self.assertEqual(json.loads(r3.stdout), [])
-                # Appending required post-receipt CI notes to the run file MUST NOT reopen an installed phase
+                # Appending required post-receipt CI notes (even quoting an earlier deployment's
+                # `Installed commit: <sha>` in a CI bullet or blockquote) MUST NOT reopen an installed phase
                 # BOTH before pushing (local commit on restart) AND after pushing (item 21)!
-                run_file.write_text(run_file.read_text(encoding="utf-8") + "\n- CI: build.yml green after closeout\n", encoding="utf-8")
+                prior_sha = "b" * 40
+                run_file.write_text(
+                    run_file.read_text(encoding="utf-8")
+                    + f"\n- CI: build.yml green after closeout (replaced prior Installed commit: {prior_sha})\n"
+                    + f"> Installed commit: {prior_sha}\n",
+                    encoding="utf-8",
+                )
                 subprocess.run(["git", "-C", str(checkout), "add", str(run_file)], check=True, capture_output=True)
                 subprocess.run(["git", "-C", str(checkout), "commit", "-m", "append post-receipt CI note"], check=True, capture_output=True)
                 r_ci_note_local = subprocess.run([sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"], env=env, capture_output=True, text=True)

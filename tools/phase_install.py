@@ -152,9 +152,9 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
                     has_open_park = True
                     collecting_co = False
                 elif has_closeout and not has_open_park:
-                    m = re.search(r"Installed commit:\s*`?([0-9a-f]{40})`?", line)
+                    m = re.match(r"^\s*(?:-\s+)?Installed commit:\s*(?:`([0-9a-f]{40})`|([0-9a-f]{40}))\s*$", line)
                     if m:
-                        installed_sha = m.group(1)
+                        installed_sha = m.group(1) or m.group(2)
                         # Stop collecting closeout body once the receipt is written so required post-receipt
                         # CI notes or follow-up entries appended after the receipt never reopen the phase.
                         collecting_co = False
