@@ -2174,9 +2174,21 @@ class TestWindowsInstaller(unittest.TestCase):
                 self.assertIn("WSL", r_init_unr.stderr)
                 self.assertIn(bogus_distro, r_init_unr.stderr)
 
-                # Malformed UNC distro containing ESC (0x1b) never emits raw terminal control bytes on stderr!
+                # Explicit --store pointing to an unavailable UNC distro gets the standard store error
+                # (NOT the installed-default offline-WSL diagnostic!), and malformed ESC bytes are sanitized!
+                r_exp_unr = subprocess.run(
+                    [str(self.helio_exe), "check", "--store", bogus_unc],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(r_exp_unr.returncode, 3)
+                self.assertNotIn("cannot reach WSL store", r_exp_unr.stderr)
+
+                ctrl_env = dict(base_env)
+                ctrl_env["HELIO_DEFAULT_STORE"] = "\\\\wsl.localhost\\\x1b[31mEvil\\store"
                 r_ctrl = subprocess.run(
-                    [str(self.helio_exe), "check", "--store", "\\\\wsl.localhost\\\x1b[31mEvil\\store"],
+                    [str(self.helio_exe), "check"],
+                    env=ctrl_env,
                     capture_output=True,
                 )
                 self.assertEqual(r_ctrl.returncode, 3)
@@ -2246,34 +2258,11 @@ class TestWindowsInstaller(unittest.TestCase):
                 self.assertFalse(retired_file.exists())
                 self.assertEqual(m3["previous"]["helio_exe_sha256"], sha_a)
 
-                # Legacy list-format `retired: [name]`:
-                # - when file bytes match a known manifest generation (e.g. previous exe_a), it IS swept cleanly!
-                # - when file bytes are an unknown/different Heliograph PE, it is REFUSED with exit 2 and preserved!
-                leg_ret_name = ".helio.exe.abcdef012345.retired"
-                leg_ret_file = win_to / "bin" / leg_ret_name
-                exe_c = root / "helio_c.exe"
-                make_distinct_binary(self.helio_exe, exe_c, b"WIN_C_UNKNOWN")
-                shutil.copy2(exe_c, leg_ret_file)
-                mp = win_to / self.win_mod.WIN_MANIFEST_NAME
-                m_leg_raw = json.loads(mp.read_text(encoding="utf-8"))
-                m_leg_raw["retired"] = [leg_ret_name]
-                mp.write_text(json.dumps(m_leg_raw), encoding="utf-8")
-                with self.assertRaises(self.win_mod.WinInstallError) as ctx:
-                    self.win_mod.win_install(source_exe=exe_b, source_sha256=sha_b, store_path=str(s2), commit="b" * 40, win_to=win_to, reg_key=reg_key)
-                self.assertEqual(ctx.exception.code, 2)
-                self.assertTrue(leg_ret_file.is_file())
-                with self.assertRaises(self.win_mod.WinInstallError) as ctx:
-                    self.win_mod.win_remove(win_to=win_to, reg_key=reg_key)
-                self.assertEqual(ctx.exception.code, 2)
-                self.assertTrue(leg_ret_file.is_file())
-                # Now place genuine previous generation exe_a at the legacy retired name -> swept cleanly!
-                shutil.copy2(exe_a, leg_ret_file)
-                m4 = self.win_mod.win_install(source_exe=exe_b, source_sha256=sha_b, store_path=str(s2), commit="b" * 40, win_to=win_to, reg_key=reg_key)
-                self.assertEqual(m4["retired"], {})
-                self.assertFalse(leg_ret_file.exists())
-
                 # Intact earlier-template helio.cmd passes win_status (hash match), and upgrade + win_back
                 # restores the exact earlier helio.cmd bytes!
+                exe_c = root / "helio_c.exe"
+                make_distinct_binary(self.helio_exe, exe_c, b"WIN_C_UNKNOWN")
+                mp = win_to / self.win_mod.WIN_MANIFEST_NAME
                 earlier_cmd_bytes = b"@echo off\r\nREM Managed by Heliograph installer\r\nREM earlier template\r\n"
                 (win_to / "helio.cmd").write_bytes(earlier_cmd_bytes)
                 m_cur = json.loads(mp.read_text(encoding="utf-8"))
@@ -2540,47 +2529,35 @@ class TestWindowsInstaller(unittest.TestCase):
                 self.assertEqual(ctx.exception.code, 2)
                 self.assertEqual((ext_to / "helio.cmd").read_bytes(), b"@echo user restored script\r\n")
 
-                # Legacy list-format `retired: []` in a schema-2 publishing journal (and interrupted recovery after
-                # writing the normalized restored manifest but before unlinking the journal) recovers cleanly on retry!
-                leg_j_to = root / "crash_legacy_list_journal"
+                # Interrupted recovery when restoring A over busy B (pre-recording B's digest in journal BEFORE rename,
+                # and retrying recovery after writing restored manifest before journal unlink) sweeps B cleanly!
+                leg_j_to = root / "crash_recovery_busy_b"
                 self.win_mod.win_install(source_exe=exe_a, source_sha256=sha_a, store_path=str(store), commit="a" * 40, win_to=leg_j_to, reg_key=reg_key)
-                with self.assertRaises(SimulatedCrash):
-                    self.win_mod.win_install(
-                        source_exe=exe_b, source_sha256=sha_b, store_path=str(store), commit="b" * 40, win_to=leg_j_to, reg_key=reg_key,
-                        on_boundary=lambda st: (_ for _ in ()).throw(SimulatedCrash(st)) if st == "after_backup" else None,
-                    )
-                jp_leg = leg_j_to / self.win_mod.WIN_JOURNAL_NAME
-                j_leg_data = json.loads(jp_leg.read_text(encoding="utf-8"))
-                j_leg_data["retired"] = []
-                if isinstance(j_leg_data.get("previous_manifest"), dict):
-                    j_leg_data["previous_manifest"]["retired"] = []
-                saved_leg_journal = json.dumps(j_leg_data)
-                jp_leg.write_text(saved_leg_journal, encoding="utf-8")
-                self.assertTrue(self.win_mod.recover_win_if_needed(leg_j_to, reg_key))
-                self.assertEqual(self.win_mod.sha256_file(leg_j_to / "bin" / "helio.exe"), sha_a)
-                # Simulate crash after writing normalized restored manifest (retired: {}) before journal unlink: retry succeeds!
-                jp_leg.write_text(saved_leg_journal, encoding="utf-8")
-                self.assertTrue(self.win_mod.recover_win_if_needed(leg_j_to, reg_key))
-                self.assertEqual(self.win_mod.sha256_file(leg_j_to / "bin" / "helio.exe"), sha_a)
-
-                # Simulate crash after recovery retired busy B (recording B's digest in restored manifest) before journal unlink: retry succeeds!
                 with self.assertRaises(SimulatedCrash):
                     self.win_mod.win_install(
                         source_exe=exe_b, source_sha256=sha_b, store_path=str(store), commit="b" * 40, win_to=leg_j_to, reg_key=reg_key,
                         on_boundary=lambda st: (_ for _ in ()).throw(SimulatedCrash(st)) if st == "after_exe" else None,
                     )
-                j_busy_raw = jp_leg.read_text(encoding="utf-8")
-                j_busy = json.loads(j_busy_raw)
+                jp_leg = leg_j_to / self.win_mod.WIN_JOURNAL_NAME
+                j_busy = json.loads(jp_leg.read_text(encoding="utf-8"))
                 tx_busy = j_busy["tx_id"]
                 ret_b_name = f".helio.exe.{tx_busy}.retired"
+                # Crash during recovery right after _replace_win_exe renamed B aside and restored A (BEFORE manifest write!).
+                real_replace = self.win_mod._replace_win_exe
+                def crash_after_restore_replace(staged, target, tid):
+                    res = real_replace(staged, target, tid)
+                    if target.name == "helio.exe":
+                        shutil.copy2(exe_b, target.parent / ret_b_name)
+                        raise SimulatedCrash("after_restore_replace")
+                    return res
+                with mock.patch.object(self.win_mod, "_replace_win_exe", side_effect=crash_after_restore_replace):
+                    with self.assertRaises(SimulatedCrash):
+                        self.win_mod.recover_win_if_needed(leg_j_to, reg_key)
+                # Journal already recorded B's digest on disk before rename -> retry sweeps B cleanly!
+                j_after_crash = json.loads(jp_leg.read_text(encoding="utf-8"))
+                self.assertEqual(j_after_crash["retired"].get(ret_b_name), sha_b)
                 self.assertTrue(self.win_mod.recover_win_if_needed(leg_j_to, reg_key))
-                mp_leg = leg_j_to / self.win_mod.WIN_MANIFEST_NAME
-                m_after = json.loads(mp_leg.read_text(encoding="utf-8"))
-                m_after["retired"] = {ret_b_name: sha_b}
-                mp_leg.write_text(json.dumps(m_after), encoding="utf-8")
-                shutil.copy2(exe_b, leg_j_to / "bin" / ret_b_name)
-                jp_leg.write_text(j_busy_raw, encoding="utf-8")
-                self.assertTrue(self.win_mod.recover_win_if_needed(leg_j_to, reg_key))
+                self.assertEqual(self.win_mod.sha256_file(leg_j_to / "bin" / "helio.exe"), sha_a)
                 self.assertFalse((leg_j_to / "bin" / ret_b_name).exists())
                 self.win_mod.win_remove(win_to=leg_j_to, reg_key=reg_key)
 

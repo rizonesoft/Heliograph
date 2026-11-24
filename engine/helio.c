@@ -22,12 +22,12 @@ static const char help[] =
 
 typedef struct options {
     const char *me, *about, *urgency, *folder, *session, *key, *due;
-    bool all;
+    bool all, from_default;
     char *words[4]; /* the command and what follows it */
     int count;
     place here;
     text lane, to;
-    char *me_env, *folder_env, *session_env;
+    char *me_env, *folder_env, *default_env, *session_env;
     const char *why;
 } options;
 
@@ -47,8 +47,9 @@ static bool print(text *out) {
 
 static bool parse(options *o, int count, char **args) {
     *o = (options){.about = "", .urgency = "next", .key = "", .due = "", .why = NULL};
-    o->me_env = p_env("HELIO_AS"), o->folder_env = p_env("HELIO_STORE");
+    o->me_env = p_env("HELIO_AS"), o->folder_env = p_env("HELIO_STORE"), o->default_env = p_env("HELIO_DEFAULT_STORE");
     o->me = o->me_env ? o->me_env : "", o->folder = o->folder_env ? o->folder_env : "";
+    if (!*o->folder && o->default_env && *o->default_env) o->folder = o->default_env, o->from_default = true;
     if (!(o->session_env = p_env("HELIO_SESSION"))) o->session_env = p_env("CLAUDE_CODE_SESSION_ID");
     o->session = o->session_env ? o->session_env : "";
     for (int i = 1; i < count; i++) {
@@ -56,6 +57,7 @@ static bool parse(options *o, int count, char **args) {
         if (value) {
             if (++i == count) return o->why = "an option has no value", false;
             *value = args[i];
+            if (value == &o->folder) o->from_default = false;
         } else if (same(args[i], "--all")) o->all = true;
         else if (same(args[i], "--now")) o->urgency = "now";
         else if (same(args[i], "--whenever")) o->urgency = "whenever";
@@ -289,14 +291,14 @@ static bool fail_wsl_store(const char *folder) {
     return true;
 }
 
-static int init(const char *folder) {
+static int init(const char *folder, bool from_default) {
     text at = {0};
     p_result result = p_folder(folder);
     add(&at, folder), add(&at, "/messages");
     if (result == P_OK) result = at.failed ? P_FAILED : p_folder(at.data);
     text_free(&at);
     if (result == P_OK) return 0;
-    if (fail_wsl_store(folder)) return 3;
+    if (from_default && fail_wsl_store(folder)) return 3;
     return fail("the store cannot be made", 3);
 }
 
@@ -304,7 +306,7 @@ static int run(options *o) {
     const char *command = o->count ? o->words[0] : "inbox";
     if (same(command, "help")) return p_print(help) ? 0 : 3;
     if (!*o->folder) return fail("say where the store is: --store or HELIO_STORE", 2);
-    if (same(command, "init")) return o->count == 1 ? init(o->folder) : fail("init takes no words", 2);
+    if (same(command, "init")) return o->count == 1 ? init(o->folder, o->from_default) : fail("init takes no words", 2);
 
     static const struct { const char *name; int least, most; } commands[] = {
         {"inbox", 0, 1}, {"log", 1, 1}, {"check", 1, 1}, {"show", 2, 2}, {"take", 2, 2}, {"release", 2, 2}, {"done", 2, 3},
@@ -319,7 +321,7 @@ static int run(options *o) {
     store s;
     if (store_open(&s, o->folder) != S_OK) {
         store_close(&s);
-        if (fail_wsl_store(o->folder)) return 3;
+        if (o->from_default && fail_wsl_store(o->folder)) return 3;
         return fail(s.why, 3);
     }
     if ((which == 0 || which == 8) && watch_summary(&s) != S_OK) fail(s.why, 3); /* the inbox is shown all the same */
@@ -363,7 +365,7 @@ static int run(options *o) {
 int helio(int count, char **args) {
     options o;
     int code = parse(&o, count, args) ? run(&o) : fail(o.why, 2);
-    p_free(o.me_env), p_free(o.folder_env), p_free(o.session_env);
+    p_free(o.me_env), p_free(o.folder_env), p_free(o.default_env), p_free(o.session_env);
     text_free(&o.lane), text_free(&o.to), place_close(&o.here);
     return code;
 }
