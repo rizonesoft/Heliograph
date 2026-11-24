@@ -1299,6 +1299,7 @@ class TestQuickInstaller(unittest.TestCase):
             real_os_unlink = os.unlink
             real_os_remove = os.remove
             real_os_rename = os.rename
+            real_os_replace = os.replace
             in_exe_replace = False
             saw_atomic_replace = False
 
@@ -1333,6 +1334,12 @@ class TestQuickInstaller(unittest.TestCase):
                 _probe_exe_during_gap("rename", src)
                 return res
 
+            def _spy_replace(src, dst, *args, **kwargs):
+                res = real_os_replace(src, dst, *args, **kwargs)
+                if Path(os.fspath(dst)).resolve() != exe_target:
+                    _probe_exe_during_gap("replace-away", src)
+                return res
+
             real_replace_atomic = self.mod.replace_binary_atomic
 
             def _wrapped_replace(staged: Path, target: Path) -> None:
@@ -1357,6 +1364,7 @@ class TestQuickInstaller(unittest.TestCase):
                         mock.patch("os.unlink", side_effect=_spy_unlink),
                         mock.patch("os.remove", side_effect=_spy_remove),
                         mock.patch("os.rename", side_effect=_spy_rename),
+                        mock.patch("os.replace", side_effect=_spy_replace),
                     ):
                         self.mod.install(
                             repo=repo,
