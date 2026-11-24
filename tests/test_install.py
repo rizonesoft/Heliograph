@@ -4407,24 +4407,25 @@ class TestPhaseInstaller(unittest.TestCase):
                         self.assertEqual(st_still["manifest"]["current"]["store"], expected_store)
                         (to_dir / self.phase_mod.PHASE_JOURNAL_NAME).unlink()
 
-                    # (b) Schema-2 journal missing required `win_store` -> refused with exit 2 before any mutation!
+                    # (b) Schema-2 journal missing required `win_store` OR with non-integer `phase` -> refused with exit 2 before any mutation!
                     no_ws_j = {k: v for k, v in rb_j.items() if k != "win_store"}
-                    self.mod.write_json_atomic(to_dir / self.phase_mod.PHASE_JOURNAL_NAME, no_ws_j)
-                    with self.assertRaises(self.mod.InstallError) as ctx_nows:
-                        self.phase_mod._recover_pending_phase_journal(
-                            to_dir=to_dir,
-                            wrapper_path=wrapper,
-                            store_dir=store_dir,
-                            win_to_raw=win_c_to,
-                            reg_key=reg_key_c,
-                            python_exe=self.python_exe,
-                            install_py_win=install_py_win,
-                            win_install_py_win=win_install_py_win,
-                            install_mod=self.mod,
-                        )
-                    self.assertEqual(ctx_nows.exception.code, 2)
-                    self.assertTrue((to_dir / self.phase_mod.PHASE_JOURNAL_NAME).is_file())
-                    (to_dir / self.phase_mod.PHASE_JOURNAL_NAME).unlink()
+                    for bad_j in (no_ws_j, {**rb_j, "phase_state": "notifying", "phase": "zero"}):
+                        self.mod.write_json_atomic(to_dir / self.phase_mod.PHASE_JOURNAL_NAME, bad_j)
+                        with self.assertRaises(self.mod.InstallError) as ctx_nows:
+                            self.phase_mod._recover_pending_phase_journal(
+                                to_dir=to_dir,
+                                wrapper_path=wrapper,
+                                store_dir=store_dir,
+                                win_to_raw=win_c_to,
+                                reg_key=reg_key_c,
+                                python_exe=self.python_exe,
+                                install_py_win=install_py_win,
+                                win_install_py_win=win_install_py_win,
+                                install_mod=self.mod,
+                            )
+                        self.assertEqual(ctx_nows.exception.code, 2)
+                        self.assertTrue((to_dir / self.phase_mod.PHASE_JOURNAL_NAME).is_file())
+                        (to_dir / self.phase_mod.PHASE_JOURNAL_NAME).unlink()
 
                     # (c) Unshipped pre-stamp draft `schema_version: 1` journals are refused with exit 2
                     # leaving journal, Windows marker, and both installations completely untouched!
@@ -4712,9 +4713,14 @@ class TestPhaseInstaller(unittest.TestCase):
                 self.assertEqual(self.mod.read_manifest(to_dir)["current"]["commit"], head_sha)
                 st_win = self.phase_mod._probe_win_state(self.python_exe, win_install_py_win, win_to, reg_key)
                 self.assertEqual(st_win["manifest"]["current"]["commit"], head_sha)
-                # Commit `Installed commit: <sha>` -> --pending-phases now returns [] (exit 0)!
+                # Commit `Installed commit: <sha>` locally WITHOUT pushing: MUST STILL report [0] (exit 1)!
                 subprocess.run(["git", "-C", str(checkout), "add", str(run_file)], check=True, capture_output=True)
                 subprocess.run(["git", "-C", str(checkout), "commit", "-m", "record installed commit"], check=True, capture_output=True)
+                r_unpushed = subprocess.run([sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"], env=env, capture_output=True, text=True)
+                self.assertEqual(r_unpushed.returncode, 1, r_unpushed.stdout + r_unpushed.stderr)
+                self.assertEqual(json.loads(r_unpushed.stdout), [0])
+                # Push the receipt commit to origin/main (zero reinstallations!) -> --pending-phases now returns [] (exit 0)!
+                subprocess.run(["git", "-C", str(checkout), "push", "origin", "main"], check=True, capture_output=True)
                 r3 = subprocess.run([sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"], env=env, capture_output=True, text=True)
                 self.assertEqual(r3.returncode, 0, r3.stdout + r3.stderr)
                 self.assertEqual(json.loads(r3.stdout), [])
@@ -4722,6 +4728,7 @@ class TestPhaseInstaller(unittest.TestCase):
                 run_file.write_text(run_file.read_text(encoding="utf-8") + "\n## Closeout run=reopened\n\nRe-closed.\n", encoding="utf-8")
                 subprocess.run(["git", "-C", str(checkout), "add", str(run_file)], check=True, capture_output=True)
                 subprocess.run(["git", "-C", str(checkout), "commit", "-m", "new closeout"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(checkout), "push", "origin", "main"], check=True, capture_output=True)
                 r4 = subprocess.run([sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"], env=env, capture_output=True, text=True)
                 self.assertEqual(r4.returncode, 1, r4.stdout + r4.stderr)
                 self.assertEqual(json.loads(r4.stdout), [0])
@@ -4770,7 +4777,7 @@ class TestPhaseInstaller(unittest.TestCase):
                     "            st = pathlib.Path(td) / 'store'\n"
                     "            subprocess.run([str(linux_h), '--store', str(st), 'init'], check=True, capture_output=True)\n"
                     "            ids = []\n"
-                    "            for i in range(20):\n"
+                    "            for i in range(120):\n"
                     "                out = subprocess.run(\n"
                     "                    [str(linux_h), '--store', str(st), 'ask', 'impossible/all', f'job {i}', '--as', 'impossible/a'],\n"
                     "                    input='body\\n', text=True, capture_output=True, check=True,\n"
@@ -4778,19 +4785,24 @@ class TestPhaseInstaller(unittest.TestCase):
                     "                ids.append(out)\n"
                     "            win_st = subprocess.check_output(['wslpath', '-w', str(st)], text=True).strip()\n"
                     "            p_l = subprocess.Popen([str(linux_r), str(st), 'impossible/lin', *ids], stdin=subprocess.DEVNULL)\n"
-                    "            p_w = subprocess.Popen([str(win_r), win_st, 'impossible/win', *ids[::-1]], stdin=subprocess.DEVNULL)\n"
+                    "            p_w1 = subprocess.Popen([str(win_r), win_st, 'impossible/win1', *ids[::-1]], stdin=subprocess.DEVNULL)\n"
+                    "            p_w2 = subprocess.Popen([str(win_r), win_st, 'impossible/win2', *ids[::-1]], stdin=subprocess.DEVNULL)\n"
+                    "            procs = (p_l, p_w1, p_w2)\n"
                     "            try:\n"
                     "                for _ in range(300):\n"
-                    "                    if len(list(st.glob('ready.*'))) == 2:\n"
+                    "                    if len(list(st.glob('ready.*'))) == len(procs):\n"
                     "                        break\n"
                     "                    time.sleep(0.1)\n"
+                    "                self.assertEqual(len(list(st.glob('ready.*'))), len(procs), 'all racers must reach barrier')\n"
                     "                (st / 'go').write_text('x', encoding='utf-8')\n"
-                    "                won = [p_l.wait(60), p_w.wait(60)]\n"
+                    "                won = [p.wait(60) for p in procs]\n"
                     "            finally:\n"
-                    "                for p in (p_l, p_w):\n"
+                    "                for p in procs:\n"
                     "                    if p.poll() is None:\n"
                     "                        p.kill()\n"
                     "            self.assertEqual(sum(won), len(ids), won)\n"
+                    "            self.assertGreater(won[0], 0, f'Linux must win jobs: {won}')\n"
+                    "            self.assertGreater(won[1] + won[2], 0, f'Windows must win jobs: {won}')\n"
                     "            log_out = subprocess.run([str(linux_h), '--store', str(st), 'log'], capture_output=True, text=True, check=True).stdout\n"
                     "            self.assertEqual(log_out.count('request taken by'), len(ids))\n",
                     encoding="utf-8",

@@ -66,6 +66,47 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
         _fail(f"cannot read committed docs/phase-runs from HEAD in {repo}: {(ls_res.stderr or ls_res.stdout).strip()}")
     committed_run_paths = sorted(p.strip() for p in ls_res.stdout.splitlines() if p.strip())
 
+    # Check whether local HEAD is pushed to `origin/main` so a local-only receipt commit is still reported pending!
+    head_pushed = True
+    rem_url = subprocess.run(
+        ["git", "-C", str(repo), "config", "--get", "remote.origin.url"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if rem_url.returncode == 0 and rem_url.stdout.strip():
+        head_res = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        ls_rem = subprocess.run(
+            ["git", "-C", str(repo), "ls-remote", "origin", "refs/heads/main"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if head_res.returncode != 0 or ls_rem.returncode != 0:
+            _fail(f"cannot verify origin/main push state in {repo}")
+        head_sha = head_res.stdout.strip()
+        rem_lines = [ln.strip() for ln in ls_rem.stdout.splitlines() if ln.strip()]
+        rem_sha = rem_lines[0].split()[0] if rem_lines else ""
+        if not rem_sha:
+            head_pushed = False
+        elif rem_sha != head_sha:
+            anc = subprocess.run(
+                ["git", "-C", str(repo), "merge-base", "--is-ancestor", head_sha, rem_sha],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            head_pushed = anc.returncode == 0
+
     pending: list[int] = []
     declared_phases = data["phases"]
     sections = data.get("sections") if isinstance(data.get("sections"), list) else []
@@ -104,7 +145,7 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
                     has_open_park = True
                 elif has_closeout and not has_open_park and re.search(r"Installed commit:\s*`?[0-9a-f]{40}`?", line):
                     has_installed_commit = True
-        if has_closeout and not has_open_park and not has_installed_commit:
+        if has_closeout and not has_open_park and (not has_installed_commit or not head_pushed):
             pending.append(pnum)
     return sorted(pending)
 
@@ -1044,6 +1085,9 @@ def _read_and_validate_phase_journal(
     tx_id = journal.get("tx_id")
     if not isinstance(tx_id, str) or not re.fullmatch(r"[0-9a-f]{12}", tx_id):
         raise install_mod.InstallError(f"refusing phase journal with invalid tx_id at {jp}", code=2)
+    phase_val = journal.get("phase")
+    if isinstance(phase_val, bool) or not isinstance(phase_val, int) or phase_val < 0:
+        raise install_mod.InstallError(f"refusing phase journal with invalid phase {phase_val!r} at {jp}", code=2)
     if journal.get("phase_state") not in ("acquiring", "planned", "wsl_done", "both_done", "notifying", "rolling_back", "rolled_back"):
         raise install_mod.InstallError(f"refusing phase journal with invalid state at {jp}", code=2)
     for dkey in ("proved_wsl_sha", "proved_win_sha"):
@@ -1517,6 +1561,11 @@ def run_phase_install(
                     if win_had_install:
                         win_pre_prev = (win_pre_manifest or {}).get("previous")
                         if isinstance(win_pre_prev, dict):
+                            # Persist `win_prev_snapshotted = True` BEFORE creating the Windows snapshot so a crash
+                            # right after Windows writes the file always cleans it up on rollback!
+                            journal["win_prev_snapshotted"] = True
+                            journal["win_pre_previous"] = win_pre_prev
+                            install_mod.write_json_atomic(to_dir / PHASE_JOURNAL_NAME, journal)
                             _win_phase_marker_call(
                                 python_exe,
                                 win_install_py_win,
@@ -1526,8 +1575,6 @@ def run_phase_install(
                                 tx_id,
                                 install_mod=install_mod,
                             )
-                            journal["win_prev_snapshotted"] = True
-                            journal["win_pre_previous"] = win_pre_prev
                         else:
                             journal["win_pre_previous"] = None
                     journal["win_changed"] = True
