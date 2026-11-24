@@ -42,6 +42,7 @@ WIN_EXE_NAME = "helio.exe"
 WIN_OLD_EXE_NAME = "helio.exe.old"
 WIN_MANIFEST_NAME = "installed.win.json"
 WIN_JOURNAL_NAME = "install.win.journal.json"
+WIN_PHASE_MARKER_NAME = ".phase-active.json"
 WIN_CMD_MARKER = "REM Managed by Heliograph installer"
 WIN_SH_MARKER = "# Managed by Heliograph installer"
 DEFAULT_REG_KEY = "Environment"
@@ -868,6 +869,71 @@ def _handle_win_failure(exc: BaseException, win_to: Path, reg_key: str) -> None:
     raise exc
 
 
+def _check_win_phase_marker(dest: Path, phase_tx_id: str | None) -> None:
+    mp = dest / WIN_PHASE_MARKER_NAME
+    if not mp.exists() and not _is_reparse_or_symlink(mp):
+        return
+    if _is_reparse_or_symlink(mp):
+        raise WinInstallError(f"refusing symlink phase marker at {mp}", code=2)
+    try:
+        data = json.loads(mp.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise WinInstallError(f"corrupt Windows phase marker at {mp}: {exc}", code=3) from exc
+    if not isinstance(data, dict) or data.get("managed_by") != "heliograph-phase-installer":
+        raise WinInstallError(f"refusing unowned phase marker at {mp}", code=2)
+    if phase_tx_id is None or data.get("tx_id") != phase_tx_id:
+        raise WinInstallError(
+            f"refusing Windows operation while phase transaction {data.get('tx_id', '?')} is active on {dest}",
+            code=3,
+        )
+
+
+def win_phase_begin(*, win_to: Path | None, reg_key: str, tx_id: str, phase: int, commit: str) -> Path:
+    """Acquire exclusive phase ownership on a Windows destination."""
+    dest = (win_to or default_win_to_dir()).resolve()
+    dest.mkdir(parents=True, exist_ok=True)
+    with acquire_win_lock(_dest_lock_path(dest), blocking=False):
+        _check_win_phase_marker(dest, tx_id)
+        _write_json_atomic(
+            dest / WIN_PHASE_MARKER_NAME,
+            {
+                "managed_by": "heliograph-phase-installer",
+                "tx_id": tx_id,
+                "phase": phase,
+                "commit": commit,
+                "reg_key": reg_key,
+            },
+        )
+    return dest
+
+
+def win_phase_end(*, win_to: Path | None, tx_id: str) -> None:
+    """Release phase ownership on a Windows destination if owned by tx_id."""
+    dest = (win_to or default_win_to_dir()).resolve()
+    mp = dest / WIN_PHASE_MARKER_NAME
+    if not dest.is_dir() or not mp.exists():
+        return
+    with acquire_win_lock(_dest_lock_path(dest), blocking=False):
+        if not mp.exists() or _is_reparse_or_symlink(mp):
+            return
+        try:
+            data = json.loads(mp.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if isinstance(data, dict) and data.get("managed_by") == "heliograph-phase-installer" and data.get("tx_id") == tx_id:
+            mp.unlink()
+
+
+def win_recover(*, win_to: Path | None = None, reg_key: str = DEFAULT_REG_KEY) -> bool:
+    """Acquire destination & registry locks and recover any pending inner Windows install/back/remove journal."""
+    dest = (win_to or default_win_to_dir()).resolve()
+    if not dest.is_dir():
+        return False
+    with acquire_win_lock(_dest_lock_path(dest), blocking=False):
+        with acquire_win_lock(_reg_lock_path(reg_key), blocking=True):
+            return recover_win_if_needed(dest, reg_key)
+
+
 def win_install(
     *,
     source_exe: Path,
@@ -877,6 +943,7 @@ def win_install(
     dirty: bool = False,
     win_to: Path | None = None,
     reg_key: str = DEFAULT_REG_KEY,
+    phase_tx_id: str | None = None,
     on_boundary: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Install helio.exe into <win_to>\\bin, helio.cmd into <win_to>, and add <win_to> to HKCU\\<reg_key>\\Path."""
@@ -899,6 +966,7 @@ def win_install(
 
     with acquire_win_lock(_dest_lock_path(dest), blocking=False):
         with acquire_win_lock(_reg_lock_path(reg_key), blocking=True):
+            _check_win_phase_marker(dest, phase_tx_id)
             recover_win_if_needed(dest, reg_key)
             existing = read_win_manifest(dest)
             if existing is not None and str(existing.get("reg_key", reg_key)).lower() != reg_key.lower():
@@ -1276,6 +1344,7 @@ def win_back(
     *,
     win_to: Path | None = None,
     reg_key: str = DEFAULT_REG_KEY,
+    phase_tx_id: str | None = None,
     on_boundary: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Restore the previous Windows generation (helio.exe.old and previous store)."""
@@ -1286,6 +1355,7 @@ def win_back(
 
     with acquire_win_lock(_dest_lock_path(dest), blocking=False):
         with acquire_win_lock(_reg_lock_path(reg_key), blocking=True):
+            _check_win_phase_marker(dest, phase_tx_id)
             recover_win_if_needed(dest, reg_key)
             manifest = read_win_manifest(dest)
             if manifest is None:
@@ -1466,6 +1536,7 @@ def win_remove(
     *,
     win_to: Path | None = None,
     reg_key: str = DEFAULT_REG_KEY,
+    phase_tx_id: str | None = None,
     on_boundary: Callable[[str], None] | None = None,
 ) -> bool:
     """Remove installer-owned files and undo only the owned Path entry; leave unrelated files intact."""
@@ -1477,6 +1548,7 @@ def win_remove(
     removed_any = False
     with acquire_win_lock(_dest_lock_path(dest), blocking=False):
         with acquire_win_lock(_reg_lock_path(reg_key), blocking=True):
+            _check_win_phase_marker(dest, phase_tx_id)
             recovered = recover_win_if_needed(dest, reg_key)
             manifest = read_win_manifest(dest)
             owned_rels = [

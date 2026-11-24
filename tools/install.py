@@ -1828,6 +1828,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--source-sha256", type=str, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--commit", type=str, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--dirty", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--phase-tx", type=str, default=None, help=argparse.SUPPRESS)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--status", action="store_true", help="verify and print the installed commit and health")
     mode.add_argument("--back", action="store_true", help="restore the previously installed pair")
@@ -1883,13 +1884,13 @@ def main(argv: list[str] | None = None) -> int:
                         print(line)
                     return code
                 if args.back:
-                    manifest = win_mod.win_back(win_to=win_to, reg_key=args.reg_key)
+                    manifest = win_mod.win_back(win_to=win_to, reg_key=args.reg_key, phase_tx_id=args.phase_tx)
                     cur = manifest["current"]
                     label = f"{cur['commit']} (dirty)" if cur.get("dirty") else cur["commit"]
                     print(f"restored {label} in {(win_to or win_mod.default_win_to_dir()).resolve()}")
                     return 0
                 if args.remove:
-                    removed = win_mod.win_remove(win_to=win_to, reg_key=args.reg_key)
+                    removed = win_mod.win_remove(win_to=win_to, reg_key=args.reg_key, phase_tx_id=args.phase_tx)
                     target_dir = (win_to or win_mod.default_win_to_dir()).resolve()
                     print(f"removed Heliograph from {target_dir}" if removed else f"nothing to remove in {target_dir}")
                     return 0
@@ -1903,6 +1904,7 @@ def main(argv: list[str] | None = None) -> int:
                     dirty=bool(args.dirty),
                     win_to=win_to,
                     reg_key=args.reg_key,
+                    phase_tx_id=args.phase_tx,
                 )
                 cur = manifest["current"]
                 label = f"{cur['commit']} (dirty)" if cur.get("dirty") else cur["commit"]

@@ -179,16 +179,16 @@ def _check_clean_and_origin_main(repo: Path, install_mod: Any, *, expected_commi
             f"refusing phase install: cannot verify authoritative origin/main ({fetch.stderr.strip()})",
             code=2,
         )
-    origin = _git(repo, "rev-parse", "origin/main")
-    if origin.returncode != 0:
+    fetched = _git(repo, "rev-parse", "FETCH_HEAD")
+    if fetched.returncode != 0:
         raise install_mod.InstallError(
-            f"refusing phase install: origin/main not found ({origin.stderr.strip()})",
+            f"refusing phase install: FETCH_HEAD unavailable after fetching origin main ({fetched.stderr.strip()})",
             code=2,
         )
-    origin_sha = origin.stdout.strip()
-    if commit != origin_sha:
+    fetched_sha = fetched.stdout.strip()
+    if commit != fetched_sha:
         raise install_mod.InstallError(
-            f"refusing phase install: HEAD ({commit[:12]}) is not at origin/main ({origin_sha[:12]})",
+            f"refusing phase install: HEAD ({commit[:12]}) is not at fetched origin/main ({fetched_sha[:12]})",
             code=2,
         )
     return commit
@@ -262,6 +262,49 @@ def _probe_win_state(
         raise RuntimeError(msg) from exc
 
 
+def _win_phase_marker_call(
+    python_exe: str,
+    win_install_py_win: str,
+    action: str,
+    win_to_raw: str | None,
+    reg_key: str,
+    tx_id: str,
+    phase: int = 0,
+    commit: str = "",
+    install_mod: Any | None = None,
+) -> None:
+    code = (
+        "import importlib.util, sys\n"
+        "from pathlib import Path\n"
+        "spec = importlib.util.spec_from_file_location('wi', sys.argv[1])\n"
+        "mod = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(mod)\n"
+        "action = sys.argv[2]\n"
+        "win_to = Path(sys.argv[3]) if sys.argv[3] else None\n"
+        "reg_key, tx_id, phase, commit = sys.argv[4], sys.argv[5], int(sys.argv[6]), sys.argv[7]\n"
+        "try:\n"
+        "    if action == 'begin':\n"
+        "        mod.win_phase_begin(win_to=win_to, reg_key=reg_key, tx_id=tx_id, phase=phase, commit=commit)\n"
+        "    elif action == 'end':\n"
+        "        mod.win_phase_end(win_to=win_to, tx_id=tx_id)\n"
+        "    elif action == 'recover':\n"
+        "        mod.win_recover(win_to=win_to, reg_key=reg_key)\n"
+        "except mod.WinInstallError as exc:\n"
+        "    print(str(exc), file=sys.stderr)\n"
+        "    sys.exit(exc.code)\n"
+    )
+    res = _run(
+        [python_exe, "-B", "-c", code, win_install_py_win, action, win_to_raw or "", reg_key, tx_id, str(phase), commit],
+        timeout=60,
+        install_mod=install_mod,
+    )
+    if res.returncode != 0:
+        msg = f"Windows phase {action} failed (exit {res.returncode}): {(res.stderr or res.stdout).strip()}"
+        if install_mod is not None:
+            raise install_mod.InstallError(msg, code=3)
+        raise RuntimeError(msg)
+
+
 def _run_win_cli(
     python_exe: str,
     install_py_win: str,
@@ -316,7 +359,7 @@ def _run_clean_wsl_helio(
     *,
     input_text: str | None = None,
     timeout: int = 60,
-    check_ambient_shadowing: bool = False,
+    require_on_path: bool = False,
     install_mod: Any | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run bare `helio` in a fresh POSIX environment with HELIO_STORE unset."""
@@ -326,34 +369,31 @@ def _run_clean_wsl_helio(
         if k not in ("HELIO_STORE", "HELIO_DEFAULT_STORE", "HELIO_DEFAULT_STORE_HEX", "HELIO_AS")
     }
     base_path = env.get("PATH", "/usr/bin:/bin")
-    entries = [p for p in base_path.split(os.pathsep) if p]
-    wrapper_dir_resolved = wrapper_path.parent.resolve()
-    on_ambient_path = False
-    for entry in entries:
-        try:
-            if Path(entry).resolve() == wrapper_dir_resolved:
-                on_ambient_path = True
-                break
-        except OSError:
-            continue
-    if on_ambient_path:
+    if require_on_path:
         env["PATH"] = base_path
-        if check_ambient_shadowing and install_mod is not None:
-            winner = shutil.which("helio", path=base_path)
-            if winner is None:
+        winner = shutil.which("helio", path=base_path)
+        if winner is None:
+            if install_mod is not None:
                 raise install_mod.InstallError(
-                    f"installed WSL wrapper {wrapper_path} is not executable on PATH",
+                    f"installed WSL wrapper {wrapper_path} is not reachable on PATH ({wrapper_path.parent} missing from PATH)",
                     code=3,
                 )
-            if Path(winner).resolve() != wrapper_path.resolve():
+        elif Path(winner).resolve() != wrapper_path.resolve():
+            if install_mod is not None:
                 raise install_mod.InstallError(
                     f"another helio earlier on PATH shadows {wrapper_path}: {winner}",
                     code=3,
                 )
-    else:
-        env["PATH"] = f"{wrapper_path.parent}:{base_path}"
+        return _run(
+            ["sh", "-c", 'exec helio "$@"', "sh", *helio_args],
+            env=env,
+            cwd=Path("/tmp"),
+            input_text=input_text,
+            timeout=timeout,
+            install_mod=install_mod,
+        )
     return _run(
-        ["sh", "-c", 'exec helio "$@"', "sh", *helio_args],
+        [str(wrapper_path), *helio_args],
         env=env,
         cwd=Path("/tmp"),
         input_text=input_text,
@@ -369,6 +409,7 @@ def _verify_live_installations(
     store_dir: Path,
     win_to_raw: str | None,
     reg_key: str,
+    commit: str,
     proved_wsl_sha: str,
     proved_win_sha: str,
     python_exe: str,
@@ -380,20 +421,33 @@ def _verify_live_installations(
     if on_verify:
         on_verify("before_verify")
 
-    # 1. Verify WSL live status and exact binary digests.
+    # 1. Verify WSL live status, commit provenance, and exact binary digests.
     wsl_code, wsl_lines = install_mod.status(to_dir=to_dir, wrapper_path=wrapper_path)
     if wsl_code != 0:
         raise install_mod.InstallError(f"post-install WSL status unhealthy (exit {wsl_code}): {'; '.join(wsl_lines)}", code=3)
+    wsl_m = install_mod.read_manifest(to_dir) or {}
+    wsl_cur = wsl_m.get("current") or {}
+    if wsl_cur.get("commit") != commit or bool(wsl_cur.get("dirty", False)):
+        raise install_mod.InstallError(
+            f"post-install WSL manifest commit mismatch: expected clean {commit[:12]}, got {wsl_cur.get('commit')}",
+            code=3,
+        )
     live_wsl_sha = install_mod.sha256_file(to_dir / "helio")
     live_wsl_exe_sha = install_mod.sha256_file(to_dir / "helio.exe")
     if live_wsl_sha != proved_wsl_sha or live_wsl_exe_sha != proved_win_sha:
         raise install_mod.InstallError("post-install WSL binaries do not match proved SHA-256 digests", code=3)
 
-    # 2. Verify Windows live status (includes PATH shadowing check) and exact binary digest.
+    # 2. Verify Windows live status (includes PATH shadowing check), commit provenance, and exact binary digest.
     win_state = _probe_win_state(python_exe, win_install_py_win, win_to_raw, reg_key, install_mod=install_mod)
     if win_state["status_code"] != 0:
         raise install_mod.InstallError(
             f"post-install Windows status unhealthy (exit {win_state['status_code']}): {'; '.join(win_state['status_lines'])}",
+            code=3,
+        )
+    win_cur = (win_state.get("manifest") or {}).get("current") or {}
+    if win_cur.get("commit") != commit or bool(win_cur.get("dirty", False)):
+        raise install_mod.InstallError(
+            f"post-install Windows manifest commit mismatch: expected clean {commit[:12]}, got {win_cur.get('commit')}",
             code=3,
         )
     if win_state["exe_sha"] != proved_win_sha:
@@ -402,11 +456,12 @@ def _verify_live_installations(
     if on_verify:
         on_verify("before_real_store_check")
 
-    # 3. Clean-environment `helio check` on the REAL store from both WSL and Windows entry points.
+    # 3. Clean-environment `helio check` on the REAL store from both WSL and Windows entry points
+    # using the session's ACTUAL PATH (never prepending a missing wrapper directory).
     wsl_real = _run_clean_wsl_helio(
         wrapper_path,
         ["check"],
-        check_ambient_shadowing=True,
+        require_on_path=True,
         install_mod=install_mod,
     )
     if wsl_real.returncode != 0:
@@ -570,18 +625,25 @@ def _rollback_phase_journal(
     if on_boundary:
         on_boundary("after_rollback_journal")
 
+    tx_id = str(journal.get("tx_id") or "")
     errors: list[str] = []
 
     if journal.get("win_changed"):
-        # Recover any interrupted inner Windows transaction BEFORE checking whether rollback is needed.
-        st_args = ["--status", "--reg-key", reg_key]
-        if win_to_raw:
-            st_args.extend(["--to", win_to_raw])
-        _run_win_cli(python_exe, install_py_win, st_args)
+        # Recover any interrupted inner Windows transaction FIRST (actually calling `win_recover`, NOT `--status`!)
+        # so an interrupted publication of C over B restores B cleanly instead of `--back` double-rolling back to A!
         try:
+            _win_phase_marker_call(
+                python_exe,
+                win_install_py_win,
+                "recover",
+                win_to_raw,
+                reg_key,
+                tx_id,
+                install_mod=install_mod,
+            )
             cur_win = _probe_win_state(python_exe, win_install_py_win, win_to_raw, reg_key, install_mod=install_mod)
         except Exception as exc:
-            errors.append(f"Windows rollback probe failed: {exc}")
+            errors.append(f"Windows rollback recovery/probe failed: {exc}")
             cur_win = None
         if cur_win is not None:
             cur_win_m = cur_win.get("manifest") or {}
@@ -596,23 +658,29 @@ def _rollback_phase_journal(
                 else (cur_win.get("manifest") is None and not cur_win.get("exe_sha"))
             )
             if not win_already_restored:
-                win_args = ["--back" if journal.get("win_had_install") else "--remove", "--reg-key", reg_key]
-                if win_to_raw:
-                    win_args.extend(["--to", win_to_raw])
-                wres = _run_win_cli(python_exe, install_py_win, win_args)
-                if wres.returncode != 0:
-                    errors.append(f"Windows rollback failed (exit {wres.returncode}): {(wres.stderr or wres.stdout).strip()}")
+                # On first-install rollback, verify the live manifest belongs to THIS phase commit before removing!
+                if not journal.get("win_had_install") and cur_win_c.get("commit") != journal.get("commit"):
+                    errors.append(
+                        f"refusing Windows first-install removal: live commit {cur_win_c.get('commit')} != phase commit {journal.get('commit')}"
+                    )
                 else:
-                    try:
-                        post_win = _probe_win_state(python_exe, win_install_py_win, win_to_raw, reg_key, install_mod=install_mod)
-                        if journal.get("win_had_install"):
-                            if post_win["exe_sha"] != journal.get("win_pre_exe_sha", ""):
-                                errors.append("Windows rollback hash does not match pre-transaction binary")
-                        else:
-                            if post_win["manifest"] is not None:
-                                errors.append("Windows rollback did not remove newly installed manifest")
-                    except Exception as exc:
-                        errors.append(f"Windows rollback verification failed: {exc}")
+                    win_args = ["--back" if journal.get("win_had_install") else "--remove", "--reg-key", reg_key, "--phase-tx", tx_id]
+                    if win_to_raw:
+                        win_args.extend(["--to", win_to_raw])
+                    wres = _run_win_cli(python_exe, install_py_win, win_args)
+                    if wres.returncode != 0:
+                        errors.append(f"Windows rollback failed (exit {wres.returncode}): {(wres.stderr or wres.stdout).strip()}")
+                    else:
+                        try:
+                            post_win = _probe_win_state(python_exe, win_install_py_win, win_to_raw, reg_key, install_mod=install_mod)
+                            if journal.get("win_had_install"):
+                                if post_win["exe_sha"] != journal.get("win_pre_exe_sha", ""):
+                                    errors.append("Windows rollback hash does not match pre-transaction binary")
+                            else:
+                                if post_win["manifest"] is not None:
+                                    errors.append("Windows rollback did not remove newly installed manifest")
+                        except Exception as exc:
+                            errors.append(f"Windows rollback verification failed: {exc}")
         if on_boundary:
             on_boundary("after_win_rollback")
 
@@ -650,6 +718,12 @@ def _rollback_phase_journal(
         if on_boundary:
             on_boundary("after_wsl_rollback")
 
+    if tx_id:
+        try:
+            _win_phase_marker_call(python_exe, win_install_py_win, "end", win_to_raw, reg_key, tx_id, install_mod=install_mod)
+        except Exception as exc:
+            errors.append(f"failed to release Windows phase marker: {exc}")
+
     if errors:
         raise install_mod.InstallError("phase rollback incomplete: " + "; ".join(errors), code=3)
 
@@ -657,6 +731,35 @@ def _rollback_phase_journal(
     if jp.exists():
         jp.unlink()
         install_mod.fsync_dir(to_dir)
+
+
+def _read_and_validate_phase_journal(to_dir: Path, install_mod: Any) -> dict[str, Any]:
+    """Validate ownership and destination binding of phase.journal.json BEFORE any recovery side effect."""
+    jp = to_dir / PHASE_JOURNAL_NAME
+    if jp.is_symlink():
+        raise install_mod.InstallError(f"refusing symlink phase journal at {jp}", code=2)
+    if not jp.is_file():
+        raise install_mod.InstallError(f"refusing non-regular phase journal at {jp}", code=2)
+    try:
+        journal = json.loads(jp.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise install_mod.InstallError(f"refusing unreadable or foreign phase journal at {jp}: {exc}", code=2) from exc
+    if not isinstance(journal, dict):
+        raise install_mod.InstallError(f"refusing foreign phase journal at {jp}", code=2)
+    if journal.get("managed_by") != "heliograph-phase-installer" or journal.get("schema_version") != 1:
+        raise install_mod.InstallError(f"refusing unowned phase journal at {jp}", code=2)
+    tx_id = journal.get("tx_id")
+    if not isinstance(tx_id, str) or not re.fullmatch(r"[0-9a-f]{12}", tx_id):
+        raise install_mod.InstallError(f"refusing phase journal with invalid tx_id at {jp}", code=2)
+    if journal.get("phase_state") not in ("planned", "wsl_done", "both_done", "notifying", "rolling_back"):
+        raise install_mod.InstallError(f"refusing phase journal with invalid state at {jp}", code=2)
+    rec_to = journal.get("wsl_to")
+    if not isinstance(rec_to, str) or not rec_to or Path(rec_to).resolve() != to_dir.resolve():
+        raise install_mod.InstallError(
+            f"refusing phase journal bound to {rec_to!r}, expected {to_dir.resolve()}",
+            code=2,
+        )
+    return journal
 
 
 def _recover_pending_phase_journal(
@@ -670,12 +773,9 @@ def _recover_pending_phase_journal(
 ) -> dict[str, Any] | None:
     """Recover an existing phase.journal.json. Returns notification result if a `notifying` journal was completed."""
     jp = to_dir / PHASE_JOURNAL_NAME
-    if not jp.exists():
+    if not jp.exists() and not jp.is_symlink():
         return None
-    try:
-        journal = json.loads(jp.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise install_mod.InstallError(f"corrupt phase journal at {jp}: {exc}", code=3) from exc
+    journal = _read_and_validate_phase_journal(to_dir, install_mod)
 
     state = journal.get("phase_state")
     if state == "notifying":
@@ -758,7 +858,7 @@ def run_phase_install(
         )
 
     # First: if a previous `--phase` run left a durable journal in to_dir, acquire the phase lock and recover it.
-    if (to_dir / PHASE_JOURNAL_NAME).exists():
+    if (to_dir / PHASE_JOURNAL_NAME).exists() or (to_dir / PHASE_JOURNAL_NAME).is_symlink():
         with install_mod.acquire_lock(to_dir / PHASE_LOCK_NAME, blocking=False):
             resumed = _recover_pending_phase_journal(
                 to_dir=to_dir,
@@ -938,9 +1038,11 @@ def run_phase_install(
                 and win_pre_cur.get("store") == win_store
             )
 
+            tx_id = secrets.token_hex(6)
             journal: dict[str, Any] = {
                 "schema_version": 1,
-                "tx_id": secrets.token_hex(6),
+                "managed_by": "heliograph-phase-installer",
+                "tx_id": tx_id,
                 "phase": phase,
                 "commit": commit,
                 "phase_state": "planned",
@@ -965,6 +1067,18 @@ def run_phase_install(
                 "wsl_changed": False,
                 "win_changed": False,
             }
+            # Acquire exclusive phase ownership on the Windows destination before writing the journal / mutating either host.
+            _win_phase_marker_call(
+                python_exe,
+                win_install_py_win,
+                "begin",
+                win_to_raw,
+                reg_key,
+                tx_id,
+                phase=phase,
+                commit=commit,
+                install_mod=install_mod,
+            )
             install_mod.write_json_atomic(to_dir / PHASE_JOURNAL_NAME, journal)
             if on_boundary:
                 on_boundary("after_phase_journal")
@@ -1004,6 +1118,8 @@ def run_phase_install(
                         win_store,
                         "--reg-key",
                         reg_key,
+                        "--phase-tx",
+                        tx_id,
                     ]
                     if win_to_raw:
                         win_args.extend(["--to", win_to_raw])
@@ -1024,6 +1140,7 @@ def run_phase_install(
                     store_dir=store_dir,
                     win_to_raw=win_to_raw,
                     reg_key=reg_key,
+                    commit=commit,
                     proved_wsl_sha=pre_wsl_sha,
                     proved_win_sha=pre_win_sha,
                     python_exe=python_exe,
@@ -1035,6 +1152,7 @@ def run_phase_install(
 
                 journal["phase_state"] = "notifying"
                 install_mod.write_json_atomic(to_dir / PHASE_JOURNAL_NAME, journal)
+                _win_phase_marker_call(python_exe, win_install_py_win, "end", win_to_raw, reg_key, tx_id)
             except BaseException as exc:
                 _rollback_phase_journal(
                     journal,
@@ -1044,8 +1162,6 @@ def run_phase_install(
                     install_mod=install_mod,
                     on_boundary=on_boundary,
                 )
-                if isinstance(exc, install_mod.InstallError):
-                    raise
                 raise install_mod.InstallError(f"phase install failed and rolled back: {exc}", code=3) from exc
 
             # Post-verification notification: if this fails, keep `phase_state == "notifying"` so retry only re-sends.

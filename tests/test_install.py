@@ -3374,7 +3374,9 @@ class TestPhaseInstaller(unittest.TestCase):
                 self.assertEqual(w1.returncode, 0, w1.stdout + w1.stderr)
 
                 # Run full `--phase 0` via CLI with distinct nondefault WSL --to and spaced Windows --win-to!
-                env_cli = {**os.environ, "HELIO_REPO": str(checkout), "HELIO_AS": "impossible/runner-a"}
+                # Put wrapper.parent on PATH so fresh-shell verification resolves bare `helio` without prepending.
+                path_with_wrapper = f"{wrapper.parent}:{os.environ.get('PATH', '/usr/bin:/bin')}"
+                env_cli = {**os.environ, "PATH": path_with_wrapper, "HELIO_REPO": str(checkout), "HELIO_AS": "impossible/runner-a"}
                 cli_res = subprocess.run(
                     [
                         sys.executable,
@@ -3431,7 +3433,7 @@ class TestPhaseInstaller(unittest.TestCase):
                 self.assertIn(head_sha[:12], inbox_other.stdout)
 
                 # Idempotent retry under a DIFFERENT ambient HELIO_AS: neither host changes, previous stays V1, same notice!
-                with mock.patch.dict(os.environ, {"HELIO_AS": "impossible/runner-b"}):
+                with mock.patch.dict(os.environ, {"PATH": path_with_wrapper, "HELIO_AS": "impossible/runner-b"}):
                     retry_res = self.phase_mod.run_phase_install(
                         repo=checkout,
                         phase=0,
@@ -3463,19 +3465,20 @@ class TestPhaseInstaller(unittest.TestCase):
                     if stage == "before_roundtrip":
                         raise self.mod.InstallError("planted post-install verification fault", code=3)
 
-                with self.assertRaises(self.mod.InstallError) as ctx:
-                    self.phase_mod.run_phase_install(
-                        repo=checkout,
-                        phase=0,
-                        to_dir=to_dir,
-                        store_dir=store_dir,
-                        wrapper_path=wrapper,
-                        win_to_raw=win_to,
-                        reg_key=reg_key,
-                        sdk_url="unused",
-                        install_mod=self.mod,
-                        on_verify=fail_verify,
-                    )
+                with mock.patch.dict(os.environ, {"PATH": path_with_wrapper}):
+                    with self.assertRaises(self.mod.InstallError) as ctx:
+                        self.phase_mod.run_phase_install(
+                            repo=checkout,
+                            phase=0,
+                            to_dir=to_dir,
+                            store_dir=store_dir,
+                            wrapper_path=wrapper,
+                            win_to_raw=win_to,
+                            reg_key=reg_key,
+                            sdk_url="unused",
+                            install_mod=self.mod,
+                            on_verify=fail_verify,
+                        )
                 self.assertEqual(ctx.exception.code, 3)
                 # Both hosts restored to V2 (head_sha), journal cleaned up, zero new notices!
                 self.assertEqual(self.mod.read_manifest(to_dir)["current"]["commit"], head_sha)
@@ -3486,6 +3489,28 @@ class TestPhaseInstaller(unittest.TestCase):
                 self.assertFalse((to_dir / self.phase_mod.PHASE_JOURNAL_NAME).exists())
                 self.assertEqual(len(list((store_dir / "messages").glob("*.post"))), 1)
 
+                # Missing wrapper.parent on PATH -> fresh-shell check fails, rolls back both hosts to V2, exits 3, zero new notices!
+                with mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}):
+                    with self.assertRaises(self.mod.InstallError) as ctx_nopath:
+                        self.phase_mod.run_phase_install(
+                            repo=checkout,
+                            phase=0,
+                            to_dir=to_dir,
+                            store_dir=store_dir,
+                            wrapper_path=wrapper,
+                            win_to_raw=win_to,
+                            reg_key=reg_key,
+                            sdk_url="unused",
+                            install_mod=self.mod,
+                        )
+                self.assertEqual(ctx_nopath.exception.code, 3)
+                self.assertEqual(self.mod.read_manifest(to_dir)["current"]["commit"], head_sha)
+                self.assertEqual(
+                    self.phase_mod._probe_win_state(self.python_exe, win_install_py_win, win_to, reg_key)["manifest"]["current"]["commit"],
+                    head_sha,
+                )
+                self.assertEqual(len(list((store_dir / "messages").glob("*.post"))), 1)
+
                 # Pending-notification resume: fail once at `before_tell`, verify journal stays `notifying`,
                 # then retry resumes ONLY notification without reinstalling!
                 v3_sha = subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip()
@@ -3494,8 +3519,26 @@ class TestPhaseInstaller(unittest.TestCase):
                     if boundary == "before_tell":
                         raise self.mod.InstallError("simulated tell failure", code=3)
 
-                with self.assertRaises(self.mod.InstallError):
-                    self.phase_mod.run_phase_install(
+                with mock.patch.dict(os.environ, {"PATH": path_with_wrapper}):
+                    with self.assertRaises(self.mod.InstallError):
+                        self.phase_mod.run_phase_install(
+                            repo=checkout,
+                            phase=0,
+                            to_dir=to_dir,
+                            store_dir=store_dir,
+                            wrapper_path=wrapper,
+                            win_to_raw=win_to,
+                            reg_key=reg_key,
+                            sdk_url="unused",
+                            install_mod=self.mod,
+                            on_boundary=fail_tell,
+                        )
+                jp = to_dir / self.phase_mod.PHASE_JOURNAL_NAME
+                self.assertTrue(jp.is_file())
+                self.assertEqual(json.loads(jp.read_text(encoding="utf-8"))["phase_state"], "notifying")
+
+                with mock.patch.dict(os.environ, {"PATH": path_with_wrapper}):
+                    resumed = self.phase_mod.run_phase_install(
                         repo=checkout,
                         phase=0,
                         to_dir=to_dir,
@@ -3505,23 +3548,7 @@ class TestPhaseInstaller(unittest.TestCase):
                         reg_key=reg_key,
                         sdk_url="unused",
                         install_mod=self.mod,
-                        on_boundary=fail_tell,
                     )
-                jp = to_dir / self.phase_mod.PHASE_JOURNAL_NAME
-                self.assertTrue(jp.is_file())
-                self.assertEqual(json.loads(jp.read_text(encoding="utf-8"))["phase_state"], "notifying")
-
-                resumed = self.phase_mod.run_phase_install(
-                    repo=checkout,
-                    phase=0,
-                    to_dir=to_dir,
-                    store_dir=store_dir,
-                    wrapper_path=wrapper,
-                    win_to_raw=win_to,
-                    reg_key=reg_key,
-                    sdk_url="unused",
-                    install_mod=self.mod,
-                )
                 self.assertTrue(resumed["resumed_notification"])
                 self.assertEqual(resumed["commit"], v3_sha)
                 self.assertFalse(jp.exists())
@@ -3747,6 +3774,7 @@ class TestPhaseInstaller(unittest.TestCase):
                 )
                 crashed_journal = {
                     "schema_version": 1,
+                    "managed_by": "heliograph-phase-installer",
                     "tx_id": "aabbccddeeff",
                     "phase": 0,
                     "commit": head_sha,
@@ -3871,11 +3899,178 @@ class TestPhaseInstaller(unittest.TestCase):
                         self.phase_mod._run_clean_wsl_helio(
                             wrapper,
                             ["check"],
-                            check_ambient_shadowing=True,
+                            require_on_path=True,
                             install_mod=self.mod,
                         )
                     self.assertEqual(ctx_sh.exception.code, 3)
                     self.assertIn("shadows", str(ctx_sh.exception))
+
+                # 7. Foreign/symlink/wrong-dest phase.journal.json refused with exit 2 BEFORE any side effects!
+                foreign_to = root / "foreign_to"
+                foreign_to.mkdir()
+                foreign_jp = foreign_to / self.phase_mod.PHASE_JOURNAL_NAME
+                foreign_jp.write_text(json.dumps({"schema_version": 1, "tx_id": "112233445566", "wsl_to": str(foreign_to)}), encoding="utf-8")
+                with self.assertRaises(self.mod.InstallError) as ctx_fj:
+                    self.phase_mod._recover_pending_phase_journal(
+                        to_dir=foreign_to,
+                        python_exe=self.python_exe,
+                        install_py_win=install_py_win,
+                        win_install_py_win=win_install_py_win,
+                        install_mod=self.mod,
+                    )
+                self.assertEqual(ctx_fj.exception.code, 2)
+                self.assertTrue(foreign_jp.is_file())
+                foreign_jp.unlink()
+                other_file = root / "other_target.json"
+                other_file.write_text("{}", encoding="utf-8")
+                foreign_jp.symlink_to(other_file)
+                with self.assertRaises(self.mod.InstallError) as ctx_sym:
+                    self.phase_mod._recover_pending_phase_journal(
+                        to_dir=foreign_to,
+                        python_exe=self.python_exe,
+                        install_py_win=install_py_win,
+                        win_install_py_win=win_install_py_win,
+                        install_mod=self.mod,
+                    )
+                self.assertEqual(ctx_sym.exception.code, 2)
+                self.assertTrue(foreign_jp.is_symlink())
+
+                # 8. Mid-transaction publication fault (foreign file at wrapper -> inner code 2) rolls back & exits 3!
+                bad_wrap_dir = root / "bad_wrap_dir"
+                bad_wrap_dir.mkdir()
+                bad_wrap = bad_wrap_dir / "helio"
+                bad_wrap.write_text("#!/bin/sh\necho FOREIGN\n", encoding="utf-8")
+                os.chmod(bad_wrap, 0o755)
+                bad_to = root / "bad_to"
+                with self.assertRaises(self.mod.InstallError) as ctx_fw:
+                    self.phase_mod.run_phase_install(
+                        repo=checkout,
+                        phase=0,
+                        to_dir=bad_to,
+                        store_dir=store_dir,
+                        wrapper_path=bad_wrap,
+                        win_to_raw=win_to,
+                        reg_key=reg_key,
+                        sdk_url="unused",
+                        install_mod=self.mod,
+                    )
+                self.assertEqual(ctx_fw.exception.code, 3)
+
+                # 9. Windows phase marker blocks concurrent `--windows --back` / `--remove` with exit 3!
+                self.phase_mod._win_phase_marker_call(
+                    self.python_exe, win_install_py_win, "begin", win_to, reg_key, "abcdef012345", phase=0, commit=head_sha, install_mod=self.mod
+                )
+                try:
+                    blk = self.phase_mod._run_win_cli(self.python_exe, install_py_win, ["--remove", "--to", win_to, "--reg-key", reg_key])
+                    self.assertEqual(blk.returncode, 3, blk.stdout + blk.stderr)
+                finally:
+                    self.phase_mod._win_phase_marker_call(
+                        self.python_exe, win_install_py_win, "end", win_to, reg_key, "abcdef012345", install_mod=self.mod
+                    )
+
+                # 10. Narrowed remote.origin.fetch where origin/main is stale while FETCH_HEAD advanced -> refused (exit 2)!
+                subprocess.run(
+                    ["git", "-C", str(checkout), "config", "remote.origin.fetch", "+refs/heads/other:refs/remotes/origin/other"],
+                    check=True,
+                    capture_output=True,
+                )
+                other_clone2 = root / "other_clone2"
+                subprocess.run(["git", "clone", str(origin), str(other_clone2)], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(other_clone2), "config", "user.name", "Other"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(other_clone2), "config", "user.email", "o@example.com"], check=True, capture_output=True)
+                (other_clone2 / "narrow.txt").write_text("narrow\n", encoding="utf-8")
+                subprocess.run(["git", "-C", str(other_clone2), "add", "narrow.txt"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(other_clone2), "commit", "-m", "narrow"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(other_clone2), "push", "origin", "main"], check=True, capture_output=True)
+                with self.assertRaises(self.mod.InstallError) as ctx_nf:
+                    self.phase_mod._check_clean_and_origin_main(checkout, self.mod)
+                self.assertEqual(ctx_nf.exception.code, 2)
+                self.assertIn("FETCH_HEAD" if "FETCH_HEAD" in str(ctx_nf.exception) else "fetched", str(ctx_nf.exception))
+
+                # 11. Interrupted inner Windows publication of C over B (with predecessor A) on BOTH sides of live-file
+                # replacement: phase rollback calls `win_recover` first and restores exact B with ZERO pending
+                # `install.win.journal.json` (never double-rolling back to A)!
+                v0_h, v0_e = self._make_distinct_pair(root / "v0", b"CRASH_V0_A")
+                v0_e_sha = self.mod.sha256_file(v0_e)
+                v3_h, v3_e = self._make_distinct_pair(root / "v3", b"CRASH_V3_C")
+                v3_e_sha = self.mod.sha256_file(v3_e)
+                win_c_to = self._win_temp_dir("Helio Win Crash B")
+                reg_key_c = self._new_reg_key()
+                try:
+                    # Install A then B on Windows so B is live and A is `previous`.
+                    for src_p, sha_p, cmt_p in ((v0_e, v0_e_sha, "0" * 40), (v1_e, v1_e_sha, v1_commit)):
+                        r_ab = self.phase_mod._run_win_cli(
+                            self.python_exe,
+                            install_py_win,
+                            ["--source-exe", self.win_mod.wsl_to_windows_path(src_p), "--source-sha256", sha_p, "--commit", cmt_p, "--store", win_store, "--to", win_c_to, "--reg-key", reg_key_c],
+                        )
+                        self.assertEqual(r_ab.returncode, 0, r_ab.stdout + r_ab.stderr)
+                    for boundary_name in ("after_journal", "after_exe"):
+                        # Interrupt inner win_install of C at `boundary_name` leaving install.win.journal.json on disk!
+                        crash_helper = (
+                            "import importlib.util, pathlib, sys\n"
+                            "spec = importlib.util.spec_from_file_location('wi', sys.argv[1])\n"
+                            "mod = importlib.util.module_from_spec(spec)\n"
+                            "spec.loader.exec_module(mod)\n"
+                            "class Crash(BaseException):\n"
+                            "    _leave_journal_for_test = True\n"
+                            "def on_b(b):\n"
+                            "    if b == sys.argv[6]:\n"
+                            "        raise Crash('boom')\n"
+                            "try:\n"
+                            "    mod.win_install(source_exe=pathlib.Path(sys.argv[2]), source_sha256=sys.argv[3], "
+                            "store_path=sys.argv[4], commit='3'*40, win_to=pathlib.Path(sys.argv[5]), reg_key=sys.argv[7], on_boundary=on_b)\n"
+                            "except Crash:\n"
+                            "    pass\n"
+                        )
+                        subprocess.run(
+                            [self.python_exe, "-B", "-c", crash_helper, win_install_py_win, self.win_mod.wsl_to_windows_path(v3_e), v3_e_sha, win_store, win_c_to, boundary_name, reg_key_c],
+                            check=True,
+                            stdin=subprocess.DEVNULL,
+                            capture_output=True,
+                        )
+                        win_crash_j = {
+                            "schema_version": 1,
+                            "managed_by": "heliograph-phase-installer",
+                            "tx_id": "123456789abc",
+                            "phase": 0,
+                            "commit": "3" * 40,
+                            "phase_state": "both_done",
+                            "wsl_to": str(to_dir.resolve()),
+                            "wrapper": str(wrapper.resolve()),
+                            "store": str(store_dir.resolve()),
+                            "win_to_arg": win_c_to,
+                            "win_dest": win_c_to,
+                            "reg_key": reg_key_c,
+                            "wsl_had_install": True,
+                            "wsl_pre_helio_sha": self.mod.sha256_file(to_dir / "helio"),
+                            "wsl_pre_commit": head_sha,
+                            "wsl_pre_store": str(store_dir.resolve()),
+                            "wsl_pre_wrapper": str(wrapper.resolve()),
+                            "win_had_install": True,
+                            "win_pre_exe_sha": v1_e_sha,
+                            "win_pre_commit": v1_commit,
+                            "win_pre_store": win_store,
+                            "wsl_changed": False,
+                            "win_changed": True,
+                        }
+                        self.mod.write_json_atomic(to_dir / self.phase_mod.PHASE_JOURNAL_NAME, win_crash_j)
+                        self.phase_mod._recover_pending_phase_journal(
+                            to_dir=to_dir,
+                            python_exe=self.python_exe,
+                            install_py_win=install_py_win,
+                            win_install_py_win=win_install_py_win,
+                            install_mod=self.mod,
+                        )
+                        st_after = self.phase_mod._probe_win_state(self.python_exe, win_install_py_win, win_c_to, reg_key_c)
+                        self.assertEqual(st_after["status_code"], 0, f"{boundary_name}: {st_after['status_lines']}")
+                        self.assertEqual(st_after["exe_sha"], v1_e_sha, boundary_name)
+                        self.assertEqual(st_after["manifest"]["current"]["commit"], v1_commit, boundary_name)
+                        self.assertEqual(st_after["manifest"]["previous"]["commit"], "0" * 40, boundary_name)
+                    self.phase_mod._run_win_cli(self.python_exe, install_py_win, ["--remove", "--to", win_c_to, "--reg-key", reg_key_c])
+                finally:
+                    self._delete_reg_key(reg_key_c)
+                    self._cleanup_win_parent(win_c_to)
 
                 # Clean up Windows installation cleanly
                 self.phase_mod._run_win_cli(self.python_exe, install_py_win, ["--remove", "--to", win_to, "--reg-key", reg_key])
