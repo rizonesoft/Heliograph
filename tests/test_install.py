@@ -1231,18 +1231,13 @@ class TestQuickInstaller(unittest.TestCase):
                 text=True,
             )
             win_stop = threading.Event()
-            in_pub_window = threading.Event()
-            caller_in_flight = threading.Event()
+            replace_done = threading.Event()
             win_failures: list[str] = []
-            call_intervals: list[tuple[float, float]] = []
-            replace_window: list[float] = [0.0, 0.0]
+            bg_calls = 0
 
             def win_caller():
-                import time as time_mod
-
+                nonlocal bg_calls
                 while not win_stop.is_set():
-                    during = in_pub_window.is_set()
-                    t_launch = time_mod.monotonic()
                     proc = None
                     try:
                         proc = subprocess.Popen(
@@ -1252,8 +1247,6 @@ class TestQuickInstaller(unittest.TestCase):
                             stderr=subprocess.PIPE,
                             text=True,
                         )
-                        if during:
-                            caller_in_flight.set()
                         try:
                             _out, err = proc.communicate(timeout=30)
                         except subprocess.TimeoutExpired:
@@ -1261,29 +1254,37 @@ class TestQuickInstaller(unittest.TestCase):
                             proc.communicate()
                             win_failures.append("helio.exe timed out")
                             continue
-                        t_end = time_mod.monotonic()
                         if proc.returncode != 0:
                             win_failures.append(f"rc={proc.returncode} stderr={err}")
                         else:
-                            call_intervals.append((t_launch, t_end))
+                            bg_calls += 1
                     except (OSError, subprocess.SubprocessError) as exc:
                         if proc is not None and proc.poll() is None:
                             proc.kill()
                             proc.communicate()
                         win_failures.append(f"exc={exc}")
 
-            def wait_for_overlap(stage: str) -> None:
-                import time as time_mod
+            pinned_proc: list[subprocess.Popen[str]] = []
+            pinned_alive_after: list[bool] = [False]
 
+            def wait_for_overlap(stage: str) -> None:
                 if stage == "after_helio":
-                    # Open the overlap window and wait until win_caller has actually spawned helio.exe
-                    # BEFORE returning control so replace_binary_atomic(stage_exe, helio.exe) overlaps it.
-                    in_pub_window.set()
-                    self.assertTrue(caller_in_flight.wait(timeout=15), "Windows caller never entered publication window")
-                    replace_window[0] = time_mod.monotonic()
+                    # Launch a live helio.exe process blocked on stdin BEFORE replace_binary_atomic(stage_exe, helio.exe),
+                    # proving it is genuinely executing across the replacement boundary itself.
+                    win_store = subprocess.run(["wslpath", "-w", str(store)], capture_output=True, text=True, check=True).stdout.strip()
+                    p = subprocess.Popen(
+                        [str(to_dir / "helio.exe"), "tell", "demo/lane", "overlap-proof", "--as", "demo/sender", "--store", win_store],
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+                    pinned_proc.append(p)
+                    self.assertIsNone(p.poll(), "overlapping helio.exe exited before replacement started")
                 elif stage == "after_helio_exe":
-                    replace_window[1] = time_mod.monotonic()
-                    in_pub_window.clear()
+                    if pinned_proc:
+                        pinned_alive_after[0] = pinned_proc[0].poll() is None
+                    replace_done.set()
 
             wt = threading.Thread(target=win_caller)
             try:
@@ -1301,8 +1302,22 @@ class TestQuickInstaller(unittest.TestCase):
                     )
                 except self.mod.BusyExecutableError as exc:
                     self.assertEqual(exc.code, 3)
+                    if pinned_proc:
+                        pinned_alive_after[0] = pinned_proc[0].poll() is None
+                finally:
+                    if pinned_proc:
+                        p = pinned_proc[0]
+                        try:
+                            _o, err = p.communicate(input="overlap body\n", timeout=30)
+                        except subprocess.TimeoutExpired:
+                            p.kill()
+                            p.communicate()
+                            win_failures.append("pinned overlapping helio.exe timed out")
+                        else:
+                            if p.returncode != 0:
+                                win_failures.append(f"pinned helio.exe rc={p.returncode} stderr={err}")
             finally:
-                in_pub_window.clear()
+                replace_done.set()
                 win_stop.set()
                 wt.join(timeout=35)
                 holder.terminate()
@@ -1312,11 +1327,8 @@ class TestQuickInstaller(unittest.TestCase):
                 if holder.stderr:
                     holder.stderr.close()
             self.assertEqual(win_failures, [])
-            t_start, t_end = replace_window
-            if t_end == 0.0:
-                t_end = t_start
-            overlapped = [iv for iv in call_intervals if iv[0] <= t_end and iv[1] >= t_start]
-            self.assertGreater(len(overlapped), 0, f"no Windows call overlapped replacement window {replace_window}: {call_intervals}")
+            self.assertTrue(pinned_alive_after[0], "overlapping helio.exe did not remain live across replacement")
+            self.assertGreater(bg_calls, 0)
             code, _ = self.mod.status(to_dir=to_dir, wrapper_path=wrapper)
             self.assertEqual(code, 0)
 
