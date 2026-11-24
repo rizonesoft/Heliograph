@@ -2410,14 +2410,13 @@ class TestWindowsInstaller(unittest.TestCase):
                     try:
                         sh_shadow_file.symlink_to(win_to / "helio")
                     except OSError:
-                        # Non-admin Windows without Developer Mode may refuse file symlinks; simulate via mock.
+                        # Non-admin Windows without Developer Mode may refuse file symlinks; fall back to regular file.
                         sh_shadow_file.write_text("#!/bin/sh\necho LINK\n", encoding="utf-8")
-                    with mock.patch.object(Path, "resolve", wraps=Path.resolve):
-                        w_link = self.win_mod._find_winning_helio_sh(reg_key, win_to)
-                        self.assertIsNotNone(w_link)
-                        self.assertEqual(os.path.normcase(str(w_link)), os.path.normcase(os.path.abspath(str(sh_shadow_file))))
-                        code_lnk, _ = self.win_mod.win_status(win_to=win_to, reg_key=reg_key)
-                        self.assertEqual(code_lnk, 3)
+                    w_link = self.win_mod._find_winning_helio_sh(reg_key, win_to)
+                    self.assertIsNotNone(w_link)
+                    self.assertEqual(os.path.normcase(str(w_link)), os.path.normcase(os.path.abspath(str(sh_shadow_file))))
+                    code_lnk, _ = self.win_mod.win_status(win_to=win_to, reg_key=reg_key)
+                    self.assertEqual(code_lnk, 3)
                 finally:
                     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_key, 0, winreg.KEY_SET_VALUE) as k:
                         winreg.SetValueEx(k, "Path", 0, orig_rk, orig_rp)
