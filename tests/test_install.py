@@ -4657,10 +4657,15 @@ class TestPhaseInstaller(unittest.TestCase):
                 check_snap_code = (
                     "import pathlib, sys\n"
                     "p = pathlib.Path(sys.argv[1]) / 'bin' / '.phase-prev-aa11bb22cc33.helio.exe.old'\n"
-                    "assert p.is_file(), 'unrecorded pre-existing file with matching bytes must NOT be deleted'\n"
+                    "expected = pathlib.Path(sys.argv[2]).read_bytes()\n"
+                    "assert p.is_file() and p.read_bytes() == expected, 'unrecorded pre-existing file bytes must be preserved verbatim'\n"
                     "p.unlink()\n"
                 )
-                subprocess.run([self.python_exe, "-B", "-c", check_snap_code, win_to], check=True, stdin=subprocess.DEVNULL)
+                subprocess.run(
+                    [self.python_exe, "-B", "-c", check_snap_code, win_to, self.win_mod.wsl_to_windows_path(a_e)],
+                    check=True,
+                    stdin=subprocess.DEVNULL,
+                )
                 self.phase_mod._win_phase_marker_call(
                     self.python_exe, win_install_py_win, "end", win_to, reg_key, "aa11bb22cc33", install_mod=self.mod
                 )
@@ -4788,10 +4793,30 @@ class TestPhaseInstaller(unittest.TestCase):
                 )
                 self.assertEqual(r_comp.returncode, 1, r_comp.stdout + r_comp.stderr)
                 self.assertEqual(json.loads(r_comp.stdout), [0])
-                # A newer `## Closeout` after an older `Installed commit:` supersedes it -> returns [0] (exit 1)!
+                # Resolve competing receipt rebase conflict by keeping the verified manifest SHA (`head_sha`) and pushing!
+                rb_res = subprocess.run(["git", "-C", str(stale_clone), "pull", "--rebase", "origin", "main"], capture_output=True, text=True)
+                if rb_res.returncode != 0:
+                    # Keep the verified receipt line matching both installed manifests (`head_sha`) and continue rebase!
+                    base_txt = (checkout / "docs" / "phase-runs" / "2026-11-24-phase-0.md").read_text(encoding="utf-8")
+                    stale_rf.write_text(base_txt, encoding="utf-8")
+                    subprocess.run(["git", "-C", str(stale_clone), "add", str(stale_rf)], check=True, capture_output=True)
+                    subprocess.run(["git", "-C", str(stale_clone), "rebase", "--continue"], env={**os.environ, "GIT_EDITOR": "true"}, check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(stale_clone), "push", "origin", "main"], check=True, capture_output=True)
+                r_comp_ok = subprocess.run(
+                    [sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"],
+                    env={**os.environ, "HELIO_REPO": str(stale_clone)},
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(r_comp_ok.returncode, 0, r_comp_ok.stdout + r_comp_ok.stderr)
+                self.assertEqual(json.loads(r_comp_ok.stdout), [])
+                # A newer local `## Closeout` committed WITHOUT pushing MUST STILL report [0] (never inherit older remote receipt)!
                 run_file.write_text(run_file.read_text(encoding="utf-8") + "\n## Closeout run=reopened\n\nRe-closed.\n", encoding="utf-8")
                 subprocess.run(["git", "-C", str(checkout), "add", str(run_file)], check=True, capture_output=True)
                 subprocess.run(["git", "-C", str(checkout), "commit", "-m", "new closeout"], check=True, capture_output=True)
+                r4_local = subprocess.run([sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"], env=env, capture_output=True, text=True)
+                self.assertEqual(r4_local.returncode, 1, r4_local.stdout + r4_local.stderr)
+                self.assertEqual(json.loads(r4_local.stdout), [0])
                 subprocess.run(["git", "-C", str(checkout), "push", "origin", "main"], check=True, capture_output=True)
                 r4 = subprocess.run([sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"], env=env, capture_output=True, text=True)
                 self.assertEqual(r4.returncode, 1, r4.stdout + r4.stderr)

@@ -980,9 +980,19 @@ def win_phase_snapshot_prev(*, win_to: Path | None, tx_id: str) -> None:
         data = old_exe.read_bytes()
         snap_name = f".phase-prev-{secrets.token_hex(12)}.{WIN_OLD_EXE_NAME}"
         snap_exe = dest / WIN_BIN_SUBDIR / snap_name
-        # O_CREAT | O_EXCL | O_BINARY guarantees this transaction created the file verbatim and never overwrites a pre-existing file!
+        if snap_exe.exists() or _is_reparse_or_symlink(snap_exe):
+            raise WinInstallError(f"refusing existing or linked phase previous snapshot at {snap_exe}", code=2)
+        # Durably record the 96-bit random snapshot filename in `.phase-active.json` FIRST so a crash immediately
+        # after O_EXCL creation can never strand the file; if O_EXCL refuses an occupied path, clear the record!
+        marker["snapshot_file"] = snap_name
+        _write_json_atomic(dest / WIN_PHASE_MARKER_NAME, marker)
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
-        fd = os.open(str(snap_exe), flags, 0o600)
+        try:
+            fd = os.open(str(snap_exe), flags, 0o600)
+        except FileExistsError:
+            marker.pop("snapshot_file", None)
+            _write_json_atomic(dest / WIN_PHASE_MARKER_NAME, marker)
+            raise WinInstallError(f"refusing existing phase previous snapshot at {snap_exe}", code=2)
         try:
             os.write(fd, data)
             os.fsync(fd)
@@ -992,10 +1002,10 @@ def win_phase_snapshot_prev(*, win_to: Path | None, tx_id: str) -> None:
                 snap_exe.unlink()
             except OSError:
                 pass
+            marker.pop("snapshot_file", None)
+            _write_json_atomic(dest / WIN_PHASE_MARKER_NAME, marker)
             raise
         os.close(fd)
-        marker["snapshot_file"] = snap_name
-        _write_json_atomic(dest / WIN_PHASE_MARKER_NAME, marker)
 
 
 def win_phase_restore_prev(*, win_to: Path | None, tx_id: str, pre_previous: dict[str, Any] | None) -> None:
