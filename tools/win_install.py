@@ -718,8 +718,12 @@ def recover_win_if_needed(win_to: Path, reg_key: str) -> bool:
 
     if journal.get("had_manifest") and isinstance(prev_manifest, dict):
         restored_manifest = dict(prev_manifest)
-        merged_retired = _normalize_retired_map(restored_manifest.get("retired"))
-        merged_retired.update(extra_retired)
+        merged_retired = dict(extra_retired)
+        merged_retired.update(_normalize_retired_map(restored_manifest.get("retired")))
+        if isinstance(current_manifest, dict) and current_manifest != desired:
+            for rk, rv in _normalize_retired_map(current_manifest.get("retired")).items():
+                if rv is not None:
+                    merged_retired[rk] = rv
         restored_manifest["retired"] = _sweep_retired_exes(
             win_to / WIN_BIN_SUBDIR,
             merged_retired,
@@ -871,7 +875,7 @@ def win_install(
                     else:
                         prev_cmd_text = prev_cur.get("helio_cmd_text")
                         if not isinstance(prev_cmd_text, str) and saved[WIN_CMD_NAME]["existed"]:
-                            prev_cmd_text = (dest / saved[WIN_CMD_NAME]["rec_name"]).read_text(encoding="utf-8")
+                            prev_cmd_text = (dest / saved[WIN_CMD_NAME]["rec_name"]).read_bytes().decode("utf-8")
                         previous_entry = {
                             "commit": prev_cur["commit"],
                             "dirty": bool(prev_cur.get("dirty", False)),
@@ -1155,7 +1159,7 @@ def win_back(
                 cur = manifest["current"]
                 cur_cmd_text = cur.get("helio_cmd_text")
                 if not isinstance(cur_cmd_text, str):
-                    cur_cmd_text = (dest / saved[WIN_CMD_NAME]["rec_name"]).read_text(encoding="utf-8")
+                    cur_cmd_text = (dest / saved[WIN_CMD_NAME]["rec_name"]).read_bytes().decode("utf-8")
                 swept_retired = _sweep_retired_exes(
                     bin_dir,
                     _normalize_retired_map(manifest.get("retired")),
