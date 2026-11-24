@@ -1231,7 +1231,6 @@ class TestQuickInstaller(unittest.TestCase):
                 text=True,
             )
             win_stop = threading.Event()
-            replace_done = threading.Event()
             win_failures: list[str] = []
             bg_calls = 0
 
@@ -1284,7 +1283,16 @@ class TestQuickInstaller(unittest.TestCase):
                 elif stage == "after_helio_exe":
                     if pinned_proc:
                         pinned_alive_after[0] = pinned_proc[0].poll() is None
-                    replace_done.set()
+                    # Verify a fresh caller can open and execute helio.exe by name immediately after replacement.
+                    after_r = subprocess.run(
+                        [str(to_dir / "helio.exe"), "help"],
+                        stdin=subprocess.DEVNULL,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    if after_r.returncode != 0:
+                        win_failures.append(f"post-replace helio.exe rc={after_r.returncode} stderr={after_r.stderr}")
 
             wt = threading.Thread(target=win_caller)
             try:
@@ -1317,7 +1325,6 @@ class TestQuickInstaller(unittest.TestCase):
                             if p.returncode != 0:
                                 win_failures.append(f"pinned helio.exe rc={p.returncode} stderr={err}")
             finally:
-                replace_done.set()
                 win_stop.set()
                 wt.join(timeout=35)
                 holder.terminate()
