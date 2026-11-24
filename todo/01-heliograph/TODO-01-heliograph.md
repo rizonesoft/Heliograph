@@ -50,7 +50,7 @@ title: "TODO-01 -- Heliograph"
 | 13 | §13 | Design and help that match the program | §11, §12, §14 | [ ] |
 | 14 | §14 | Unowned paths kept to their repository | §4, §6 | [ ] |
 | 15 | §15 | Quick installer | -- | [x] |
-| 16 | §16 | Installer for Windows sessions | §15 | [ ] |
+| 16 | §16 | Installer for Windows sessions | §15 | [x] |
 | 17 | §17 | Installed program replaced after a tested phase | §15 | [ ] |
 
 ## 1. Steps that notice an archived job
@@ -411,9 +411,12 @@ A Windows session has no `helio` on its `PATH`, so its hook finds nothing. The i
 - [x] Add `<win_to>` to the user's `Path` once in `tools/install.py` (under a shared registry lock), preserving every other entry and its registry kind (`REG_SZ`/`REG_EXPAND_SZ`, leaving `%...%` unexpanded), persisting `path_added`, and broadcasting `WM_SETTINGCHANGE`. Done when: a second install changes nothing and skips broadcast, a pre-existing equivalent entry sets `path_added=false`, and an entry with `%` stays unexpanded. Cheaper substitute: `setx`, which cuts a long `PATH`.
 - [x] Support `--windows --status`, `--windows --back`, and `--windows --remove` in `tools/install.py`, undoing only the installer-owned `Path` entry on `--remove` (preserving intervening edits) and removing `<win_to>` only when empty of unrelated files. Done when: `--status` verifies live/backup hashes, `helio.cmd` bytes, `Path` and store; `--back` restores the previous binary/store and refuses corrupt/missing backups; and `--remove` restores `Path` surgically and removes owned files while preserving unrelated files. Cheaper substitute: leaving `Path` or deleting blindly.
 - [x] Document the Windows install, `--status`, `--back`, and `--remove` commands in `README.md` Quick start and cover them in `TestWindowsInstaller` (executed by `prove.py`) plus WSL handoff tests in `tests/test_install.py`. Done when: `prove.py` executes all Windows tests natively with zero skips on the new class and `app_build.py` passes in WSL. Cheaper substitute: skipping Windows tests or omitting docs.
-- [ ] Commit: `install: Windows sessions`
+- [x] Commit: `install: Windows sessions`
 
 **Test checkpoint:** `python3 ../ImpossibleSDK/tools/prove.py .` exits 0 after the commit and the new tests fail when their production change is reverted.
+
+> **Verified:** 2026-11-24 | §16 | 7a376e422268ee520a6afa025688585d6350bd5d
+> **Review:** `docs/reviews/d01-t01-s16.json`
 
 ## 17. Installed program replaced after a tested phase
 

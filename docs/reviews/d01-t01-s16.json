@@ -1,0 +1,87 @@
+{
+  "ref": "D01 T01 \u00a716",
+  "title": "Installer for Windows sessions",
+  "implementation_sha": "7a376e422268ee520a6afa025688585d6350bd5d",
+  "date": "2026-11-24",
+  "reviews": [
+    {
+      "round": 1,
+      "report": "docs/reviews/01-heliograph/D01-T01-s16.md",
+      "verdict": "fixed"
+    }
+  ],
+  "checks": [
+    "WSL app_build.py -> Ran 72 tests OK (skipped=4 Windows-only); Windows prove.py -> proved on Windows: Heliograph 7a376e4 (Ran 72 tests OK, skipped=14, 0 skips in TestWindowsInstaller)"
+  ],
+  "completion": {
+    "report": "docs/reviews/01-heliograph/D01-T01-s16.md",
+    "verdict": "reconciled",
+    "candidate": "7a376e422268ee520a6afa025688585d6350bd5d",
+    "reviewer": "astra",
+    "model": "gpt-6.2-astra",
+    "filed": []
+  },
+  "rounds_spent": 1,
+  "round_cap": 33,
+  "plan": {
+    "report": "docs/reviews/01-heliograph/D01-T01-s16.md",
+    "candidate": "dd96ff5b2d86a79d97d697151b81955ce517ab13",
+    "reviewer": "astra",
+    "model": "gpt-6.2-astra",
+    "effort": "medium",
+    "lenses": [
+      "plan"
+    ]
+  },
+  "schedule_sha": "dd96ff5b2d86a79d97d697151b81955ce517ab13",
+  "schedule": {
+    "policy": "three-pass",
+    "pass_cap": 33,
+    "blocking": [
+      "P1",
+      "P2"
+    ],
+    "plan": {
+      "effort": "medium",
+      "lenses": [
+        "plan"
+      ]
+    },
+    "rounds": [
+      {
+        "effort": "medium",
+        "lenses": [
+          "adversarial",
+          "integration",
+          "source-defect",
+          "consistency",
+          "quality",
+          "optimization",
+          "design"
+        ]
+      }
+    ],
+    "completion": {
+      "effort": "low",
+      "lenses": [
+        "plan-delivery",
+        "record"
+      ]
+    },
+    "reconciliation": {
+      "effort": "low",
+      "lenses": [
+        "adversarial",
+        "integration",
+        "plan-delivery",
+        "record"
+      ]
+    },
+    "lenses": {
+      "thread-safety": "Which state is reached from two threads (UI, worker, callback, timer) without one lock or atomic owning it, and which lock order, wait, cancellation or teardown can deadlock or run after its owner is gone?",
+      "memory-safety": "Which pointer, reference, view, handle or iterator can outlive what it refers to, and which size, index or cast is trusted unchecked?"
+    }
+  },
+  "passes_spent": 10,
+  "pass_cap": 33
+}
