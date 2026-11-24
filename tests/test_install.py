@@ -4,6 +4,7 @@ import errno
 import importlib.util
 import json
 import os
+import secrets
 import shutil
 import subprocess
 import sys
@@ -2975,6 +2976,808 @@ class TestWindowsInstaller(unittest.TestCase):
                 self.win_mod.win_remove(win_to=d2, reg_key=reg_key)
         finally:
             self._delete_reg_key(reg_key)
+
+
+@unittest.skipIf(os.name == "nt", "WSL phase installer tests run on Linux/WSL")
+class TestPhaseInstaller(unittest.TestCase):
+    """Tests for `tools/install.py --phase <n>` (D01 T01 §17)."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.mod = load_installer()
+        cls.phase_mod = cls.mod._load_phase_install()
+        cls.win_mod = cls.mod._load_win_install()
+        cls.helio_bin, cls.helio_exe = find_built_binaries()
+        if not cls.helio_bin.is_file() or not cls.helio_exe.is_file():
+            raise unittest.SkipTest("built binaries not found in build/linux")
+        cls.python_exe = shutil.which("python.exe")
+        cls.wslpath = shutil.which("wslpath")
+        if not cls.python_exe or not cls.wslpath:
+            raise unittest.SkipTest("WSL-to-Windows interop (python.exe / wslpath) not available")
+
+    def _new_reg_key(self) -> str:
+        return f"Software\\HeliographPhaseTest\\{secrets.token_hex(6)}"
+
+    def _delete_reg_key(self, reg_key: str) -> None:
+        code = (
+            "import sys, winreg\n"
+            "key = sys.argv[1]\n"
+            "try:\n"
+            "    winreg.DeleteKey(winreg.HKEY_CURRENT_USER, key)\n"
+            "except OSError:\n"
+            "    pass\n"
+        )
+        subprocess.run([self.python_exe, "-B", "-c", code, reg_key], stdin=subprocess.DEVNULL, capture_output=True)
+
+    def _win_temp_dir(self, name: str) -> str:
+        code = (
+            "import os, pathlib, sys, tempfile\n"
+            "d = pathlib.Path(tempfile.mkdtemp(prefix='helio_phase_')) / sys.argv[1]\n"
+            "print(str(d))\n"
+        )
+        res = subprocess.run([self.python_exe, "-B", "-c", code, name], stdin=subprocess.DEVNULL, capture_output=True, text=True, check=True)
+        return res.stdout.strip().splitlines()[-1]
+
+    def _cleanup_win_parent(self, win_dir: str) -> None:
+        code = (
+            "import pathlib, shutil, sys\n"
+            "p = pathlib.Path(sys.argv[1]).parent\n"
+            "shutil.rmtree(p, ignore_errors=True)\n"
+        )
+        subprocess.run([self.python_exe, "-B", "-c", code, win_dir], stdin=subprocess.DEVNULL, capture_output=True)
+
+    def _make_distinct_pair(self, out_dir: Path, tag: bytes) -> tuple[Path, Path]:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        h = out_dir / "helio"
+        e = out_dir / "helio.exe"
+        h.write_bytes(self.helio_bin.read_bytes() + b"\x00" * 16 + tag)
+        e.write_bytes(self.helio_exe.read_bytes() + b"\x00" * 16 + tag)
+        os.chmod(h, 0o755)
+        os.chmod(e, 0o755)
+        return (h, e)
+
+    def _make_fixture_workspace(
+        self,
+        root: Path,
+        *,
+        plan_json: dict,
+        closeout_text: str | None = "# Phase 0\n\n## Closeout run=abc123\n\nAll done.\n",
+        app_build_mode: str = "ok",
+        prove_mode: str = "ok",
+        bin_tag: bytes = b"CAND_V1",
+    ) -> tuple[Path, Path, Path]:
+        """Create an isolated workspace with fixture checkout, bare origin remote, and stub ImpossibleSDK."""
+        ws = root / "ws"
+        ws.mkdir(parents=True, exist_ok=True)
+        origin = ws / "origin.git"
+        subprocess.run(["git", "init", "--bare", "-b", "main", str(origin)], check=True, capture_output=True)
+
+        checkout = ws / "Heliograph"
+        checkout.mkdir()
+        subprocess.run(["git", "init", "-b", "main", str(checkout)], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(checkout), "config", "user.name", "Test"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(checkout), "config", "user.email", "test@example.com"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(checkout), "remote", "add", "origin", str(origin)], check=True, capture_output=True)
+        (checkout / ".gitignore").write_text("build/\n__pycache__/\n", encoding="utf-8")
+
+        # scripts/todo-graph.py returning plan_json
+        scripts_dir = checkout / "scripts"
+        scripts_dir.mkdir()
+        (scripts_dir / "todo-graph.py").write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, pathlib, sys\n"
+            "data = json.loads((pathlib.Path(__file__).resolve().parent / 'plan_fixture.json').read_text(encoding='utf-8'))\n"
+            "print(json.dumps(data))\n",
+            encoding="utf-8",
+        )
+        (scripts_dir / "plan_fixture.json").write_text(json.dumps(plan_json), encoding="utf-8")
+
+        if closeout_text is not None:
+            runs_dir = checkout / "docs" / "phase-runs"
+            runs_dir.mkdir(parents=True)
+            (runs_dir / "2026-11-24-phase-0.md").write_text(closeout_text, encoding="utf-8")
+
+        # Nonrecursive test inside fixture checkout that exercises IMPOSSIBLE_BUILD\helio.exe on Windows.
+        tests_dir = checkout / "tests"
+        tests_dir.mkdir()
+        (tests_dir / "test_fixture.py").write_text(
+            "import os, pathlib, subprocess, unittest\n"
+            "class FixtureProof(unittest.TestCase):\n"
+            "    def test_helio_exe_runs_from_impossible_build(self):\n"
+            "        b = pathlib.Path(os.environ['IMPOSSIBLE_BUILD']) / 'helio.exe'\n"
+            "        self.assertTrue(b.is_file(), str(b))\n"
+            "        res = subprocess.run([str(b), 'help'], capture_output=True, text=True)\n"
+            "        self.assertEqual(res.returncode, 0, res.stderr)\n"
+            "        self.assertIn('helio passes messages', res.stdout)\n",
+            encoding="utf-8",
+        )
+
+        # Stage source binaries for stub SDK app_build.py
+        src_bins = ws / "src_bins"
+        h_src, e_src = self._make_distinct_pair(src_bins, bin_tag)
+
+        # Stub ImpossibleSDK beside checkout
+        sdk_tools = ws / "ImpossibleSDK" / "tools"
+        sdk_tools.mkdir(parents=True)
+        (sdk_tools / "app_build.py").write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, pathlib, shutil, sys\n"
+            "repo = pathlib.Path(sys.argv[1]).resolve()\n"
+            "mode = (pathlib.Path(__file__).resolve().parent / 'app_build.mode').read_text(encoding='utf-8').strip()\n"
+            "src_dir = repo.parent / 'src_bins'\n"
+            "out_win = repo / 'build' / 'linux' / 'helio.exe'\n"
+            "out_wsl = repo / 'build' / 'linux' / 'linux' / 'helio'\n"
+            "out_wsl.parent.mkdir(parents=True, exist_ok=True)\n"
+            "if not out_wsl.exists() or out_wsl.read_bytes() != (src_dir / 'helio').read_bytes():\n"
+            "    shutil.copy2(src_dir / 'helio', out_wsl)\n"
+            "if not out_win.exists() or out_win.read_bytes() != (src_dir / 'helio.exe').read_bytes():\n"
+            "    shutil.copy2(src_dir / 'helio.exe', out_win)\n"
+            "if '--no-test' in sys.argv:\n"
+            "    sys.exit(0)\n"
+            "if mode == 'fail':\n"
+            "    print('FAIL: simulated build failure')\n"
+            "    sys.exit(1)\n"
+            "if mode == 'skip_race':\n"
+            "    print('test_windows_and_linux_take_each_job_once (test_helio.Jobs) ... skipped \\'no windows\\'')\n"
+            "    sys.exit(0)\n"
+            "print('test_windows_and_linux_take_each_job_once (test_helio.Jobs) ... ok')\n"
+            "sys.exit(0)\n",
+            encoding="utf-8",
+        )
+        (sdk_tools / "app_build.mode").write_text(app_build_mode, encoding="utf-8")
+
+        (sdk_tools / "prove.py").write_text(
+            "#!/usr/bin/env python3\n"
+            "import pathlib, subprocess, sys\n"
+            "repo = pathlib.Path(sys.argv[1]).resolve()\n"
+            "mode = (pathlib.Path(__file__).resolve().parent / 'prove.mode').read_text(encoding='utf-8').strip()\n"
+            "if mode == 'fail':\n"
+            "    print('NOT proved on Windows: Heliograph')\n"
+            "    sys.exit(1)\n"
+            "sha = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', '--short', 'HEAD'], text=True).strip()\n"
+            "print(f'proved on Windows: Heliograph {sha}')\n"
+            "sys.exit(0)\n",
+            encoding="utf-8",
+        )
+        (sdk_tools / "prove.mode").write_text(prove_mode, encoding="utf-8")
+
+        subprocess.run(["git", "-C", str(checkout), "add", "."], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(checkout), "commit", "-m", "fixture: phase 0 closed"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(checkout), "push", "-u", "origin", "main"], check=True, capture_output=True)
+        return (checkout, origin, src_bins)
+
+    def test_phase_cli_validation_docs_and_refusals(self) -> None:
+        # 1. Docs & owning closeout skills all name `tools/install.py --phase`
+        for rel in (
+            "AGENTS.md",
+            "docs/unattended-prompt.md",
+            ".agents/skills/process-phase/SKILL.md",
+            ".claude/skills/process-phase/SKILL.md",
+            ".codex/skills/process-phase/SKILL.md",
+        ):
+            text = (REPO / rel).read_text(encoding="utf-8")
+            self.assertIn("tools/install.py --phase", text, rel)
+
+        # 2. Incompatible CLI combinations refuse with exit 2
+        self.assertEqual(self.mod.main(["--phase", "0", "--windows"]), 2)
+        self.assertEqual(self.mod.main(["--win-to", "C:\\Helio"]), 2)
+        self.assertEqual(self.mod.main(["--phase", "-1"]), 2)
+        self.assertEqual(self.mod.main(["--phase", "0", "--win-to", "C:\\Bad;Dir"]), 2)
+
+        # 3. Missing WSL-to-Windows interop refuses with exit 3 before touching destinations
+        with mock.patch.object(shutil, "which", return_value=None):
+            with self.assertRaises(self.mod.InstallError) as ctx:
+                self.phase_mod._check_interop(self.mod)
+            self.assertEqual(ctx.exception.code, 3)
+
+        # 4. Pre-flight refusal matrix on fixture checkout (installed program untouched, zero notices)
+        base_plan = {
+            "phases": {"0": "Phase 0", "99": "Manual"},
+            "sections": [
+                {"ref": "D01 T01 §15", "phase": 0, "status": "verified"},
+                {"ref": "D01 T01 §16", "phase": 0, "status": "verified"},
+            ],
+        }
+        reg_key = self._new_reg_key()
+        win_to = self._win_temp_dir("Helio Refusal")
+        try:
+            with tempfile.TemporaryDirectory(prefix="helio-phase-refuse-") as tmp:
+                root = Path(tmp)
+                checkout, origin, src_bins = self._make_fixture_workspace(root, plan_json=base_plan)
+                to_dir = root / "wsl_bin"
+                store_dir = root / "store"
+                wrapper = root / "local_bin" / "helio"
+
+                def call_phase(phase_num: int = 0, **kw):
+                    return self.phase_mod.run_phase_install(
+                        repo=checkout,
+                        phase=phase_num,
+                        to_dir=to_dir,
+                        store_dir=store_dir,
+                        wrapper_path=wrapper,
+                        win_to_raw=win_to,
+                        reg_key=reg_key,
+                        sdk_url="unused",
+                        install_mod=self.mod,
+                        **kw,
+                    )
+
+                # Unknown phase & empty phase 99
+                for bad_phase in (77, 99):
+                    with self.assertRaises(self.mod.InstallError) as ctx:
+                        call_phase(bad_phase)
+                    self.assertEqual(ctx.exception.code, 2)
+
+                # One open section in phase 0
+                open_plan = {
+                    "phases": {"0": "Phase 0"},
+                    "sections": [
+                        {"ref": "D01 T01 §15", "phase": 0, "status": "verified"},
+                        {"ref": "D01 T01 §16", "phase": 0, "status": "open"},
+                    ],
+                }
+                (checkout / "scripts" / "plan_fixture.json").write_text(json.dumps(open_plan), encoding="utf-8")
+                subprocess.run(["git", "-C", str(checkout), "commit", "-am", "open"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(checkout), "push", "origin", "main"], check=True, capture_output=True)
+                with self.assertRaises(self.mod.InstallError) as ctx:
+                    call_phase(0)
+                self.assertEqual(ctx.exception.code, 2)
+                self.assertIn("§16", str(ctx.exception))
+
+                # Restore verified plan, remove Closeout heading -> refused
+                (checkout / "scripts" / "plan_fixture.json").write_text(json.dumps(base_plan), encoding="utf-8")
+                (checkout / "docs" / "phase-runs" / "2026-11-24-phase-0.md").write_text("# Phase 0\n\nNo closeout yet.\n", encoding="utf-8")
+                subprocess.run(["git", "-C", str(checkout), "commit", "-am", "unclosed"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(checkout), "push", "origin", "main"], check=True, capture_output=True)
+                with self.assertRaises(self.mod.InstallError) as ctx:
+                    call_phase(0)
+                self.assertEqual(ctx.exception.code, 2)
+                self.assertIn("Closeout", str(ctx.exception))
+
+                # PARKED phase -> refused
+                (checkout / "docs" / "phase-runs" / "2026-11-24-phase-0.md").write_text(
+                    "# Phase 0\n\nPARKED 2026-11-24T00:00Z run=abc waiting\n", encoding="utf-8"
+                )
+                subprocess.run(["git", "-C", str(checkout), "commit", "-am", "parked"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(checkout), "push", "origin", "main"], check=True, capture_output=True)
+                with self.assertRaises(self.mod.InstallError) as ctx:
+                    call_phase(0)
+                self.assertEqual(ctx.exception.code, 2)
+                self.assertIn("PARKED", str(ctx.exception))
+
+                # Restore Closeout, plant unpushed commit (HEAD != origin/main) -> refused
+                (checkout / "docs" / "phase-runs" / "2026-11-24-phase-0.md").write_text(
+                    "# Phase 0\n\n## Closeout run=abc\n\nDone.\n", encoding="utf-8"
+                )
+                subprocess.run(["git", "-C", str(checkout), "commit", "-am", "closed-unpushed"], check=True, capture_output=True)
+                with self.assertRaises(self.mod.InstallError) as ctx:
+                    call_phase(0)
+                self.assertEqual(ctx.exception.code, 2)
+                self.assertIn("origin/main", str(ctx.exception))
+
+                # Push it, then plant dirty working tree -> refused
+                subprocess.run(["git", "-C", str(checkout), "push", "origin", "main"], check=True, capture_output=True)
+                (checkout / "dirty.txt").write_text("untracked\n", encoding="utf-8")
+                with self.assertRaises(self.mod.InstallError) as ctx:
+                    call_phase(0)
+                self.assertEqual(ctx.exception.code, 2)
+                self.assertIn("uncommitted", str(ctx.exception))
+                (checkout / "dirty.txt").unlink()
+
+                # app_build.py fails -> refused
+                mode_ab = checkout.parent / "ImpossibleSDK" / "tools" / "app_build.mode"
+                mode_pr = checkout.parent / "ImpossibleSDK" / "tools" / "prove.mode"
+                mode_ab.write_text("fail", encoding="utf-8")
+                with self.assertRaises(self.mod.InstallError) as ctx:
+                    call_phase(0)
+                self.assertEqual(ctx.exception.code, 3)
+
+                # app_build.py skips race test -> refused
+                mode_ab.write_text("skip_race", encoding="utf-8")
+                with self.assertRaises(self.mod.InstallError) as ctx:
+                    call_phase(0)
+                self.assertEqual(ctx.exception.code, 3)
+                self.assertIn("skipped", str(ctx.exception))
+                mode_ab.write_text("ok", encoding="utf-8")
+
+                # prove.py fails -> refused
+                mode_pr.write_text("fail", encoding="utf-8")
+                with self.assertRaises(self.mod.InstallError) as ctx:
+                    call_phase(0)
+                self.assertEqual(ctx.exception.code, 3)
+                mode_pr.write_text("ok", encoding="utf-8")
+
+                # Binary rebuilt/modified after pre-proof hash -> refused
+                def tamper_after_hash(wsl_b: Path, win_b: Path) -> None:
+                    win_b.write_bytes(win_b.read_bytes() + b"\x00")
+
+                with self.assertRaises(self.mod.InstallError) as ctx:
+                    call_phase(0, on_after_pre_proof_hash=tamper_after_hash)
+                self.assertEqual(ctx.exception.code, 3)
+                self.assertIn("rebuilt", str(ctx.exception))
+
+                # Nothing was installed and no store/notice was created by any refusal!
+                self.assertFalse(to_dir.exists())
+                self.assertFalse(wrapper.exists())
+                self.assertFalse(store_dir.exists())
+        finally:
+            self._delete_reg_key(reg_key)
+            self._cleanup_win_parent(win_to)
+
+    def test_phase_end_to_end_retry_rollback_crash_recovery_and_tell(self) -> None:
+        base_plan = {
+            "phases": {"0": "Phase 0"},
+            "sections": [{"ref": "D01 T01 §15", "phase": 0, "status": "verified"}],
+        }
+        reg_key = self._new_reg_key()
+        win_to = self._win_temp_dir("Helio Phase Dir")
+        try:
+            with tempfile.TemporaryDirectory(prefix="helio-phase-e2e-") as tmp:
+                root = Path(tmp)
+                checkout, origin, src_bins = self._make_fixture_workspace(root, plan_json=base_plan, bin_tag=b"PHASE_V2")
+                to_dir = root / "wsl bin"
+                store_dir = root / "phase store"
+                wrapper = root / "local bin" / "helio"
+
+                # Seed a distinct V1 installation on BOTH WSL and Windows so we have a real previous generation.
+                v1_dir = root / "v1_bins"
+                v1_h, v1_e = self._make_distinct_pair(v1_dir, b"PRIOR_V1")
+                v1_h_sha = self.mod.sha256_file(v1_h)
+                v1_e_sha = self.mod.sha256_file(v1_e)
+                v1_commit = "1" * 40
+                self.mod.install(
+                    repo=checkout,
+                    to_dir=to_dir,
+                    store_dir=store_dir,
+                    wrapper_path=wrapper,
+                    prebuilt=(v1_h, v1_e),
+                    commit_override=v1_commit,
+                    dirty_override=False,
+                )
+                install_py_win = self.win_mod.wsl_to_windows_path(REPO / "tools" / "install.py")
+                win_store = self.win_mod.wsl_to_windows_path(store_dir)
+                w1 = self.phase_mod._run_win_cli(
+                    self.python_exe,
+                    install_py_win,
+                    [
+                        "--source-exe",
+                        self.win_mod.wsl_to_windows_path(v1_e),
+                        "--source-sha256",
+                        v1_e_sha,
+                        "--commit",
+                        v1_commit,
+                        "--store",
+                        win_store,
+                        "--to",
+                        win_to,
+                        "--reg-key",
+                        reg_key,
+                    ],
+                )
+                self.assertEqual(w1.returncode, 0, w1.stdout + w1.stderr)
+
+                # Run full `--phase 0` via CLI with distinct nondefault WSL --to and spaced Windows --win-to!
+                env_cli = {**os.environ, "HELIO_REPO": str(checkout), "HELIO_AS": "impossible/runner-a"}
+                cli_res = subprocess.run(
+                    [
+                        sys.executable,
+                        str(REPO / "tools" / "install.py"),
+                        "--phase",
+                        "0",
+                        "--to",
+                        str(to_dir),
+                        "--win-to",
+                        win_to,
+                        "--store",
+                        str(store_dir),
+                        "--wrapper",
+                        str(wrapper),
+                        "--reg-key",
+                        reg_key,
+                    ],
+                    env=env_cli,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(cli_res.returncode, 0, cli_res.stdout + cli_res.stderr)
+
+                head_sha = subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip()
+                v2_h_sha = self.mod.sha256_file(src_bins / "helio")
+                v2_e_sha = self.mod.sha256_file(src_bins / "helio.exe")
+
+                # Verify both WSL and Windows manifests & live binaries match proved V2 and keep V1 as previous.
+                wsl_m = self.mod.read_manifest(to_dir)
+                self.assertEqual(wsl_m["current"]["commit"], head_sha)
+                self.assertFalse(wsl_m["current"]["dirty"])
+                self.assertEqual(wsl_m["current"]["helio_sha256"], v2_h_sha)
+                self.assertEqual(wsl_m["previous"]["commit"], v1_commit)
+                self.assertEqual(wsl_m["previous"]["helio_sha256"], v1_h_sha)
+
+                win_install_py_win = self.win_mod.wsl_to_windows_path(REPO / "tools" / "win_install.py")
+                win_st = self.phase_mod._probe_win_state(self.python_exe, win_install_py_win, win_to, reg_key)
+                self.assertEqual(win_st["status_code"], 0, win_st["status_lines"])
+                self.assertEqual(win_st["exe_sha"], v2_e_sha)
+                self.assertEqual(win_st["manifest"]["current"]["commit"], head_sha)
+                self.assertEqual(win_st["manifest"]["previous"]["commit"], v1_commit)
+
+                # Verify exactly ONE notice arrived in another lane's inbox naming phase 0 and head_sha.
+                msg_files_before = sorted((store_dir / "messages").glob("*.post"))
+                self.assertEqual(len(msg_files_before), 1, msg_files_before)
+                inbox_other = subprocess.run(
+                    [str(wrapper), "--store", str(store_dir), "--as", "impossible/other"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                self.assertIn("phase 0", inbox_other.stdout.lower())
+                self.assertIn(head_sha[:12], inbox_other.stdout)
+
+                # Idempotent retry under a DIFFERENT ambient HELIO_AS: neither host changes, previous stays V1, same notice!
+                with mock.patch.dict(os.environ, {"HELIO_AS": "impossible/runner-b"}):
+                    retry_res = self.phase_mod.run_phase_install(
+                        repo=checkout,
+                        phase=0,
+                        to_dir=to_dir,
+                        store_dir=store_dir,
+                        wrapper_path=wrapper,
+                        win_to_raw=win_to,
+                        reg_key=reg_key,
+                        sdk_url="unused",
+                        install_mod=self.mod,
+                    )
+                self.assertFalse(retry_res["wsl_changed"])
+                self.assertFalse(retry_res["win_changed"])
+                self.assertEqual(self.mod.read_manifest(to_dir)["previous"]["commit"], v1_commit)
+                self.assertEqual(
+                    self.phase_mod._probe_win_state(self.python_exe, win_install_py_win, win_to, reg_key)["manifest"]["previous"]["commit"],
+                    v1_commit,
+                )
+                self.assertEqual(len(list((store_dir / "messages").glob("*.post"))), 1)
+
+                # Prepare a V3 commit and plant a verification fault -> BOTH WSL and Windows roll back to V2 (head_sha) and exit 3!
+                self._make_distinct_pair(src_bins, b"PHASE_V3")
+                (checkout / "v3.txt").write_text("v3\n", encoding="utf-8")
+                subprocess.run(["git", "-C", str(checkout), "add", "v3.txt"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(checkout), "commit", "-m", "v3"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(checkout), "push", "origin", "main"], check=True, capture_output=True)
+
+                def fail_verify(stage: str) -> None:
+                    if stage == "before_roundtrip":
+                        raise self.mod.InstallError("planted post-install verification fault", code=3)
+
+                with self.assertRaises(self.mod.InstallError) as ctx:
+                    self.phase_mod.run_phase_install(
+                        repo=checkout,
+                        phase=0,
+                        to_dir=to_dir,
+                        store_dir=store_dir,
+                        wrapper_path=wrapper,
+                        win_to_raw=win_to,
+                        reg_key=reg_key,
+                        sdk_url="unused",
+                        install_mod=self.mod,
+                        on_verify=fail_verify,
+                    )
+                self.assertEqual(ctx.exception.code, 3)
+                # Both hosts restored to V2 (head_sha), journal cleaned up, zero new notices!
+                self.assertEqual(self.mod.read_manifest(to_dir)["current"]["commit"], head_sha)
+                self.assertEqual(self.mod.sha256_file(to_dir / "helio"), v2_h_sha)
+                win_after_rb = self.phase_mod._probe_win_state(self.python_exe, win_install_py_win, win_to, reg_key)
+                self.assertEqual(win_after_rb["manifest"]["current"]["commit"], head_sha)
+                self.assertEqual(win_after_rb["exe_sha"], v2_e_sha)
+                self.assertFalse((to_dir / self.phase_mod.PHASE_JOURNAL_NAME).exists())
+                self.assertEqual(len(list((store_dir / "messages").glob("*.post"))), 1)
+
+                # Pending-notification resume: fail once at `before_tell`, verify journal stays `notifying`,
+                # then retry resumes ONLY notification without reinstalling!
+                v3_sha = subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip()
+
+                def fail_tell(boundary: str) -> None:
+                    if boundary == "before_tell":
+                        raise self.mod.InstallError("simulated tell failure", code=3)
+
+                with self.assertRaises(self.mod.InstallError):
+                    self.phase_mod.run_phase_install(
+                        repo=checkout,
+                        phase=0,
+                        to_dir=to_dir,
+                        store_dir=store_dir,
+                        wrapper_path=wrapper,
+                        win_to_raw=win_to,
+                        reg_key=reg_key,
+                        sdk_url="unused",
+                        install_mod=self.mod,
+                        on_boundary=fail_tell,
+                    )
+                jp = to_dir / self.phase_mod.PHASE_JOURNAL_NAME
+                self.assertTrue(jp.is_file())
+                self.assertEqual(json.loads(jp.read_text(encoding="utf-8"))["phase_state"], "notifying")
+
+                resumed = self.phase_mod.run_phase_install(
+                    repo=checkout,
+                    phase=0,
+                    to_dir=to_dir,
+                    store_dir=store_dir,
+                    wrapper_path=wrapper,
+                    win_to_raw=win_to,
+                    reg_key=reg_key,
+                    sdk_url="unused",
+                    install_mod=self.mod,
+                )
+                self.assertTrue(resumed["resumed_notification"])
+                self.assertEqual(resumed["commit"], v3_sha)
+                self.assertFalse(jp.exists())
+                self.assertEqual(len(list((store_dir / "messages").glob("*.post"))), 2)
+
+                # Clean up Windows installation cleanly
+                self.phase_mod._run_win_cli(self.python_exe, install_py_win, ["--remove", "--to", win_to, "--reg-key", reg_key])
+        finally:
+            self._delete_reg_key(reg_key)
+            self._cleanup_win_parent(win_to)
+
+    def test_previous_program_reads_populated_store_written_by_candidate_and_preserves_keyed_sends(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="helio-compat-") as tmp:
+            root = Path(tmp)
+            to_dir = root / "bin"
+            store_dir = root / "store"
+            wrapper = root / "local" / "helio"
+            prev_dir = root / "prev"
+            cand_dir = root / "cand"
+            prev_h, prev_e = self._make_distinct_pair(prev_dir, b"PREV_COMPAT")
+            cand_h, cand_e = self._make_distinct_pair(cand_dir, b"CAND_COMPAT")
+
+            # Install previous, then replace with candidate.
+            self.mod.install(
+                repo=REPO,
+                to_dir=to_dir,
+                store_dir=store_dir,
+                wrapper_path=wrapper,
+                prebuilt=(prev_h, prev_e),
+                commit_override="a" * 40,
+                dirty_override=False,
+            )
+            self.mod.install(
+                repo=REPO,
+                to_dir=to_dir,
+                store_dir=store_dir,
+                wrapper_path=wrapper,
+                prebuilt=(cand_h, cand_e),
+                commit_override="b" * 40,
+                dirty_override=False,
+            )
+
+            # Candidate populates the store: a heads-up, a taken+done job, and a keyed message.
+            tell_id = subprocess.run(
+                [str(wrapper), "tell", "impossible/all", "compat heads-up", "--as", "impossible/a"],
+                input="hello from candidate\n",
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip().splitlines()[-1]
+            job_id = subprocess.run(
+                [str(wrapper), "ask", "impossible/all", "compat job", "--as", "impossible/a"],
+                input="job body from candidate\n",
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip().splitlines()[-1]
+            subprocess.run([str(wrapper), "take", job_id, "--as", "impossible/b"], check=True, capture_output=True, text=True)
+            subprocess.run([str(wrapper), "done", job_id, "finished", "--as", "impossible/b"], check=True, capture_output=True, text=True)
+            keyed_id = subprocess.run(
+                [str(wrapper), "tell", "impossible/all", "compat keyed", "--as", "impossible/a", "--key", "compat-k1"],
+                input="keyed body\n",
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip().splitlines()[-1]
+            msg_count_before = len(list((store_dir / "messages").glob("*.post")))
+            self.assertEqual(msg_count_before, 3)
+
+            # Roll back to previous program and verify `check`, `show`, job state/taker, and keyed-send idempotence!
+            self.mod.go_back(to_dir=to_dir, wrapper_path=wrapper)
+            self.assertEqual(self.mod.sha256_file(to_dir / "helio"), self.mod.sha256_file(prev_h))
+
+            chk = subprocess.run([str(wrapper), "check"], capture_output=True, text=True)
+            self.assertEqual(chk.returncode, 0, chk.stdout + chk.stderr)
+
+            show_tell = subprocess.run([str(wrapper), "show", tell_id, "--as", "impossible/b"], capture_output=True, text=True, check=True).stdout
+            self.assertIn("hello from candidate", show_tell)
+
+            show_job = subprocess.run([str(wrapper), "show", job_id, "--as", "impossible/b"], capture_output=True, text=True, check=True).stdout
+            self.assertIn("job body from candidate", show_job)
+            self.assertIn("impossible/b", show_job)
+            self.assertIn("done", show_job.lower())
+
+            retry_keyed_id = subprocess.run(
+                [str(wrapper), "tell", "impossible/all", "compat keyed", "--as", "impossible/a", "--key", "compat-k1"],
+                input="keyed body\n",
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip().splitlines()[-1]
+            self.assertEqual(retry_keyed_id, keyed_id)
+            self.assertEqual(len(list((store_dir / "messages").glob("*.post"))), msg_count_before)
+
+    def test_phase_crash_recovery_between_hosts_mid_rollback_and_mixed_host(self) -> None:
+        base_plan = {
+            "phases": {"0": "Phase 0"},
+            "sections": [{"ref": "D01 T01 §15", "phase": 0, "status": "verified"}],
+        }
+        reg_key = self._new_reg_key()
+        win_to = self._win_temp_dir("Helio Crash")
+        try:
+            with tempfile.TemporaryDirectory(prefix="helio-phase-crash-") as tmp:
+                root = Path(tmp)
+                checkout, origin, src_bins = self._make_fixture_workspace(root, plan_json=base_plan, bin_tag=b"CRASH_V2")
+                to_dir = root / "wsl_bin"
+                store_dir = root / "store"
+                wrapper = root / "local" / "helio"
+                install_py_win = self.win_mod.wsl_to_windows_path(REPO / "tools" / "install.py")
+                win_install_py_win = self.win_mod.wsl_to_windows_path(REPO / "tools" / "win_install.py")
+                win_store = self.win_mod.wsl_to_windows_path(store_dir)
+
+                # Seed V1 on both WSL and Windows.
+                v1_h, v1_e = self._make_distinct_pair(root / "v1", b"CRASH_V1")
+                v1_h_sha = self.mod.sha256_file(v1_h)
+                v1_e_sha = self.mod.sha256_file(v1_e)
+                v1_commit = "1" * 40
+                self.mod.install(
+                    repo=checkout,
+                    to_dir=to_dir,
+                    store_dir=store_dir,
+                    wrapper_path=wrapper,
+                    prebuilt=(v1_h, v1_e),
+                    commit_override=v1_commit,
+                    dirty_override=False,
+                )
+                w1 = self.phase_mod._run_win_cli(
+                    self.python_exe,
+                    install_py_win,
+                    [
+                        "--source-exe",
+                        self.win_mod.wsl_to_windows_path(v1_e),
+                        "--source-sha256",
+                        v1_e_sha,
+                        "--commit",
+                        v1_commit,
+                        "--store",
+                        win_store,
+                        "--to",
+                        win_to,
+                        "--reg-key",
+                        reg_key,
+                    ],
+                )
+                self.assertEqual(w1.returncode, 0, w1.stdout + w1.stderr)
+
+                # 1. Remote drift during proof (origin/main advances) -> refused, both hosts stay on V1!
+                def drift_origin(wsl_b: Path, win_b: Path) -> None:
+                    other_clone = root / "other_clone"
+                    subprocess.run(["git", "clone", str(origin), str(other_clone)], check=True, capture_output=True)
+                    subprocess.run(["git", "-C", str(other_clone), "config", "user.name", "Other"], check=True, capture_output=True)
+                    subprocess.run(["git", "-C", str(other_clone), "config", "user.email", "o@example.com"], check=True, capture_output=True)
+                    (other_clone / "drift.txt").write_text("drift\n", encoding="utf-8")
+                    subprocess.run(["git", "-C", str(other_clone), "add", "drift.txt"], check=True, capture_output=True)
+                    subprocess.run(["git", "-C", str(other_clone), "commit", "-m", "drift"], check=True, capture_output=True)
+                    subprocess.run(["git", "-C", str(other_clone), "push", "origin", "main"], check=True, capture_output=True)
+
+                with self.assertRaises(self.mod.InstallError) as ctx:
+                    self.phase_mod.run_phase_install(
+                        repo=checkout,
+                        phase=0,
+                        to_dir=to_dir,
+                        store_dir=store_dir,
+                        wrapper_path=wrapper,
+                        win_to_raw=win_to,
+                        reg_key=reg_key,
+                        sdk_url="unused",
+                        install_mod=self.mod,
+                        on_after_pre_proof_hash=drift_origin,
+                    )
+                self.assertEqual(ctx.exception.code, 2)
+                self.assertEqual(self.mod.sha256_file(to_dir / "helio"), v1_h_sha)
+
+                # Pull drift so checkout == origin/main again.
+                subprocess.run(["git", "-C", str(checkout), "pull", "--rebase", "origin", "main"], check=True, capture_output=True)
+                head_sha = subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip()
+
+                # 2. Simulate crash BETWEEN WSL install and Windows install: manually plant a `wsl_done` journal
+                # after updating WSL only, then run recovery -> WSL rolls back to V1, Windows stays untouched on V1!
+                v2_h, v2_e = src_bins / "helio", src_bins / "helio.exe"
+                self.mod.install(
+                    repo=checkout,
+                    to_dir=to_dir,
+                    store_dir=store_dir,
+                    wrapper_path=wrapper,
+                    prebuilt=(v2_h, v2_e),
+                    commit_override=head_sha,
+                    dirty_override=False,
+                )
+                crashed_journal = {
+                    "schema_version": 1,
+                    "tx_id": "aabbccddeeff",
+                    "phase": 0,
+                    "commit": head_sha,
+                    "phase_state": "wsl_done",
+                    "wsl_to": str(to_dir.resolve()),
+                    "wrapper": str(wrapper.resolve()),
+                    "store": str(store_dir.resolve()),
+                    "win_to_arg": win_to,
+                    "win_dest": win_to,
+                    "reg_key": reg_key,
+                    "proved_wsl_sha": self.mod.sha256_file(v2_h),
+                    "proved_win_sha": self.mod.sha256_file(v2_e),
+                    "wsl_had_install": True,
+                    "wsl_pre_helio_sha": v1_h_sha,
+                    "wsl_pre_commit": v1_commit,
+                    "wsl_pre_store": str(store_dir.resolve()),
+                    "wsl_pre_wrapper": str(wrapper.resolve()),
+                    "win_had_install": True,
+                    "win_pre_exe_sha": v1_e_sha,
+                    "win_pre_commit": v1_commit,
+                    "win_pre_store": win_store,
+                    "wsl_changed": True,
+                    "win_changed": False,
+                }
+                self.mod.write_json_atomic(to_dir / self.phase_mod.PHASE_JOURNAL_NAME, crashed_journal)
+                self.phase_mod._recover_pending_phase_journal(
+                    to_dir=to_dir,
+                    python_exe=self.python_exe,
+                    install_py_win=install_py_win,
+                    win_install_py_win=win_install_py_win,
+                    install_mod=self.mod,
+                )
+                self.assertEqual(self.mod.sha256_file(to_dir / "helio"), v1_h_sha)
+                self.assertEqual(
+                    self.phase_mod._probe_win_state(self.python_exe, win_install_py_win, win_to, reg_key)["exe_sha"],
+                    v1_e_sha,
+                )
+                self.assertFalse((to_dir / self.phase_mod.PHASE_JOURNAL_NAME).exists())
+
+                # 3. Mixed-host update (WSL already on V2, Windows still on V1) + planted verification fault:
+                # ONLY Windows rolls back to V1; WSL stays on V2 with its `previous` (V1) preserved!
+                self.mod.install(
+                    repo=checkout,
+                    to_dir=to_dir,
+                    store_dir=store_dir,
+                    wrapper_path=wrapper,
+                    prebuilt=(v2_h, v2_e),
+                    commit_override=head_sha,
+                    dirty_override=False,
+                )
+
+                def fail_after_win(stage: str) -> None:
+                    if stage == "before_roundtrip":
+                        raise self.mod.InstallError("planted mixed-host fault", code=3)
+
+                with self.assertRaises(self.mod.InstallError) as ctx:
+                    self.phase_mod.run_phase_install(
+                        repo=checkout,
+                        phase=0,
+                        to_dir=to_dir,
+                        store_dir=store_dir,
+                        wrapper_path=wrapper,
+                        win_to_raw=win_to,
+                        reg_key=reg_key,
+                        sdk_url="unused",
+                        install_mod=self.mod,
+                        on_verify=fail_after_win,
+                    )
+                self.assertEqual(ctx.exception.code, 3)
+                # WSL was untouched (still V2 with previous=V1), Windows rolled back to V1!
+                wsl_after = self.mod.read_manifest(to_dir)
+                self.assertEqual(wsl_after["current"]["commit"], head_sha)
+                self.assertEqual(wsl_after["previous"]["commit"], v1_commit)
+                win_after = self.phase_mod._probe_win_state(self.python_exe, win_install_py_win, win_to, reg_key)
+                self.assertEqual(win_after["exe_sha"], v1_e_sha)
+                self.assertEqual(win_after["manifest"]["current"]["commit"], v1_commit)
+
+                # Clean up Windows installation cleanly
+                self.phase_mod._run_win_cli(self.python_exe, install_py_win, ["--remove", "--to", win_to, "--reg-key", reg_key])
+        finally:
+            self._delete_reg_key(reg_key)
+            self._cleanup_win_parent(win_to)
 
 
 if __name__ == "__main__":

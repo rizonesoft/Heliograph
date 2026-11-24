@@ -7,5 +7,15 @@
     "2": "The right reader",
     "3": "Scripts and queues",
     "99": "Manual, operator only"
+  },
+  "needs": [
+    "wsl-windows-interop"
+  ],
+  "probes": {
+    "wsl-windows-interop": [
+      "sh",
+      "-c",
+      "command -v python.exe >/dev/null 2>&1 && command -v wslpath >/dev/null 2>&1"
+    ]
   }
 }

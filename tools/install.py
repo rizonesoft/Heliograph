@@ -23,6 +23,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import types
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -1062,6 +1063,8 @@ def install(
     wrapper_path: Path,
     sdk_url: str = DEFAULT_SDK_URL,
     prebuilt: tuple[Path, Path] | None = None,
+    commit_override: str | None = None,
+    dirty_override: bool | None = None,
     on_boundary: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Build (unless prebuilt is supplied for internal/phase callers) and install Heliograph."""
@@ -1080,7 +1083,11 @@ def install(
         if prebuilt is None:
             helio_src, helio_exe_src, commit, dirty = ensure_sdk_and_build(repo, sdk_url, snap_dir)
         else:
-            commit, dirty = git_provenance(repo)
+            if commit_override is not None:
+                commit = commit_override
+                dirty = bool(dirty_override) if dirty_override is not None else False
+            else:
+                commit, dirty = git_provenance(repo)
             helio_src, helio_exe_src = prebuilt
             for p in (helio_src, helio_exe_src):
                 if not p.is_file():
@@ -1683,6 +1690,18 @@ def _load_win_install():
     return mod
 
 
+def _load_phase_install():
+    phase_mod_path = Path(__file__).resolve().parent / "phase_install.py"
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("helio_phase_install", phase_mod_path)
+    if spec is None or spec.loader is None:
+        raise InstallError(f"cannot load phase installer helper at {phase_mod_path}", code=3)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def _looks_like_windows_path(raw: str) -> bool:
     return raw.startswith("\\\\") or (len(raw) >= 2 and raw[1] == ":" and raw[0].isalpha())
 
@@ -1769,6 +1788,7 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--to", type=str, default=None, help="program folder (default: <checkout>/../bin or %%LOCALAPPDATA%%\\Heliograph)")
+    parser.add_argument("--win-to", type=str, default=None, help="Windows program folder for --phase mode (default: %%LOCALAPPDATA%%\\Heliograph; Windows path)")
     parser.add_argument("--store", type=str, default=None, help="store folder (default: <checkout>/../Heliograph-signals)")
     parser.add_argument("--wrapper", type=Path, default=def_wrapper, help="wrapper path (default: ~/.local/bin/helio)")
     parser.add_argument("--windows", action="store_true", help="install, check, roll back, or remove for Windows sessions")
@@ -1781,9 +1801,36 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--status", action="store_true", help="verify and print the installed commit and health")
     mode.add_argument("--back", action="store_true", help="restore the previously installed pair")
     mode.add_argument("--remove", action="store_true", help="remove installer-owned files, leaving the store untouched")
+    mode.add_argument("--phase", type=int, default=None, metavar="N", help="replace WSL and Windows programs after phase N is verified and closed")
     args = parser.parse_args(argv)
 
     try:
+        if args.phase is not None:
+            if args.windows:
+                raise InstallError("--phase replaces both WSL and Windows programs and cannot be combined with --windows", code=2)
+            phase_mod = _load_phase_install()
+            to_path = Path(args.to) if args.to else def_to
+            store_path = Path(args.store) if args.store else def_store
+            sdk_url = os.environ.get("HELIO_SDK_URL", DEFAULT_SDK_URL)
+            result = phase_mod.run_phase_install(
+                repo=repo,
+                phase=args.phase,
+                to_dir=to_path,
+                store_dir=store_path,
+                wrapper_path=args.wrapper,
+                win_to_raw=args.win_to,
+                reg_key=args.reg_key,
+                sdk_url=sdk_url,
+                install_mod=sys.modules.get(__name__) or types.SimpleNamespace(**globals()),
+            )
+            print(
+                f"phase {result['phase']} installed {result['commit']} "
+                f"(wsl: {result['wsl_to']}, windows: {result['win_to']}, store: {result['store']}, notice: {result['notice_id']})"
+            )
+            return 0
+        if args.win_to is not None:
+            raise InstallError("--win-to is only valid with --phase <n> (use --windows --to for Windows-only install)", code=2)
+
         if args.windows:
             op_mode = "status" if args.status else ("back" if args.back else ("remove" if args.remove else "install"))
             if os.name != "nt":

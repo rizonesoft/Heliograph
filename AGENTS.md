@@ -77,3 +77,5 @@ A project with a branch workflow replaces the first rule with its own; the other
 ## TODO workflow
 
 Plan and build through the TODO system: [docs/todo-workflow.md](./docs/todo-workflow.md).
+
+After a phase closeout commit is pushed, replace the installed WSL and Windows programs with `python3 tools/install.py --phase <n>`, record the installed commit in the phase run file in a subsequent commit, and heal any refusal as a red gate.

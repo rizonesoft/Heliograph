@@ -10,11 +10,11 @@ Format and rules: `todo/README.md`. Run sections with the `process-plan`, `proce
 
 Sections: 3 | Checklist items: 24
 
-| Status | Reference   | Deliverable                                     | Needs | Items |
-| ------ | ----------- | ----------------------------------------------- | ----- | ----- |
-| [x]    | D01 T01 §15 | Quick installer                                 | none  | 10    |
-| [x]    | D01 T01 §16 | Installer for Windows sessions                  | none  | 6     |
-| [ ]    | D01 T01 §17 | Installed program replaced after a tested phase | none  | 8     |
+| Status | Reference   | Deliverable                                     | Needs               | Items |
+| ------ | ----------- | ----------------------------------------------- | ------------------- | ----- |
+| [x]    | D01 T01 §15 | Quick installer                                 | none                | 10    |
+| [x]    | D01 T01 §16 | Installer for Windows sessions                  | none                | 6     |
+| [ ]    | D01 T01 §17 | Installed program replaced after a tested phase | wsl-windows-interop | 8     |
 
 ### Phase 1: A store that stays small
 
@@ -53,4 +53,4 @@ Sections: 4 | Checklist items: 19
 
 Progress: 2/17 verified sections, 4 ready to run now.
 
-Checklist: 16/99 items completed (includes Commit items).
+Checklist: 23/99 items completed (includes Commit items).
