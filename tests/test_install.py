@@ -1234,12 +1234,16 @@ class TestQuickInstaller(unittest.TestCase):
             in_pub_window = threading.Event()
             caller_in_flight = threading.Event()
             win_failures: list[str] = []
-            overlap_calls = 0
+            call_intervals: list[tuple[float, float]] = []
+            replace_window: list[float] = [0.0, 0.0]
 
             def win_caller():
-                nonlocal overlap_calls
+                import time as time_mod
+
                 while not win_stop.is_set():
                     during = in_pub_window.is_set()
+                    t_launch = time_mod.monotonic()
+                    proc = None
                     try:
                         proc = subprocess.Popen(
                             [str(to_dir / "helio.exe"), "help"],
@@ -1250,21 +1254,35 @@ class TestQuickInstaller(unittest.TestCase):
                         )
                         if during:
                             caller_in_flight.set()
-                        _out, err = proc.communicate(timeout=30)
+                        try:
+                            _out, err = proc.communicate(timeout=30)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                            proc.communicate()
+                            win_failures.append("helio.exe timed out")
+                            continue
+                        t_end = time_mod.monotonic()
                         if proc.returncode != 0:
                             win_failures.append(f"rc={proc.returncode} stderr={err}")
-                        elif during:
-                            overlap_calls += 1
+                        else:
+                            call_intervals.append((t_launch, t_end))
                     except (OSError, subprocess.SubprocessError) as exc:
+                        if proc is not None and proc.poll() is None:
+                            proc.kill()
+                            proc.communicate()
                         win_failures.append(f"exc={exc}")
 
             def wait_for_overlap(stage: str) -> None:
+                import time as time_mod
+
                 if stage == "after_helio":
-                    # Open the overlap window and wait until win_caller has actually launched a call
+                    # Open the overlap window and wait until win_caller has actually spawned helio.exe
                     # BEFORE returning control so replace_binary_atomic(stage_exe, helio.exe) overlaps it.
                     in_pub_window.set()
                     self.assertTrue(caller_in_flight.wait(timeout=15), "Windows caller never entered publication window")
+                    replace_window[0] = time_mod.monotonic()
                 elif stage == "after_helio_exe":
+                    replace_window[1] = time_mod.monotonic()
                     in_pub_window.clear()
 
             wt = threading.Thread(target=win_caller)
@@ -1294,7 +1312,11 @@ class TestQuickInstaller(unittest.TestCase):
                 if holder.stderr:
                     holder.stderr.close()
             self.assertEqual(win_failures, [])
-            self.assertGreater(overlap_calls, 0)
+            t_start, t_end = replace_window
+            if t_end == 0.0:
+                t_end = t_start
+            overlapped = [iv for iv in call_intervals if iv[0] <= t_end and iv[1] >= t_start]
+            self.assertGreater(len(overlapped), 0, f"no Windows call overlapped replacement window {replace_window}: {call_intervals}")
             code, _ = self.mod.status(to_dir=to_dir, wrapper_path=wrapper)
             self.assertEqual(code, 0)
 
@@ -1438,13 +1460,13 @@ class TestQuickInstaller(unittest.TestCase):
             code, _ = self.mod.status(to_dir=oserr_dir, wrapper_path=oserr_wrap)
             self.assertEqual(code, 0)
 
-            # 6. Clean home with system /etc/skel/.profile finds `helio` by name in one fresh login shell
+            # 6. Clean home with system login profile finds `helio` by name in one fresh login shell
             #    without test-injected PATH, verifying wrapper identity and unset HELIO_STORE BEFORE any write.
             clean_home = root / "clean_home"
             clean_home.mkdir()
             skel_profile = Path("/etc/skel/.profile")
-            self.assertTrue(skel_profile.is_file(), "/etc/skel/.profile is required for clean-home login shell proof")
-            shutil.copy2(skel_profile, clean_home / ".profile")
+            if skel_profile.is_file():
+                shutil.copy2(skel_profile, clean_home / ".profile")
             clean_to = root / "clean_to"
             clean_store = root / "clean_store"
             clean_wrap = clean_home / ".local" / "bin" / "helio"
@@ -1452,13 +1474,13 @@ class TestQuickInstaller(unittest.TestCase):
             expected_wrap = str(clean_wrap.resolve())
             before_msgs = set((clean_store / "messages").iterdir())
             login_script = (
-                f'resolved="$(command -v helio)" || exit 11; '
-                f'[ "$resolved" = {expected_wrap!r} ] || exit 12; '
-                f'[ -z "${{HELIO_STORE:-}}" ] || exit 13; '
-                f'helio check && helio tell demo/lane clean-home-msg --as demo/sender <<< body && helio inbox --as demo/lane'
+                'resolved="$(command -v helio)" || exit 11; '
+                '[ "$resolved" = "$1" ] || exit 12; '
+                '[ -z "${HELIO_STORE:-}" ] || exit 13; '
+                'helio check && helio tell demo/lane clean-home-msg --as demo/sender <<< body && helio inbox --as demo/lane'
             )
             login_res = subprocess.run(
-                ["env", "-i", f"HOME={clean_home}", "PATH=/usr/bin:/bin", "bash", "-lc", login_script],
+                ["env", "-i", f"HOME={clean_home}", "PATH=/usr/bin:/bin", "bash", "-lc", login_script, "_", expected_wrap],
                 capture_output=True,
                 text=True,
             )
