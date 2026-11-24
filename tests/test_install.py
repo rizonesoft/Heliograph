@@ -4749,19 +4749,42 @@ class TestPhaseInstaller(unittest.TestCase):
                     self._delete_reg_key(sole_reg_key)
                     self._cleanup_win_parent(sole_win_to)
 
-                # Verify first-write crash recovery via reserved `.phase.journal.init.json` (items 2 & 32):
+                # Verify first-write crash recovery via reserved `.phase.journal.init.json` (items 2, 9, & 32):
+                # 0) A foreign regular file at `.phase.journal.init.json` MUST be refused (exit 2) and preserved verbatim!
                 # 1) Interrupted pre-replace `.phase.journal.init.json` (with `phase.journal.json` absent);
                 # 2) 0-byte empty `.phase.journal.init.json` (killed right after O_CREAT);
-                # Both run through full `run_phase_install` retry and assert it cleaned `.phase.journal.init.json`,
+                # Both owned cases run through full `run_phase_install` retry and assert it cleaned `.phase.journal.init.json`,
                 # published on Windows (`after_win_install`), reached `fail_verify` with the planted diagnostic,
                 # and left neither `.phase.journal.init.json` nor `phase.journal.json` behind!
                 init_jp = to_dir / self.phase_mod.PHASE_JOURNAL_INIT_NAME
+                init_jp.write_bytes(b"operator foreign init bytes\n")
+                with self.assertRaises(self.mod.InstallError) as foreign_ctx:
+                    self.phase_mod.run_phase_install(
+                        repo=checkout,
+                        phase=0,
+                        to_dir=to_dir,
+                        store_dir=store_dir,
+                        wrapper_path=wrapper,
+                        win_to_raw=win_to,
+                        reg_key=reg_key,
+                        sdk_url="unused",
+                        install_mod=self.mod,
+                    )
+                self.assertEqual(foreign_ctx.exception.code, 2)
+                self.assertEqual(init_jp.read_bytes(), b"operator foreign init bytes\n")
+                init_jp.unlink()
                 for init_case in ("pre_replace", "empty"):
                     if init_case == "pre_replace":
                         with mock.patch.object(os, "replace", side_effect=lambda _s, _d: None):
                             self.phase_mod._create_initial_phase_journal(
                                 to_dir / self.phase_mod.PHASE_JOURNAL_NAME,
-                                {"tx_id": "aabbccddeeff", "phase_state": "acquiring"},
+                                {
+                                    "commit": a_commit,
+                                    "managed_by": "heliograph-phase-installer",
+                                    "phase_state": "acquiring",
+                                    "schema_version": 2,
+                                    "tx_id": "aabbccddeeff",
+                                },
                                 self.mod,
                             )
                     else:

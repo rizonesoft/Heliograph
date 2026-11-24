@@ -229,14 +229,40 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
     return sorted(pending)
 
 
+_INIT_JOURNAL_PREFIX = b'{\n  "commit": "'
+
+
+def _is_owned_init_journal_bytes(raw: bytes) -> bool:
+    """Return True if raw bytes are an empty/partial or complete initial acquiring journal written by this installer."""
+    if raw == b"":
+        return True
+    if _INIT_JOURNAL_PREFIX.startswith(raw):
+        return True
+    if raw.startswith(_INIT_JOURNAL_PREFIX):
+        try:
+            obj = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            # Truncated mid-write after the sorted-JSON opening prefix.
+            return True
+        return (
+            isinstance(obj, dict)
+            and obj.get("managed_by") == "heliograph-phase-installer"
+            and obj.get("schema_version") == 2
+            and obj.get("phase_state") == "acquiring"
+        )
+    return False
+
+
 def _cleanup_initial_phase_journal(to_dir: Path, install_mod: Any) -> None:
-    """Remove any leftover reserved `.phase.journal.init.json` from a killed initial acquiring write."""
+    """Remove only an installer-owned leftover `.phase.journal.init.json`; refuse and preserve any foreign file."""
     init_jp = to_dir / PHASE_JOURNAL_INIT_NAME
     if init_jp.is_symlink():
         raise install_mod.InstallError(f"refusing symlink at reserved phase journal init path: {init_jp}", code=2)
     if init_jp.exists():
         if not init_jp.is_file():
             raise install_mod.InstallError(f"refusing non-file at reserved phase journal init path: {init_jp}", code=2)
+        if not _is_owned_init_journal_bytes(init_jp.read_bytes()):
+            raise install_mod.InstallError(f"refusing foreign file at reserved phase journal init path: {init_jp}", code=2)
         init_jp.unlink()
         install_mod.fsync_dir(to_dir)
 
@@ -246,12 +272,11 @@ def _create_initial_phase_journal(jp: Path, payload: dict[str, Any], install_mod
     init_jp = jp.parent / PHASE_JOURNAL_INIT_NAME
     if init_jp.is_symlink():
         raise install_mod.InstallError(f"refusing symlink at reserved phase journal init path: {init_jp}", code=2)
-    if init_jp.exists():
-        if not init_jp.is_file():
-            raise install_mod.InstallError(f"refusing non-file at reserved phase journal init path: {init_jp}", code=2)
-        init_jp.unlink()
     raw = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    fd = os.open(str(init_jp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    try:
+        fd = os.open(str(init_jp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError as exc:
+        raise install_mod.InstallError(f"refusing existing file at reserved phase journal init path: {init_jp}", code=2) from exc
     try:
         with os.fdopen(fd, "wb") as fh:
             fh.write(raw)
