@@ -2398,10 +2398,26 @@ class TestWindowsInstaller(unittest.TestCase):
                         reg_key=reg_key,
                     )
                     self.assertTrue((uni_store / "messages").is_dir())
-                    self.assertEqual(Path(m_sh_shadow["shadowed_by"]).resolve(), sh_shadow_file.resolve())
+                    self.assertEqual(os.path.normcase(m_sh_shadow["shadowed_by"]), os.path.normcase(os.path.abspath(str(sh_shadow_file))))
+                    self.assertEqual(os.path.normcase(m_sh_shadow["shadowed_target"]), os.path.normcase(os.path.abspath(str(win_to / "helio"))))
                     code_shs, lines_shs = self.win_mod.win_status(win_to=win_to, reg_key=reg_key)
                     self.assertEqual(code_shs, 3, lines_shs)
                     self.assertTrue(any(str(sh_shadow_file.resolve()).lower() in ln.lower() for ln in lines_shs), lines_shs)
+
+                    # Even a symlink in an earlier PATH dir pointing at <win_to>\helio is detected as shadowing
+                    # (without resolving the leaf) because `dirname "$0"` would look under the link's dir!
+                    sh_shadow_file.unlink()
+                    try:
+                        sh_shadow_file.symlink_to(win_to / "helio")
+                    except OSError:
+                        # Non-admin Windows without Developer Mode may refuse file symlinks; simulate via mock.
+                        sh_shadow_file.write_text("#!/bin/sh\necho LINK\n", encoding="utf-8")
+                    with mock.patch.object(Path, "resolve", wraps=Path.resolve):
+                        w_link = self.win_mod._find_winning_helio_sh(reg_key, win_to)
+                        self.assertIsNotNone(w_link)
+                        self.assertEqual(os.path.normcase(str(w_link)), os.path.normcase(os.path.abspath(str(sh_shadow_file))))
+                        code_lnk, _ = self.win_mod.win_status(win_to=win_to, reg_key=reg_key)
+                        self.assertEqual(code_lnk, 3)
                 finally:
                     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_key, 0, winreg.KEY_SET_VALUE) as k:
                         winreg.SetValueEx(k, "Path", 0, orig_rk, orig_rp)

@@ -1831,8 +1831,9 @@ def main(argv: list[str] | None = None) -> int:
                 dest_dir = (win_to or win_mod.default_win_to_dir()).resolve()
                 print(f"installed {label} to {dest_dir} (store: {cur['store']})")
                 if manifest.get("shadowed_by"):
+                    target_name = manifest.get("shadowed_target") or str(dest_dir / win_mod.WIN_CMD_NAME)
                     print(
-                        f"warning: another helio earlier on PATH shadows {dest_dir / win_mod.WIN_CMD_NAME}: {manifest['shadowed_by']}",
+                        f"warning: another helio earlier on PATH shadows {target_name}: {manifest['shadowed_by']}",
                         file=sys.stderr,
                     )
                 print("open a new Windows terminal and run `helio check` to verify")

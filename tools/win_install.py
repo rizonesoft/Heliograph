@@ -420,14 +420,18 @@ def _find_winning_helio(reg_key: str, win_to: Path) -> Path | None:
 
 
 def _find_winning_helio_sh(reg_key: str, win_to: Path) -> Path | None:
-    """Return the first extensionless `helio` (Git Bash / POSIX shim) resolved via Windows effective PATH."""
+    """Return the first extensionless `helio` (Git Bash / POSIX shim) resolved via Windows effective PATH.
+
+    Preserves the symlink location (without resolving the leaf) so a symlink in an earlier PATH directory
+    is detected as shadowing `<win_to>\\helio` (since `dirname "$0"` in the shim follows the invocation dir).
+    """
     for d in _effective_win_path_dirs(reg_key):
         dp = Path(d)
         if not dp.is_dir():
             continue
         cand = dp / WIN_SH_NAME
         if cand.is_file():
-            return cand.resolve()
+            return Path(os.path.abspath(str(cand)))
     return None
 
 
@@ -435,12 +439,17 @@ def _annotate_shadowing(manifest: dict[str, Any], reg_key: str, dest: Path) -> d
     winner = _find_winning_helio(reg_key, dest)
     winner_sh = _find_winning_helio_sh(reg_key, dest)
     out = dict(manifest)
+    cmd_target = (dest / WIN_CMD_NAME).resolve()
+    sh_target = Path(os.path.abspath(str(dest / WIN_SH_NAME)))
     if winner is None:
         out["shadowed_by"] = "none (.CMD missing from PATHEXT)"
-    elif winner != (dest / WIN_CMD_NAME).resolve():
+        out["shadowed_target"] = str(cmd_target)
+    elif winner != cmd_target:
         out["shadowed_by"] = str(winner)
-    elif winner_sh is not None and winner_sh != (dest / WIN_SH_NAME).resolve():
+        out["shadowed_target"] = str(cmd_target)
+    elif winner_sh is not None and os.path.normcase(str(winner_sh)) != os.path.normcase(str(sh_target)):
         out["shadowed_by"] = str(winner_sh)
+        out["shadowed_target"] = str(sh_target)
     return out
 
 
@@ -1247,7 +1256,7 @@ def win_status(*, win_to: Path | None = None, reg_key: str = DEFAULT_REG_KEY) ->
                 problems.append(f"another helio earlier on PATH shadows {cmd_p}: {winner}")
             if cur.get("helio_sh_sha256"):
                 winner_sh = _find_winning_helio_sh(reg_key, dest)
-                if winner_sh is not None and winner_sh != sh_p.resolve():
+                if winner_sh is not None and os.path.normcase(str(winner_sh)) != os.path.normcase(os.path.abspath(str(sh_p))):
                     problems.append(f"another extensionless helio earlier on PATH shadows Git Bash shim {sh_p}: {winner_sh}")
 
     store_p = Path(cur["store"])
