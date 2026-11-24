@@ -5123,6 +5123,25 @@ class TestPhaseInstaller(unittest.TestCase):
                 r_repeat_ident = subprocess.run([sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"], env=env, capture_output=True, text=True)
                 self.assertEqual(r_repeat_ident.returncode, 1, r_repeat_ident.stdout + r_repeat_ident.stderr)
                 self.assertEqual(json.loads(r_repeat_ident.stdout), [0])
+                # Locally deleting a newer dated phase-run file while an older closeout file survives MUST keep
+                # phase 0 pending ([0], exit 1) (item 38)!
+                run_file_2 = checkout / "docs" / "phase-runs" / "2026-11-25-phase-0.md"
+                run_file_2.write_text("# Phase 0 run 2\n\n## Closeout run=run2\n\nDone 2.\n", encoding="utf-8")
+                subprocess.run(["git", "-C", str(checkout), "add", str(run_file_2)], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(checkout), "commit", "-m", "second dated phase-0 closeout"], check=True, capture_output=True)
+                rf2_sha = subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip()
+                run_file_2.write_text(run_file_2.read_text(encoding="utf-8") + f"\nInstalled commit: {rf2_sha}\n", encoding="utf-8")
+                subprocess.run(["git", "-C", str(checkout), "add", str(run_file_2)], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(checkout), "commit", "-m", "second dated phase-0 receipt"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(checkout), "push", "origin", "main"], check=True, capture_output=True)
+                r_rf2_ok = subprocess.run([sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"], env=env, capture_output=True, text=True)
+                self.assertEqual(r_rf2_ok.returncode, 0, r_rf2_ok.stdout + r_rf2_ok.stderr)
+                self.assertEqual(json.loads(r_rf2_ok.stdout), [])
+                subprocess.run(["git", "-C", str(checkout), "rm", str(run_file_2)], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(checkout), "commit", "-m", "locally delete newer phase-0 run file"], check=True, capture_output=True)
+                r_rf2_del = subprocess.run([sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"], env=env, capture_output=True, text=True)
+                self.assertEqual(r_rf2_del.returncode, 1, r_rf2_del.stdout + r_rf2_del.stderr)
+                self.assertEqual(json.loads(r_rf2_del.stdout), [0])
                 # A newer local `## Closeout` committed WITHOUT pushing MUST STILL report [0] (never inherit older remote receipt)!
                 run_file.write_text(run_file.read_text(encoding="utf-8") + "\n## Closeout run=reopened\n\nRe-closed.\n", encoding="utf-8")
                 subprocess.run(["git", "-C", str(checkout), "add", str(run_file)], check=True, capture_output=True)

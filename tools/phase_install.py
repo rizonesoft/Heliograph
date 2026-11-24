@@ -182,7 +182,7 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
         if not head_closed or head_parked:
             continue
         rem_sha = _resolve_origin_main_sha()
-        rem_closed, rem_parked, rem_installed_sha, _rem_files, rem_co_cnt, rem_co_file, rem_co_lines = _scan_run_files(rem_sha, pnum)
+        rem_closed, rem_parked, rem_installed_sha, rem_files, rem_co_cnt, rem_co_file, rem_co_lines = _scan_run_files(rem_sha, pnum)
         rem_settled = False
         if rem_closed and not rem_parked and bool(rem_installed_sha):
             inst_anc = subprocess.run(
@@ -205,12 +205,15 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
             pending.append(pnum)
             continue
         # `origin/main` has a valid published receipt bound to its latest closeout.
+        # Check history across phase-run files from BOTH HEAD and `origin/main` so locally deleting a newer
+        # run file while an older closeout file survives is still detected as an unpushed run-file change!
         # If HEAD's last run-file commit is an ancestor of `origin/main` (stale checkouts or unrelated local commits),
         # the phase is settled. If HEAD has unpushed run-file commits, it stays settled ONLY when HEAD's closeout
         # count, file, body, and receipt SHA all match `origin/main` (e.g. unpushed post-receipt CI notes);
-        # any unpushed amended closeout or competing receipt remains pending!
+        # any unpushed amended closeout, deleted run file, or competing receipt remains pending!
+        all_phase_files = sorted(set(head_files) | set(rem_files))
         rl = subprocess.run(
-            ["git", "-C", str(repo), "rev-list", "-1", "HEAD", "--", *head_files],
+            ["git", "-C", str(repo), "rev-list", "-1", "HEAD", "--", *all_phase_files],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
