@@ -1871,6 +1871,21 @@ class TestQuickInstaller(unittest.TestCase):
                 self.assertIn(msg_subject, cmd_out)
                 self.assertIn(msg_subject, ps_out)
 
+                # Reachable WSL directory that is NOT initialized (missing messages/) reports "there is no store here",
+                # NOT an offline WSL distro error!
+                empty_wsl_dir = root / "reachable_empty_wsl_dir"
+                empty_wsl_dir.mkdir()
+                empty_wsl_unc = subprocess.run(["wslpath", "-w", str(empty_wsl_dir)], capture_output=True, text=True, check=True).stdout.strip()
+                r_empty_wsl = subprocess.run(
+                    ["python.exe", "-c", f"import subprocess; r=subprocess.run([{win_to + '\\\\bin\\\\helio.exe'!r}, 'check', '--store', {empty_wsl_unc!r}], capture_output=True, text=True); print(r.stderr); raise SystemExit(r.returncode)"],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(r_empty_wsl.returncode, 3)
+                self.assertIn("there is no store here", r_empty_wsl.stdout)
+                self.assertNotIn("cannot reach WSL store", r_empty_wsl.stdout)
+
                 # Failed build from WSL leaves the existing Windows installation untouched!
                 fail_ws = root / "fail_ws"
                 fail_repo = fail_ws / "Heliograph"
@@ -2146,6 +2161,26 @@ class TestWindowsInstaller(unittest.TestCase):
                 )
                 self.assertEqual(r_help.returncode, 0, r_help.stdout + r_help.stderr)
                 self.assertIn("helio", r_help.stdout.lower())
+
+                # Offline `helio init` against unreachable WSL distro ALSO reports WSL + distro (exit 3)!
+                r_init_unr = subprocess.run(
+                    ["cmd.exe", "/c", "helio", "init"],
+                    cwd=str(outside_cwd),
+                    env=base_env,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(r_init_unr.returncode, 3, r_init_unr.stdout + r_init_unr.stderr)
+                self.assertIn("WSL", r_init_unr.stderr)
+                self.assertIn(bogus_distro, r_init_unr.stderr)
+
+                # Malformed UNC distro containing ESC (0x1b) never emits raw terminal control bytes on stderr!
+                r_ctrl = subprocess.run(
+                    [str(self.helio_exe), "check", "--store", "\\\\wsl.localhost\\\x1b[31mEvil\\store"],
+                    capture_output=True,
+                )
+                self.assertEqual(r_ctrl.returncode, 3)
+                self.assertNotIn(b"\x1b", r_ctrl.stderr)
         finally:
             self._delete_reg_key(reg_key)
 
@@ -2211,11 +2246,14 @@ class TestWindowsInstaller(unittest.TestCase):
                 self.assertFalse(retired_file.exists())
                 self.assertEqual(m3["previous"]["helio_exe_sha256"], sha_a)
 
-                # Unhashed legacy list-format `retired: [name]` where the file exists on disk is REFUSED (never unlinked without digest!),
-                # while empty legacy `retired: []` upgrades cleanly!
+                # Legacy list-format `retired: [name]`:
+                # - when file bytes match a known manifest generation (e.g. previous exe_a), it IS swept cleanly!
+                # - when file bytes are an unknown/different Heliograph PE, it is REFUSED with exit 2 and preserved!
                 leg_ret_name = ".helio.exe.abcdef012345.retired"
                 leg_ret_file = win_to / "bin" / leg_ret_name
-                shutil.copy2(exe_a, leg_ret_file)
+                exe_c = root / "helio_c.exe"
+                make_distinct_binary(self.helio_exe, exe_c, b"WIN_C_UNKNOWN")
+                shutil.copy2(exe_c, leg_ret_file)
                 mp = win_to / self.win_mod.WIN_MANIFEST_NAME
                 m_leg_raw = json.loads(mp.read_text(encoding="utf-8"))
                 m_leg_raw["retired"] = [leg_ret_name]
@@ -2228,11 +2266,28 @@ class TestWindowsInstaller(unittest.TestCase):
                     self.win_mod.win_remove(win_to=win_to, reg_key=reg_key)
                 self.assertEqual(ctx.exception.code, 2)
                 self.assertTrue(leg_ret_file.is_file())
-                leg_ret_file.unlink()
-                m_leg_raw["retired"] = []
-                mp.write_text(json.dumps(m_leg_raw), encoding="utf-8")
+                # Now place genuine previous generation exe_a at the legacy retired name -> swept cleanly!
+                shutil.copy2(exe_a, leg_ret_file)
                 m4 = self.win_mod.win_install(source_exe=exe_b, source_sha256=sha_b, store_path=str(s2), commit="b" * 40, win_to=win_to, reg_key=reg_key)
                 self.assertEqual(m4["retired"], {})
+                self.assertFalse(leg_ret_file.exists())
+
+                # Intact earlier-template helio.cmd passes win_status (hash match), and upgrade + win_back
+                # restores the exact earlier helio.cmd bytes!
+                earlier_cmd_bytes = b"@echo off\r\nREM Managed by Heliograph installer\r\nREM earlier template\r\n"
+                (win_to / "helio.cmd").write_bytes(earlier_cmd_bytes)
+                m_cur = json.loads(mp.read_text(encoding="utf-8"))
+                m_cur["current"]["helio_cmd_sha256"] = self.win_mod.sha256_file(win_to / "helio.cmd")
+                m_cur["current"].pop("helio_cmd_text", None)
+                mp.write_text(json.dumps(m_cur), encoding="utf-8")
+                code_earl, lines_earl = self.win_mod.win_status(win_to=win_to, reg_key=reg_key)
+                self.assertEqual(code_earl, 0, lines_earl)
+                self.win_mod.win_install(source_exe=exe_c, source_sha256=self.win_mod.sha256_file(exe_c), store_path=str(s2), commit="c" * 40, win_to=win_to, reg_key=reg_key)
+                self.win_mod.win_back(win_to=win_to, reg_key=reg_key)
+                self.assertEqual((win_to / "helio.cmd").read_bytes(), earlier_cmd_bytes)
+                # Restore B over A cleanly for the remaining status/back checks below.
+                self.win_mod.win_install(source_exe=exe_a, source_sha256=sha_a, store_path=str(s1), commit="a" * 40, win_to=win_to, reg_key=reg_key)
+                self.win_mod.win_install(source_exe=exe_b, source_sha256=sha_b, store_path=str(s2), commit="b" * 40, win_to=win_to, reg_key=reg_key)
 
                 # Status healthy -> 0; tamper checks (wrapper, empty store, top-level helio.exe shadow, wrong reg_key) -> 3.
                 code, _ = self.win_mod.win_status(win_to=win_to, reg_key=reg_key)
@@ -2507,6 +2562,26 @@ class TestWindowsInstaller(unittest.TestCase):
                 jp_leg.write_text(saved_leg_journal, encoding="utf-8")
                 self.assertTrue(self.win_mod.recover_win_if_needed(leg_j_to, reg_key))
                 self.assertEqual(self.win_mod.sha256_file(leg_j_to / "bin" / "helio.exe"), sha_a)
+
+                # Simulate crash after recovery retired busy B (recording B's digest in restored manifest) before journal unlink: retry succeeds!
+                with self.assertRaises(SimulatedCrash):
+                    self.win_mod.win_install(
+                        source_exe=exe_b, source_sha256=sha_b, store_path=str(store), commit="b" * 40, win_to=leg_j_to, reg_key=reg_key,
+                        on_boundary=lambda st: (_ for _ in ()).throw(SimulatedCrash(st)) if st == "after_exe" else None,
+                    )
+                j_busy_raw = jp_leg.read_text(encoding="utf-8")
+                j_busy = json.loads(j_busy_raw)
+                tx_busy = j_busy["tx_id"]
+                ret_b_name = f".helio.exe.{tx_busy}.retired"
+                self.assertTrue(self.win_mod.recover_win_if_needed(leg_j_to, reg_key))
+                mp_leg = leg_j_to / self.win_mod.WIN_MANIFEST_NAME
+                m_after = json.loads(mp_leg.read_text(encoding="utf-8"))
+                m_after["retired"] = {ret_b_name: sha_b}
+                mp_leg.write_text(json.dumps(m_after), encoding="utf-8")
+                shutil.copy2(exe_b, leg_j_to / "bin" / ret_b_name)
+                jp_leg.write_text(j_busy_raw, encoding="utf-8")
+                self.assertTrue(self.win_mod.recover_win_if_needed(leg_j_to, reg_key))
+                self.assertFalse((leg_j_to / "bin" / ret_b_name).exists())
                 self.win_mod.win_remove(win_to=leg_j_to, reg_key=reg_key)
 
                 # Out-of-root journal key is refused by _validate_win_journal.

@@ -252,15 +252,6 @@ static const char *reader(store *s, options *o, const char *to) {
     return o->to.failed ? "" : o->to.data;
 }
 
-static int init(const char *folder) {
-    text at = {0};
-    p_result result = p_folder(folder);
-    add(&at, folder), add(&at, "/messages");
-    if (result == P_OK) result = at.failed ? P_FAILED : p_folder(at.data);
-    text_free(&at);
-    return result == P_OK ? 0 : fail("the store cannot be made", 3);
-}
-
 static bool ascii_starts_ci(const char *s, const char *prefix) {
     for (; *prefix; s++, prefix++) {
         char a = *s, b = *prefix;
@@ -271,6 +262,11 @@ static bool ascii_starts_ci(const char *s, const char *prefix) {
     return true;
 }
 
+static bool noop_entry(void *user, const char *name) {
+    (void)user, (void)name;
+    return true;
+}
+
 static bool fail_wsl_store(const char *folder) {
     const char *rest = ascii_starts_ci(folder, "\\\\wsl.localhost\\") ? folder + 16
                      : ascii_starts_ci(folder, "\\\\wsl$\\") ? folder + 7 : NULL;
@@ -278,14 +274,30 @@ static bool fail_wsl_store(const char *folder) {
     const char *end = rest;
     while (*end && *end != '\\' && *end != '/') end++;
     if (end == rest) return false;
-    text msg = {0};
+    text root = {0}, distro = {0}, msg = {0};
+    add_bytes(&root, folder, (size_t)(end - folder));
+    bool reachable = !root.failed && p_list(root.data, noop_entry, NULL) == P_OK;
+    text_free(&root);
+    if (reachable) return false;
+    add_bytes(&distro, rest, (size_t)(end - rest));
     add(&msg, "cannot reach WSL store '"), clean(&msg, folder, true);
     add(&msg, "' - check that WSL and distro '");
-    for (const char *p = rest; p < end; p++) add_bytes(&msg, p, 1);
+    if (!distro.failed && distro.data) clean(&msg, distro.data, true);
     add(&msg, "' are running");
     fail(msg.failed ? "cannot reach WSL store" : msg.data, 3);
-    text_free(&msg);
+    text_free(&distro), text_free(&msg);
     return true;
+}
+
+static int init(const char *folder) {
+    text at = {0};
+    p_result result = p_folder(folder);
+    add(&at, folder), add(&at, "/messages");
+    if (result == P_OK) result = at.failed ? P_FAILED : p_folder(at.data);
+    text_free(&at);
+    if (result == P_OK) return 0;
+    if (fail_wsl_store(folder)) return 3;
+    return fail("the store cannot be made", 3);
 }
 
 static int run(options *o) {
