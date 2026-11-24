@@ -4749,48 +4749,46 @@ class TestPhaseInstaller(unittest.TestCase):
                     self._delete_reg_key(sole_reg_key)
                     self._cleanup_win_parent(sole_win_to)
 
-                # Verify first-write crash recovery via reserved `.phase.journal.init.json` (items 2, 9, & 32):
-                # 0) A foreign regular file at `.phase.journal.init.json` MUST be refused (exit 2) and preserved verbatim!
-                # 1) Interrupted pre-replace `.phase.journal.init.json` (with `phase.journal.json` absent);
-                # 2) 0-byte empty `.phase.journal.init.json` (killed right after O_CREAT);
-                # Both owned cases run through full `run_phase_install` retry and assert it cleaned `.phase.journal.init.json`,
-                # published on Windows (`after_win_install`), reached `fail_verify` with the planted diagnostic,
-                # and left neither `.phase.journal.init.json` nor `phase.journal.json` behind!
-                init_jp = to_dir / self.phase_mod.PHASE_JOURNAL_INIT_NAME
-                init_jp.write_bytes(b"operator foreign init bytes\n")
-                with self.assertRaises(self.mod.InstallError) as foreign_ctx:
-                    self.phase_mod.run_phase_install(
-                        repo=checkout,
-                        phase=0,
-                        to_dir=to_dir,
-                        store_dir=store_dir,
-                        wrapper_path=wrapper,
-                        win_to_raw=win_to,
-                        reg_key=reg_key,
-                        sdk_url="unused",
-                        install_mod=self.mod,
+                # Verify initial journal publication via O_TMPFILE + /proc/self/fd link (items 2, 9, & 32):
+                # 1) Interrupting `_create_initial_phase_journal` right before `os.link` leaves ZERO directory
+                #    entries on disk (no temp file, no empty/partial journal);
+                # 2) Any foreign file in `to_dir` (empty 0-byte marker OR copied acquiring journal at
+                #    `.phase.journal.init.json`) survives a full `run_phase_install` retry byte-for-byte
+                #    because the installer never creates or unlinks any initial staging filename!
+                init_dir = root / "init_otmpfile_check"
+                init_dir.mkdir(parents=True, exist_ok=True)
+                pre_link_entries: list[list[str]] = []
+
+                def abort_before_link(_src: str, _dst: str) -> None:
+                    pre_link_entries.append([p.name for p in init_dir.iterdir()])
+                    raise RuntimeError("killed before os.link")
+
+                with mock.patch.object(os, "link", side_effect=abort_before_link):
+                    with self.assertRaisesRegex(RuntimeError, "killed before os.link"):
+                        self.phase_mod._create_initial_phase_journal(
+                            init_dir / self.phase_mod.PHASE_JOURNAL_NAME,
+                            {"commit": a_commit, "managed_by": "heliograph-phase-installer", "phase_state": "acquiring", "schema_version": 2, "tx_id": "aabbccddeeff"},
+                            self.mod,
+                        )
+                self.assertEqual(pre_link_entries, [[]], "O_TMPFILE must leave zero directory entries before os.link")
+                self.assertEqual(list(init_dir.iterdir()), [], "aborted O_TMPFILE write must leave zero files on disk")
+                copied_acquiring = (
+                    json.dumps(
+                        {
+                            "commit": a_commit,
+                            "managed_by": "heliograph-phase-installer",
+                            "phase_state": "acquiring",
+                            "schema_version": 2,
+                            "tx_id": "aabbccddeeff",
+                        },
+                        indent=2,
+                        sort_keys=True,
                     )
-                self.assertEqual(foreign_ctx.exception.code, 2)
-                self.assertEqual(init_jp.read_bytes(), b"operator foreign init bytes\n")
-                init_jp.unlink()
-                for init_case in ("pre_replace", "empty"):
-                    if init_case == "pre_replace":
-                        with mock.patch.object(os, "replace", side_effect=lambda _s, _d: None):
-                            self.phase_mod._create_initial_phase_journal(
-                                to_dir / self.phase_mod.PHASE_JOURNAL_NAME,
-                                {
-                                    "commit": a_commit,
-                                    "managed_by": "heliograph-phase-installer",
-                                    "phase_state": "acquiring",
-                                    "schema_version": 2,
-                                    "tx_id": "aabbccddeeff",
-                                },
-                                self.mod,
-                            )
-                    else:
-                        init_jp.write_bytes(b"")
-                    self.assertTrue(init_jp.is_file(), f"{init_case}: interrupted initial journal write must leave reserved init file")
-                    self.assertFalse((to_dir / self.phase_mod.PHASE_JOURNAL_NAME).exists())
+                    + "\n"
+                ).encode("utf-8")
+                for foreign_tag, foreign_bytes in (("empty", b""), ("copied_journal", copied_acquiring)):
+                    foreign_init = to_dir / ".phase.journal.init.json"
+                    foreign_init.write_bytes(foreign_bytes)
                     retry_bounds: list[str] = []
                     retry_verify: list[str] = []
 
@@ -4816,11 +4814,16 @@ class TestPhaseInstaller(unittest.TestCase):
                             on_verify=retry_fail_verify,
                         )
                     self.assertEqual(retry_ctx.exception.code, 3)
-                    self.assertIn("after_win_install", retry_bounds, f"{init_case}: retry must publish on Windows")
-                    self.assertTrue(retry_verify, f"{init_case}: retry must reach planted live verification fault")
+                    self.assertIn("after_win_install", retry_bounds, f"{foreign_tag}: retry must publish on Windows")
+                    self.assertTrue(retry_verify, f"{foreign_tag}: retry must reach planted live verification fault")
                     self.assertIn("planted live verification fault", str(retry_ctx.exception))
-                    self.assertFalse(init_jp.exists(), f"{init_case}: retry must clean leftover .phase.journal.init.json")
+                    self.assertEqual(
+                        foreign_init.read_bytes(),
+                        foreign_bytes,
+                        f"{foreign_tag}: foreign .phase.journal.init.json must survive untouched verbatim",
+                    )
                     self.assertFalse((to_dir / self.phase_mod.PHASE_JOURNAL_NAME).exists())
+                    foreign_init.unlink()
 
                 # Also verify `_store_needs_init` uses `os.stat` (preserving OS errors even on Python 3.14!)
                 # and propagates PermissionError for local Windows stores, reachable WSL shares, AND WSL

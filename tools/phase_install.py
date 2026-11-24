@@ -27,7 +27,6 @@ from typing import Any, Callable
 
 PHASE_LOCK_NAME = ".phase.lock"
 PHASE_JOURNAL_NAME = "phase.journal.json"
-PHASE_JOURNAL_INIT_NAME = ".phase.journal.init.json"
 PHASE_TELL_AS = "impossible/apps"
 PHASE_TELL_TO = "impossible/all"
 
@@ -229,68 +228,29 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
     return sorted(pending)
 
 
-_INIT_JOURNAL_PREFIX = b'{\n  "commit": "'
-
-
-def _is_owned_init_journal_bytes(raw: bytes) -> bool:
-    """Return True if raw bytes are an empty/partial or complete initial acquiring journal written by this installer."""
-    if raw == b"":
-        return True
-    if _INIT_JOURNAL_PREFIX.startswith(raw):
-        return True
-    if raw.startswith(_INIT_JOURNAL_PREFIX):
-        try:
-            obj = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            # Truncated mid-write after the sorted-JSON opening prefix.
-            return True
-        return (
-            isinstance(obj, dict)
-            and obj.get("managed_by") == "heliograph-phase-installer"
-            and obj.get("schema_version") == 2
-            and obj.get("phase_state") == "acquiring"
-        )
-    return False
-
-
-def _cleanup_initial_phase_journal(to_dir: Path, install_mod: Any) -> None:
-    """Remove only an installer-owned leftover `.phase.journal.init.json`; refuse and preserve any foreign file."""
-    init_jp = to_dir / PHASE_JOURNAL_INIT_NAME
-    if init_jp.is_symlink():
-        raise install_mod.InstallError(f"refusing symlink at reserved phase journal init path: {init_jp}", code=2)
-    if init_jp.exists():
-        if not init_jp.is_file():
-            raise install_mod.InstallError(f"refusing non-file at reserved phase journal init path: {init_jp}", code=2)
-        if not _is_owned_init_journal_bytes(init_jp.read_bytes()):
-            raise install_mod.InstallError(f"refusing foreign file at reserved phase journal init path: {init_jp}", code=2)
-        init_jp.unlink()
-        install_mod.fsync_dir(to_dir)
-
-
 def _create_initial_phase_journal(jp: Path, payload: dict[str, Any], install_mod: Any) -> None:
-    """Atomically publish the initial acquiring phase.journal.json via the single reserved `.phase.journal.init.json` path."""
-    init_jp = jp.parent / PHASE_JOURNAL_INIT_NAME
-    if init_jp.is_symlink():
-        raise install_mod.InstallError(f"refusing symlink at reserved phase journal init path: {init_jp}", code=2)
+    """Atomically create the initial acquiring phase.journal.json via Linux O_TMPFILE + /proc/self/fd link.
+
+    No directory entry exists in `jp.parent` until the complete, fsynced JSON inode is atomically linked to `jp`
+    in a single kernel syscall. A kill before `os.link` leaves zero files on disk and requires no cleanup sweep.
+    """
     raw = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    fd = os.open(str(jp.parent), os.O_TMPFILE | os.O_WRONLY, 0o644)
     try:
-        fd = os.open(str(init_jp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-    except FileExistsError as exc:
-        raise install_mod.InstallError(f"refusing existing file at reserved phase journal init path: {init_jp}", code=2) from exc
-    try:
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(raw)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(init_jp, jp)
-        install_mod.fsync_dir(jp.parent)
-    except BaseException:
+        view = memoryview(raw)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("short write while creating initial phase journal")
+            view = view[written:]
+        os.fsync(fd)
         try:
-            if init_jp.exists() and not init_jp.is_symlink():
-                init_jp.unlink()
-        except OSError:
-            pass
-        raise
+            os.link(f"/proc/self/fd/{fd}", str(jp))
+        except FileExistsError as exc:
+            raise install_mod.InstallError(f"refusing existing phase journal at {jp}", code=2) from exc
+        install_mod.fsync_dir(jp.parent)
+    finally:
+        os.close(fd)
 
 
 def _sweep_phase_journal_temps(to_dir: Path, tx_id: str, install_mod: Any) -> None:
@@ -1309,7 +1269,6 @@ def _recover_pending_phase_journal(
     on_boundary: Callable[[str], None] | None = None,
 ) -> dict[str, Any] | None:
     """Recover an existing phase.journal.json. Returns notification result if a `notifying` journal was completed."""
-    _cleanup_initial_phase_journal(to_dir, install_mod)
     jp = to_dir / PHASE_JOURNAL_NAME
     if not jp.exists() and not jp.is_symlink():
         return None
@@ -1557,8 +1516,6 @@ def run_phase_install(
         # Now enter the durable cross-host phase transaction.
         to_dir.mkdir(parents=True, exist_ok=True)
         with install_mod.acquire_lock(to_dir / PHASE_LOCK_NAME, blocking=False):
-            # Clean any leftover reserved `.phase.journal.init.json` from a killed initial acquiring write before checking journal.
-            _cleanup_initial_phase_journal(to_dir, install_mod)
             # Re-check for a pending journal under the lock in case another phase run crashed while we were proving!
             if (to_dir / PHASE_JOURNAL_NAME).exists() or (to_dir / PHASE_JOURNAL_NAME).is_symlink():
                 resumed = _recover_pending_phase_journal(
