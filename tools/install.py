@@ -530,8 +530,12 @@ def _validate_journal_paths(journal: Any, to_dir: Path, wrapper_path: Path) -> d
     schema_version = journal.get("schema_version")
     if schema_version == 2:
         pass
-    elif schema_version == 1 and (phase == "staging" or op == "remove"):
-        # Staging and removal journals carry identical fields in v1 and v2 and recover losslessly.
+    elif schema_version == 1 and (
+        phase == "staging"
+        or op == "remove"
+        or (op in ("install", "back") and isinstance(journal.get("pre_wrappers"), dict))
+    ):
+        # Accept v1 staging, v1 removal, and v1 install/back journals that carry explicit pre_wrappers.
         pass
     else:
         raise InstallError("unrecognized install journal schema", code=2)
@@ -552,9 +556,13 @@ def _validate_journal_paths(journal: Any, to_dir: Path, wrapper_path: Path) -> d
         "expected_hashes",
         "desired_manifest",
     }
+    if op == "remove" and schema_version == 1:
+        allowed_keys.add("previous_wrapper_existed")
     unknown_keys = set(journal) - allowed_keys
     if unknown_keys:
         raise InstallError(f"corrupt or foreign install journal: unknown keys {sorted(unknown_keys)}", code=2)
+    if "previous_wrapper_existed" in journal and not isinstance(journal["previous_wrapper_existed"], bool):
+        raise InstallError("install journal previous_wrapper_existed must be a boolean", code=2)
     tx_id = journal.get("tx_id")
     if not isinstance(tx_id, str) or not TX_ID_RE.fullmatch(tx_id):
         raise InstallError("invalid install journal tx_id", code=2)

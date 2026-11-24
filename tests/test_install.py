@@ -845,7 +845,7 @@ class TestQuickInstaller(unittest.TestCase):
 
             v1_rem_dir = root / "v1_rem_rec"
             v1_rem_wrap = root / "v1_rw" / "helio"
-            self.mod.install(repo=repo, to_dir=v1_rem_dir, store_dir=store, wrapper_path=v1_rem_wrap, prebuilt=(a_h, a_e))
+            m_v1_rem = self.mod.install(repo=repo, to_dir=v1_rem_dir, store_dir=store, wrapper_path=v1_rem_wrap, prebuilt=(a_h, a_e))
             (v1_rem_dir / self.mod.JOURNAL_NAME).write_text(
                 json.dumps({
                     "schema_version": 1,
@@ -855,6 +855,10 @@ class TestQuickInstaller(unittest.TestCase):
                     "to_dir": str(v1_rem_dir.resolve()),
                     "wrapper_path": str(v1_rem_wrap.resolve()),
                     "remove_wrappers": [str(v1_rem_wrap.resolve())],
+                    "store_dir": "",
+                    "had_manifest": True,
+                    "previous_manifest": m_v1_rem,
+                    "previous_wrapper_existed": True,
                     "saved_files": {},
                     "temp_files": [],
                     "expected_hashes": {
@@ -862,6 +866,7 @@ class TestQuickInstaller(unittest.TestCase):
                         "helio.exe": self.mod.sha256_file(v1_rem_dir / "helio.exe"),
                         self.mod.MANIFEST_NAME: self.mod.sha256_file(v1_rem_dir / self.mod.MANIFEST_NAME),
                     },
+                    "desired_manifest": None,
                 }),
                 encoding="utf-8",
             )
@@ -869,6 +874,25 @@ class TestQuickInstaller(unittest.TestCase):
             self.assertFalse((v1_rem_dir / "helio").exists())
             self.assertFalse(v1_rem_wrap.exists())
             self.assertFalse((v1_rem_dir / self.mod.JOURNAL_NAME).exists())
+
+            # Schema version 1 back/install journals with pre_wrappers (e.g. 306302d) also recover losslessly.
+            v1_back_dir = root / "v1_back_rec"
+            v1_bw = root / "v1_bw" / "helio"
+            v1_bs_old, v1_bs_new = root / "v1_bs_old", root / "v1_bs_new"
+            self.mod.install(repo=repo, to_dir=v1_back_dir, store_dir=v1_bs_old, wrapper_path=v1_bw, prebuilt=(a_h, a_e))
+            self.mod.install(repo=repo, to_dir=v1_back_dir, store_dir=v1_bs_new, wrapper_path=v1_bw, prebuilt=(b_h, b_e))
+
+            def crash_v1_back(stage: str) -> None:
+                if stage == "after_wrapper":
+                    raise SimulatedCrash(stage)
+
+            with self.assertRaises(SimulatedCrash):
+                self.mod.go_back(to_dir=v1_back_dir, wrapper_path=v1_bw, on_boundary=crash_v1_back)
+            j_v1_back = json.loads((v1_back_dir / self.mod.JOURNAL_NAME).read_text(encoding="utf-8"))
+            j_v1_back["schema_version"] = 1
+            (v1_back_dir / self.mod.JOURNAL_NAME).write_text(json.dumps(j_v1_back), encoding="utf-8")
+            self.assertTrue(self.mod.recover_if_needed(v1_back_dir, v1_bw))
+            self.assertEqual(v1_bw.read_text(encoding="utf-8"), self.mod.render_wrapper(v1_back_dir, v1_bs_new))
 
             # 9. Removing a two-wrapper installation through the CURRENT wrapper (wb) removes BOTH wa and wb.
             rem_cur_dir = root / "rem_via_current_wrap"
