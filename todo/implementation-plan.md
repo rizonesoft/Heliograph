@@ -22,7 +22,7 @@ Sections: 3 | Checklist items: 19
 
 | Status | Reference  | Deliverable                               | Needs | Items |
 | ------ | ---------- | ----------------------------------------- | ----- | ----- |
-| [ ]    | D01 T01 §1 | Steps that notice an archived job         | none  | 5     |
+| [x]    | D01 T01 §1 | Steps that notice an archived job         | none  | 5     |
 | [ ]    | D01 T01 §2 | Move a closed message to its month        | none  | 7     |
 | [ ]    | D01 T01 §3 | Read, answer and repeat archived messages | none  | 7     |
 
@@ -51,6 +51,6 @@ Sections: 4 | Checklist items: 19
 | [ ]    | D01 T01 §12 | Expiry of seen heads-ups and findings  | none  | 4     |
 | [ ]    | D01 T01 §13 | Design and help that match the program | none  | 4     |
 
-Progress: 3/17 verified sections, 3 ready to run now.
+Progress: 4/17 verified sections, 3 ready to run now.
 
-Checklist: 28/99 items completed (includes Commit items).
+Checklist: 29/99 items completed (includes Commit items).

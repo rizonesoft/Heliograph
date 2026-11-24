@@ -35,7 +35,7 @@ title: "TODO-01 -- Heliograph"
 
 | Order | Section | Deliverable | Depends On | Status |
 | ----- | ------- | ----------- | ---------- | ------ |
-| 1 | §1 | Steps that notice an archived job | -- | [ ] |
+| 1 | §1 | Steps that notice an archived job | -- | [x] |
 | 2 | §2 | Move a closed message to its month | §1 | [ ] |
 | 3 | §3 | Read, answer and repeat archived messages | §2 | [ ] |
 | 4 | §4 | Sessions announced by every call | -- | [ ] |
@@ -75,9 +75,12 @@ Archiving removes files that `store_job` reads one by one. A reader that holds t
 - [x] Look again after a step is made in `change_job` of `engine/store.c`, and remove the step this call made when the post is gone. Done when: no step without a post is left and the call is refused. Cheaper substitute: looking only before.
 - [x] Add `p_remove` to `engine/plat.h`, `src/plat_linux.c` and `src/plat_windows.c`, removing one file and flushing its folder. Done when: a missing file gives `P_MISSING` on both systems. Cheaper substitute: a removal that ignores failure.
 - [x] Pause a racer between reading and writing a step in `tests/racer.c`, remove the post and steps meanwhile, and let it go on. Done when: `tests/test_helio.py` sees a refusal and an empty folder, and fails with either second look removed. Cheaper substitute: a test without the pause.
-- [ ] Commit: `store: steps notice an archived job`
+- [x] Commit: `store: steps notice an archived job`
 
 **Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
+
+> **Verified:** 2026-11-24 | §1 | b671912bc78b1d68e4a800a14d0fc1615cc5c4b1
+> **Review:** `docs/reviews/d01-t01-s1.json`
 
 ## 2. Move a closed message to its month
 
