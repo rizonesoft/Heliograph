@@ -937,6 +937,19 @@ def win_phase_begin(*, win_to: Path | None, reg_key: str, tx_id: str, phase: int
     return dest
 
 
+_WIN_PHASE_TMP_RE = re.compile(r"^\.helio\.exe\.old\.tmp\.[0-9]+\.[0-9a-f]{8}$")
+
+
+def _sweep_win_phase_temps(dest: Path) -> None:
+    """Remove only atomic-writer `.helio.exe.old.tmp.<pid>.<8hex>` files left by a killed rollback restore."""
+    bin_dir = dest / WIN_BIN_SUBDIR
+    if not bin_dir.is_dir() or _is_reparse_or_symlink(bin_dir):
+        return
+    for p in bin_dir.iterdir():
+        if _WIN_PHASE_TMP_RE.fullmatch(p.name) and p.is_file() and not _is_reparse_or_symlink(p):
+            p.unlink()
+
+
 def win_phase_end(*, win_to: Path | None, tx_id: str) -> None:
     """Release phase ownership on a Windows destination if owned by tx_id."""
     dest = (win_to or default_win_to_dir()).resolve()
@@ -951,6 +964,7 @@ def win_phase_end(*, win_to: Path | None, tx_id: str) -> None:
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise WinInstallError(f"cannot read Windows phase marker at {mp}: {exc}", code=3) from exc
         if isinstance(data, dict) and data.get("managed_by") == "heliograph-phase-installer" and data.get("tx_id") == tx_id:
+            _sweep_win_phase_temps(dest)
             try:
                 mp.unlink()
             except OSError as exc:
@@ -1015,6 +1029,7 @@ def win_phase_restore_prev(
         if expected_sha and hashlib.sha256(restore_bytes).hexdigest() != expected_sha:
             raise WinInstallError("previous-generation backup hash mismatch for Windows restore", code=3)
         _write_bytes_atomic(old_exe, restore_bytes)
+        _sweep_win_phase_temps(dest)
         manifest["previous"] = pre_previous
         _write_json_atomic(dest / WIN_MANIFEST_NAME, manifest)
 

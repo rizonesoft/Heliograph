@@ -228,11 +228,14 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
     return sorted(pending)
 
 
+_WSL_PHASE_TMP_RE = re.compile(r"^\.(?:phase\.journal\.json|helio\.old|helio\.exe\.old)\.tmp\.[0-9]+\.[0-9a-f]{8}$")
+
+
 def _sweep_phase_journal_temps(to_dir: Path, install_mod: Any) -> None:
-    """Remove any stale `.phase.journal.json.tmp.*` files left behind by a killed atomic journal write."""
+    """Remove only atomic-writer `.<target>.tmp.<pid>.<8hex>` files left by a killed journal or rollback restore write."""
     removed = False
-    for p in to_dir.glob(f".{PHASE_JOURNAL_NAME}.tmp.*"):
-        if p.is_file() and not p.is_symlink():
+    for p in to_dir.iterdir():
+        if _WSL_PHASE_TMP_RE.fullmatch(p.name) and p.is_file() and not p.is_symlink():
             p.unlink()
             removed = True
     if removed:
