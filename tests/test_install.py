@@ -4749,6 +4749,17 @@ class TestPhaseInstaller(unittest.TestCase):
                     self._delete_reg_key(sole_reg_key)
                     self._cleanup_win_parent(sole_win_to)
 
+                # Verify `_create_initial_phase_journal` creates ONLY the canonical `phase.journal.json`
+                # directly via O_CREAT|O_EXCL with zero `.tmp.` files (item 2 initial-write crash class)!
+                init_dir = root / "init_journal_check"
+                init_dir.mkdir(parents=True, exist_ok=True)
+                self.phase_mod._create_initial_phase_journal(
+                    init_dir / self.phase_mod.PHASE_JOURNAL_NAME,
+                    {"tx_id": "aabbccddeeff", "phase_state": "acquiring"},
+                    self.mod,
+                )
+                self.assertEqual([p.name for p in init_dir.iterdir()], [self.phase_mod.PHASE_JOURNAL_NAME])
+
                 # Also verify `_store_needs_init` uses `os.stat` (preserving OS errors even on Python 3.14!)
                 # and propagates PermissionError for local Windows stores, reachable WSL shares, AND WSL
                 # distribution-root ACL denials (items 24, 25, and 28), returning False ONLY on genuine

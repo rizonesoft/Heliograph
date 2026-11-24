@@ -228,6 +228,24 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
     return sorted(pending)
 
 
+def _create_initial_phase_journal(jp: Path, payload: dict[str, Any], install_mod: Any) -> None:
+    """Create the initial acquiring phase.journal.json directly via O_CREAT|O_EXCL (zero temporary file before tx_id is durable)."""
+    raw = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    fd = os.open(str(jp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(raw)
+            fh.flush()
+            os.fsync(fh.fileno())
+        install_mod.fsync_dir(jp.parent)
+    except BaseException:
+        try:
+            jp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def _sweep_phase_journal_temps(to_dir: Path, tx_id: str, install_mod: Any) -> None:
     """Remove only this transaction's atomic-writer `.<target>.tx-<tx_id>.tmp.<pid>.<8hex>` files."""
     if not tx_id or not re.fullmatch(r"[0-9a-f]{12}", tx_id):
@@ -1542,7 +1560,7 @@ def run_phase_install(
                 "wsl_changed": False,
                 "win_changed": False,
             }
-            install_mod.write_json_atomic(to_dir / PHASE_JOURNAL_NAME, journal, tx_id=str(journal.get("tx_id") or "") or None)
+            _create_initial_phase_journal(to_dir / PHASE_JOURNAL_NAME, journal, install_mod)
             try:
                 _win_phase_marker_call(
                     python_exe,
