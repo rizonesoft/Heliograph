@@ -4526,36 +4526,49 @@ class TestPhaseInstaller(unittest.TestCase):
                     self.assertEqual(rw.returncode, 0, rw.stdout + rw.stderr)
 
                 # Plant foreign backup-shaped files (including at the exact tx_id paths that the old
-                # separate-file snapshot mechanism used!), operator diagnostic `.tmp.saved` copies,
-                # AND simulated killed-write atomic-writer `.tmp.<pid>.<8hex>` files in BOTH WSL `to_dir`
-                # AND Windows `win_to\bin\` BEFORE running the failed-C upgrade + rollback (items 2, 9, and 23).
+                # separate-file snapshot mechanism used!), operator diagnostic copies (including a
+                # WSL-format basename copied into Windows bin\), AND real pre-replace atomic-writer
+                # temp files produced by each host's OWN writer (`write_bytes_atomic` / `_write_bytes_atomic`)
+                # BEFORE running the failed-C upgrade + rollback (items 2, 9, 23, and 27).
                 fixed_tx = "deadbeef1234"
                 wsl_foreign_copy = to_dir / f".phase-prev-{fixed_tx}.helio.old"
                 wsl_foreign_empty = to_dir / f".phase-prev-{fixed_tx}.win.helio.exe.old"
                 wsl_op_saved = to_dir / ".phase.journal.json.tmp.saved"
-                wsl_stale_jtmp = to_dir / ".phase.journal.json.tmp.99999.deadbeef"
-                wsl_stale_htmp = to_dir / ".helio.old.tmp.99999.deadbeef"
-                wsl_stale_etmp = to_dir / ".helio.exe.old.tmp.99999.deadbeef"
                 wsl_foreign_copy.write_bytes(a_h.read_bytes())
                 wsl_foreign_empty.write_bytes(b"")
                 wsl_op_saved.write_bytes(b"operator diagnostic journal copy\n")
-                wsl_stale_jtmp.write_bytes(b'{"partial": true}')
-                wsl_stale_htmp.write_bytes(b"partial-helio-old")
-                wsl_stale_etmp.write_bytes(b"partial-helio-exe-old")
+                wsl_real_tmps: list[Path] = []
+                with mock.patch.object(os, "replace", side_effect=lambda src, _dst: wsl_real_tmps.append(Path(src))):
+                    self.mod.write_bytes_atomic(to_dir / "phase.journal.json", b'{"partial": true}')
+                    self.mod.write_bytes_atomic(to_dir / "helio.old", b"partial-helio-old")
+                    self.mod.write_bytes_atomic(to_dir / "helio.exe.old", b"partial-helio-exe-old")
+                self.assertEqual(len(wsl_real_tmps), 3)
+                for tp in wsl_real_tmps:
+                    self.assertTrue(tp.is_file(), f"real WSL writer temp {tp} must exist before rollback")
                 plant_win_foreign = (
-                    "import pathlib, sys\n"
+                    "import importlib.util, os, pathlib, sys\n"
+                    "from unittest import mock\n"
+                    "spec = importlib.util.spec_from_file_location('wi', sys.argv[4])\n"
+                    "mod = importlib.util.module_from_spec(spec)\n"
+                    "spec.loader.exec_module(mod)\n"
                     "b = pathlib.Path(sys.argv[1]) / 'bin'\n"
                     "tx = sys.argv[3]\n"
                     "(b / f'.phase-prev-{tx}.helio.exe.old').write_bytes(pathlib.Path(sys.argv[2]).read_bytes())\n"
                     "(b / '.phase-prev-foreignempty.helio.exe.old').write_bytes(b'')\n"
                     "(b / '.helio.exe.old.tmp.saved').write_bytes(b'operator diagnostic win copy')\n"
-                    "(b / '.helio.exe.old.tmp.99999.deadbeef').write_bytes(b'partial-win-old')\n"
+                    "(b / '.helio.exe.old.tmp.99999.deadbeef').write_bytes(b'wsl-format foreign copy on windows')\n"
+                    "captured = []\n"
+                    "with mock.patch.object(os, 'replace', side_effect=lambda src, _dst: captured.append(pathlib.Path(src))):\n"
+                    "    mod._write_bytes_atomic(b / 'helio.exe.old', b'partial-win-old')\n"
+                    "assert len(captured) == 1 and captured[0].is_file()\n"
+                    "print(captured[0].name)\n"
                 )
-                subprocess.run(
-                    [self.python_exe, "-B", "-c", plant_win_foreign, win_to, self.win_mod.wsl_to_windows_path(a_e), fixed_tx],
-                    check=True,
+                win_tmp_name = subprocess.check_output(
+                    [self.python_exe, "-B", "-c", plant_win_foreign, win_to, self.win_mod.wsl_to_windows_path(a_e), fixed_tx, win_install_py_win],
+                    text=True,
                     stdin=subprocess.DEVNULL,
-                )
+                ).strip()
+                self.assertTrue(win_tmp_name.startswith(".helio.exe.old.") and win_tmp_name.endswith(".tmp"), win_tmp_name)
 
                 # Run phase C with a planted verification fault -> must publish C on BOTH hosts first,
                 # reach the planted fault, and then roll back BOTH hosts to current=B, previous=A!
@@ -4589,15 +4602,14 @@ class TestPhaseInstaller(unittest.TestCase):
                 self.assertTrue(verify_called, "must reach planted live verification fault after publication")
                 self.assertIn("planted live verification fault", str(ctx.exception))
 
-                # Verify BOTH WSL and Windows foreign files AND operator `.tmp.saved` copies survived
-                # capture, publication, and rollback byte-for-byte while ALL atomic-writer `.tmp.<pid>.<8hex>`
-                # files on BOTH hosts were swept!
+                # Verify BOTH WSL and Windows foreign files AND operator copies (including WSL-format copy
+                # on Windows) survived capture, publication, and rollback byte-for-byte while ALL real
+                # pre-replace atomic-writer temp files on BOTH hosts were swept!
                 self.assertEqual(wsl_foreign_copy.read_bytes(), a_h.read_bytes())
                 self.assertEqual(wsl_foreign_empty.read_bytes(), b"")
                 self.assertEqual(wsl_op_saved.read_bytes(), b"operator diagnostic journal copy\n")
-                self.assertFalse(wsl_stale_jtmp.exists(), "stale .phase.journal.json.tmp.<pid>.<8hex> must be swept")
-                self.assertFalse(wsl_stale_htmp.exists(), "stale .helio.old.tmp.<pid>.<8hex> must be swept")
-                self.assertFalse(wsl_stale_etmp.exists(), "stale .helio.exe.old.tmp.<pid>.<8hex> must be swept")
+                for tp in wsl_real_tmps:
+                    self.assertFalse(tp.exists(), f"real WSL writer temp {tp} must be swept")
                 self.assertEqual(
                     sorted(p.name for p in to_dir.iterdir() if "phase-prev" in p.name),
                     sorted([wsl_foreign_copy.name, wsl_foreign_empty.name]),
@@ -4610,19 +4622,22 @@ class TestPhaseInstaller(unittest.TestCase):
                     "b = pathlib.Path(sys.argv[1]) / 'bin'\n"
                     "expected = pathlib.Path(sys.argv[2]).read_bytes()\n"
                     "tx = sys.argv[3]\n"
+                    "real_tmp = sys.argv[4]\n"
                     "p1 = b / f'.phase-prev-{tx}.helio.exe.old'\n"
                     "p2 = b / '.phase-prev-foreignempty.helio.exe.old'\n"
                     "p3 = b / '.helio.exe.old.tmp.saved'\n"
                     "p4 = b / '.helio.exe.old.tmp.99999.deadbeef'\n"
+                    "p5 = b / real_tmp\n"
                     "assert p1.is_file() and p1.read_bytes() == expected, 'Windows foreign copy must survive rollback verbatim'\n"
                     "assert p2.is_file() and p2.read_bytes() == b'', 'Windows foreign empty file must survive rollback verbatim'\n"
                     "assert p3.is_file() and p3.read_bytes() == b'operator diagnostic win copy', 'Windows .tmp.saved must survive verbatim'\n"
-                    "assert not p4.exists(), 'stale Windows .helio.exe.old.tmp.<pid>.<8hex> must be swept'\n"
+                    "assert p4.is_file() and p4.read_bytes() == b'wsl-format foreign copy on windows', 'WSL-format foreign copy on Windows must survive verbatim'\n"
+                    "assert not p5.exists(), f'real Windows writer temp {p5} must be swept'\n"
                     "assert sorted(p.name for p in b.iterdir() if 'phase-prev' in p.name) == sorted([p1.name, p2.name])\n"
-                    "p1.unlink(); p2.unlink(); p3.unlink()\n"
+                    "p1.unlink(); p2.unlink(); p3.unlink(); p4.unlink()\n"
                 )
                 subprocess.run(
-                    [self.python_exe, "-B", "-c", check_win_foreign, win_to, self.win_mod.wsl_to_windows_path(a_e), fixed_tx],
+                    [self.python_exe, "-B", "-c", check_win_foreign, win_to, self.win_mod.wsl_to_windows_path(a_e), fixed_tx, win_tmp_name],
                     check=True,
                     stdin=subprocess.DEVNULL,
                 )

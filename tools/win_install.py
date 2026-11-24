@@ -937,11 +937,11 @@ def win_phase_begin(*, win_to: Path | None, reg_key: str, tx_id: str, phase: int
     return dest
 
 
-_WIN_PHASE_TMP_RE = re.compile(r"^\.helio\.exe\.old\.tmp\.[0-9]+\.[0-9a-f]{8}$")
+_WIN_PHASE_TMP_RE = re.compile(r"^\.helio\.exe\.old\.[0-9a-f]{12}\.tmp$")
 
 
 def _sweep_win_phase_temps(dest: Path) -> None:
-    """Remove only atomic-writer `.helio.exe.old.tmp.<pid>.<8hex>` files left by a killed rollback restore."""
+    """Remove only Windows atomic-writer `.helio.exe.old.<12hex>.tmp` files left by a killed rollback restore."""
     bin_dir = dest / WIN_BIN_SUBDIR
     if not bin_dir.is_dir() or _is_reparse_or_symlink(bin_dir):
         return
