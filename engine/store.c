@@ -498,6 +498,7 @@ s_result store_post(store *s, const message *m, const char *key, text *id) {
             bool published = false;
             result = out.failed ? say(s, S_DAMAGED, "out of memory") : make_ex(s, id->data, "post", out.data, &published);
             if (published && *key) {
+                if (s->pause) s->pause(s->pause_user, "after-post-write");
                 /* Second look after publication: if the keyed message was archived while we raced, remove our
                    late live post so the closed job can never reopen as open. */
                 message arch = {0};
@@ -516,8 +517,14 @@ s_result store_post(store *s, const message *m, const char *key, text *id) {
                     else if (result != S_OK) s->why = write_why;
                 }
             } else if (result == S_NOTHING && *key) {
-                message there;
+                if (s->pause) s->pause(s->pause_user, "post-collision");
+                message there = {0};
                 result = store_message(s, id->data, &there);
+                if (result == S_REFUSED && same(s->why, "there is no such message")) {
+                    /* Live post was archived between create collision and read: check archive! */
+                    s_result ar = archive_read_message(s, id->data, &there);
+                    result = ar == S_OK ? S_OK : ar == S_NOTHING ? say(s, S_REFUSED, "there is no such message") : S_DAMAGED;
+                }
                 if (result == S_OK && !(same(there.from, m->from) && same(there.to, m->to) && same(there.kind, m->kind) && same(there.subject, subject.data) && same(there.body, body.data)))
                     result = say(s, S_REFUSED, "that key stands for another message");
                 message_free(&there);
@@ -579,6 +586,12 @@ static s_result change_job(store *s, const char *id, actor me, change what, cons
     s_result result = store_message(s, id, &m);
     if (result != S_OK) return result;
     if (!is_job(&m)) result = say(s, S_REFUSED, "only a request or a handoff can be taken");
+    if (result == S_OK) {
+        /* Refuse immediately if an archived terminal copy already exists (even if a killed keyed retry left a duplicate live post). */
+        s_result ar = archive_has_terminal_job(s->folder, id, NULL);
+        if (ar == S_OK) result = say(s, S_REFUSED, "it was archived");
+        else if (ar == S_DAMAGED) result = say(s, S_DAMAGED, "an archived job is damaged");
+    }
     unsigned before = MOST_LINKS + 1;
     while (result == S_OK) {
         job now;

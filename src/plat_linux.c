@@ -50,6 +50,7 @@ p_result p_input(size_t most, char **data, size_t *length) { return all(0, most,
 #ifdef HELIO_TEST_HOOKS
 bool plat_fail_flush = false;
 bool plat_fail_sync = false;
+uint64_t plat_now_override = 0;
 #endif
 static bool settle(const char *path) {
 #ifdef HELIO_TEST_HOOKS
@@ -118,7 +119,7 @@ static bool sync_dir(const char *path) {
 #endif
     int file = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (file < 0) return false;
-    bool good = !fsync(file) || errno == EINVAL || errno == ENOTSUP;
+    bool good = !fsync(file);
     close(file);
     return good;
 }
@@ -142,6 +143,9 @@ p_result p_list(const char *path, bool (*each)(void *user, const char *name), vo
 }
 
 uint64_t p_now(void) {
+#ifdef HELIO_TEST_HOOKS
+    if (plat_now_override) return plat_now_override;
+#endif
     struct timespec t;
     clock_gettime(CLOCK_REALTIME, &t);
     return (uint64_t)t.tv_sec * 1000000 + (uint64_t)t.tv_nsec / 1000;

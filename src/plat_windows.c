@@ -22,6 +22,7 @@ static bool passing_win(int attempt, DWORD error) {
 #ifdef HELIO_TEST_HOOKS
 bool plat_fail_flush = false;
 bool plat_fail_sync = false;
+uint64_t plat_now_override = 0;
 #endif
 static bool settle_win(const char *path) {
 #ifdef HELIO_TEST_HOOKS
@@ -124,7 +125,12 @@ p_result p_folder(const char *path) {
     return settle_win(path) && sync_dir_win(path) ? P_OK : P_FAILED;
 }
 p_result p_input(size_t most, char **data, size_t *length) { return from(im_read_input(most, data, length)); }
-uint64_t p_now(void) { return im_now(); }
+uint64_t p_now(void) {
+#ifdef HELIO_TEST_HOOKS
+    if (plat_now_override) return plat_now_override;
+#endif
+    return im_now();
+}
 bool p_print(const char *text) { return im_print(text); }
 
 uint64_t p_tick(void) {

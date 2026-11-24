@@ -509,6 +509,46 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
         add_report(report, it->id, "the message cannot be read");
         return S_DAMAGED;
     }
+    /* If an archived terminal copy ALREADY exists (e.g. a killed keyed retry left a duplicate live post),
+       verify bytes match and sweep the duplicate live post without reopening the job! */
+    unsigned existing_links = 0;
+    if (archive_has_terminal_job(folder, it->id, &existing_links) == S_OK) {
+        if (!ensure_archive_month(folder, it->month)) {
+            p_free(pdata);
+            text_free(&post_p);
+            add_report(report, it->id, "archive folder cannot be created");
+            return S_DAMAGED;
+        }
+        text dst_post = {0};
+        arch_path(folder, it->month, &dst_post, it->id, "post");
+        char *adata = NULL;
+        size_t alen = 0;
+        p_result ar = dst_post.failed ? P_FAILED : p_read(dst_post.data, MOST_FILE, &adata, &alen);
+        bool equal = ar == P_OK && alen == plen;
+        for (size_t k = 0; equal && k < plen; k++) equal = adata[k] == pdata[k];
+        p_free(adata);
+        p_free(pdata);
+        if (!equal) {
+            text_free(&dst_post), text_free(&post_p);
+            add_report(report, it->id, "archive copy differs from live file");
+            return S_DAMAGED;
+        }
+        if (p_sync(dst_post.data) != P_OK) {
+            text_free(&dst_post), text_free(&post_p);
+            add_report(report, it->id, "an archive copy cannot be flushed");
+            return S_DAMAGED;
+        }
+        text_free(&dst_post);
+        p_result rm_post = p_remove(post_p.data);
+        text_free(&post_p);
+        if (rm_post != P_OK && rm_post != P_MISSING) {
+            add_report(report, it->id, "the post could not be removed");
+            return S_DAMAGED;
+        }
+        it->arch_links = existing_links;
+        it->post_removed = true;
+        return S_OK;
+    }
     message m = {0};
     if (store_parse_post(pdata, plen, it->id, &m, &why) != S_OK) {
         text_free(&post_p);
@@ -793,6 +833,7 @@ s_result archive_daily(const char *folder, text *report, void (*pause)(void *use
     }
 
     /* Claim today's 200-job pass so concurrent inboxes do not exceed 200 and stale crashes resume cleanly. */
+    if (pause) pause(pause_user, "before-daily-claim");
     size_t prior_done = 0;
     text cbody = {0};
     add_number(&cbody, now, 0), add(&cbody, " 0\n");
@@ -807,16 +848,13 @@ s_result archive_daily(const char *folder, text *report, void (*pause)(void *use
         bool parsed = cr == P_OK && parse_claim(cdata, &cts, &cdone);
         p_free(cdata);
         if (cr == P_MISSING) {
-            /* Completed by peer just now. */
             text_free(&day), text_free(&sdir), text_free(&mark), text_free(&claim), text_free(&unique);
             return S_OK;
         }
         if (parsed && cts <= now && now - cts < CLAIM_STALE_US) {
-            /* Another live inbox holds today's claim. */
             text_free(&day), text_free(&sdir), text_free(&mark), text_free(&claim), text_free(&unique);
             return S_OK;
         }
-        /* Stale claim from a crashed inbox: take over with remaining budget. */
         prior_done = parsed ? cdone : 0;
         text take_body = {0};
         add_number(&take_body, now, 0), add(&take_body, " "), add_number(&take_body, (uint64_t)prior_done, 0), add(&take_body, "\n");
@@ -831,23 +869,50 @@ s_result archive_daily(const char *folder, text *report, void (*pause)(void *use
         return S_DAMAGED;
     }
 
-    size_t remaining = prior_done < 200 ? 200 - prior_done : 0;
-    size_t moved = 0;
+    /* Re-check .archived AFTER acquiring .claiming so a peer that just finished and removed its claim
+       never lets us start a second 200-job pass on the same date! */
+    char *recheck = NULL;
+    size_t rlen = 0;
+    p_result rgot = p_read(mark.data, 64, &recheck, &rlen);
+    p_free(recheck);
+    if (rgot == P_OK) {
+        p_remove(claim.data);
+        text_free(&day), text_free(&sdir), text_free(&mark), text_free(&claim), text_free(&unique);
+        return S_OK;
+    }
+    if (rgot != P_MISSING) {
+        text_free(&day), text_free(&sdir), text_free(&mark), text_free(&claim), text_free(&unique);
+        return S_DAMAGED;
+    }
+
+    /* Pre-debit chunks (up to 20 per chunk) durably in .claiming BEFORE moving so a kill at ANY moment
+       never allows a stale takeover to exceed 200 distinct automatic moves for the date! */
+    size_t spent = prior_done;
     s_result res = S_OK;
-    if (remaining > 0) {
-        s_result ar = archive_store(folder, remaining, &moved, report, pause, pause_user);
-        if (ar == S_DAMAGED) {
-            /* Persist progress in .claiming so a retry respects the 200 cap, and surface S_DAMAGED. */
-            text prog = {0};
-            add_number(&prog, p_now(), 0), add(&prog, " "), add_number(&prog, (uint64_t)(prior_done + moved), 0), add(&prog, "\n");
-            if (!prog.failed) p_write(claim.data, prog.data, prog.length, true, unique.data);
-            text_free(&prog);
+    while (spent < 200) {
+        size_t chunk = 200 - spent;
+        if (chunk > 20) chunk = 20;
+        /* Pre-debit the chunk durably BEFORE touching live posts! */
+        text pre = {0};
+        add_number(&pre, p_now(), 0), add(&pre, " "), add_number(&pre, (uint64_t)(spent + chunk), 0), add(&pre, "\n");
+        p_result pw = pre.failed ? P_FAILED : p_write(claim.data, pre.data, pre.length, true, unique.data);
+        text_free(&pre);
+        if (pw != P_OK) {
             res = S_DAMAGED;
+            break;
         }
+        size_t moved = 0;
+        s_result ar = archive_store(folder, chunk, &moved, report, pause, pause_user);
+        spent += moved;
+        if (ar == S_DAMAGED) {
+            res = S_DAMAGED;
+            break;
+        }
+        if (ar == S_NOTHING || moved < chunk) break;
     }
     if (res == S_OK) {
         text body = {0};
-        add_number(&body, (uint64_t)(prior_done + moved), 0), add(&body, "\n");
+        add_number(&body, (uint64_t)spent, 0), add(&body, "\n");
         p_result wr = body.failed ? P_FAILED : p_write(mark.data, body.data, body.length, false, unique.data);
         text_free(&body);
         if (wr != P_OK && wr != P_EXISTS) res = S_DAMAGED;

@@ -12,6 +12,7 @@
 #ifdef HELIO_TEST_HOOKS
 extern bool plat_fail_flush;
 extern bool plat_fail_sync;
+extern uint64_t plat_now_override;
 extern size_t store_max_names;
 #endif
 
@@ -103,6 +104,12 @@ int racer(int count, char **args) {
         plat_fail_sync = true;
         return helio(count - 1, args + 1);
     }
+    if (count >= 4 && same(args[1], "--now")) {
+        uint64_t v = 0;
+        for (const char *p = args[2]; *p >= '0' && *p <= '9'; p++) v = v * 10 + (uint64_t)(*p - '0');
+        plat_now_override = v;
+        return helio(count - 2, args + 2);
+    }
     if (count >= 4 && same(args[1], "--max-names")) {
         size_t lim = 0;
         for (const char *p = args[2]; *p >= '0' && *p <= '9'; p++) lim = lim * 10 + (size_t)(*p - '0');
@@ -127,7 +134,7 @@ int racer(int count, char **args) {
         for (int i = 0; i < rounds; i++) {
             size_t moved = 0;
             text rep = {0};
-            s_result r = archive_store(folder, 0, &moved, &rep, NULL, NULL);
+            s_result r = archive_store(folder, 1, &moved, &rep, NULL, NULL);
             if (r == S_DAMAGED) {
                 if (rep.length) p_error(rep.data);
                 text_free(&rep);
