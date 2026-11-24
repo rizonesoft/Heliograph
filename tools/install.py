@@ -1671,14 +1671,104 @@ def default_paths(repo: Path) -> tuple[Path, Path, Path]:
     )
 
 
+def _load_win_install():
+    win_mod_path = Path(__file__).resolve().parent / "win_install.py"
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("helio_win_install", win_mod_path)
+    if spec is None or spec.loader is None:
+        raise InstallError(f"cannot load Windows installer helper at {win_mod_path}", code=3)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _looks_like_windows_path(raw: str) -> bool:
+    return raw.startswith("\\\\") or (len(raw) >= 2 and raw[1] == ":" and raw[0].isalpha())
+
+
+def run_windows_from_wsl(
+    *,
+    repo: Path,
+    mode: str,
+    win_to_raw: str | None,
+    store_raw: str | None,
+    reg_key: str,
+    sdk_url: str = DEFAULT_SDK_URL,
+    prebuilt_exe: Path | None = None,
+) -> int:
+    """Build/test in WSL (for install) and hand off to Windows Python for Windows-native installation."""
+    python_exe = shutil.which("python.exe")
+    wslpath_bin = shutil.which("wslpath")
+    if not python_exe or not wslpath_bin:
+        raise InstallError("Windows installation from WSL requires python.exe and wslpath on PATH", code=3)
+    win_mod = _load_win_install()
+    install_py_win = win_mod.wsl_to_windows_path(Path(__file__).resolve())
+
+    if mode in ("status", "back", "remove"):
+        cmd = [python_exe, "-B", install_py_win, "--windows", f"--{mode}", "--reg-key", reg_key]
+        if win_to_raw:
+            cmd.extend(["--to", win_to_raw])
+        res = subprocess.run(cmd, stdin=subprocess.DEVNULL, check=False)
+        return res.returncode
+
+    def_store = repo.parent / "Heliograph-signals"
+    if store_raw:
+        win_store = store_raw if _looks_like_windows_path(store_raw) else win_mod.wsl_to_windows_path(Path(store_raw).resolve())
+    else:
+        win_store = win_mod.wsl_to_windows_path(def_store.resolve())
+
+    with tempfile.TemporaryDirectory(prefix="helio-win-snap-") as snap_tmp:
+        snap_dir = Path(snap_tmp)
+        if prebuilt_exe is None:
+            helio_src, helio_exe_src, commit, dirty = ensure_sdk_and_build(repo, sdk_url, snap_dir)
+            if not store_raw:
+                _ensure_store_ready(helio_src, def_store.resolve())
+        else:
+            commit, dirty = git_provenance(repo)
+            helio_exe_src = prebuilt_exe
+            if not helio_exe_src.is_file():
+                raise InstallError(f"expected Windows executable is missing: {helio_exe_src}", code=3)
+        exe_sha = sha256_file(helio_exe_src)
+        win_exe_src = win_mod.wsl_to_windows_path(helio_exe_src)
+        cmd = [
+            python_exe,
+            "-B",
+            install_py_win,
+            "--windows",
+            "--source-exe",
+            win_exe_src,
+            "--source-sha256",
+            exe_sha,
+            "--commit",
+            commit,
+            "--store",
+            win_store,
+            "--reg-key",
+            reg_key,
+        ]
+        if dirty:
+            cmd.append("--dirty")
+        if win_to_raw:
+            cmd.extend(["--to", win_to_raw])
+        res = subprocess.run(cmd, stdin=subprocess.DEVNULL, check=False)
+        return res.returncode
+
+
 def main(argv: list[str] | None = None) -> int:
     repo = Path(os.environ.get("HELIO_REPO") or Path(__file__).resolve().parents[1]).resolve()
     def_to, def_store, def_wrapper = default_paths(repo)
 
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--to", type=Path, default=def_to, help="program folder (default: <checkout>/../bin)")
-    parser.add_argument("--store", type=Path, default=def_store, help="store folder (default: <checkout>/../Heliograph-signals)")
+    parser.add_argument("--to", type=str, default=None, help="program folder (default: <checkout>/../bin or %%LOCALAPPDATA%%\\Heliograph)")
+    parser.add_argument("--store", type=str, default=None, help="store folder (default: <checkout>/../Heliograph-signals)")
     parser.add_argument("--wrapper", type=Path, default=def_wrapper, help="wrapper path (default: ~/.local/bin/helio)")
+    parser.add_argument("--windows", action="store_true", help="install, check, roll back, or remove for Windows sessions")
+    parser.add_argument("--reg-key", type=str, default="Environment", help="HKCU registry subkey for Windows Path (default: Environment)")
+    parser.add_argument("--source-exe", type=Path, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--source-sha256", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--commit", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--dirty", action="store_true", help=argparse.SUPPRESS)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--status", action="store_true", help="verify and print the installed commit and health")
     mode.add_argument("--back", action="store_true", help="restore the previously installed pair")
@@ -1686,33 +1776,87 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
+        if args.windows:
+            op_mode = "status" if args.status else ("back" if args.back else ("remove" if args.remove else "install"))
+            if os.name != "nt":
+                sdk_url = os.environ.get("HELIO_SDK_URL", DEFAULT_SDK_URL)
+                return run_windows_from_wsl(
+                    repo=repo,
+                    mode=op_mode,
+                    win_to_raw=args.to,
+                    store_raw=args.store,
+                    reg_key=args.reg_key,
+                    sdk_url=sdk_url,
+                )
+            win_mod = _load_win_install()
+            win_to = Path(args.to) if args.to else None
+            try:
+                if args.status:
+                    code, lines = win_mod.win_status(win_to=win_to, reg_key=args.reg_key)
+                    for line in lines:
+                        print(line)
+                    return code
+                if args.back:
+                    manifest = win_mod.win_back(win_to=win_to, reg_key=args.reg_key)
+                    cur = manifest["current"]
+                    label = f"{cur['commit']} (dirty)" if cur.get("dirty") else cur["commit"]
+                    print(f"restored {label} in {(win_to or win_mod.default_win_to_dir()).resolve()}")
+                    return 0
+                if args.remove:
+                    removed = win_mod.win_remove(win_to=win_to, reg_key=args.reg_key)
+                    target_dir = (win_to or win_mod.default_win_to_dir()).resolve()
+                    print(f"removed Heliograph from {target_dir}" if removed else f"nothing to remove in {target_dir}")
+                    return 0
+                if args.source_exe is None or not args.store:
+                    raise InstallError("Windows install requires --source-exe and --store (run from WSL with `python3 tools/install.py --windows`)", code=2)
+                manifest = win_mod.win_install(
+                    source_exe=args.source_exe,
+                    source_sha256=args.source_sha256,
+                    store_path=args.store,
+                    commit=args.commit or "unknown",
+                    dirty=bool(args.dirty),
+                    win_to=win_to,
+                    reg_key=args.reg_key,
+                )
+                cur = manifest["current"]
+                label = f"{cur['commit']} (dirty)" if cur.get("dirty") else cur["commit"]
+                dest_dir = (win_to or win_mod.default_win_to_dir()).resolve()
+                print(f"installed {label} to {dest_dir} (store: {cur['store']})")
+                print("open a new Windows terminal and run `helio check` to verify")
+                return 0
+            except win_mod.WinInstallError as exc:
+                print(f"install.py: {exc}", file=sys.stderr)
+                return exc.code
+
+        to_path = Path(args.to) if args.to else def_to
+        store_path = Path(args.store) if args.store else def_store
         if args.status:
-            code, lines = status(to_dir=args.to, wrapper_path=args.wrapper)
+            code, lines = status(to_dir=to_path, wrapper_path=args.wrapper)
             for line in lines:
                 print(line)
             return code
         if args.back:
-            manifest = go_back(to_dir=args.to, wrapper_path=args.wrapper)
+            manifest = go_back(to_dir=to_path, wrapper_path=args.wrapper)
             cur = manifest["current"]
             label = f"{cur['commit']} (dirty)" if cur.get("dirty") else cur["commit"]
-            print(f"restored {label} in {args.to.resolve()}")
+            print(f"restored {label} in {to_path.resolve()}")
             return 0
         if args.remove:
-            removed = remove(to_dir=args.to, wrapper_path=args.wrapper)
-            print(f"removed Heliograph from {args.to.resolve()}" if removed else f"nothing to remove in {args.to.resolve()}")
+            removed = remove(to_dir=to_path, wrapper_path=args.wrapper)
+            print(f"removed Heliograph from {to_path.resolve()}" if removed else f"nothing to remove in {to_path.resolve()}")
             return 0
 
         sdk_url = os.environ.get("HELIO_SDK_URL", DEFAULT_SDK_URL)
         manifest = install(
             repo=repo,
-            to_dir=args.to,
-            store_dir=args.store,
+            to_dir=to_path,
+            store_dir=store_path,
             wrapper_path=args.wrapper,
             sdk_url=sdk_url,
         )
         cur = manifest["current"]
         label = f"{cur['commit']} (dirty)" if cur.get("dirty") else cur["commit"]
-        print(f"installed {label} to {args.to.resolve()} (wrapper: {_normalize_wrapper_path(args.wrapper)}, store: {args.store.resolve()})")
+        print(f"installed {label} to {to_path.resolve()} (wrapper: {_normalize_wrapper_path(args.wrapper)}, store: {store_path.resolve()})")
         wrapper_dir = str(_normalize_wrapper_path(args.wrapper).parent)
         path_entries = [str(Path(p).resolve()) for p in os.environ.get("PATH", "").split(os.pathsep) if p]
         if wrapper_dir not in path_entries:
