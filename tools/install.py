@@ -583,13 +583,12 @@ def _validate_journal_paths(journal: Any, to_dir: Path, wrapper_path: Path) -> d
         if rec_name is not None and rec_name != f".{name}.{tx_id}.rec":
             raise InstallError(f"install journal recovery path invalid: {rec_name}", code=2)
     allowed_manifest_wrappers: set[Path] = {wrapper_path}
-    for mkey in ("previous_manifest", "desired_manifest"):
-        m = journal.get(mkey)
-        if isinstance(m, dict):
-            for section in ("current", "previous"):
-                rec = m.get(section)
-                if isinstance(rec, dict) and isinstance(rec.get("wrapper"), str) and rec["wrapper"]:
-                    allowed_manifest_wrappers.add(_normalize_wrapper_path(Path(rec["wrapper"])))
+    prev_m = journal.get("previous_manifest")
+    if isinstance(prev_m, dict):
+        for section in ("current", "previous"):
+            rec = prev_m.get(section)
+            if isinstance(rec, dict) and isinstance(rec.get("wrapper"), str) and rec["wrapper"]:
+                allowed_manifest_wrappers.add(_normalize_wrapper_path(Path(rec["wrapper"])))
 
     if sv == 1:
         for wkey in ("alt_wrapper_path", "prev_current_wrapper_path"):
@@ -845,17 +844,28 @@ def recover_if_needed(to_dir: Path, wrapper_path: Path, *, allow_superseded_wrap
         prev_prev = prev_manifest.get("previous") if isinstance(prev_manifest, dict) and isinstance(prev_manifest.get("previous"), dict) else None
         prev_store = prev_cur.get("store") if prev_cur else None
         alt_store = prev_prev.get("store") if prev_prev else None
+        prev_cur_wrap = (
+            _normalize_wrapper_path(Path(prev_cur["wrapper"]))
+            if prev_cur and isinstance(prev_cur.get("wrapper"), str) and prev_cur["wrapper"]
+            else None
+        )
         prev_prev_wrap = (
             _normalize_wrapper_path(Path(prev_prev["wrapper"]))
             if prev_prev and isinstance(prev_prev.get("wrapper"), str) and prev_prev["wrapper"]
             else None
         )
         if journal.get("previous_wrapper_existed"):
-            if prev_prev_wrap is not None and wrapper_path == prev_prev_wrap and alt_store:
+            if prev_cur_wrap is not None and wrapper_path == prev_cur_wrap and prev_store:
+                pre_wrappers[str(wrapper_path)] = prev_store
+            elif prev_prev_wrap is not None and wrapper_path == prev_prev_wrap and alt_store:
                 pre_wrappers[str(wrapper_path)] = alt_store
             elif prev_store:
                 pre_wrappers[str(wrapper_path)] = prev_store
-            # Legacy adoption without previous_manifest: keep existing wrapper untouched rather than deleting it.
+            else:
+                raise InstallError(
+                    "cannot recover v1 legacy-adoption journal without recorded pre-transaction wrapper store",
+                    code=2,
+                )
         else:
             pre_wrappers[str(wrapper_path)] = None
         if isinstance(journal.get("alt_wrapper_path"), str):
@@ -884,6 +894,15 @@ def recover_if_needed(to_dir: Path, wrapper_path: Path, *, allow_superseded_wrap
             wp.unlink()
             fsync_dir(wp.parent)
 
+    # If a required wrapper is owned by another destination and caller is not removing to_dir,
+    # keep the journal intact so a retry after the other destination releases the wrapper can finish restoration.
+    if superseded_wrappers and not allow_superseded_wrapper:
+        names = ", ".join(str(p) for p in superseded_wrappers)
+        raise InstallError(
+            f"recovery paused: required wrapper path is currently owned by another installation: {names}",
+            code=3,
+        )
+
     # Restore manifest state (already verified above).
     if journal.get("had_manifest") and isinstance(prev_manifest, dict):
         write_json_atomic(manifest_file, prev_manifest)
@@ -895,12 +914,6 @@ def recover_if_needed(to_dir: Path, wrapper_path: Path, *, allow_superseded_wrap
     _cleanup_temp_files(to_dir, temp_files, tx_id)
     journal_path.unlink()
     fsync_dir(to_dir)
-    if superseded_wrappers and not allow_superseded_wrapper:
-        names = ", ".join(str(p) for p in superseded_wrappers)
-        raise InstallError(
-            f"recovery restored {to_dir}, but required wrapper path is now owned by another installation: {names}",
-            code=3,
-        )
     return True
 
 

@@ -679,6 +679,8 @@ class TestQuickInstaller(unittest.TestCase):
             self.assertTrue(self.mod.recover_if_needed(w3_dir, w3c))
             self.assertEqual(w3a.read_text(encoding="utf-8"), self.mod.render_wrapper(w3_dir, s3a))
             self.assertEqual(w3b.read_text(encoding="utf-8"), self.mod.render_wrapper(w3_dir, s3b))
+            self.assertEqual(w3c.read_text(encoding="utf-8"), self.mod.render_wrapper(w3_dir, s3c))
+
             # 7e. Foreign journal with had_manifest=False cannot write an external wrapper or create its parent dir.
             fnom_dir = root / "foreign_no_manifest"
             fnom_dir.mkdir()
@@ -729,6 +731,13 @@ class TestQuickInstaller(unittest.TestCase):
                 self.mod.recover_if_needed(sup_a, sup_wb)
             self.assertEqual(ctx.exception.code, 3)
             self.assertTrue(self.mod.wrapper_belongs_to(sup_wb, sup_d))
+            self.assertTrue((sup_a / self.mod.JOURNAL_NAME).exists())
+            # Once D releases sup_wb, retrying recovery finishes cleanly and restores sup_wb with r_sb!
+            self.mod.remove(to_dir=sup_d, wrapper_path=sup_wb)
+            self.assertTrue(self.mod.recover_if_needed(sup_a, sup_wb))
+            self.assertEqual(sup_wb.read_text(encoding="utf-8"), self.mod.render_wrapper(sup_a, r_sb))
+            code, _ = self.mod.status(to_dir=sup_a, wrapper_path=sup_wb)
+            self.assertEqual(code, 0)
 
             # 7g. Legacy adoption with a different --store preserves the legacy wrapper's store in previous.store for --back.
             leg2_dir = root / "legacy_diff_store"
