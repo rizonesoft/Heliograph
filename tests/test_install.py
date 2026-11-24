@@ -4294,11 +4294,15 @@ class TestPhaseInstaller(unittest.TestCase):
                     self.assertEqual(st_later["status_code"], 0, st_later["status_lines"])
                     self.assertEqual(st_later["manifest"]["current"]["store"], other_win_store)
 
-                    # 14. Strict lock-token ownership class regression: when `.phase-active.json` is absent
-                    # (e.g., upgraded older `rolling_back` journal that already released its marker before crashing),
-                    # recovery MUST NOT remove a later ordinary Windows installation -- whether it used a DIFFERENT store
-                    # OR the EXACT SAME release, binary digest, AND store -- and `--phase-tx` without an active marker
-                    # is also refused inside Windows' destination lock!
+                    # 14. Strict lock-token ownership + unblocked retry class regression:
+                    # (a) When an older schema-2 `rolling_back` journal already released `.phase-active.json` before
+                    # crashing and a later ordinary Windows installer published (either different store OR exact same
+                    # release, digest, and store), recovery MUST preserve the later installation untouched AND retire
+                    # `phase.journal.json` so subsequent retries are NOT permanently blocked!
+                    # (b) Direct `--remove --phase-tx` without an active marker is refused inside Windows' dest lock.
+                    # (c) A non-`rolling_back` (`both_done`) schema-2 journal with a missing marker refuses with exit 3.
+                    # (d) Genuine schema-1 journals (no marker) recover BOTH an interrupted inner Windows publication
+                    # (`after_journal`) AND a completed Windows publication (`both_done`, C over B -> restores exact B, A preserved)!
                     legacy_rb_j = {k: v for k, v in rb_j.items() if k != "win_store"}
                     legacy_rb_j["phase_state"] = "rolling_back"
                     for expected_store in (other_win_store, win_store):
@@ -4310,20 +4314,19 @@ class TestPhaseInstaller(unittest.TestCase):
                             )
                             self.assertEqual(r_same.returncode, 0, r_same.stdout + r_same.stderr)
                         self.mod.write_json_atomic(to_dir / self.phase_mod.PHASE_JOURNAL_NAME, legacy_rb_j)
-                        with self.assertRaises(self.mod.InstallError) as ctx_ref_rb:
-                            self.phase_mod._recover_pending_phase_journal(
-                                to_dir=to_dir,
-                                wrapper_path=wrapper,
-                                store_dir=store_dir,
-                                win_to_raw=win_c_to,
-                                reg_key=reg_key_c,
-                                python_exe=self.python_exe,
-                                install_py_win=install_py_win,
-                                win_install_py_win=win_install_py_win,
-                                install_mod=self.mod,
-                            )
-                        self.assertEqual(ctx_ref_rb.exception.code, 3)
-                        self.assertIn("active phase marker", str(ctx_ref_rb.exception))
+                        # Recovery preserves the later writer AND retires the journal cleanly (unblocking retries)!
+                        self.phase_mod._recover_pending_phase_journal(
+                            to_dir=to_dir,
+                            wrapper_path=wrapper,
+                            store_dir=store_dir,
+                            win_to_raw=win_c_to,
+                            reg_key=reg_key_c,
+                            python_exe=self.python_exe,
+                            install_py_win=install_py_win,
+                            win_install_py_win=win_install_py_win,
+                            install_mod=self.mod,
+                        )
+                        self.assertFalse((to_dir / self.phase_mod.PHASE_JOURNAL_NAME).exists())
                         # Direct `--remove --phase-tx` without an active marker is also refused inside Windows lock!
                         r_no_marker = self.phase_mod._run_win_cli(
                             self.python_exe,
@@ -4334,7 +4337,104 @@ class TestPhaseInstaller(unittest.TestCase):
                         st_still = self.phase_mod._probe_win_state(self.python_exe, win_install_py_win, win_c_to, reg_key_c)
                         self.assertEqual(st_still["status_code"], 0, st_still["status_lines"])
                         self.assertEqual(st_still["manifest"]["current"]["store"], expected_store)
-                        (to_dir / self.phase_mod.PHASE_JOURNAL_NAME).unlink()
+
+                    # (c) Non-rolling_back schema-2 journal (`both_done`) with missing marker refuses with exit 3!
+                    missing_m_j = {**rb_j, "phase_state": "both_done"}
+                    self.mod.write_json_atomic(to_dir / self.phase_mod.PHASE_JOURNAL_NAME, missing_m_j)
+                    with self.assertRaises(self.mod.InstallError) as ctx_mm:
+                        self.phase_mod._recover_pending_phase_journal(
+                            to_dir=to_dir,
+                            wrapper_path=wrapper,
+                            store_dir=store_dir,
+                            win_to_raw=win_c_to,
+                            reg_key=reg_key_c,
+                            python_exe=self.python_exe,
+                            install_py_win=install_py_win,
+                            win_install_py_win=win_install_py_win,
+                            install_mod=self.mod,
+                        )
+                    self.assertEqual(ctx_mm.exception.code, 3)
+                    self.assertIn("active phase marker", str(ctx_mm.exception))
+                    (to_dir / self.phase_mod.PHASE_JOURNAL_NAME).unlink()
+                    self.phase_mod._run_win_cli(self.python_exe, install_py_win, ["--remove", "--to", win_c_to, "--reg-key", reg_key_c])
+
+                    # (d) Genuine schema-1 upgrade recovery (no `.phase-active.json`):
+                    # Install A then B, then test BOTH (i) interrupted inner Windows publication (`after_journal`)
+                    # and (ii) completed Windows publication (`both_done`) of C over B -> both restore exact B with A preserved!
+                    for src_p, sha_p, cmt_p in ((v0_e, v0_e_sha, "0" * 40), (v1_e, v1_e_sha, v1_commit)):
+                        r_s1_ab = self.phase_mod._run_win_cli(
+                            self.python_exe,
+                            install_py_win,
+                            ["--source-exe", self.win_mod.wsl_to_windows_path(src_p), "--source-sha256", sha_p, "--commit", cmt_p, "--store", win_store, "--to", win_c_to, "--reg-key", reg_key_c],
+                        )
+                        self.assertEqual(r_s1_ab.returncode, 0, r_s1_ab.stdout + r_s1_ab.stderr)
+                    # (d-i) Schema-1 interrupted at `after_journal` (no marker, B still visible, inner journal pending)
+                    s1_crash_helper = (
+                        "import importlib.util, pathlib, sys\n"
+                        "spec = importlib.util.spec_from_file_location('wi', sys.argv[1])\n"
+                        "mod = importlib.util.module_from_spec(spec)\n"
+                        "spec.loader.exec_module(mod)\n"
+                        "class Crash(BaseException):\n"
+                        "    _leave_journal_for_test = True\n"
+                        "def on_b(b):\n"
+                        "    if b == 'after_journal':\n"
+                        "        raise Crash('boom')\n"
+                        "try:\n"
+                        "    mod.win_install(source_exe=pathlib.Path(sys.argv[2]), source_sha256=sys.argv[3], "
+                        "store_path=sys.argv[4], commit='3'*40, win_to=pathlib.Path(sys.argv[5]), reg_key=sys.argv[6], on_boundary=on_b)\n"
+                        "except Crash:\n"
+                        "    pass\n"
+                    )
+                    subprocess.run(
+                        [self.python_exe, "-B", "-c", s1_crash_helper, win_install_py_win, self.win_mod.wsl_to_windows_path(v3_e), v3_e_sha, win_store, win_c_to, reg_key_c],
+                        check=True,
+                        stdin=subprocess.DEVNULL,
+                        capture_output=True,
+                    )
+                    s1_win_j = {
+                        k: v for k, v in win_crash_j.items() if k != "managed_by"
+                    }
+                    s1_win_j["schema_version"] = 1
+                    self.mod.write_json_atomic(to_dir / self.phase_mod.PHASE_JOURNAL_NAME, s1_win_j)
+                    self.phase_mod._recover_pending_phase_journal(
+                        to_dir=to_dir,
+                        wrapper_path=wrapper,
+                        store_dir=store_dir,
+                        win_to_raw=win_c_to,
+                        reg_key=reg_key_c,
+                        python_exe=self.python_exe,
+                        install_py_win=install_py_win,
+                        win_install_py_win=win_install_py_win,
+                        install_mod=self.mod,
+                    )
+                    st_s1_int = self.phase_mod._probe_win_state(self.python_exe, win_install_py_win, win_c_to, reg_key_c)
+                    self.assertEqual(st_s1_int["status_code"], 0, st_s1_int["status_lines"])
+                    self.assertEqual(st_s1_int["exe_sha"], v1_e_sha)
+                    self.assertEqual(st_s1_int["manifest"]["previous"]["commit"], "0" * 40)
+                    # (d-ii) Schema-1 completed Windows publication of C over B (`both_done`, no marker) -> rolls back to B!
+                    r_s1_c = self.phase_mod._run_win_cli(
+                        self.python_exe,
+                        install_py_win,
+                        ["--source-exe", self.win_mod.wsl_to_windows_path(v3_e), "--source-sha256", v3_e_sha, "--commit", "3" * 40, "--store", win_store, "--to", win_c_to, "--reg-key", reg_key_c],
+                    )
+                    self.assertEqual(r_s1_c.returncode, 0, r_s1_c.stdout + r_s1_c.stderr)
+                    self.mod.write_json_atomic(to_dir / self.phase_mod.PHASE_JOURNAL_NAME, s1_win_j)
+                    self.phase_mod._recover_pending_phase_journal(
+                        to_dir=to_dir,
+                        wrapper_path=wrapper,
+                        store_dir=store_dir,
+                        win_to_raw=win_c_to,
+                        reg_key=reg_key_c,
+                        python_exe=self.python_exe,
+                        install_py_win=install_py_win,
+                        win_install_py_win=win_install_py_win,
+                        install_mod=self.mod,
+                    )
+                    st_s1_done = self.phase_mod._probe_win_state(self.python_exe, win_install_py_win, win_c_to, reg_key_c)
+                    self.assertEqual(st_s1_done["status_code"], 0, st_s1_done["status_lines"])
+                    self.assertEqual(st_s1_done["exe_sha"], v1_e_sha)
+                    self.assertEqual(st_s1_done["manifest"]["current"]["commit"], v1_commit)
+                    self.assertEqual(st_s1_done["manifest"]["previous"]["commit"], "3" * 40)
                     self.phase_mod._run_win_cli(self.python_exe, install_py_win, ["--remove", "--to", win_c_to, "--reg-key", reg_key_c])
                 finally:
                     self._delete_reg_key(reg_key_c)
