@@ -389,7 +389,11 @@ One command takes a checkout to a working `helio` in WSL. It records what it ins
 
 ## 16. Installer for Windows sessions
 
+> **Started:** 2026-11-24T01:48Z
+
 A Windows session has no `helio` on its `PATH`, so its hook finds nothing. The installer gives it one that uses the store in WSL. It is worked on in WSL: the Windows half runs through Windows' own Python, as `tools/prove.py` of Impossible SDK does.
+
+**Corrected 2026-11-24:** Added the external-file and Windows-registry safety contract before plan review because `tools/install.py --windows` mutates `%LOCALAPPDATA%\Heliograph` and `HKCU\Environment\Path`. Guard Windows writes with an exclusive lock (`<win_to>\.install.lock` via `msvcrt.locking`), a durable in-progress journal (`<win_to>\install.win.journal.json`, removed only after `installed.win.json` commits or `--windows --remove` completes) recording file snapshots and the prior registry `Path` value/kind/existence, ownership verification before replacing or deleting `helio.exe`, `helio.cmd` (`REM Managed by Heliograph installer`), or retired copies, crash/failure recovery on retry, and clean removal of `<win_to>` only when empty of unrelated user files. Tests use isolated temporary folders and an isolated registry subkey (`--reg-key`) so the operator's real `HKCU\Environment\Path` is never touched during `prove.py`.
 
 **Phase:** 0
 **Needs:** none
