@@ -658,10 +658,10 @@ def _rollback_phase_journal(
                 else (cur_win.get("manifest") is None and not cur_win.get("exe_sha"))
             )
             if not win_already_restored:
-                # On first-install rollback, verify the live manifest belongs to THIS phase commit before removing!
-                if not journal.get("win_had_install") and cur_win_c.get("commit") != journal.get("commit"):
+                # Verify the live Windows manifest belongs to THIS phase commit before running --back or --remove!
+                if cur_win_c.get("commit") != journal.get("commit"):
                     errors.append(
-                        f"refusing Windows first-install removal: live commit {cur_win_c.get('commit')} != phase commit {journal.get('commit')}"
+                        f"refusing Windows rollback: live commit {cur_win_c.get('commit')} != phase commit {journal.get('commit')}"
                     )
                 else:
                     win_args = ["--back" if journal.get("win_had_install") else "--remove", "--reg-key", reg_key, "--phase-tx", tx_id]
@@ -718,14 +718,15 @@ def _rollback_phase_journal(
         if on_boundary:
             on_boundary("after_wsl_rollback")
 
+    # Keep the Windows phase marker active if rollback had ANY error so no concurrent installer can interleave before retry!
+    if errors:
+        raise install_mod.InstallError("phase rollback incomplete: " + "; ".join(errors), code=3)
+
     if tx_id:
         try:
             _win_phase_marker_call(python_exe, win_install_py_win, "end", win_to_raw, reg_key, tx_id, install_mod=install_mod)
         except Exception as exc:
-            errors.append(f"failed to release Windows phase marker: {exc}")
-
-    if errors:
-        raise install_mod.InstallError("phase rollback incomplete: " + "; ".join(errors), code=3)
+            raise install_mod.InstallError(f"phase rollback succeeded but failed to release Windows phase marker: {exc}", code=3) from exc
 
     jp = to_dir / PHASE_JOURNAL_NAME
     if jp.exists():
@@ -733,8 +734,32 @@ def _rollback_phase_journal(
         install_mod.fsync_dir(to_dir)
 
 
-def _read_and_validate_phase_journal(to_dir: Path, install_mod: Any) -> dict[str, Any]:
-    """Validate ownership and destination binding of phase.journal.json BEFORE any recovery side effect."""
+_REQUIRED_PHASE_JOURNAL_KEYS = (
+    "tx_id",
+    "phase",
+    "commit",
+    "phase_state",
+    "wsl_to",
+    "wrapper",
+    "store",
+    "reg_key",
+    "wsl_changed",
+    "win_changed",
+    "wsl_had_install",
+    "win_had_install",
+)
+
+
+def _read_and_validate_phase_journal(
+    to_dir: Path,
+    *,
+    wrapper_path: Path,
+    store_dir: Path,
+    win_to_raw: str | None,
+    reg_key: str,
+    install_mod: Any,
+) -> dict[str, Any]:
+    """Validate ownership and exact destination/wrapper/store binding of phase.journal.json BEFORE any side effect."""
     jp = to_dir / PHASE_JOURNAL_NAME
     if jp.is_symlink():
         raise install_mod.InstallError(f"refusing symlink phase journal at {jp}", code=2)
@@ -746,12 +771,22 @@ def _read_and_validate_phase_journal(to_dir: Path, install_mod: Any) -> dict[str
         raise install_mod.InstallError(f"refusing unreadable or foreign phase journal at {jp}: {exc}", code=2) from exc
     if not isinstance(journal, dict):
         raise install_mod.InstallError(f"refusing foreign phase journal at {jp}", code=2)
-    if journal.get("managed_by") != "heliograph-phase-installer" or journal.get("schema_version") != 1:
-        raise install_mod.InstallError(f"refusing unowned phase journal at {jp}", code=2)
+    sv = journal.get("schema_version")
+    if sv == 2:
+        if journal.get("managed_by") != "heliograph-phase-installer":
+            raise install_mod.InstallError(f"refusing unowned phase journal at {jp}", code=2)
+    elif sv == 1:
+        # Accept schema-1 journals only when they carry the complete schema-1 field set (upgrade compatibility)
+        # and every external path matches this invocation's bound destinations.
+        if not all(k in journal for k in _REQUIRED_PHASE_JOURNAL_KEYS):
+            raise install_mod.InstallError(f"refusing incomplete or foreign phase journal at {jp}", code=2)
+    else:
+        raise install_mod.InstallError(f"refusing unsupported phase journal schema_version {sv!r} at {jp}", code=2)
+
     tx_id = journal.get("tx_id")
     if not isinstance(tx_id, str) or not re.fullmatch(r"[0-9a-f]{12}", tx_id):
         raise install_mod.InstallError(f"refusing phase journal with invalid tx_id at {jp}", code=2)
-    if journal.get("phase_state") not in ("planned", "wsl_done", "both_done", "notifying", "rolling_back"):
+    if journal.get("phase_state") not in ("acquiring", "planned", "wsl_done", "both_done", "notifying", "rolling_back"):
         raise install_mod.InstallError(f"refusing phase journal with invalid state at {jp}", code=2)
     rec_to = journal.get("wsl_to")
     if not isinstance(rec_to, str) or not rec_to or Path(rec_to).resolve() != to_dir.resolve():
@@ -759,12 +794,40 @@ def _read_and_validate_phase_journal(to_dir: Path, install_mod: Any) -> dict[str
             f"refusing phase journal bound to {rec_to!r}, expected {to_dir.resolve()}",
             code=2,
         )
+    rec_wrap = journal.get("wrapper")
+    if not isinstance(rec_wrap, str) or not rec_wrap or install_mod._normalize_wrapper_path(Path(rec_wrap)) != wrapper_path:
+        raise install_mod.InstallError(
+            f"refusing phase journal bound to wrapper {rec_wrap!r}, expected {wrapper_path}",
+            code=2,
+        )
+    rec_store = journal.get("store")
+    if not isinstance(rec_store, str) or not rec_store or Path(rec_store).resolve() != store_dir.resolve():
+        raise install_mod.InstallError(
+            f"refusing phase journal bound to store {rec_store!r}, expected {store_dir.resolve()}",
+            code=2,
+        )
+    if journal.get("win_to_arg") != win_to_raw or str(journal.get("reg_key") or "").lower() != reg_key.lower():
+        raise install_mod.InstallError(
+            f"refusing phase journal bound to Windows target ({journal.get('win_to_arg')!r}, {journal.get('reg_key')!r}), "
+            f"expected ({win_to_raw!r}, {reg_key!r})",
+            code=2,
+        )
+    if journal.get("phase_state") == "notifying":
+        if not install_mod.wrapper_belongs_to(wrapper_path, to_dir):
+            raise install_mod.InstallError(
+                f"refusing phase notification recovery: wrapper {wrapper_path} is not owned by {to_dir}",
+                code=2,
+            )
     return journal
 
 
 def _recover_pending_phase_journal(
     *,
     to_dir: Path,
+    wrapper_path: Path,
+    store_dir: Path,
+    win_to_raw: str | None,
+    reg_key: str,
     python_exe: str,
     install_py_win: str,
     win_install_py_win: str,
@@ -775,10 +838,27 @@ def _recover_pending_phase_journal(
     jp = to_dir / PHASE_JOURNAL_NAME
     if not jp.exists() and not jp.is_symlink():
         return None
-    journal = _read_and_validate_phase_journal(to_dir, install_mod)
+    journal = _read_and_validate_phase_journal(
+        to_dir,
+        wrapper_path=wrapper_path,
+        store_dir=store_dir,
+        win_to_raw=win_to_raw,
+        reg_key=reg_key,
+        install_mod=install_mod,
+    )
 
     state = journal.get("phase_state")
     if state == "notifying":
+        # Idempotently release any stranded Windows phase marker from a crash right after writing `notifying`.
+        _win_phase_marker_call(
+            python_exe,
+            win_install_py_win,
+            "end",
+            journal.get("win_to_arg"),
+            str(journal["reg_key"]),
+            str(journal["tx_id"]),
+            install_mod=install_mod,
+        )
         msg_id = _send_phase_tell(
             wrapper_path=Path(journal["wrapper"]),
             store_dir=Path(journal["store"]),
@@ -862,6 +942,10 @@ def run_phase_install(
         with install_mod.acquire_lock(to_dir / PHASE_LOCK_NAME, blocking=False):
             resumed = _recover_pending_phase_journal(
                 to_dir=to_dir,
+                wrapper_path=wrapper_path,
+                store_dir=store_dir,
+                win_to_raw=win_to_raw,
+                reg_key=reg_key,
                 python_exe=python_exe,
                 install_py_win=install_py_win,
                 win_install_py_win=win_install_py_win,
@@ -982,9 +1066,13 @@ def run_phase_install(
         to_dir.mkdir(parents=True, exist_ok=True)
         with install_mod.acquire_lock(to_dir / PHASE_LOCK_NAME, blocking=False):
             # Re-check for a pending journal under the lock in case another phase run crashed while we were proving!
-            if (to_dir / PHASE_JOURNAL_NAME).exists():
+            if (to_dir / PHASE_JOURNAL_NAME).exists() or (to_dir / PHASE_JOURNAL_NAME).is_symlink():
                 resumed = _recover_pending_phase_journal(
                     to_dir=to_dir,
+                    wrapper_path=wrapper_path,
+                    store_dir=store_dir,
+                    win_to_raw=win_to_raw,
+                    reg_key=reg_key,
                     python_exe=python_exe,
                     install_py_win=install_py_win,
                     win_install_py_win=win_install_py_win,
@@ -994,96 +1082,117 @@ def run_phase_install(
                 if resumed is not None and _resumed_matches_request(resumed, commit):
                     return resumed
 
-            # Capture pre-transaction state for both hosts (including legacy WSL pair without manifest!).
-            wsl_pre_manifest = install_mod.read_manifest(to_dir)
-            wsl_pre_status, _ = install_mod.status(to_dir=to_dir, wrapper_path=wrapper_path)
-            wsl_had_install = wsl_pre_manifest is not None
-            wsl_had_legacy = (
-                wsl_pre_manifest is None
-                and (to_dir / "helio").is_file()
-                and not (to_dir / "helio").is_symlink()
-                and (to_dir / "helio.exe").is_file()
-                and not (to_dir / "helio.exe").is_symlink()
-            )
-            wsl_pre_cur = (wsl_pre_manifest or {}).get("current") or {}
-            wsl_pre_helio_sha = (
-                wsl_pre_cur.get("helio_sha256", "")
-                if wsl_had_install
-                else (install_mod.sha256_file(to_dir / "helio") if wsl_had_legacy else "")
-            )
-
-            wsl_already_current = (
-                wsl_had_install
-                and wsl_pre_status == 0
-                and wsl_pre_cur.get("commit") == commit
-                and not bool(wsl_pre_cur.get("dirty", False))
-                and wsl_pre_cur.get("helio_sha256") == pre_wsl_sha
-                and wsl_pre_cur.get("helio_exe_sha256") == pre_win_sha
-                and wsl_pre_cur.get("store") == str(store_dir)
-                and wsl_pre_cur.get("wrapper") == str(wrapper_path)
-            )
-
-            win_pre = _probe_win_state(python_exe, win_install_py_win, win_to_raw, reg_key, install_mod=install_mod)
-            win_dest = win_pre["dest"]
-            win_pre_manifest = win_pre["manifest"]
-            win_had_install = win_pre_manifest is not None
-            win_pre_cur = (win_pre_manifest or {}).get("current") or {}
-
-            win_already_current = (
-                win_had_install
-                and win_pre["status_code"] == 0
-                and win_pre_cur.get("commit") == commit
-                and not bool(win_pre_cur.get("dirty", False))
-                and win_pre_cur.get("helio_exe_sha256") == pre_win_sha
-                and win_pre_cur.get("store") == win_store
-            )
-
+            # Write durable `acquiring` journal FIRST, THEN acquire the Windows phase marker, THEN probe
+            # Windows pre-transaction state under that exclusive marker! This guarantees:
+            # (a) a crash right after Windows marker acquisition never strands the marker (WSL journal already has tx_id), and
+            # (b) no concurrent Windows installer can slip in between probing Windows state and acquiring the marker!
             tx_id = secrets.token_hex(6)
             journal: dict[str, Any] = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "managed_by": "heliograph-phase-installer",
                 "tx_id": tx_id,
                 "phase": phase,
                 "commit": commit,
-                "phase_state": "planned",
+                "phase_state": "acquiring",
                 "wsl_to": str(to_dir),
                 "wrapper": str(wrapper_path),
                 "store": str(store_dir),
                 "win_to_arg": win_to_raw,
-                "win_dest": win_dest,
+                "win_dest": win_to_raw or "",
                 "reg_key": reg_key,
                 "proved_wsl_sha": pre_wsl_sha,
                 "proved_win_sha": pre_win_sha,
-                "wsl_had_install": wsl_had_install,
-                "wsl_had_legacy": wsl_had_legacy,
-                "wsl_pre_helio_sha": wsl_pre_helio_sha,
-                "wsl_pre_commit": wsl_pre_cur.get("commit", "legacy" if wsl_had_legacy else ""),
-                "wsl_pre_store": wsl_pre_cur.get("store", ""),
-                "wsl_pre_wrapper": wsl_pre_cur.get("wrapper", ""),
-                "win_had_install": win_had_install,
-                "win_pre_exe_sha": win_pre.get("exe_sha", ""),
-                "win_pre_commit": win_pre_cur.get("commit", ""),
-                "win_pre_store": win_pre_cur.get("store", ""),
+                "wsl_had_install": False,
+                "wsl_had_legacy": False,
+                "wsl_pre_helio_sha": "",
+                "wsl_pre_commit": "",
+                "wsl_pre_store": "",
+                "wsl_pre_wrapper": "",
+                "win_had_install": False,
+                "win_pre_exe_sha": "",
+                "win_pre_commit": "",
+                "win_pre_store": "",
                 "wsl_changed": False,
                 "win_changed": False,
             }
-            # Acquire exclusive phase ownership on the Windows destination before writing the journal / mutating either host.
-            _win_phase_marker_call(
-                python_exe,
-                win_install_py_win,
-                "begin",
-                win_to_raw,
-                reg_key,
-                tx_id,
-                phase=phase,
-                commit=commit,
-                install_mod=install_mod,
-            )
             install_mod.write_json_atomic(to_dir / PHASE_JOURNAL_NAME, journal)
-            if on_boundary:
-                on_boundary("after_phase_journal")
-
             try:
+                _win_phase_marker_call(
+                    python_exe,
+                    win_install_py_win,
+                    "begin",
+                    win_to_raw,
+                    reg_key,
+                    tx_id,
+                    phase=phase,
+                    commit=commit,
+                    install_mod=install_mod,
+                )
+
+                # Capture pre-transaction state for both hosts while BOTH locks/markers are held!
+                wsl_pre_manifest = install_mod.read_manifest(to_dir)
+                wsl_pre_status, _ = install_mod.status(to_dir=to_dir, wrapper_path=wrapper_path)
+                wsl_had_install = wsl_pre_manifest is not None
+                wsl_had_legacy = (
+                    wsl_pre_manifest is None
+                    and (to_dir / "helio").is_file()
+                    and not (to_dir / "helio").is_symlink()
+                    and (to_dir / "helio.exe").is_file()
+                    and not (to_dir / "helio.exe").is_symlink()
+                )
+                wsl_pre_cur = (wsl_pre_manifest or {}).get("current") or {}
+                wsl_pre_helio_sha = (
+                    wsl_pre_cur.get("helio_sha256", "")
+                    if wsl_had_install
+                    else (install_mod.sha256_file(to_dir / "helio") if wsl_had_legacy else "")
+                )
+
+                wsl_already_current = (
+                    wsl_had_install
+                    and wsl_pre_status == 0
+                    and wsl_pre_cur.get("commit") == commit
+                    and not bool(wsl_pre_cur.get("dirty", False))
+                    and wsl_pre_cur.get("helio_sha256") == pre_wsl_sha
+                    and wsl_pre_cur.get("helio_exe_sha256") == pre_win_sha
+                    and wsl_pre_cur.get("store") == str(store_dir)
+                    and wsl_pre_cur.get("wrapper") == str(wrapper_path)
+                )
+
+                win_pre = _probe_win_state(python_exe, win_install_py_win, win_to_raw, reg_key, install_mod=install_mod)
+                win_dest = win_pre["dest"]
+                win_pre_manifest = win_pre["manifest"]
+                win_had_install = win_pre_manifest is not None
+                win_pre_cur = (win_pre_manifest or {}).get("current") or {}
+
+                win_already_current = (
+                    win_had_install
+                    and win_pre["status_code"] == 0
+                    and win_pre_cur.get("commit") == commit
+                    and not bool(win_pre_cur.get("dirty", False))
+                    and win_pre_cur.get("helio_exe_sha256") == pre_win_sha
+                    and win_pre_cur.get("store") == win_store
+                )
+
+                journal.update(
+                    {
+                        "phase_state": "planned",
+                        "win_dest": win_dest,
+                        "wsl_had_install": wsl_had_install,
+                        "wsl_had_legacy": wsl_had_legacy,
+                        "wsl_pre_helio_sha": wsl_pre_helio_sha,
+                        "wsl_pre_commit": wsl_pre_cur.get("commit", "legacy" if wsl_had_legacy else ""),
+                        "wsl_pre_store": wsl_pre_cur.get("store", ""),
+                        "wsl_pre_wrapper": wsl_pre_cur.get("wrapper", ""),
+                        "win_had_install": win_had_install,
+                        "win_pre_exe_sha": win_pre.get("exe_sha", ""),
+                        "win_pre_commit": win_pre_cur.get("commit", ""),
+                        "win_pre_store": win_pre_cur.get("store", ""),
+                    }
+                )
+                install_mod.write_json_atomic(to_dir / PHASE_JOURNAL_NAME, journal)
+                if on_boundary:
+                    on_boundary("after_phase_journal")
+
                 if not wsl_already_current:
                     journal["wsl_changed"] = True
                     install_mod.write_json_atomic(to_dir / PHASE_JOURNAL_NAME, journal)
@@ -1150,9 +1259,11 @@ def run_phase_install(
                     on_verify=on_verify,
                 )
 
+                # Release the Windows phase marker BEFORE transitioning to `notifying` (and notifying recovery also
+                # calls `end` idempotently) so a crash can never strand `.phase-active.json`.
+                _win_phase_marker_call(python_exe, win_install_py_win, "end", win_to_raw, reg_key, tx_id, install_mod=install_mod)
                 journal["phase_state"] = "notifying"
                 install_mod.write_json_atomic(to_dir / PHASE_JOURNAL_NAME, journal)
-                _win_phase_marker_call(python_exe, win_install_py_win, "end", win_to_raw, reg_key, tx_id)
             except BaseException as exc:
                 _rollback_phase_journal(
                     journal,

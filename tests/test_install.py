@@ -3760,8 +3760,8 @@ class TestPhaseInstaller(unittest.TestCase):
                 subprocess.run(["git", "-C", str(checkout), "pull", "--rebase", "origin", "main"], check=True, capture_output=True)
                 head_sha = subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip()
 
-                # 2. Simulate crash BETWEEN WSL install and Windows install: manually plant a `wsl_done` journal
-                # after updating WSL only, then run recovery -> WSL rolls back to V1, Windows stays untouched on V1!
+                # 2. Simulate crash BETWEEN WSL install and Windows install using a legacy schema-1 journal
+                # (without `managed_by`, proving upgrade compatibility from schema 1!) -> WSL rolls back to V1!
                 v2_h, v2_e = src_bins / "helio", src_bins / "helio.exe"
                 self.mod.install(
                     repo=checkout,
@@ -3774,7 +3774,6 @@ class TestPhaseInstaller(unittest.TestCase):
                 )
                 crashed_journal = {
                     "schema_version": 1,
-                    "managed_by": "heliograph-phase-installer",
                     "tx_id": "aabbccddeeff",
                     "phase": 0,
                     "commit": head_sha,
@@ -3802,6 +3801,10 @@ class TestPhaseInstaller(unittest.TestCase):
                 self.mod.write_json_atomic(to_dir / self.phase_mod.PHASE_JOURNAL_NAME, crashed_journal)
                 self.phase_mod._recover_pending_phase_journal(
                     to_dir=to_dir,
+                    wrapper_path=wrapper,
+                    store_dir=store_dir,
+                    win_to_raw=win_to,
+                    reg_key=reg_key,
                     python_exe=self.python_exe,
                     install_py_win=install_py_win,
                     win_install_py_win=win_install_py_win,
@@ -3905,7 +3908,7 @@ class TestPhaseInstaller(unittest.TestCase):
                     self.assertEqual(ctx_sh.exception.code, 3)
                     self.assertIn("shadows", str(ctx_sh.exception))
 
-                # 7. Foreign/symlink/wrong-dest phase.journal.json refused with exit 2 BEFORE any side effects!
+                # 7. Foreign/symlink/unbound-wrapper-or-store phase.journal.json refused with exit 2 BEFORE any side effects!
                 foreign_to = root / "foreign_to"
                 foreign_to.mkdir()
                 foreign_jp = foreign_to / self.phase_mod.PHASE_JOURNAL_NAME
@@ -3913,6 +3916,10 @@ class TestPhaseInstaller(unittest.TestCase):
                 with self.assertRaises(self.mod.InstallError) as ctx_fj:
                     self.phase_mod._recover_pending_phase_journal(
                         to_dir=foreign_to,
+                        wrapper_path=wrapper,
+                        store_dir=store_dir,
+                        win_to_raw=win_to,
+                        reg_key=reg_key,
                         python_exe=self.python_exe,
                         install_py_win=install_py_win,
                         win_install_py_win=win_install_py_win,
@@ -3920,6 +3927,33 @@ class TestPhaseInstaller(unittest.TestCase):
                     )
                 self.assertEqual(ctx_fj.exception.code, 2)
                 self.assertTrue(foreign_jp.is_file())
+                # Schema-2 journal pointing at a DIFFERENT wrapper/store is ALSO refused with exit 2!
+                foreign_jp.write_text(
+                    json.dumps(
+                        {
+                            **crashed_journal,
+                            "schema_version": 2,
+                            "managed_by": "heliograph-phase-installer",
+                            "wsl_to": str(foreign_to.resolve()),
+                            "wrapper": str(root / "evil_wrapper"),
+                            "phase_state": "notifying",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                with self.assertRaises(self.mod.InstallError) as ctx_unbound:
+                    self.phase_mod._recover_pending_phase_journal(
+                        to_dir=foreign_to,
+                        wrapper_path=wrapper,
+                        store_dir=store_dir,
+                        win_to_raw=win_to,
+                        reg_key=reg_key,
+                        python_exe=self.python_exe,
+                        install_py_win=install_py_win,
+                        win_install_py_win=win_install_py_win,
+                        install_mod=self.mod,
+                    )
+                self.assertEqual(ctx_unbound.exception.code, 2)
                 foreign_jp.unlink()
                 other_file = root / "other_target.json"
                 other_file.write_text("{}", encoding="utf-8")
@@ -3927,6 +3961,10 @@ class TestPhaseInstaller(unittest.TestCase):
                 with self.assertRaises(self.mod.InstallError) as ctx_sym:
                     self.phase_mod._recover_pending_phase_journal(
                         to_dir=foreign_to,
+                        wrapper_path=wrapper,
+                        store_dir=store_dir,
+                        win_to_raw=win_to,
+                        reg_key=reg_key,
                         python_exe=self.python_exe,
                         install_py_win=install_py_win,
                         win_install_py_win=win_install_py_win,
@@ -3956,17 +3994,35 @@ class TestPhaseInstaller(unittest.TestCase):
                     )
                 self.assertEqual(ctx_fw.exception.code, 3)
 
-                # 9. Windows phase marker blocks concurrent `--windows --back` / `--remove` with exit 3!
+                # 9. Windows phase marker blocks concurrent `--windows --remove` with exit 3, AND recovering
+                # an `acquiring` crash journal releases the marker cleanly!
                 self.phase_mod._win_phase_marker_call(
                     self.python_exe, win_install_py_win, "begin", win_to, reg_key, "abcdef012345", phase=0, commit=head_sha, install_mod=self.mod
                 )
-                try:
-                    blk = self.phase_mod._run_win_cli(self.python_exe, install_py_win, ["--remove", "--to", win_to, "--reg-key", reg_key])
-                    self.assertEqual(blk.returncode, 3, blk.stdout + blk.stderr)
-                finally:
-                    self.phase_mod._win_phase_marker_call(
-                        self.python_exe, win_install_py_win, "end", win_to, reg_key, "abcdef012345", install_mod=self.mod
-                    )
+                blk = self.phase_mod._run_win_cli(self.python_exe, install_py_win, ["--remove", "--to", win_to, "--reg-key", reg_key])
+                self.assertEqual(blk.returncode, 3, blk.stdout + blk.stderr)
+                acq_j = {
+                    **crashed_journal,
+                    "schema_version": 2,
+                    "managed_by": "heliograph-phase-installer",
+                    "tx_id": "abcdef012345",
+                    "phase_state": "acquiring",
+                    "wsl_changed": False,
+                    "win_changed": False,
+                }
+                self.mod.write_json_atomic(to_dir / self.phase_mod.PHASE_JOURNAL_NAME, acq_j)
+                self.phase_mod._recover_pending_phase_journal(
+                    to_dir=to_dir,
+                    wrapper_path=wrapper,
+                    store_dir=store_dir,
+                    win_to_raw=win_to,
+                    reg_key=reg_key,
+                    python_exe=self.python_exe,
+                    install_py_win=install_py_win,
+                    win_install_py_win=win_install_py_win,
+                    install_mod=self.mod,
+                )
+                self.assertFalse((to_dir / self.phase_mod.PHASE_JOURNAL_NAME).exists())
 
                 # 10. Narrowed remote.origin.fetch where origin/main is stale while FETCH_HEAD advanced -> refused (exit 2)!
                 subprocess.run(
@@ -4030,7 +4086,7 @@ class TestPhaseInstaller(unittest.TestCase):
                             capture_output=True,
                         )
                         win_crash_j = {
-                            "schema_version": 1,
+                            "schema_version": 2,
                             "managed_by": "heliograph-phase-installer",
                             "tx_id": "123456789abc",
                             "phase": 0,
@@ -4057,6 +4113,10 @@ class TestPhaseInstaller(unittest.TestCase):
                         self.mod.write_json_atomic(to_dir / self.phase_mod.PHASE_JOURNAL_NAME, win_crash_j)
                         self.phase_mod._recover_pending_phase_journal(
                             to_dir=to_dir,
+                            wrapper_path=wrapper,
+                            store_dir=store_dir,
+                            win_to_raw=win_c_to,
+                            reg_key=reg_key_c,
                             python_exe=self.python_exe,
                             install_py_win=install_py_win,
                             win_install_py_win=win_install_py_win,
