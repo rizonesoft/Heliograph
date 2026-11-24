@@ -4525,6 +4525,27 @@ class TestPhaseInstaller(unittest.TestCase):
                     )
                     self.assertEqual(rw.returncode, 0, rw.stdout + rw.stderr)
 
+                # Plant foreign backup-shaped files (including at the exact tx_id paths that the old
+                # separate-file snapshot mechanism used!) in BOTH WSL `to_dir` AND Windows `win_to\bin\`
+                # BEFORE running the failed-C upgrade + rollback (items 2, 9, and 23).
+                fixed_tx = "deadbeef1234"
+                wsl_foreign_copy = to_dir / f".phase-prev-{fixed_tx}.helio.old"
+                wsl_foreign_empty = to_dir / f".phase-prev-{fixed_tx}.win.helio.exe.old"
+                wsl_foreign_copy.write_bytes(a_h.read_bytes())
+                wsl_foreign_empty.write_bytes(b"")
+                plant_win_foreign = (
+                    "import pathlib, sys\n"
+                    "b = pathlib.Path(sys.argv[1]) / 'bin'\n"
+                    "tx = sys.argv[3]\n"
+                    "(b / f'.phase-prev-{tx}.helio.exe.old').write_bytes(pathlib.Path(sys.argv[2]).read_bytes())\n"
+                    "(b / '.phase-prev-foreignempty.helio.exe.old').write_bytes(b'')\n"
+                )
+                subprocess.run(
+                    [self.python_exe, "-B", "-c", plant_win_foreign, win_to, self.win_mod.wsl_to_windows_path(a_e), fixed_tx],
+                    check=True,
+                    stdin=subprocess.DEVNULL,
+                )
+
                 # Run phase C with a planted verification fault -> must publish C on BOTH hosts first,
                 # reach the planted fault, and then roll back BOTH hosts to current=B, previous=A!
                 seen_boundaries: list[str] = []
@@ -4537,24 +4558,53 @@ class TestPhaseInstaller(unittest.TestCase):
                     verify_called.append(stage)
                     raise self.mod.InstallError("planted live verification fault", code=3)
 
-                with self.assertRaises(self.mod.InstallError) as ctx:
-                    self.phase_mod.run_phase_install(
-                        repo=checkout,
-                        phase=0,
-                        to_dir=to_dir,
-                        store_dir=store_dir,
-                        wrapper_path=wrapper,
-                        win_to_raw=win_to,
-                        reg_key=reg_key,
-                        sdk_url="unused",
-                        install_mod=self.mod,
-                        on_boundary=record_boundary,
-                        on_verify=fail_verify,
-                    )
+                with mock.patch.object(self.phase_mod.secrets, "token_hex", return_value=fixed_tx):
+                    with self.assertRaises(self.mod.InstallError) as ctx:
+                        self.phase_mod.run_phase_install(
+                            repo=checkout,
+                            phase=0,
+                            to_dir=to_dir,
+                            store_dir=store_dir,
+                            wrapper_path=wrapper,
+                            win_to_raw=win_to,
+                            reg_key=reg_key,
+                            sdk_url="unused",
+                            install_mod=self.mod,
+                            on_boundary=record_boundary,
+                            on_verify=fail_verify,
+                        )
                 self.assertEqual(ctx.exception.code, 3)
                 self.assertIn("after_win_install", seen_boundaries, "must publish C on Windows before rolling back")
                 self.assertTrue(verify_called, "must reach planted live verification fault after publication")
                 self.assertIn("planted live verification fault", str(ctx.exception))
+
+                # Verify BOTH WSL and Windows foreign files (including at the exact tx_id paths) survived
+                # capture, publication, and rollback byte-for-byte with ZERO stranded phase-prev files!
+                self.assertEqual(wsl_foreign_copy.read_bytes(), a_h.read_bytes())
+                self.assertEqual(wsl_foreign_empty.read_bytes(), b"")
+                self.assertEqual(
+                    sorted(p.name for p in to_dir.iterdir() if "phase-prev" in p.name),
+                    sorted([wsl_foreign_copy.name, wsl_foreign_empty.name]),
+                )
+                wsl_foreign_copy.unlink()
+                wsl_foreign_empty.unlink()
+                check_win_foreign = (
+                    "import pathlib, sys\n"
+                    "b = pathlib.Path(sys.argv[1]) / 'bin'\n"
+                    "expected = pathlib.Path(sys.argv[2]).read_bytes()\n"
+                    "tx = sys.argv[3]\n"
+                    "p1 = b / f'.phase-prev-{tx}.helio.exe.old'\n"
+                    "p2 = b / '.phase-prev-foreignempty.helio.exe.old'\n"
+                    "assert p1.is_file() and p1.read_bytes() == expected, 'Windows foreign copy must survive rollback verbatim'\n"
+                    "assert p2.is_file() and p2.read_bytes() == b'', 'Windows foreign empty file must survive rollback verbatim'\n"
+                    "assert sorted(p.name for p in b.iterdir() if 'phase-prev' in p.name) == sorted([p1.name, p2.name])\n"
+                    "p1.unlink(); p2.unlink()\n"
+                )
+                subprocess.run(
+                    [self.python_exe, "-B", "-c", check_win_foreign, win_to, self.win_mod.wsl_to_windows_path(a_e), fixed_tx],
+                    check=True,
+                    stdin=subprocess.DEVNULL,
+                )
 
                 # Verify WSL has current=B, previous=A, and ordinary `--back` restores A!
                 wsl_m = self.mod.read_manifest(to_dir)
@@ -4648,54 +4698,24 @@ class TestPhaseInstaller(unittest.TestCase):
                     self._delete_reg_key(sole_reg_key)
                     self._cleanup_win_parent(sole_win_to)
 
-                # Class-level regression (items 2 & 9): previous-generation backups are stored inside
-                # `phase.journal.json` (zero separate `.phase-prev-*` or `..phase-prev-*` files created on
-                # EITHER WSL `to_dir` or Windows `win_to\bin\`), so no crash can strand a backup file AND any
-                # pre-existing foreign file in EITHER destination (byte-identical OR empty 0-byte) is preserved verbatim.
-                self.assertEqual([p.name for p in to_dir.iterdir() if "phase-prev" in p.name], [])
-                wsl_foreign_copy = to_dir / ".phase-prev-foreigncopy.helio.old"
-                wsl_foreign_empty = to_dir / ".phase-prev-foreignempty.helio.old"
-                wsl_foreign_copy.write_bytes(a_h.read_bytes())
-                wsl_foreign_empty.write_bytes(b"")
-                self.phase_mod._win_phase_marker_call(
-                    self.python_exe, win_install_py_win, "begin", win_to, reg_key, "aa11bb22cc33", phase=0, commit=a_commit, install_mod=self.mod
-                )
-                plant_foreign = (
-                    "import pathlib, sys\n"
-                    "b = pathlib.Path(sys.argv[1]) / 'bin'\n"
-                    "(b / '.phase-prev-foreigncopy.helio.exe.old').write_bytes(pathlib.Path(sys.argv[2]).read_bytes())\n"
-                    "(b / '.phase-prev-foreignempty.helio.exe.old').write_bytes(b'')\n"
+                # Also verify `_store_needs_init` propagates OSError for local Windows stores (item 24)
+                # while returning False for unreachable WSL UNC shares!
+                local_store_err_code = (
+                    "import importlib.util, pathlib, sys\n"
+                    "from unittest import mock\n"
+                    "spec = importlib.util.spec_from_file_location('wi', sys.argv[1])\n"
+                    "mod = importlib.util.module_from_spec(spec)\n"
+                    "spec.loader.exec_module(mod)\n"
+                    "with mock.patch.object(pathlib.Path, 'is_dir', side_effect=PermissionError('ACL denied')):\n"
+                    "    assert mod._store_needs_init(r'\\\\wsl.localhost\\NoSuchDistro\\store') is False\n"
+                    "    try:\n"
+                    "        mod._store_needs_init(r'C:\\LockedLocalStore')\n"
+                    "        raise AssertionError('local store PermissionError must not be swallowed')\n"
+                    "    except PermissionError:\n"
+                    "        pass\n"
                 )
                 subprocess.run(
-                    [self.python_exe, "-B", "-c", plant_foreign, win_to, self.win_mod.wsl_to_windows_path(a_e)],
-                    check=True,
-                    stdin=subprocess.DEVNULL,
-                )
-                b64_snap = self.phase_mod._win_phase_marker_call(
-                    self.python_exe, win_install_py_win, "snapshot_prev", win_to, reg_key, "aa11bb22cc33", install_mod=self.mod
-                ).strip()
-                import base64, hashlib
-                self.assertEqual(hashlib.sha256(base64.b64decode(b64_snap)).hexdigest(), b_e_sha)
-                self.phase_mod._win_phase_marker_call(
-                    self.python_exe, win_install_py_win, "end", win_to, reg_key, "aa11bb22cc33", install_mod=self.mod
-                )
-                self.assertEqual(wsl_foreign_copy.read_bytes(), a_h.read_bytes())
-                self.assertEqual(wsl_foreign_empty.read_bytes(), b"")
-                wsl_foreign_copy.unlink()
-                wsl_foreign_empty.unlink()
-                check_foreign = (
-                    "import pathlib, sys\n"
-                    "b = pathlib.Path(sys.argv[1]) / 'bin'\n"
-                    "expected = pathlib.Path(sys.argv[2]).read_bytes()\n"
-                    "p1 = b / '.phase-prev-foreigncopy.helio.exe.old'\n"
-                    "p2 = b / '.phase-prev-foreignempty.helio.exe.old'\n"
-                    "assert p1.is_file() and p1.read_bytes() == expected, 'foreign copy must be preserved verbatim'\n"
-                    "assert p2.is_file() and p2.read_bytes() == b'', 'foreign empty file must be preserved verbatim'\n"
-                    "assert sorted(p.name for p in b.glob('.phase-prev-*')) == ['.phase-prev-foreigncopy.helio.exe.old', '.phase-prev-foreignempty.helio.exe.old']\n"
-                    "p1.unlink(); p2.unlink()\n"
-                )
-                subprocess.run(
-                    [self.python_exe, "-B", "-c", check_foreign, win_to, self.win_mod.wsl_to_windows_path(a_e)],
+                    [self.python_exe, "-B", "-c", local_store_err_code, win_install_py_win],
                     check=True,
                     stdin=subprocess.DEVNULL,
                 )

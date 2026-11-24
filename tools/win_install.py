@@ -473,12 +473,14 @@ def _store_needs_init(store_path: str) -> bool:
     """Return True if store_path is reachable on Windows and lacks an initialized messages/ directory."""
     if os.name != "nt":
         return False
-    if not _wsl_share_reachable(store_path):
-        return False
-    try:
-        return not (Path(store_path) / "messages").is_dir()
-    except OSError:
-        return False
+    if _extract_wsl_distro(store_path):
+        if not _wsl_share_reachable(store_path):
+            return False
+        try:
+            return not (Path(store_path) / "messages").is_dir()
+        except OSError:
+            return False
+    return not (Path(store_path) / "messages").is_dir()
 
 
 def _verify_win_ownership(win_to: Path, manifest: dict[str, Any] | None, *, require_live: bool = False) -> None:
