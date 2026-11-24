@@ -45,9 +45,33 @@ static bool print(text *out) {
     return good;
 }
 
+static char *decode_hex_env(const char *hex) {
+    if (!hex || !*hex) return NULL;
+    size_t n = len(hex);
+    if (n % 2 != 0) return NULL;
+    char *out = p_alloc(n / 2 + 1);
+    if (!out) return NULL;
+    for (size_t i = 0; i < n; i += 2) {
+        int hi = hex[i] >= '0' && hex[i] <= '9' ? hex[i] - '0' : hex[i] >= 'a' && hex[i] <= 'f' ? hex[i] - 'a' + 10 : hex[i] >= 'A' && hex[i] <= 'F' ? hex[i] - 'A' + 10 : -1;
+        int lo = hex[i + 1] >= '0' && hex[i + 1] <= '9' ? hex[i + 1] - '0' : hex[i + 1] >= 'a' && hex[i + 1] <= 'f' ? hex[i + 1] - 'a' + 10 : hex[i + 1] >= 'A' && hex[i + 1] <= 'F' ? hex[i + 1] - 'A' + 10 : -1;
+        if (hi < 0 || lo < 0) return p_free(out), NULL;
+        out[i / 2] = (char)((hi << 4) | lo);
+    }
+    out[n / 2] = 0;
+    return out;
+}
+
 static bool parse(options *o, int count, char **args) {
     *o = (options){.about = "", .urgency = "next", .key = "", .due = "", .why = NULL};
     o->me_env = p_env("HELIO_AS"), o->folder_env = p_env("HELIO_STORE"), o->default_env = p_env("HELIO_DEFAULT_STORE");
+    if (!o->default_env || !*o->default_env) {
+        char *hex = p_env("HELIO_DEFAULT_STORE_HEX");
+        if (hex && *hex) {
+            p_free(o->default_env);
+            o->default_env = decode_hex_env(hex);
+        }
+        p_free(hex);
+    }
     o->me = o->me_env ? o->me_env : "", o->folder = o->folder_env ? o->folder_env : "";
     if (!*o->folder && o->default_env && *o->default_env) o->folder = o->default_env, o->from_default = true;
     if (!(o->session_env = p_env("HELIO_SESSION"))) o->session_env = p_env("CLAUDE_CODE_SESSION_ID");

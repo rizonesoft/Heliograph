@@ -1795,17 +1795,9 @@ class TestQuickInstaller(unittest.TestCase):
                     encoding="utf-8",
                 )
                 # Documented NO-OVERRIDE `--windows` install (store_raw=None -> <repo.parent>/Heliograph-signals)
-                # initializes/uses the default WSL store and reads back a message sent from WSL!
+                # initializes the default WSL store itself (NOT pre-initialized!), then reads back a WSL message!
                 def_wsl_store = ok_repo.parent / "Heliograph-signals"
-                subprocess.run([str(self.helio_bin), "init", "--store", str(def_wsl_store)], capture_output=True, text=True, check=True)
-                def_subj = f"wsl-default-{uuid.uuid4().hex[:8]}"
-                subprocess.run(
-                    [str(self.helio_bin), "tell", "demo/win", def_subj, "--as", "demo/wsl", "--store", str(def_wsl_store)],
-                    input="default store message from WSL\n",
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                )
+                self.assertFalse(def_wsl_store.exists())
                 rc_def = self.mod.run_windows_from_wsl(
                     repo=ok_repo,
                     mode="install",
@@ -1814,6 +1806,15 @@ class TestQuickInstaller(unittest.TestCase):
                     reg_key=reg_key,
                 )
                 self.assertEqual(rc_def, 0)
+                self.assertTrue((def_wsl_store / "messages").is_dir())
+                def_subj = f"wsl-default-{uuid.uuid4().hex[:8]}"
+                subprocess.run(
+                    [str(self.helio_bin), "tell", "demo/win", def_subj, "--as", "demo/wsl", "--store", str(def_wsl_store)],
+                    input="default store message from WSL\n",
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
 
                 # Upgrade to explicit wsl_store (second generation -> enables CLI `--windows --back` proof below!).
                 rc = self.mod.run_windows_from_wsl(
@@ -1875,11 +1876,12 @@ class TestQuickInstaller(unittest.TestCase):
                         "python.exe",
                         "-c",
                         (
-                            "import os, shutil, subprocess, winreg; "
+                            "import os, pathlib, shutil, subprocess, winreg; "
                             f"k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, {reg_key!r}); "
                             "reg_path, _ = winreg.QueryValueEx(k, 'Path'); k.Close(); "
                             "env = dict(os.environ); env.pop('HELIO_STORE', None); "
-                            "env['PATH'] = env.get('PATH', '') + ';' + reg_path; "
+                            "clean_sys = [d for d in env.get('PATH', '').split(';') if d and not any((pathlib.Path(d)/n).is_file() for n in ('helio','helio.cmd','helio.exe'))]; "
+                            "env['PATH'] = ';'.join(clean_sys) + ';' + reg_path; "
                             "cwd = os.environ.get('TEMP', 'C:\\\\Windows\\\\Temp'); "
                             "w_cmd = subprocess.run(['cmd.exe', '/c', 'where', 'helio'], cwd=cwd, env=env, capture_output=True, text=True); "
                             "r_cmd = subprocess.run(['cmd.exe', '/c', 'helio', 'inbox', '--as', 'demo/win'], "
@@ -1918,13 +1920,21 @@ class TestQuickInstaller(unittest.TestCase):
                         "python.exe",
                         "-c",
                         (
-                            "import os, subprocess, winreg; "
-                            "bash = r'C:\\Program Files\\Git\\bin\\bash.exe'; "
-                            "assert os.path.exists(bash), 'Git Bash required on Windows'; "
+                            "import os, pathlib, shutil, subprocess, winreg; "
+                            "cands = []; "
+                            "git_exe = shutil.which('git'); "
+                            "git_root = pathlib.Path(git_exe).resolve().parent.parent if git_exe else None; "
+                            "cands.extend([git_root/'bin'/'bash.exe', git_root/'usr'/'bin'/'bash.exe'] if git_root else []); "
+                            "wb = shutil.which('bash'); "
+                            "cands.append(pathlib.Path(wb)) if wb and 'system32' not in wb.lower() else None; "
+                            "cands.extend([pathlib.Path(r'C:\\Program Files\\Git\\bin\\bash.exe'), pathlib.Path(r'C:\\Program Files (x86)\\Git\\bin\\bash.exe')]); "
+                            "bash = next((str(p) for p in cands if p and p.is_file()), None); "
+                            "assert bash, 'Git Bash required on Windows'; "
                             f"k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, {reg_key!r}); "
                             "reg_path, _ = winreg.QueryValueEx(k, 'Path'); k.Close(); "
                             "env = dict(os.environ); env.pop('HELIO_STORE', None); "
-                            "env['PATH'] = env.get('PATH', '') + ';' + reg_path; "
+                            "clean_sys = [d for d in env.get('PATH', '').split(';') if d and not any((pathlib.Path(d)/n).is_file() for n in ('helio','helio.cmd','helio.exe'))]; "
+                            "env['PATH'] = ';'.join(clean_sys) + ';' + reg_path; "
                             "cwd = os.environ.get('TEMP', 'C:\\\\Windows\\\\Temp'); "
                             "env_msg = dict(env); env_msg['HELIO_AS'] = 'demo/win'; "
                             f"r_msg = subprocess.run([bash, '-c', {hook_cmd!r}], cwd=cwd, env=env_msg, capture_output=True, text=True); "
@@ -1951,11 +1961,12 @@ class TestQuickInstaller(unittest.TestCase):
                         "python.exe",
                         "-c",
                         (
-                            "import os, subprocess, winreg; "
+                            "import os, pathlib, subprocess, winreg; "
                             f"k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, {reg_key!r}); "
                             "reg_path, _ = winreg.QueryValueEx(k, 'Path'); k.Close(); "
                             "env = dict(os.environ); env.pop('HELIO_STORE', None); "
-                            "env['PATH'] = env.get('PATH', '') + ';' + reg_path; "
+                            "clean_sys = [d for d in env.get('PATH', '').split(';') if d and not any((pathlib.Path(d)/n).is_file() for n in ('helio','helio.cmd','helio.exe'))]; "
+                            "env['PATH'] = ';'.join(clean_sys) + ';' + reg_path; "
                             "r = subprocess.run(['cmd.exe', '/c', 'helio', 'inbox', '--as', 'demo/win'], "
                             "cwd=os.environ.get('TEMP', 'C:\\\\Windows\\\\Temp'), env=env, capture_output=True, text=True); "
                             "print(r.stdout); raise SystemExit(r.returncode)"
@@ -2092,8 +2103,12 @@ class TestWindowsInstaller(unittest.TestCase):
                 self.assertTrue(existed_p)
                 base_env = dict(os.environ)
                 base_env.pop("HELIO_STORE", None)
-                # Append the registry Path value after system PATH, matching real Windows new-session resolution order.
-                base_env["PATH"] = f"{base_env.get('PATH', '')};{reg_path_val}"
+                # Append the registry Path value after system PATH (excluding any pre-existing production helio dir).
+                clean_sys = [
+                    d for d in base_env.get("PATH", "").split(";")
+                    if d and not any((Path(d) / n).is_file() for n in ("helio", "helio.cmd", "helio.exe"))
+                ]
+                base_env["PATH"] = f"{';'.join(clean_sys)};{reg_path_val}"
 
                 # Bare `helio` from cmd.exe outside win_to resolves to <win_to>\helio.cmd and reaches default_store.
                 w_cmd = subprocess.run(["cmd.exe", "/c", "where", "helio"], cwd=str(outside_cwd), env=base_env, capture_output=True, text=True)
@@ -2292,6 +2307,58 @@ class TestWindowsInstaller(unittest.TestCase):
                 )
                 self.assertEqual(r_ctrl.returncode, 3)
                 self.assertNotIn(b"\x1b", r_ctrl.stderr)
+
+                # Non-ASCII Unicode Windows store path works through helio.cmd via HELIO_DEFAULT_STORE_HEX!
+                uni_store = root / "Donn\u00e9es_store"
+                self.win_mod.win_install(
+                    source_exe=self.helio_exe,
+                    source_sha256=exe_sha,
+                    store_path=str(uni_store),
+                    commit="c" * 40,
+                    win_to=win_to,
+                    reg_key=reg_key,
+                )
+                self.assertIn("HELIO_DEFAULT_STORE_HEX=", (win_to / "helio.cmd").read_text(encoding="ascii"))
+                r_uni = subprocess.run(
+                    ["cmd.exe", "/c", "helio", "check"],
+                    cwd=str(outside_cwd),
+                    env=base_env,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(r_uni.returncode, 0, r_uni.stdout + r_uni.stderr)
+
+                # Semicolon in --to is refused with exit 2; non-empty unrelated --store is refused with exit 2;
+                # PATHEXT missing .CMD fails win_status with exit 3!
+                with self.assertRaises(self.win_mod.WinInstallError) as ctx:
+                    self.win_mod.win_install(
+                        source_exe=self.helio_exe,
+                        source_sha256=exe_sha,
+                        store_path=str(default_store),
+                        commit="c" * 40,
+                        win_to=root / "Apps;Team" / "Heliograph",
+                        reg_key=reg_key,
+                    )
+                self.assertEqual(ctx.exception.code, 2)
+
+                unrelated_dir = root / "unrelated_project"
+                unrelated_dir.mkdir()
+                (unrelated_dir / "README.txt").write_text("existing files\n", encoding="utf-8")
+                with self.assertRaises(self.win_mod.WinInstallError) as ctx:
+                    self.win_mod.win_install(
+                        source_exe=self.helio_exe,
+                        source_sha256=exe_sha,
+                        store_path=str(unrelated_dir),
+                        commit="c" * 40,
+                        win_to=win_to,
+                        reg_key=reg_key,
+                    )
+                self.assertEqual(ctx.exception.code, 2)
+
+                with mock.patch.dict(os.environ, {"PATHEXT": ".COM;.EXE;.BAT"}):
+                    code_pe, lines_pe = self.win_mod.win_status(win_to=win_to, reg_key=reg_key)
+                    self.assertEqual(code_pe, 3, lines_pe)
+                    self.assertTrue(any("PATHEXT" in ln for ln in lines_pe), lines_pe)
         finally:
             self._delete_reg_key(reg_key)
 
@@ -2536,15 +2603,21 @@ class TestWindowsInstaller(unittest.TestCase):
                     existed, val_pre_after, kind_pre_after = self.win_mod.read_reg_path(reg_key)
                     self.assertEqual((existed, val_pre_after, kind_pre_after), (True, pre_val, winreg.REG_EXPAND_SZ))
 
-                    # 4. User prepends an expandable spelling (%HELIO_TEST_WIN_TO%) AFTER install -> remove deletes
-                    #    ONLY the installer's exact literal entry and preserves the user's %HELIO_TEST_WIN_TO% verbatim!
+                    # 4. User prepends an expandable spelling (%HELIO_TEST_WIN_TO%) AFTER install -> remove (and recovery
+                    #    retry after interrupting at after_path!) deletes ONLY the literal entry and preserves %HELIO_TEST_WIN_TO%!
                     with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, reg_key, 0, winreg.KEY_SET_VALUE) as k:
                         winreg.SetValueEx(k, "Path", 0, winreg.REG_EXPAND_SZ, r"C:\Tools")
                     self.win_mod.win_install(source_exe=self.helio_exe, source_sha256=exe_sha, store_path=str(store), commit="a" * 40, win_to=win_to, reg_key=reg_key)
                     _, cur_p, _ = self.win_mod.read_reg_path(reg_key)
                     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_key, 0, winreg.KEY_SET_VALUE) as k:
                         winreg.SetValueEx(k, "Path", 0, winreg.REG_EXPAND_SZ, r"%HELIO_TEST_WIN_TO%;" + cur_p)
-                    self.assertTrue(self.win_mod.win_remove(win_to=win_to, reg_key=reg_key))
+                    with self.assertRaises(SimulatedCrash):
+                        self.win_mod.win_remove(
+                            win_to=win_to,
+                            reg_key=reg_key,
+                            on_boundary=lambda st: (_ for _ in ()).throw(SimulatedCrash(st)) if st == "after_path" else None,
+                        )
+                    self.assertTrue(self.win_mod.recover_win_if_needed(win_to, reg_key))
                     _, val_after_exp, kind_after_exp = self.win_mod.read_reg_path(reg_key)
                     self.assertEqual((val_after_exp, kind_after_exp), (r"%HELIO_TEST_WIN_TO%;C:\Tools", winreg.REG_EXPAND_SZ))
                 finally:

@@ -1695,7 +1695,6 @@ def run_windows_from_wsl(
     store_raw: str | None,
     reg_key: str,
     sdk_url: str = DEFAULT_SDK_URL,
-    prebuilt_exe: Path | None = None,
 ) -> int:
     """Build/test in WSL (for install) and hand off to Windows Python for Windows-native installation."""
     python_exe = shutil.which("python.exe")
@@ -1732,15 +1731,9 @@ def run_windows_from_wsl(
 
     with tempfile.TemporaryDirectory(prefix="helio-win-snap-") as snap_tmp:
         snap_dir = Path(snap_tmp)
-        if prebuilt_exe is None:
-            helio_src, helio_exe_src, commit, dirty = ensure_sdk_and_build(repo, sdk_url, snap_dir)
-            if wsl_store_to_init is not None:
-                _ensure_store_ready(helio_src, wsl_store_to_init)
-        else:
-            commit, dirty = git_provenance(repo)
-            helio_exe_src = prebuilt_exe
-            if not helio_exe_src.is_file():
-                raise InstallError(f"expected Windows executable is missing: {helio_exe_src}", code=3)
+        helio_src, helio_exe_src, commit, dirty = ensure_sdk_and_build(repo, sdk_url, snap_dir)
+        if wsl_store_to_init is not None:
+            _ensure_store_ready(helio_src, wsl_store_to_init)
         exe_sha = sha256_file(helio_exe_src)
         try:
             win_exe_src = win_mod.wsl_to_windows_path(helio_exe_src)

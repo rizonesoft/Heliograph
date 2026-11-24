@@ -168,11 +168,16 @@ def render_win_cmd(default_store: str) -> str:
     """Render helio.cmd (CRLF) forwarding %* directly to bin\\helio.exe with HELIO_DEFAULT_STORE."""
     if not default_store or any(ch in BATCH_FORBIDDEN for ch in default_store):
         raise WinInstallError(f"refusing unsafe store path for helio.cmd: {default_store!r}", code=2)
+    if default_store.isascii():
+        env_line = f'set "HELIO_DEFAULT_STORE={default_store}"'
+    else:
+        # Pure ASCII UTF-8 hex avoids cmd.exe code-page corruption on non-UTF-8 locales.
+        env_line = f'set "HELIO_DEFAULT_STORE_HEX={default_store.encode("utf-8").hex()}"'
     lines = [
         "@echo off",
         WIN_CMD_MARKER,
         "setlocal EnableExtensions",
-        f'set "HELIO_DEFAULT_STORE={default_store}"',
+        env_line,
         '"%~dp0bin\\helio.exe" %*',
         "exit /b %ERRORLEVEL%",
     ]
@@ -322,19 +327,13 @@ def remove_reg_path_entry(reg_key: str, folder: Path, *, path_had_value: bool) -
     existed, raw_val, val_type = read_reg_path(reg_key)
     if not existed:
         return False
-    expand_existing = val_type == int(winreg.REG_EXPAND_SZ)
     segments = raw_val.split(";")
     removed_idx: int | None = None
-    # Prefer removing the exact literal entry written by the installer over a user-added %...% spelling.
+    # Remove ONLY an exact literal entry written by the installer; never delete a user-owned %...% spelling.
     for idx, seg in enumerate(segments):
         if seg.strip() and _norm_path_entry(seg, expand_env=False) == target_norm:
             removed_idx = idx
             break
-    if removed_idx is None and expand_existing:
-        for idx, seg in enumerate(segments):
-            if seg.strip() and _norm_path_entry(seg, expand_env=True) == target_norm:
-                removed_idx = idx
-                break
     if removed_idx is None:
         return False
     remaining = segments[:removed_idx] + segments[removed_idx + 1 :]
@@ -645,6 +644,13 @@ def _manifests_recovery_match(
 
 def recover_win_if_needed(win_to: Path, reg_key: str) -> bool:
     """Recover an interrupted Windows install, rollback, or removal journal."""
+    if _is_reparse_or_symlink(win_to):
+        raise WinInstallError(f"refusing symlink or junction destination during recovery: {win_to}", code=2)
+    bin_dir = win_to / WIN_BIN_SUBDIR
+    if _is_reparse_or_symlink(bin_dir):
+        raise WinInstallError(f"refusing symlink or junction bin directory during recovery: {bin_dir}", code=2)
+    if bin_dir.exists() and not bin_dir.is_dir():
+        raise WinInstallError(f"refusing non-directory bin path during recovery: {bin_dir}", code=2)
     jp = win_to / WIN_JOURNAL_NAME
     if _is_reparse_or_symlink(jp):
         raise WinInstallError(f"refusing symlink journal: {jp}", code=2)
@@ -829,6 +835,8 @@ def win_install(
     sh_sha = hashlib.sha256(sh_bytes).hexdigest()
 
     dest = (win_to or default_win_to_dir()).resolve()
+    if ";" in str(dest) or any(ch in BATCH_FORBIDDEN for ch in str(dest)):
+        raise WinInstallError(f"refusing unsafe Windows install folder path: {dest}", code=2)
     bin_dir = dest / WIN_BIN_SUBDIR
     dest.mkdir(parents=True, exist_ok=True)
     bin_dir.mkdir(parents=True, exist_ok=True)
@@ -846,6 +854,42 @@ def win_install(
 
             prev_retired = _normalize_retired_map(existing.get("retired")) if existing else {}
             remaining_retired = _sweep_retired_exes(bin_dir, prev_retired)
+
+            path_existed_before, raw_path_before, path_kind_before = read_reg_path(reg_key)
+            target_norm = _norm_path_entry(str(dest), expand_env=False)
+            expand_existing = os.name == "nt" and winreg is not None and path_kind_before == int(winreg.REG_EXPAND_SZ)
+            already_on_path = any(
+                seg.strip() and _norm_path_entry(seg, expand_env=expand_existing) == target_norm
+                for seg in (raw_path_before.split(";") if raw_path_before else [])
+            )
+            path_added_this_tx = not already_on_path
+
+            # Fast no-op check BEFORE staging or snapshotting files when nothing changed and Path is already present.
+            if existing is not None and not path_added_this_tx:
+                src_sha_fast = sha256_file(source_exe)
+                if source_sha256 is None or src_sha_fast == source_sha256:
+                    prev_cur = existing["current"]
+                    fast_same = (
+                        prev_cur.get("helio_exe_sha256") == src_sha_fast
+                        and prev_cur.get("helio_cmd_sha256") == cmd_sha
+                        and prev_cur.get("helio_sh_sha256") == sh_sha
+                        and prev_cur.get("store") == store_path
+                        and prev_cur.get("commit") == commit
+                        and bool(prev_cur.get("dirty", False)) == dirty
+                    )
+                    if fast_same:
+                        result_manifest = dict(existing)
+                        if remaining_retired != prev_retired or not isinstance(existing.get("retired"), dict):
+                            result_manifest["retired"] = dict(remaining_retired)
+                            _write_json_atomic(dest / WIN_MANIFEST_NAME, result_manifest)
+                        winner = _find_winning_helio(reg_key, dest)
+                        if winner is None:
+                            result_manifest = dict(result_manifest)
+                            result_manifest["shadowed_by"] = "none (.CMD missing from PATHEXT)"
+                        elif winner != (dest / WIN_CMD_NAME).resolve():
+                            result_manifest = dict(result_manifest)
+                            result_manifest["shadowed_by"] = str(winner)
+                        return result_manifest
 
             tx_id = secrets.token_hex(6)
             temp_files = [
@@ -884,25 +928,39 @@ def win_install(
                         code=3,
                     )
 
-                # If store_path is a local Windows path (not a WSL UNC path) and not yet initialized, initialize it
-                # BEFORE modifying the live installation so first use works immediately or fails cleanly!
-                if os.name == "nt" and not _extract_wsl_distro(store_path):
-                    sp = Path(store_path)
-                    if not (sp / "messages").is_dir():
-                        create_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                        init_r = subprocess.run(
-                            [str(stage_exe), "init", "--store", store_path],
-                            stdin=subprocess.DEVNULL,
-                            capture_output=True,
-                            text=True,
-                            creationflags=create_no_window,
-                            timeout=30,
-                        )
-                        if init_r.returncode != 0:
-                            raise WinInstallError(
-                                f"failed to initialize Windows store {store_path}: {(init_r.stderr or init_r.stdout).strip()}",
-                                code=3,
+                # Initialize a new/empty store directory (local Windows path OR reachable WSL UNC path)
+                # BEFORE modifying the live installation; refuse non-empty unrelated directories (exit 2).
+                if os.name == "nt":
+                    distro = _extract_wsl_distro(store_path)
+                    can_init = True
+                    if distro:
+                        norm_s = store_path.replace("/", "\\")
+                        prefix = "\\\\wsl.localhost\\" if norm_s.lower().startswith("\\\\wsl.localhost\\") else "\\\\wsl$\\"
+                        can_init = Path(prefix + distro).is_dir()
+                    if can_init:
+                        sp = Path(store_path)
+                        if sp.exists() and not sp.is_dir():
+                            raise WinInstallError(f"store path exists and is not a directory: {store_path}", code=2)
+                        if not (sp / "messages").is_dir():
+                            if sp.is_dir() and any(sp.iterdir()):
+                                raise WinInstallError(
+                                    f"refusing to initialize non-empty unrelated directory as store: {store_path}",
+                                    code=2,
+                                )
+                            create_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                            init_r = subprocess.run(
+                                [str(stage_exe), "init", "--store", store_path],
+                                stdin=subprocess.DEVNULL,
+                                capture_output=True,
+                                text=True,
+                                creationflags=create_no_window,
+                                timeout=30,
                             )
+                            if init_r.returncode != 0:
+                                raise WinInstallError(
+                                    f"failed to initialize Windows store {store_path}: {(init_r.stderr or init_r.stdout).strip()}",
+                                    code=3,
+                                )
 
                 saved: dict[str, dict[str, Any]] = {}
                 for rel, rec_rel in (
@@ -1068,7 +1126,9 @@ def win_install(
                 (dest / WIN_JOURNAL_NAME).unlink()
                 out_manifest = dict(desired_manifest)
                 winner = _find_winning_helio(reg_key, dest)
-                if winner is not None and winner != (dest / WIN_CMD_NAME).resolve():
+                if winner is None:
+                    out_manifest["shadowed_by"] = "none (.CMD missing from PATHEXT)"
+                elif winner != (dest / WIN_CMD_NAME).resolve():
                     out_manifest["shadowed_by"] = str(winner)
                 return out_manifest
             except BaseException as exc:
@@ -1153,7 +1213,9 @@ def win_status(*, win_to: Path | None = None, reg_key: str = DEFAULT_REG_KEY) ->
             problems.append(f"missing from HKCU\\{reg_key}\\Path: {dest}")
         else:
             winner = _find_winning_helio(reg_key, dest)
-            if winner is not None and winner != cmd_p.resolve():
+            if winner is None:
+                problems.append(f"helio command cannot resolve via PATHEXT (check that .CMD is in PATHEXT): {cmd_p}")
+            elif winner != cmd_p.resolve():
                 problems.append(f"another helio earlier on PATH shadows {cmd_p}: {winner}")
 
     store_p = Path(cur["store"])
