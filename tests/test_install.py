@@ -4671,6 +4671,28 @@ class TestPhaseInstaller(unittest.TestCase):
                     check=True,
                     stdin=subprocess.DEVNULL,
                 )
+                # Also verify empty (0-byte) AND partial tx-tagged snapshots (crash mid-write) ARE cleaned up (item 2)!
+                for partial_tag, partial_bytes in (("empty", ""), ("partial", "HELIO-PHASE-SNAP:aa11bb22cc33\\nPARTIAL")):
+                    plant_partial = (
+                        "import json, pathlib, sys\n"
+                        "d = pathlib.Path(sys.argv[1])\n"
+                        "snap_name = f'.phase-prev-{sys.argv[2]}.helio.exe.old'\n"
+                        "(d / 'bin' / snap_name).write_bytes(sys.argv[3].encode('ascii').decode('unicode_escape').encode('ascii'))\n"
+                        "mp = d / '.phase-active.json'\n"
+                        "m = json.loads(mp.read_text(encoding='utf-8'))\n"
+                        "m['snapshot_file'] = snap_name\n"
+                        "mp.write_text(json.dumps(m), encoding='utf-8')\n"
+                    )
+                    subprocess.run([self.python_exe, "-B", "-c", plant_partial, win_to, partial_tag, partial_bytes], check=True, stdin=subprocess.DEVNULL)
+                    self.phase_mod._win_phase_marker_call(
+                        self.python_exe, win_install_py_win, "cleanup_prev", win_to, reg_key, "aa11bb22cc33", payload_json=a_e_sha, install_mod=self.mod
+                    )
+                    assert_gone = (
+                        "import pathlib, sys\n"
+                        "p = pathlib.Path(sys.argv[1]) / 'bin' / f'.phase-prev-{sys.argv[2]}.helio.exe.old'\n"
+                        "assert not p.exists(), f'partial snapshot {p} must be cleaned up'\n"
+                    )
+                    subprocess.run([self.python_exe, "-B", "-c", assert_gone, win_to, partial_tag], check=True, stdin=subprocess.DEVNULL)
                 self.phase_mod._win_phase_marker_call(
                     self.python_exe, win_install_py_win, "end", win_to, reg_key, "aa11bb22cc33", install_mod=self.mod
                 )
@@ -4783,48 +4805,65 @@ class TestPhaseInstaller(unittest.TestCase):
                 )
                 self.assertEqual(r_stale.returncode, 0, r_stale.stdout + r_stale.stderr)
                 self.assertEqual(json.loads(r_stale.stdout), [])
-                # Competing local receipt SHA: local side holds verified `local_verified_sha` (`9*40`) while origin/main
-                # holds a competing SHA (`head_sha`) -> pending `[0]`; resolving rebase conflict by keeping the verified
-                # LOCAL receipt (`9*40`) and pushing publishes `9*40` to origin/main and clears `--pending-phases`!
-                local_verified_sha = "9" * 40
-                stale_rf = stale_clone / "docs" / "phase-runs" / "2026-11-24-phase-0.md"
-                stale_base_text = stale_rf.read_text(encoding="utf-8")
-                stale_rf.write_text(stale_base_text + f"\nInstalled commit: {local_verified_sha}\n", encoding="utf-8")
-                subprocess.run(["git", "-C", str(stale_clone), "config", "user.name", "Test"], check=True, capture_output=True)
-                subprocess.run(["git", "-C", str(stale_clone), "config", "user.email", "t@example.com"], check=True, capture_output=True)
-                subprocess.run(["git", "-C", str(stale_clone), "add", str(stale_rf)], check=True, capture_output=True)
-                subprocess.run(["git", "-C", str(stale_clone), "commit", "-m", "competing local receipt"], check=True, capture_output=True)
+                # Competing local receipt SHA: create a clean closeout with no receipt yet on origin/main,
+                # clone `comp_clone` there, have remote push a competing/stale receipt (`8*40`), while `comp_clone`
+                # commits the verified manifest SHA (`head_sha`, matching BOTH WSL and Windows manifests!).
+                # Resolving the genuine rebase conflict by keeping `head_sha` and pushing publishes `head_sha`!
+                self.assertEqual(self.mod.read_manifest(to_dir)["current"]["commit"], head_sha)
+                self.assertEqual(st_win["manifest"]["current"]["commit"], head_sha)
+                run_file.write_text(run_file.read_text(encoding="utf-8") + "\n## Closeout run=competing\n\nReady.\n", encoding="utf-8")
+                subprocess.run(["git", "-C", str(checkout), "add", str(run_file)], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(checkout), "commit", "-m", "closeout before competing receipts"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(checkout), "push", "origin", "main"], check=True, capture_output=True)
+                comp_clone = root / "comp_clone"
+                subprocess.run(["git", "clone", str(checkout), str(comp_clone)], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(comp_clone), "remote", "set-url", "origin", str(checkout.parent / "origin.git")], check=True, capture_output=True)
+                comp_rf = comp_clone / "docs" / "phase-runs" / "2026-11-24-phase-0.md"
+                comp_base_text = comp_rf.read_text(encoding="utf-8")
+                # Remote advances with a competing receipt (`8*40`)
+                run_file.write_text(comp_base_text + f"\nInstalled commit: {'8' * 40}\n", encoding="utf-8")
+                subprocess.run(["git", "-C", str(checkout), "add", str(run_file)], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(checkout), "commit", "-m", "competing remote receipt"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(checkout), "push", "origin", "main"], check=True, capture_output=True)
+                # Local checkout commits the verified manifest SHA (`head_sha`)
+                comp_rf.write_text(comp_base_text + f"\nInstalled commit: {head_sha}\n", encoding="utf-8")
+                subprocess.run(["git", "-C", str(comp_clone), "config", "user.name", "Test"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(comp_clone), "config", "user.email", "t@example.com"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(comp_clone), "add", str(comp_rf)], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(comp_clone), "commit", "-m", "verified local receipt"], check=True, capture_output=True)
                 r_comp = subprocess.run(
                     [sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"],
-                    env={**os.environ, "HELIO_REPO": str(stale_clone)},
+                    env={**os.environ, "HELIO_REPO": str(comp_clone)},
                     capture_output=True,
                     text=True,
                 )
                 self.assertEqual(r_comp.returncode, 1, r_comp.stdout + r_comp.stderr)
                 self.assertEqual(json.loads(r_comp.stdout), [0])
-                rb_res = subprocess.run(["git", "-C", str(stale_clone), "pull", "--rebase", "origin", "main"], capture_output=True, text=True)
-                if rb_res.returncode != 0:
-                    # Keep the verified LOCAL receipt SHA (`local_verified_sha`) and continue rebase!
-                    stale_rf.write_text(stale_base_text + f"\nInstalled commit: {local_verified_sha}\n", encoding="utf-8")
-                    subprocess.run(["git", "-C", str(stale_clone), "add", str(stale_rf)], check=True, capture_output=True)
-                    subprocess.run(["git", "-C", str(stale_clone), "rebase", "--continue"], env={**os.environ, "GIT_EDITOR": "true"}, check=True, capture_output=True)
-                subprocess.run(["git", "-C", str(stale_clone), "push", "origin", "main"], check=True, capture_output=True)
+                rb_res = subprocess.run(["git", "-C", str(comp_clone), "pull", "--rebase", "origin", "main"], capture_output=True, text=True)
+                self.assertNotEqual(rb_res.returncode, 0, "competing receipt lines must trigger a genuine rebase conflict")
+                # Keep the verified manifest SHA (`head_sha`) and continue rebase!
+                comp_rf.write_text(comp_base_text + f"\nInstalled commit: {head_sha}\n", encoding="utf-8")
+                subprocess.run(["git", "-C", str(comp_clone), "add", str(comp_rf)], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(comp_clone), "rebase", "--continue"], env={**os.environ, "GIT_EDITOR": "true"}, check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(comp_clone), "push", "origin", "main"], check=True, capture_output=True)
                 r_comp_ok = subprocess.run(
                     [sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"],
-                    env={**os.environ, "HELIO_REPO": str(stale_clone)},
+                    env={**os.environ, "HELIO_REPO": str(comp_clone)},
                     capture_output=True,
                     text=True,
                 )
                 self.assertEqual(r_comp_ok.returncode, 0, r_comp_ok.stdout + r_comp_ok.stderr)
                 self.assertEqual(json.loads(r_comp_ok.stdout), [])
                 published_rf = subprocess.check_output(
-                    ["git", "-C", str(stale_clone), "show", "origin/main:docs/phase-runs/2026-11-24-phase-0.md"],
+                    ["git", "-C", str(comp_clone), "show", "origin/main:docs/phase-runs/2026-11-24-phase-0.md"],
                     text=True,
                 )
-                self.assertIn(f"Installed commit: {local_verified_sha}", published_rf)
-                # Equal-count divergent local Closeout (`## Closeout run=localB` vs published `## Closeout run=remoteA`):
-                # MUST report [0] (exit 1) and NEVER inherit the different closeout's remote receipt!
+                self.assertIn(f"Installed commit: {head_sha}", published_rf.splitlines()[-1])
+                # Amended local closeout with the EXACT SAME heading (`## Closeout run=remoteA`) while origin/main
+                # has a receipt for the earlier version -> MUST report [0] (exit 1)!
+                # AND a stale checkout strictly behind a newer receipted remote closeout -> MUST report [] (exit 0)!
                 subprocess.run(["git", "-C", str(checkout), "pull", "--rebase", "origin", "main"], check=True, capture_output=True)
+                older_co_sha = subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip()
                 div_clone = root / "div_clone"
                 subprocess.run(["git", "clone", str(checkout), str(div_clone)], check=True, capture_output=True)
                 subprocess.run(["git", "-C", str(div_clone), "remote", "set-url", "origin", str(checkout.parent / "origin.git")], check=True, capture_output=True)
@@ -4835,11 +4874,20 @@ class TestPhaseInstaller(unittest.TestCase):
                 subprocess.run(["git", "-C", str(checkout), "add", str(run_file)], check=True, capture_output=True)
                 subprocess.run(["git", "-C", str(checkout), "commit", "-m", "remote closeout A"], check=True, capture_output=True)
                 subprocess.run(["git", "-C", str(checkout), "push", "origin", "main"], check=True, capture_output=True)
-                # Local div_clone commits distinct renewed `## Closeout run=localB` (SAME closeout count = 2, NO receipt)
+                # (1) Stale checkout at `older_co_sha` (strictly behind newer receipted `## Closeout run=remoteA`) -> [] (exit 0)!
+                r_behind = subprocess.run(
+                    [sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"],
+                    env={**os.environ, "HELIO_REPO": str(div_clone)},
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(r_behind.returncode, 0, r_behind.stdout + r_behind.stderr)
+                self.assertEqual(json.loads(r_behind.stdout), [])
+                # (2) Amended local closeout with the EXACT SAME heading (`## Closeout run=remoteA`) and NO receipt -> [0] (exit 1)!
                 div_rf = div_clone / "docs" / "phase-runs" / "2026-11-24-phase-0.md"
-                div_rf.write_text(div_rf.read_text(encoding="utf-8") + "\n## Closeout run=localB\n\nDistinct local renewal.\n", encoding="utf-8")
+                div_rf.write_text(div_rf.read_text(encoding="utf-8") + "\n## Closeout run=remoteA\n\nAmended body.\n", encoding="utf-8")
                 subprocess.run(["git", "-C", str(div_clone), "add", str(div_rf)], check=True, capture_output=True)
-                subprocess.run(["git", "-C", str(div_clone), "commit", "-m", "local closeout B"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(div_clone), "commit", "-m", "amended local closeout same heading"], check=True, capture_output=True)
                 r_div = subprocess.run(
                     [sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"],
                     env={**os.environ, "HELIO_REPO": str(div_clone)},

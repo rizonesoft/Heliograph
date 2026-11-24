@@ -1072,10 +1072,10 @@ def win_phase_cleanup_prev(*, win_to: Path | None, tx_id: str, expected_sha: str
         if snap_exe.is_file() and not _is_reparse_or_symlink(snap_exe):
             raw = snap_exe.read_bytes()
             hdr = _win_phase_snap_header(tx_id)
-            if raw.startswith(hdr):
-                body = raw[len(hdr) :]
-                if not expected_sha or hashlib.sha256(body).hexdigest() == expected_sha:
-                    snap_exe.unlink()
+            # Unlink if empty (crash right after O_EXCL create), partial prefix of our tx header,
+            # or prefixed by our tx header (full or partial payload write); never unlink an untagged foreign file!
+            if raw == b"" or hdr.startswith(raw) or raw.startswith(hdr):
+                snap_exe.unlink()
         marker.pop("snapshot_file", None)
         _write_json_atomic(mp, marker)
 

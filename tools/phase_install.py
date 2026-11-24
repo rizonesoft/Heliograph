@@ -99,7 +99,7 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
         if fetch_res.returncode != 0:
             _fail(f"cannot fetch origin refs/heads/main in {repo}: {(fetch_res.stderr or fetch_res.stdout).strip()}")
 
-    def _scan_run_files(commit_ref: str, pnum: int) -> tuple[bool, bool, str | None, int, str]:
+    def _scan_run_files(commit_ref: str, pnum: int) -> tuple[bool, bool, str | None, list[str]]:
         ls_r = subprocess.run(
             ["git", "-C", str(repo), "ls-tree", "-r", "--name-only", commit_ref, "docs/phase-runs"],
             stdin=subprocess.DEVNULL,
@@ -114,8 +114,6 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
         has_closeout = False
         has_open_park = False
         installed_sha: str | None = None
-        closeout_count = 0
-        latest_closeout = ""
         for rp in phase_files:
             show_r = subprocess.run(
                 ["git", "-C", str(repo), "show", f"{commit_ref}:{rp}"],
@@ -131,15 +129,13 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
                     has_closeout = True
                     has_open_park = False
                     installed_sha = None
-                    closeout_count += 1
-                    latest_closeout = line.strip()
                 elif line.startswith("PARKED "):
                     has_open_park = True
                 elif has_closeout and not has_open_park:
                     m = re.search(r"Installed commit:\s*`?([0-9a-f]{40})`?", line)
                     if m:
                         installed_sha = m.group(1)
-        return has_closeout, has_open_park, installed_sha, closeout_count, latest_closeout
+        return has_closeout, has_open_park, installed_sha, phase_files
 
     pending: list[int] = []
     declared_phases = data["phases"]
@@ -152,20 +148,38 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
         p_sections = [s for s in sections if isinstance(s, dict) and s.get("phase") == pnum]
         if not p_sections or not all(s.get("status") == "verified" for s in p_sections):
             continue
-        head_closed, head_parked, head_installed_sha, head_closeouts, head_latest_co = _scan_run_files("HEAD", pnum)
+        head_closed, head_parked, _head_installed_sha, head_files = _scan_run_files("HEAD", pnum)
         if not head_closed or head_parked:
             continue
-        rem_closed, rem_parked, rem_installed_sha, rem_closeouts, rem_latest_co = _scan_run_files(rem_sha, pnum)
-        rem_published = rem_closed and not rem_parked and bool(rem_installed_sha)
-        if head_closeouts > rem_closeouts or head_latest_co != rem_latest_co:
-            # A newer or distinct local Closeout on HEAD must NEVER inherit an older/different remote receipt!
+        # Owning-layer Git truth: find the latest commit on HEAD touching this phase's run files.
+        # If that commit is NOT an ancestor of origin/main (`rem_sha`), HEAD has unpushed closeout/receipt edits
+        # (including amended same-heading closeouts or competing receipts) -> ALWAYS pending!
+        # If it IS an ancestor of `rem_sha` (including stale checkouts strictly behind a newer receipted closeout
+        # and unrelated local commits touching other files), `origin/main`'s published receipt settles the phase.
+        rl = subprocess.run(
+            ["git", "-C", str(repo), "rev-list", "-1", "HEAD", "--", *head_files],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if rl.returncode != 0 or not rl.stdout.strip():
+            _fail(f"cannot determine last commit for phase {pnum} run files in {repo}")
+        head_run_commit = rl.stdout.strip()
+        anc = subprocess.run(
+            ["git", "-C", str(repo), "merge-base", "--is-ancestor", head_run_commit, rem_sha],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if anc.returncode not in (0, 1):
+            _fail(f"cannot compare ancestry for phase {pnum} run files in {repo}: {(anc.stderr or anc.stdout).strip()}")
+        if anc.returncode != 0:
             pending.append(pnum)
-        elif rem_published:
-            # Already published on origin/main for the exact same Closeout: stale local checkout
-            # (head_installed_sha is None) is NOT pending, while a competing local receipt SHA IS pending!
-            if head_installed_sha is not None and head_installed_sha != rem_installed_sha:
-                pending.append(pnum)
-        else:
+            continue
+        rem_closed, rem_parked, rem_installed_sha, _rem_files = _scan_run_files(rem_sha, pnum)
+        if not (rem_closed and not rem_parked and bool(rem_installed_sha)):
             pending.append(pnum)
     return sorted(pending)
 
