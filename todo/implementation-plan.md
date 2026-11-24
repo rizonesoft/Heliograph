@@ -14,7 +14,7 @@ Sections: 3 | Checklist items: 24
 | ------ | ----------- | ----------------------------------------------- | ------------------- | ----- |
 | [x]    | D01 T01 §15 | Quick installer                                 | none                | 10    |
 | [x]    | D01 T01 §16 | Installer for Windows sessions                  | none                | 6     |
-| [ ]    | D01 T01 §17 | Installed program replaced after a tested phase | wsl-windows-interop | 8     |
+| [x]    | D01 T01 §17 | Installed program replaced after a tested phase | wsl-windows-interop | 8     |
 
 ### Phase 1: A store that stays small
 
@@ -51,6 +51,6 @@ Sections: 4 | Checklist items: 19
 | [ ]    | D01 T01 §12 | Expiry of seen heads-ups and findings  | none  | 4     |
 | [ ]    | D01 T01 §13 | Design and help that match the program | none  | 4     |
 
-Progress: 2/17 verified sections, 4 ready to run now.
+Progress: 3/17 verified sections, 3 ready to run now.
 
-Checklist: 23/99 items completed (includes Commit items).
+Checklist: 24/99 items completed (includes Commit items).

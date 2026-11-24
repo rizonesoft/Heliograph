@@ -1,0 +1,90 @@
+{
+  "ref": "D01 T01 \u00a717",
+  "title": "Installed program replaced after a tested phase",
+  "implementation_sha": "bad7ff6ca4483ebfa1f78a397b98fef5a9729cd8",
+  "date": "2026-11-24",
+  "reviews": [
+    {
+      "round": 1,
+      "report": "docs/reviews/01-heliograph/D01-T01-s17.md",
+      "verdict": "fixed"
+    }
+  ],
+  "checks": [
+    "python3 ../ImpossibleSDK/tools/app_build.py . -> Ran 79 tests, OK (skipped=4)",
+    "python3 ../ImpossibleSDK/tools/prove.py . -> Ran 79 tests, OK (skipped=21), proved on Windows: Heliograph bad7ff6",
+    "python3 scripts/todo-graph.py validate && python3 scripts/todo-graph.py plan --check -> valid: 17 sections; plan current",
+    "build.yml: green at bad7ff6ca448 https://github.com/rizonesoft/Heliograph/actions/runs/45464413113"
+  ],
+  "completion": {
+    "report": "docs/reviews/01-heliograph/D01-T01-s17.md",
+    "verdict": "capped",
+    "candidate": "e7903f148455ce06c10471231f0187f5de61a186",
+    "reviewer": "astra",
+    "model": "gpt-6.2-astra",
+    "filed": []
+  },
+  "rounds_spent": 1,
+  "round_cap": 33,
+  "plan": {
+    "report": "docs/reviews/01-heliograph/D01-T01-s17.md",
+    "candidate": "e4db8033273abc19fb40878e859c240ea2910294",
+    "reviewer": "astra",
+    "model": "gpt-6.2-astra",
+    "effort": "medium",
+    "lenses": [
+      "plan"
+    ]
+  },
+  "schedule_sha": "e4db8033273abc19fb40878e859c240ea2910294",
+  "schedule": {
+    "policy": "three-pass",
+    "pass_cap": 33,
+    "blocking": [
+      "P1",
+      "P2"
+    ],
+    "plan": {
+      "effort": "medium",
+      "lenses": [
+        "plan"
+      ]
+    },
+    "rounds": [
+      {
+        "effort": "medium",
+        "lenses": [
+          "adversarial",
+          "integration",
+          "source-defect",
+          "consistency",
+          "quality",
+          "optimization",
+          "design"
+        ]
+      }
+    ],
+    "completion": {
+      "effort": "low",
+      "lenses": [
+        "plan-delivery",
+        "record"
+      ]
+    },
+    "reconciliation": {
+      "effort": "low",
+      "lenses": [
+        "adversarial",
+        "integration",
+        "plan-delivery",
+        "record"
+      ]
+    },
+    "lenses": {
+      "thread-safety": "Which state is reached from two threads (UI, worker, callback, timer) without one lock or atomic owning it, and which lock order, wait, cancellation or teardown can deadlock or run after its owner is gone?",
+      "memory-safety": "Which pointer, reference, view, handle or iterator can outlive what it refers to, and which size, index or cast is trusted unchecked?"
+    }
+  },
+  "passes_spent": 33,
+  "pass_cap": 33
+}

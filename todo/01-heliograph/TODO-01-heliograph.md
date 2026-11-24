@@ -51,7 +51,7 @@ title: "TODO-01 -- Heliograph"
 | 14 | §14 | Unowned paths kept to their repository | §4, §6 | [ ] |
 | 15 | §15 | Quick installer | -- | [x] |
 | 16 | §16 | Installer for Windows sessions | §15 | [x] |
-| 17 | §17 | Installed program replaced after a tested phase | §15, §16 | [ ] |
+| 17 | §17 | Installed program replaced after a tested phase | §15, §16 | [x] |
 
 ## 1. Steps that notice an archived job
 
@@ -444,9 +444,12 @@ When a phase is closed and everything is tested, the program that the sessions u
 - [x] Run the program before it on a store the new one wrote, in `tests/test_install.py`. Done when: `helio check` passes, so that going back loses nothing. Cheaper substitute: trusting the format.
 - [x] Add the step to the end of a phase in `AGENTS.md` and `docs/unattended-prompt.md`: run it after the closeout, record the commit in the run file, and heal a refusal as any red gate. Done when: both name the one command. Cheaper substitute: a note in `README.md`.
 - [x] Tell the other lanes with `helio tell impossible/all` from `tools/install.py --phase`, keyed by the commit. Done when: a repeat sends nothing new. Cheaper substitute: silence.
-- [ ] Commit: `install: after a tested phase`
+- [x] Commit: `install: after a tested phase`
 
 **Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
+
+> **Verified:** 2026-11-24 | §17 | bad7ff6ca4483ebfa1f78a397b98fef5a9729cd8
+> **Review:** `docs/reviews/d01-t01-s17.json`
 
 ## Verification
 
