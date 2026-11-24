@@ -4525,8 +4525,16 @@ class TestPhaseInstaller(unittest.TestCase):
                     )
                     self.assertEqual(rw.returncode, 0, rw.stdout + rw.stderr)
 
-                # Run phase C with a planted verification fault -> must roll back BOTH hosts to current=B, previous=A!
-                def fail_verify(_stage: str) -> None:
+                # Run phase C with a planted verification fault -> must publish C on BOTH hosts first,
+                # reach the planted fault, and then roll back BOTH hosts to current=B, previous=A!
+                seen_boundaries: list[str] = []
+                verify_called: list[str] = []
+
+                def record_boundary(name: str) -> None:
+                    seen_boundaries.append(name)
+
+                def fail_verify(stage: str) -> None:
+                    verify_called.append(stage)
                     raise self.mod.InstallError("planted live verification fault", code=3)
 
                 with self.assertRaises(self.mod.InstallError) as ctx:
@@ -4540,9 +4548,13 @@ class TestPhaseInstaller(unittest.TestCase):
                         reg_key=reg_key,
                         sdk_url="unused",
                         install_mod=self.mod,
+                        on_boundary=record_boundary,
                         on_verify=fail_verify,
                     )
                 self.assertEqual(ctx.exception.code, 3)
+                self.assertIn("after_win_install", seen_boundaries, "must publish C on Windows before rolling back")
+                self.assertTrue(verify_called, "must reach planted live verification fault after publication")
+                self.assertIn("planted live verification fault", str(ctx.exception))
 
                 # Verify WSL has current=B, previous=A, and ordinary `--back` restores A!
                 wsl_m = self.mod.read_manifest(to_dir)
@@ -4768,6 +4780,14 @@ class TestPhaseInstaller(unittest.TestCase):
                 r3 = subprocess.run([sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"], env=env, capture_output=True, text=True)
                 self.assertEqual(r3.returncode, 0, r3.stdout + r3.stderr)
                 self.assertEqual(json.loads(r3.stdout), [])
+                # Appending required post-receipt CI notes to the run file MUST NOT reopen an installed phase (item 21)!
+                run_file.write_text(run_file.read_text(encoding="utf-8") + "\n- CI: build.yml green after closeout\n", encoding="utf-8")
+                subprocess.run(["git", "-C", str(checkout), "add", str(run_file)], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(checkout), "commit", "-m", "append post-receipt CI note"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(checkout), "push", "origin", "main"], check=True, capture_output=True)
+                r_ci_note = subprocess.run([sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"], env=env, capture_output=True, text=True)
+                self.assertEqual(r_ci_note.returncode, 0, r_ci_note.stdout + r_ci_note.stderr)
+                self.assertEqual(json.loads(r_ci_note.stdout), [])
                 # An unrelated local commit does NOT reopen an already-published phase!
                 (checkout / "unrelated.txt").write_text("unrelated\n", encoding="utf-8")
                 subprocess.run(["git", "-C", str(checkout), "add", "unrelated.txt"], check=True, capture_output=True)
@@ -4909,6 +4929,17 @@ class TestPhaseInstaller(unittest.TestCase):
                 )
                 self.assertEqual(r_div.returncode, 1, r_div.stdout + r_div.stderr)
                 self.assertEqual(json.loads(r_div.stdout), [0])
+                # A repeated closeout with the EXACT SAME heading AND identical summary reusing `remote_a_sha` MUST stay pending [0] (item 18)!
+                run_file.write_text(
+                    run_file.read_text(encoding="utf-8") + f"\n## Closeout run=remoteA\n\nRemote body.\n\nInstalled commit: {remote_a_sha}\n",
+                    encoding="utf-8",
+                )
+                subprocess.run(["git", "-C", str(checkout), "add", str(run_file)], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(checkout), "commit", "-m", "repeated identical closeout reusing earlier sha"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(checkout), "push", "origin", "main"], check=True, capture_output=True)
+                r_repeat_ident = subprocess.run([sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"], env=env, capture_output=True, text=True)
+                self.assertEqual(r_repeat_ident.returncode, 1, r_repeat_ident.stdout + r_repeat_ident.stderr)
+                self.assertEqual(json.loads(r_repeat_ident.stdout), [0])
                 # A newer local `## Closeout` committed WITHOUT pushing MUST STILL report [0] (never inherit older remote receipt)!
                 run_file.write_text(run_file.read_text(encoding="utf-8") + "\n## Closeout run=reopened\n\nRe-closed.\n", encoding="utf-8")
                 subprocess.run(["git", "-C", str(checkout), "add", str(run_file)], check=True, capture_output=True)

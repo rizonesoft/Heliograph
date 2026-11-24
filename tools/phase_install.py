@@ -12,6 +12,8 @@ rolls back only changed hosts on any fault, and sends one idempotent
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import re
@@ -99,7 +101,7 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
         if fetch_res.returncode != 0:
             _fail(f"cannot fetch origin refs/heads/main in {repo}: {(fetch_res.stderr or fetch_res.stdout).strip()}")
 
-    def _scan_run_files(commit_ref: str, pnum: int) -> tuple[bool, bool, str | None, list[str], str, list[str]]:
+    def _scan_run_files(commit_ref: str, pnum: int) -> tuple[bool, bool, str | None, list[str], int, str, list[str]]:
         ls_r = subprocess.run(
             ["git", "-C", str(repo), "ls-tree", "-r", "--name-only", commit_ref, "docs/phase-runs"],
             stdin=subprocess.DEVNULL,
@@ -114,8 +116,10 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
         has_closeout = False
         has_open_park = False
         installed_sha: str | None = None
+        closeout_count = 0
         latest_co_file = ""
         latest_co_lines: list[str] = []
+        collecting_co = False
         for rp in phase_files:
             show_r = subprocess.run(
                 ["git", "-C", str(repo), "show", f"{commit_ref}:{rp}"],
@@ -131,19 +135,28 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
                     has_closeout = True
                     has_open_park = False
                     installed_sha = None
+                    closeout_count += 1
                     latest_co_file = rp
                     latest_co_lines = [line.rstrip()]
+                    collecting_co = True
                 elif line.startswith("PARKED "):
                     has_open_park = True
+                    collecting_co = False
                 elif has_closeout and not has_open_park:
                     m = re.search(r"Installed commit:\s*`?([0-9a-f]{40})`?", line)
                     if m:
                         installed_sha = m.group(1)
-                    elif rp == latest_co_file:
-                        latest_co_lines.append(line.rstrip())
+                        # Stop collecting closeout body once the receipt is written so required post-receipt
+                        # CI notes or follow-up entries appended after the receipt never reopen the phase.
+                        collecting_co = False
+                    elif collecting_co and rp == latest_co_file:
+                        if line.startswith("## "):
+                            collecting_co = False
+                        else:
+                            latest_co_lines.append(line.rstrip())
         while latest_co_lines and latest_co_lines[-1] == "":
             latest_co_lines.pop()
-        return has_closeout, has_open_park, installed_sha, phase_files, latest_co_file, latest_co_lines
+        return has_closeout, has_open_park, installed_sha, phase_files, closeout_count, latest_co_file, latest_co_lines
 
     pending: list[int] = []
     declared_phases = data["phases"]
@@ -156,7 +169,7 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
         p_sections = [s for s in sections if isinstance(s, dict) and s.get("phase") == pnum]
         if not p_sections or not all(s.get("status") == "verified" for s in p_sections):
             continue
-        head_closed, head_parked, _head_installed_sha, head_files, _head_co_file, _head_co_lines = _scan_run_files("HEAD", pnum)
+        head_closed, head_parked, _head_installed_sha, head_files, _head_co_cnt, _head_co_file, _head_co_lines = _scan_run_files("HEAD", pnum)
         if not head_closed or head_parked:
             continue
         # Owning-layer Git truth: find the latest commit on HEAD touching this phase's run files.
@@ -164,8 +177,9 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
         # (including amended same-heading closeouts or competing receipts) -> ALWAYS pending!
         # If it IS an ancestor of `rem_sha` (including stale checkouts strictly behind a newer receipted closeout
         # and unrelated local commits touching other files), `origin/main`'s published receipt settles the phase
-        # ONLY if the receipt's referenced commit is an ancestor of `rem_sha` AND already contained this exact
-        # latest closeout block (preventing a renewed closeout from inheriting an earlier closeout's installation).
+        # ONLY if the receipt's referenced commit is an ancestor of `rem_sha` AND already contained the exact
+        # same closeout count and latest closeout block (preventing a renewed or repeated identical closeout from
+        # inheriting an earlier closeout's installation, while allowing post-receipt CI notes).
         rl = subprocess.run(
             ["git", "-C", str(repo), "rev-list", "-1", "HEAD", "--", *head_files],
             stdin=subprocess.DEVNULL,
@@ -188,7 +202,7 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
         if anc.returncode != 0:
             pending.append(pnum)
             continue
-        rem_closed, rem_parked, rem_installed_sha, _rem_files, rem_co_file, rem_co_lines = _scan_run_files(rem_sha, pnum)
+        rem_closed, rem_parked, rem_installed_sha, _rem_files, rem_co_cnt, rem_co_file, rem_co_lines = _scan_run_files(rem_sha, pnum)
         if not (rem_closed and not rem_parked and bool(rem_installed_sha)):
             pending.append(pnum)
             continue
@@ -202,8 +216,14 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
         if inst_anc.returncode != 0:
             pending.append(pnum)
             continue
-        inst_closed, inst_parked, _inst_sha, _inst_files, inst_co_file, inst_co_lines = _scan_run_files(rem_installed_sha, pnum)
-        if not (inst_closed and not inst_parked and inst_co_file == rem_co_file and inst_co_lines == rem_co_lines):
+        inst_closed, inst_parked, _inst_sha, _inst_files, inst_co_cnt, inst_co_file, inst_co_lines = _scan_run_files(rem_installed_sha, pnum)
+        if not (
+            inst_closed
+            and not inst_parked
+            and inst_co_cnt == rem_co_cnt
+            and inst_co_file == rem_co_file
+            and inst_co_lines == rem_co_lines
+        ):
             pending.append(pnum)
     return sorted(pending)
 
@@ -1649,7 +1669,6 @@ def run_phase_install(
                             ).strip()
                             if not b64_raw:
                                 raise install_mod.InstallError("missing Windows previous generation binary during snapshot", code=3)
-                            import base64
                             raw_prev = base64.b64decode(b64_raw.encode("ascii"))
                             exp_prev_sha = str(win_pre_prev.get("helio_exe_sha256") or "")
                             if exp_prev_sha and hashlib.sha256(raw_prev).hexdigest() != exp_prev_sha:
