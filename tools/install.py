@@ -1830,10 +1830,19 @@ def main(argv: list[str] | None = None) -> int:
                 label = f"{cur['commit']} (dirty)" if cur.get("dirty") else cur["commit"]
                 dest_dir = (win_to or win_mod.default_win_to_dir()).resolve()
                 print(f"installed {label} to {dest_dir} (store: {cur['store']})")
-                if manifest.get("shadowed_by"):
-                    target_name = manifest.get("shadowed_target") or str(dest_dir / win_mod.WIN_CMD_NAME)
+                shadowings = manifest.get("shadowings") or (
+                    [
+                        {
+                            "target": manifest.get("shadowed_target") or str(dest_dir / win_mod.WIN_CMD_NAME),
+                            "by": manifest["shadowed_by"],
+                        }
+                    ]
+                    if manifest.get("shadowed_by")
+                    else []
+                )
+                for sh in shadowings:
                     print(
-                        f"warning: another helio earlier on PATH shadows {target_name}: {manifest['shadowed_by']}",
+                        f"warning: another helio earlier on PATH shadows {sh['target']}: {sh['by']}",
                         file=sys.stderr,
                     )
                 print("open a new Windows terminal and run `helio check` to verify")

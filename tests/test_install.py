@@ -2417,6 +2417,63 @@ class TestWindowsInstaller(unittest.TestCase):
                     self.assertEqual(os.path.normcase(str(w_link)), os.path.normcase(os.path.abspath(str(sh_shadow_file))))
                     code_lnk, _ = self.win_mod.win_status(win_to=win_to, reg_key=reg_key)
                     self.assertEqual(code_lnk, 3)
+
+                    # When an earlier directory supplies BOTH helio.cmd and extensionless helio (e.g., an older
+                    # Heliograph install earlier on Path), install reports BOTH conflicts (cmd AND Git Bash shim)
+                    # in `shadowings` and on CLI stderr!
+                    cmd_shadow_file = sh_shadow_dir / "helio.cmd"
+                    cmd_shadow_file.write_text("@echo off\necho OLD_CMD\n", encoding="utf-8")
+                    sh_shadow_file.unlink()
+                    sh_shadow_file.write_text("#!/bin/sh\necho OLD_SH\n", encoding="utf-8")
+                    m_both = self.win_mod.win_install(
+                        source_exe=self.helio_exe,
+                        source_sha256=exe_sha,
+                        store_path=str(uni_store),
+                        commit="c" * 40,
+                        win_to=win_to,
+                        reg_key=reg_key,
+                    )
+                    pairs = {
+                        (os.path.normcase(s["target"]), os.path.normcase(s["by"]))
+                        for s in m_both.get("shadowings", [])
+                    }
+                    self.assertIn(
+                        (os.path.normcase(str((win_to / "helio.cmd").resolve())), os.path.normcase(str(cmd_shadow_file.resolve()))),
+                        pairs,
+                        m_both,
+                    )
+                    self.assertIn(
+                        (os.path.normcase(str(win_to.resolve() / "helio")), os.path.normcase(os.path.abspath(str(sh_shadow_file)))),
+                        pairs,
+                        m_both,
+                    )
+                    cli_both = subprocess.run(
+                        [
+                            sys.executable,
+                            str(REPO / "tools" / "install.py"),
+                            "--windows",
+                            "--source-exe",
+                            str(self.helio_exe),
+                            "--source-sha256",
+                            exe_sha,
+                            "--store",
+                            str(uni_store),
+                            "--commit",
+                            "c" * 40,
+                            "--win-to",
+                            str(win_to),
+                            "--reg-key",
+                            reg_key,
+                        ],
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(cli_both.returncode, 0, cli_both.stdout + cli_both.stderr)
+                    err_low = cli_both.stderr.lower()
+                    self.assertIn(str((win_to / "helio.cmd").resolve()).lower(), err_low, cli_both.stderr)
+                    self.assertIn(str(cmd_shadow_file.resolve()).lower(), err_low, cli_both.stderr)
+                    self.assertIn(str(win_to.resolve() / "helio").lower(), err_low, cli_both.stderr)
+                    self.assertIn(os.path.abspath(str(sh_shadow_file)).lower(), err_low, cli_both.stderr)
                 finally:
                     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_key, 0, winreg.KEY_SET_VALUE) as k:
                         winreg.SetValueEx(k, "Path", 0, orig_rk, orig_rp)

@@ -441,15 +441,17 @@ def _annotate_shadowing(manifest: dict[str, Any], reg_key: str, dest: Path) -> d
     out = dict(manifest)
     cmd_target = (dest / WIN_CMD_NAME).resolve()
     sh_target = dest.resolve() / WIN_SH_NAME
+    shadowings: list[dict[str, str]] = []
     if winner is None:
-        out["shadowed_by"] = "none (.CMD missing from PATHEXT)"
-        out["shadowed_target"] = str(cmd_target)
+        shadowings.append({"target": str(cmd_target), "by": "none (.CMD missing from PATHEXT)"})
     elif winner != cmd_target:
-        out["shadowed_by"] = str(winner)
-        out["shadowed_target"] = str(cmd_target)
-    elif winner_sh is not None and os.path.normcase(str(winner_sh)) != os.path.normcase(str(sh_target)):
-        out["shadowed_by"] = str(winner_sh)
-        out["shadowed_target"] = str(sh_target)
+        shadowings.append({"target": str(cmd_target), "by": str(winner)})
+    if winner_sh is not None and os.path.normcase(str(winner_sh)) != os.path.normcase(str(sh_target)):
+        shadowings.append({"target": str(sh_target), "by": str(winner_sh)})
+    if shadowings:
+        out["shadowings"] = shadowings
+        out["shadowed_by"] = shadowings[0]["by"]
+        out["shadowed_target"] = shadowings[0]["target"]
     return out
 
 
