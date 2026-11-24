@@ -937,8 +937,13 @@ def git_provenance_snapshot(repo: Path) -> tuple[str, bool, str, str]:
         for rel_b in sorted(x for x in untracked.stdout.split(b"\x00") if x):
             p = repo / rel_b.decode("utf-8", errors="surrogateescape")
             h.update(rel_b + b"\x00")
-            if p.is_file() and not p.is_symlink():
-                h.update(sha256_file(p).encode("ascii"))
+            if p.is_symlink():
+                h.update(b"L:" + os.readlink(p).encode("utf-8", errors="surrogateescape") + b"\x00")
+            if p.is_file():
+                try:
+                    h.update(sha256_file(p).encode("ascii"))
+                except OSError:
+                    h.update(b"UNREADABLE")
     diff_sha = h.hexdigest()
     return commit, dirty, status_text, diff_sha
 

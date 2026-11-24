@@ -1232,7 +1232,7 @@ class TestQuickInstaller(unittest.TestCase):
             )
             win_stop = threading.Event()
             in_pub_window = threading.Event()
-            overlap_proved = threading.Event()
+            caller_in_flight = threading.Event()
             win_failures: list[str] = []
             overlap_calls = 0
 
@@ -1240,6 +1240,8 @@ class TestQuickInstaller(unittest.TestCase):
                 nonlocal overlap_calls
                 while not win_stop.is_set():
                     during = in_pub_window.is_set()
+                    if during:
+                        caller_in_flight.set()
                     try:
                         r = subprocess.run(
                             [str(to_dir / "helio.exe"), "help"],
@@ -1252,17 +1254,16 @@ class TestQuickInstaller(unittest.TestCase):
                             win_failures.append(f"rc={r.returncode} stderr={r.stderr}")
                         elif during:
                             overlap_calls += 1
-                            overlap_proved.set()
                     except (OSError, subprocess.SubprocessError) as exc:
                         win_failures.append(f"exc={exc}")
 
             def wait_for_overlap(stage: str) -> None:
                 if stage == "after_helio":
-                    # Open the overlap window right before replace_binary_atomic(stage_exe, helio.exe)
-                    # without waiting here, so win_caller actively races the Windows replacement itself.
+                    # Open the overlap window and wait until win_caller has actually launched a call
+                    # BEFORE returning control so replace_binary_atomic(stage_exe, helio.exe) overlaps it.
                     in_pub_window.set()
+                    self.assertTrue(caller_in_flight.wait(timeout=15), "Windows caller never entered publication window")
                 elif stage == "after_helio_exe":
-                    self.assertTrue(overlap_proved.wait(timeout=15), "no Windows caller completed during Windows replacement window")
                     in_pub_window.clear()
 
             wt = threading.Thread(target=win_caller)
@@ -1436,32 +1437,44 @@ class TestQuickInstaller(unittest.TestCase):
             code, _ = self.mod.status(to_dir=oserr_dir, wrapper_path=oserr_wrap)
             self.assertEqual(code, 0)
 
-            # 6. Clean home with standard /etc/skel/.profile finds `helio` by name in a fresh login shell without test-injected PATH.
+            # 6. Clean home with standard login profile finds `helio` by name in a fresh login shell without test-injected PATH.
+            #    Verify wrapper identity FIRST before invoking any write command so nothing can ever write outside clean_store.
+            clean_home = root / "clean_home"
+            clean_home.mkdir()
             skel_profile = Path("/etc/skel/.profile")
             if skel_profile.is_file():
-                clean_home = root / "clean_home"
-                clean_home.mkdir()
                 shutil.copy2(skel_profile, clean_home / ".profile")
-                clean_to = root / "clean_to"
-                clean_store = root / "clean_store"
-                clean_wrap = clean_home / ".local" / "bin" / "helio"
-                self.mod.install(repo=repo, to_dir=clean_to, store_dir=clean_store, wrapper_path=clean_wrap, prebuilt=(a_h, a_e))
-                login_res = subprocess.run(
-                    [
-                        "env",
-                        "-i",
-                        f"HOME={clean_home}",
-                        "PATH=/usr/bin:/bin",
-                        "bash",
-                        "-lc",
-                        "command -v helio && helio check && helio tell demo/lane clean-home-msg --as demo/sender <<< body && helio inbox --as demo/lane",
-                    ],
-                    capture_output=True,
-                    text=True,
+            else:
+                (clean_home / ".profile").write_text(
+                    'if [ -d "$HOME/.local/bin" ]; then PATH="$HOME/.local/bin:$PATH"; fi\n',
+                    encoding="utf-8",
                 )
-                self.assertEqual(login_res.returncode, 0, login_res.stderr)
-                self.assertEqual(login_res.stdout.splitlines()[0].strip(), str(clean_wrap.resolve()))
-                self.assertIn("clean-home-msg", login_res.stdout)
+            clean_to = root / "clean_to"
+            clean_store = root / "clean_store"
+            clean_wrap = clean_home / ".local" / "bin" / "helio"
+            self.mod.install(repo=repo, to_dir=clean_to, store_dir=clean_store, wrapper_path=clean_wrap, prebuilt=(a_h, a_e))
+            which_res = subprocess.run(
+                ["env", "-i", f"HOME={clean_home}", "PATH=/usr/bin:/bin", "bash", "-lc", "command -v helio"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(which_res.returncode, 0, which_res.stderr)
+            self.assertEqual(which_res.stdout.strip(), str(clean_wrap.resolve()))
+            login_res = subprocess.run(
+                [
+                    "env",
+                    "-i",
+                    f"HOME={clean_home}",
+                    "PATH=/usr/bin:/bin",
+                    "bash",
+                    "-lc",
+                    "helio check && helio tell demo/lane clean-home-msg --as demo/sender <<< body && helio inbox --as demo/lane",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(login_res.returncode, 0, login_res.stderr)
+            self.assertIn("clean-home-msg", login_res.stdout)
 
             # 7. Round 1 regressions: stale .restore cleanup, cross-destination legacy wrapper refusal,
             #    SDK URL query redaction, CRLF wrapper rejection, --back missing store recovery,
@@ -1553,6 +1566,29 @@ class TestQuickInstaller(unittest.TestCase):
             )
             with self.assertRaises(self.mod.InstallError) as ctx:
                 self.mod.install(repo=dirty_repo, to_dir=root / "dd_bin", store_dir=root / "dd_store", wrapper_path=root / "dd_w" / "helio")
+            self.assertEqual(ctx.exception.code, 3)
+            self.assertIn("source tree changed", str(ctx.exception))
+
+            # 7h. Untracked symlink whose external target changes during build is also refused with exit 3.
+            sym_ws = root / "sym_drift_ws"
+            sym_repo = sym_ws / "Heliograph"
+            init_git_repo(sym_repo)
+            ext_hdr = root / "external_header.h"
+            ext_hdr.write_text("#define V 1\n", encoding="utf-8")
+            (sym_repo / "linked.h").symlink_to(ext_hdr)
+            sym_sdk = sym_ws / "ImpossibleSDK" / "tools"
+            sym_sdk.mkdir(parents=True)
+            (sym_sdk / "app_build.py").write_text(
+                "import pathlib, shutil, sys\n"
+                "repo = pathlib.Path(sys.argv[1])\n"
+                f"pathlib.Path({str(ext_hdr)!r}).write_text('#define V 2\\n', encoding='utf-8')\n"
+                "(repo / 'build' / 'linux' / 'linux').mkdir(parents=True, exist_ok=True)\n"
+                f"shutil.copy2({str(a_h)!r}, repo / 'build' / 'linux' / 'linux' / 'helio')\n"
+                f"shutil.copy2({str(a_e)!r}, repo / 'build' / 'linux' / 'helio.exe')\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(self.mod.InstallError) as ctx:
+                self.mod.install(repo=sym_repo, to_dir=root / "sym_bin", store_dir=root / "sym_store", wrapper_path=root / "sym_w" / "helio")
             self.assertEqual(ctx.exception.code, 3)
             self.assertIn("source tree changed", str(ctx.exception))
 
