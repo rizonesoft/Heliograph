@@ -665,16 +665,20 @@ def _rollback_phase_journal(
             )
             if not win_already_restored:
                 # Verify the live Windows manifest belongs to THIS phase commit, binary, and store before --back or --remove!
+                # Derive expected_win_store from journal["store"] when absent (e.g., upgrading from an older schema-2 journal).
+                win_mod = install_mod._load_win_install()
                 expected_win_sha = str(journal.get("proved_win_sha") or "")
-                expected_win_store = str(journal.get("win_store") or "")
+                expected_win_store = str(journal.get("win_store") or win_mod.wsl_to_windows_path(Path(journal["store"])))
                 if (
                     not expected_win_sha
+                    or not expected_win_store
                     or cur_win_c.get("commit") != journal.get("commit")
                     or cur_win.get("exe_sha") != expected_win_sha
-                    or (expected_win_store and cur_win_c.get("store") != expected_win_store)
+                    or cur_win_c.get("store") != expected_win_store
                 ):
                     errors.append(
-                        f"refusing Windows rollback: live installation ({cur_win_c.get('commit')}) does not match phase publication ({journal.get('commit')})"
+                        f"refusing Windows rollback: live installation ({cur_win_c.get('commit')}, store={cur_win_c.get('store')}) "
+                        f"does not match phase publication ({journal.get('commit')}, store={expected_win_store})"
                     )
                 else:
                     win_args = ["--back" if journal.get("win_had_install") else "--remove", "--reg-key", reg_key, "--phase-tx", tx_id]
@@ -750,6 +754,8 @@ def _rollback_phase_journal(
             _win_phase_marker_call(python_exe, win_install_py_win, "end", win_to_raw, reg_key, tx_id, install_mod=install_mod)
         except Exception as exc:
             raise install_mod.InstallError(f"phase rollback succeeded but failed to release Windows phase marker: {exc}", code=3) from exc
+    if on_boundary:
+        on_boundary("after_rollback_marker_end")
 
     jp = to_dir / PHASE_JOURNAL_NAME
     if jp.exists():

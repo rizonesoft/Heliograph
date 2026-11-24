@@ -4184,8 +4184,7 @@ class TestPhaseInstaller(unittest.TestCase):
                         self.assertEqual(st_after["manifest"]["previous"]["commit"], "0" * 40, boundary_name)
                     self.phase_mod._run_win_cli(self.python_exe, install_py_win, ["--remove", "--to", win_c_to, "--reg-key", reg_key_c])
 
-                    # 12. Non-UTF-8 Windows `.phase-active.json` marker returns exit 2 cleanly (never UnicodeDecodeError),
-                    # and a `rolled_back` journal never re-enters rollback!
+                    # 12. Non-UTF-8 Windows `.phase-active.json` marker returns exit 2 cleanly (never UnicodeDecodeError).
                     bad_marker_helper = (
                         "import pathlib, sys\n"
                         "d = pathlib.Path(sys.argv[1]); d.mkdir(parents=True, exist_ok=True)\n"
@@ -4198,28 +4197,122 @@ class TestPhaseInstaller(unittest.TestCase):
                         ["--source-exe", self.win_mod.wsl_to_windows_path(v1_e), "--source-sha256", v1_e_sha, "--commit", v1_commit, "--store", win_store, "--to", win_c_to, "--reg-key", reg_key_c],
                     )
                     self.assertEqual(r_bad_m.returncode, 2, r_bad_m.stdout + r_bad_m.stderr)
+                    # Clean bad marker for next sub-test.
+                    subprocess.run(
+                        [self.python_exe, "-B", "-c", "import pathlib, sys; (pathlib.Path(sys.argv[1]) / '.phase-active.json').unlink(missing_ok=True)", win_c_to],
+                        check=True,
+                        stdin=subprocess.DEVNULL,
+                    )
 
-                    rb_done_j = {
-                        **crashed_journal,
+                    # 13. Interrupt production `_rollback_phase_journal` right after Windows marker release (`after_rollback_marker_end`),
+                    # verify `phase_state == "rolled_back"` was persisted by production code, allow an ordinary Windows installer
+                    # to publish a new installation with a different store, then run recovery and verify the later install is PRESERVED!
+                    other_store = root / "later_writer_store"
+                    other_store.mkdir()
+                    other_win_store = self.win_mod.wsl_to_windows_path(other_store)
+                    # First install v3 as a first-install on win_c_to, then interrupt rollback right after marker release.
+                    r_first = self.phase_mod._run_win_cli(
+                        self.python_exe,
+                        install_py_win,
+                        ["--source-exe", self.win_mod.wsl_to_windows_path(v3_e), "--source-sha256", v3_e_sha, "--commit", "3" * 40, "--store", win_store, "--to", win_c_to, "--reg-key", reg_key_c],
+                    )
+                    self.assertEqual(r_first.returncode, 0, r_first.stdout + r_first.stderr)
+                    self.phase_mod._win_phase_marker_call(
+                        self.python_exe, win_install_py_win, "begin", win_c_to, reg_key_c, "fedcba987654", phase=0, commit="3" * 40, install_mod=self.mod
+                    )
+                    rb_j = {
                         "schema_version": 2,
                         "managed_by": "heliograph-phase-installer",
-                        "phase_state": "rolled_back",
-                        "wsl_changed": True,
+                        "tx_id": "fedcba987654",
+                        "phase": 0,
+                        "commit": "3" * 40,
+                        "phase_state": "both_done",
+                        "wsl_to": str(to_dir.resolve()),
+                        "wrapper": str(wrapper.resolve()),
+                        "store": str(store_dir.resolve()),
+                        "win_store": win_store,
+                        "win_to_arg": win_c_to,
+                        "win_dest": win_c_to,
+                        "reg_key": reg_key_c,
+                        "proved_wsl_sha": self.mod.sha256_file(to_dir / "helio"),
+                        "proved_win_sha": v3_e_sha,
+                        "wsl_had_install": True,
+                        "wsl_pre_helio_sha": self.mod.sha256_file(to_dir / "helio"),
+                        "wsl_pre_commit": head_sha,
+                        "wsl_pre_store": str(store_dir.resolve()),
+                        "wsl_pre_wrapper": str(wrapper.resolve()),
+                        "win_had_install": False,
+                        "win_pre_exe_sha": "",
+                        "win_pre_commit": "",
+                        "win_pre_store": "",
+                        "wsl_changed": False,
                         "win_changed": True,
                     }
-                    self.mod.write_json_atomic(to_dir / self.phase_mod.PHASE_JOURNAL_NAME, rb_done_j)
+                    self.mod.write_json_atomic(to_dir / self.phase_mod.PHASE_JOURNAL_NAME, rb_j)
+
+                    def stop_after_marker(b: str) -> None:
+                        if b == "after_rollback_marker_end":
+                            raise RuntimeError("simulated crash before journal unlink")
+
+                    with self.assertRaises(RuntimeError):
+                        self.phase_mod._rollback_phase_journal(
+                            rb_j,
+                            python_exe=self.python_exe,
+                            install_py_win=install_py_win,
+                            win_install_py_win=win_install_py_win,
+                            install_mod=self.mod,
+                            on_boundary=stop_after_marker,
+                        )
+                    persisted = json.loads((to_dir / self.phase_mod.PHASE_JOURNAL_NAME).read_text(encoding="utf-8"))
+                    self.assertEqual(persisted["phase_state"], "rolled_back")
+                    # Ordinary Windows installer now publishes same release with a DIFFERENT store!
+                    r_later = self.phase_mod._run_win_cli(
+                        self.python_exe,
+                        install_py_win,
+                        ["--source-exe", self.win_mod.wsl_to_windows_path(v3_e), "--source-sha256", v3_e_sha, "--commit", "3" * 40, "--store", other_win_store, "--to", win_c_to, "--reg-key", reg_key_c],
+                    )
+                    self.assertEqual(r_later.returncode, 0, r_later.stdout + r_later.stderr)
+                    # Phase retry recovers `rolled_back` without re-entering rollback -> later installation is PRESERVED!
                     self.phase_mod._recover_pending_phase_journal(
                         to_dir=to_dir,
                         wrapper_path=wrapper,
                         store_dir=store_dir,
-                        win_to_raw=win_to,
-                        reg_key=reg_key,
+                        win_to_raw=win_c_to,
+                        reg_key=reg_key_c,
                         python_exe=self.python_exe,
                         install_py_win=install_py_win,
                         win_install_py_win=win_install_py_win,
                         install_mod=self.mod,
                     )
                     self.assertFalse((to_dir / self.phase_mod.PHASE_JOURNAL_NAME).exists())
+                    st_later = self.phase_mod._probe_win_state(self.python_exe, win_install_py_win, win_c_to, reg_key_c)
+                    self.assertEqual(st_later["status_code"], 0, st_later["status_lines"])
+                    self.assertEqual(st_later["manifest"]["current"]["store"], other_win_store)
+
+                    # 14. Upgrade from older schema-2 `rolling_back` journal omitting `win_store`: derives expected_win_store
+                    # from `store` and refuses to remove the later writer's installation that used `other_win_store`!
+                    legacy_rb_j = {k: v for k, v in rb_j.items() if k != "win_store"}
+                    legacy_rb_j["phase_state"] = "rolling_back"
+                    self.mod.write_json_atomic(to_dir / self.phase_mod.PHASE_JOURNAL_NAME, legacy_rb_j)
+                    with self.assertRaises(self.mod.InstallError) as ctx_ref_rb:
+                        self.phase_mod._recover_pending_phase_journal(
+                            to_dir=to_dir,
+                            wrapper_path=wrapper,
+                            store_dir=store_dir,
+                            win_to_raw=win_c_to,
+                            reg_key=reg_key_c,
+                            python_exe=self.python_exe,
+                            install_py_win=install_py_win,
+                            win_install_py_win=win_install_py_win,
+                            install_mod=self.mod,
+                        )
+                    self.assertEqual(ctx_ref_rb.exception.code, 3)
+                    self.assertIn("does not match phase publication", str(ctx_ref_rb.exception))
+                    st_still = self.phase_mod._probe_win_state(self.python_exe, win_install_py_win, win_c_to, reg_key_c)
+                    self.assertEqual(st_still["status_code"], 0, st_still["status_lines"])
+                    self.assertEqual(st_still["manifest"]["current"]["store"], other_win_store)
+                    (to_dir / self.phase_mod.PHASE_JOURNAL_NAME).unlink()
+                    self.phase_mod._run_win_cli(self.python_exe, install_py_win, ["--remove", "--to", win_c_to, "--reg-key", reg_key_c])
                 finally:
                     self._delete_reg_key(reg_key_c)
                     self._cleanup_win_parent(win_c_to)
