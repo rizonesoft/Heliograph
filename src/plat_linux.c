@@ -36,8 +36,8 @@ static p_result all(int file, size_t most, char **data, size_t *length) {
 }
 
 static bool passing_linux(int attempt, int err) {
-    if (attempt >= 20 || (err != EACCES && err != EBUSY)) return false;
-    struct timespec ts = {0, 1000000};
+    if (attempt >= 8 || (err != EACCES && err != EBUSY && err != EPERM && err != ESTALE && err != EIO)) return false;
+    struct timespec ts = {0, (long)(1000000u << attempt)};
     nanosleep(&ts, NULL);
     return true;
 }
