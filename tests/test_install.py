@@ -4525,12 +4525,13 @@ class TestPhaseInstaller(unittest.TestCase):
                     )
                     self.assertEqual(rw.returncode, 0, rw.stdout + rw.stderr)
 
-                # Plant foreign backup-shaped files (including at the exact tx_id paths that the old
-                # separate-file snapshot mechanism used!), operator diagnostic copies (including a
-                # WSL-format basename copied into Windows bin\), AND real pre-replace atomic-writer
-                # temp files produced by each host's OWN writer (`write_bytes_atomic` / `_write_bytes_atomic`)
-                # BEFORE running the failed-C upgrade + rollback (items 2, 9, 23, and 27).
+                # Plant foreign backup-shaped files, operator diagnostic copies (including a genuine
+                # interrupted temp file copied from a DIFFERENT transaction `other_tx` on BOTH WSL and Windows!),
+                # AND real pre-replace atomic-writer temp files for THIS transaction `fixed_tx` produced by
+                # each host's OWN writer (`write_bytes_atomic` / `_write_bytes_atomic`) BEFORE running the
+                # failed-C upgrade + rollback (items 2, 9, 23, and 27).
                 fixed_tx = "deadbeef1234"
+                other_tx = "112233445566"
                 wsl_foreign_copy = to_dir / f".phase-prev-{fixed_tx}.helio.old"
                 wsl_foreign_empty = to_dir / f".phase-prev-{fixed_tx}.win.helio.exe.old"
                 wsl_op_saved = to_dir / ".phase.journal.json.tmp.saved"
@@ -4538,37 +4539,49 @@ class TestPhaseInstaller(unittest.TestCase):
                 wsl_foreign_empty.write_bytes(b"")
                 wsl_op_saved.write_bytes(b"operator diagnostic journal copy\n")
                 wsl_real_tmps: list[Path] = []
+                wsl_other_tx_tmps: list[Path] = []
                 with mock.patch.object(os, "replace", side_effect=lambda src, _dst: wsl_real_tmps.append(Path(src))):
-                    self.mod.write_bytes_atomic(to_dir / "phase.journal.json", b'{"partial": true}')
-                    self.mod.write_bytes_atomic(to_dir / "helio.old", b"partial-helio-old")
-                    self.mod.write_bytes_atomic(to_dir / "helio.exe.old", b"partial-helio-exe-old")
+                    self.mod.write_bytes_atomic(to_dir / "phase.journal.json", b'{"partial": true}', tx_id=fixed_tx)
+                    self.mod.write_bytes_atomic(to_dir / "helio.old", b"partial-helio-old", tx_id=fixed_tx)
+                    self.mod.write_bytes_atomic(to_dir / "helio.exe.old", b"partial-helio-exe-old", tx_id=fixed_tx)
+                with mock.patch.object(os, "replace", side_effect=lambda src, _dst: wsl_other_tx_tmps.append(Path(src))):
+                    self.mod.write_bytes_atomic(to_dir / "helio.old", b"other-tx-wsl-copy", tx_id=other_tx)
                 self.assertEqual(len(wsl_real_tmps), 3)
-                for tp in wsl_real_tmps:
+                self.assertEqual(len(wsl_other_tx_tmps), 1)
+                for tp in wsl_real_tmps + wsl_other_tx_tmps:
                     self.assertTrue(tp.is_file(), f"real WSL writer temp {tp} must exist before rollback")
                 plant_win_foreign = (
-                    "import importlib.util, os, pathlib, sys\n"
+                    "import importlib.util, json, os, pathlib, sys\n"
                     "from unittest import mock\n"
                     "spec = importlib.util.spec_from_file_location('wi', sys.argv[4])\n"
                     "mod = importlib.util.module_from_spec(spec)\n"
                     "spec.loader.exec_module(mod)\n"
                     "b = pathlib.Path(sys.argv[1]) / 'bin'\n"
-                    "tx = sys.argv[3]\n"
+                    "tx, other_tx = sys.argv[3], sys.argv[5]\n"
                     "(b / f'.phase-prev-{tx}.helio.exe.old').write_bytes(pathlib.Path(sys.argv[2]).read_bytes())\n"
                     "(b / '.phase-prev-foreignempty.helio.exe.old').write_bytes(b'')\n"
                     "(b / '.helio.exe.old.tmp.saved').write_bytes(b'operator diagnostic win copy')\n"
                     "(b / '.helio.exe.old.tmp.99999.deadbeef').write_bytes(b'wsl-format foreign copy on windows')\n"
-                    "captured = []\n"
+                    "captured, other_captured = [], []\n"
                     "with mock.patch.object(os, 'replace', side_effect=lambda src, _dst: captured.append(pathlib.Path(src))):\n"
-                    "    mod._write_bytes_atomic(b / 'helio.exe.old', b'partial-win-old')\n"
+                    "    mod._write_bytes_atomic(b / 'helio.exe.old', b'partial-win-old', tx_id=tx)\n"
+                    "with mock.patch.object(os, 'replace', side_effect=lambda src, _dst: other_captured.append(pathlib.Path(src))):\n"
+                    "    mod._write_bytes_atomic(b / 'helio.exe.old', b'other-tx-win-copy', tx_id=other_tx)\n"
                     "assert len(captured) == 1 and captured[0].is_file()\n"
-                    "print(captured[0].name)\n"
+                    "assert len(other_captured) == 1 and other_captured[0].is_file()\n"
+                    "print(json.dumps({'own': captured[0].name, 'other': other_captured[0].name}))\n"
                 )
-                win_tmp_name = subprocess.check_output(
-                    [self.python_exe, "-B", "-c", plant_win_foreign, win_to, self.win_mod.wsl_to_windows_path(a_e), fixed_tx, win_install_py_win],
-                    text=True,
-                    stdin=subprocess.DEVNULL,
-                ).strip()
-                self.assertTrue(win_tmp_name.startswith(".helio.exe.old.") and win_tmp_name.endswith(".tmp"), win_tmp_name)
+                win_tmps = json.loads(
+                    subprocess.check_output(
+                        [self.python_exe, "-B", "-c", plant_win_foreign, win_to, self.win_mod.wsl_to_windows_path(a_e), fixed_tx, win_install_py_win, other_tx],
+                        text=True,
+                        stdin=subprocess.DEVNULL,
+                    ).strip()
+                )
+                win_tmp_name = win_tmps["own"]
+                win_other_tmp_name = win_tmps["other"]
+                self.assertIn(f".tx-{fixed_tx}.", win_tmp_name)
+                self.assertIn(f".tx-{other_tx}.", win_other_tmp_name)
 
                 # Run phase C with a planted verification fault -> must publish C on BOTH hosts first,
                 # reach the planted fault, and then roll back BOTH hosts to current=B, previous=A!
@@ -4602,12 +4615,12 @@ class TestPhaseInstaller(unittest.TestCase):
                 self.assertTrue(verify_called, "must reach planted live verification fault after publication")
                 self.assertIn("planted live verification fault", str(ctx.exception))
 
-                # Verify BOTH WSL and Windows foreign files AND operator copies (including WSL-format copy
-                # on Windows) survived capture, publication, and rollback byte-for-byte while ALL real
-                # pre-replace atomic-writer temp files on BOTH hosts were swept!
+                # Verify BOTH WSL and Windows foreign files AND other-tx temps survived byte-for-byte
+                # while ALL real pre-replace atomic-writer temp files for THIS transaction `fixed_tx` were swept!
                 self.assertEqual(wsl_foreign_copy.read_bytes(), a_h.read_bytes())
                 self.assertEqual(wsl_foreign_empty.read_bytes(), b"")
                 self.assertEqual(wsl_op_saved.read_bytes(), b"operator diagnostic journal copy\n")
+                self.assertEqual(wsl_other_tx_tmps[0].read_bytes(), b"other-tx-wsl-copy")
                 for tp in wsl_real_tmps:
                     self.assertFalse(tp.exists(), f"real WSL writer temp {tp} must be swept")
                 self.assertEqual(
@@ -4617,27 +4630,29 @@ class TestPhaseInstaller(unittest.TestCase):
                 wsl_foreign_copy.unlink()
                 wsl_foreign_empty.unlink()
                 wsl_op_saved.unlink()
+                wsl_other_tx_tmps[0].unlink()
                 check_win_foreign = (
                     "import pathlib, sys\n"
                     "b = pathlib.Path(sys.argv[1]) / 'bin'\n"
                     "expected = pathlib.Path(sys.argv[2]).read_bytes()\n"
-                    "tx = sys.argv[3]\n"
-                    "real_tmp = sys.argv[4]\n"
+                    "tx, real_tmp, other_tmp = sys.argv[3], sys.argv[4], sys.argv[5]\n"
                     "p1 = b / f'.phase-prev-{tx}.helio.exe.old'\n"
                     "p2 = b / '.phase-prev-foreignempty.helio.exe.old'\n"
                     "p3 = b / '.helio.exe.old.tmp.saved'\n"
                     "p4 = b / '.helio.exe.old.tmp.99999.deadbeef'\n"
                     "p5 = b / real_tmp\n"
+                    "p6 = b / other_tmp\n"
                     "assert p1.is_file() and p1.read_bytes() == expected, 'Windows foreign copy must survive rollback verbatim'\n"
                     "assert p2.is_file() and p2.read_bytes() == b'', 'Windows foreign empty file must survive rollback verbatim'\n"
                     "assert p3.is_file() and p3.read_bytes() == b'operator diagnostic win copy', 'Windows .tmp.saved must survive verbatim'\n"
                     "assert p4.is_file() and p4.read_bytes() == b'wsl-format foreign copy on windows', 'WSL-format foreign copy on Windows must survive verbatim'\n"
                     "assert not p5.exists(), f'real Windows writer temp {p5} must be swept'\n"
+                    "assert p6.is_file() and p6.read_bytes() == b'other-tx-win-copy', 'other-tx Windows temp copy must survive verbatim'\n"
                     "assert sorted(p.name for p in b.iterdir() if 'phase-prev' in p.name) == sorted([p1.name, p2.name])\n"
-                    "p1.unlink(); p2.unlink(); p3.unlink(); p4.unlink()\n"
+                    "p1.unlink(); p2.unlink(); p3.unlink(); p4.unlink(); p6.unlink()\n"
                 )
                 subprocess.run(
-                    [self.python_exe, "-B", "-c", check_win_foreign, win_to, self.win_mod.wsl_to_windows_path(a_e), fixed_tx, win_tmp_name],
+                    [self.python_exe, "-B", "-c", check_win_foreign, win_to, self.win_mod.wsl_to_windows_path(a_e), fixed_tx, win_tmp_name, win_other_tmp_name],
                     check=True,
                     stdin=subprocess.DEVNULL,
                 )
@@ -4734,33 +4749,34 @@ class TestPhaseInstaller(unittest.TestCase):
                     self._delete_reg_key(sole_reg_key)
                     self._cleanup_win_parent(sole_win_to)
 
-                # Also verify `_store_needs_init` propagates PermissionError for local Windows stores,
-                # reachable WSL shares, AND WSL distribution-root ACL denials (items 24, 25, and 28),
-                # returning False ONLY on genuine unreachable-share WinErrors (e.g. WinError 64)!
+                # Also verify `_store_needs_init` uses `os.stat` (preserving OS errors even on Python 3.14!)
+                # and propagates PermissionError for local Windows stores, reachable WSL shares, AND WSL
+                # distribution-root ACL denials (items 24, 25, and 28), returning False ONLY on genuine
+                # unreachable-share WinErrors (e.g. WinError 64)!
                 local_store_err_code = (
-                    "import importlib.util, pathlib, sys\n"
+                    "import importlib.util, os, stat, sys, types\n"
                     "from unittest import mock\n"
                     "spec = importlib.util.spec_from_file_location('wi', sys.argv[1])\n"
                     "mod = importlib.util.module_from_spec(spec)\n"
                     "spec.loader.exec_module(mod)\n"
-                    "with mock.patch.object(pathlib.Path, 'is_dir', side_effect=OSError(0, 'network name gone', None, 64)):\n"
+                    "with mock.patch.object(os, 'stat', side_effect=OSError(0, 'network name gone', None, 64)):\n"
                     "    assert mod._store_needs_init(r'\\\\wsl.localhost\\NoSuchDistro\\store') is False\n"
                     "    try:\n"
                     "        mod._store_needs_init(r'C:\\LockedLocalStore')\n"
                     "        raise AssertionError('local store OSError must not be swallowed')\n"
                     "    except OSError:\n"
                     "        pass\n"
-                    "with mock.patch.object(pathlib.Path, 'is_dir', side_effect=PermissionError(13, 'ACL denied at root')):\n"
+                    "with mock.patch.object(os, 'stat', side_effect=PermissionError(13, 'ACL denied at root')):\n"
                     "    try:\n"
                     "        mod._store_needs_init(r'\\\\wsl.localhost\\Ubuntu\\home\\u\\store')\n"
                     "        raise AssertionError('WSL root PermissionError must not be swallowed')\n"
                     "    except PermissionError:\n"
                     "        pass\n"
-                    "def _reachable_root_denied_messages(self):\n"
-                    "    if str(self).endswith('messages'):\n"
-                    "        raise PermissionError('ACL denied on messages')\n"
-                    "    return True\n"
-                    "with mock.patch.object(pathlib.Path, 'is_dir', _reachable_root_denied_messages):\n"
+                    "def _reachable_root_denied_messages(p, *a, **kw):\n"
+                    "    if str(p).endswith('messages'):\n"
+                    "        raise PermissionError(13, 'ACL denied on messages')\n"
+                    "    return types.SimpleNamespace(st_mode=stat.S_IFDIR)\n"
+                    "with mock.patch.object(os, 'stat', _reachable_root_denied_messages):\n"
                     "    try:\n"
                     "        mod._store_needs_init(r'\\\\wsl.localhost\\Ubuntu\\home\\u\\store')\n"
                     "        raise AssertionError('reachable WSL share PermissionError on messages must not be swallowed')\n"

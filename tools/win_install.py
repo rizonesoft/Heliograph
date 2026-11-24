@@ -20,6 +20,7 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -119,9 +120,10 @@ def _check_regular_or_absent(path: Path) -> None:
         raise WinInstallError(f"refusing non-file at reserved path {path}", code=2)
 
 
-def _write_bytes_atomic(path: Path, data: bytes) -> None:
+def _write_bytes_atomic(path: Path, data: bytes, *, tx_id: str | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_name = f".{path.name}.{secrets.token_hex(6)}.tmp"
+    tx_tag = f".tx-{tx_id}" if tx_id else ""
+    tmp_name = f".{path.name}{tx_tag}.{secrets.token_hex(6)}.tmp"
     tmp_path = path.parent / tmp_name
     fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
     try:
@@ -477,7 +479,7 @@ def _wsl_share_reachable(store_path: str) -> bool:
     norm_s = store_path.replace("/", "\\")
     prefix = "\\\\wsl.localhost\\" if norm_s.lower().startswith("\\\\wsl.localhost\\") else "\\\\wsl$\\"
     try:
-        return Path(prefix + distro).is_dir()
+        return stat.S_ISDIR(os.stat(prefix + distro).st_mode)
     except PermissionError:
         raise
     except OSError as exc:
@@ -492,7 +494,10 @@ def _store_needs_init(store_path: str) -> bool:
         return False
     if not _wsl_share_reachable(store_path):
         return False
-    return not (Path(store_path) / "messages").is_dir()
+    try:
+        return not stat.S_ISDIR(os.stat(str(Path(store_path) / "messages")).st_mode)
+    except FileNotFoundError:
+        return True
 
 
 def _verify_win_ownership(win_to: Path, manifest: dict[str, Any] | None, *, require_live: bool = False) -> None:
@@ -954,16 +959,16 @@ def win_phase_begin(*, win_to: Path | None, reg_key: str, tx_id: str, phase: int
     return dest
 
 
-_WIN_PHASE_TMP_RE = re.compile(r"^\.helio\.exe\.old\.[0-9a-f]{12}\.tmp$")
-
-
-def _sweep_win_phase_temps(dest: Path) -> None:
-    """Remove only Windows atomic-writer `.helio.exe.old.<12hex>.tmp` files left by a killed rollback restore."""
+def _sweep_win_phase_temps(dest: Path, tx_id: str) -> None:
+    """Remove only this transaction's atomic-writer `.helio.exe.old.tx-<tx_id>.<12hex>.tmp` files."""
+    if not tx_id or not re.fullmatch(r"[0-9a-f]{12}", tx_id):
+        return
     bin_dir = dest / WIN_BIN_SUBDIR
     if not bin_dir.is_dir() or _is_reparse_or_symlink(bin_dir):
         return
+    pat = re.compile(rf"^\.helio\.exe\.old\.tx-{re.escape(tx_id)}\.[0-9a-f]{{12}}\.tmp$")
     for p in bin_dir.iterdir():
-        if _WIN_PHASE_TMP_RE.fullmatch(p.name) and p.is_file() and not _is_reparse_or_symlink(p):
+        if pat.fullmatch(p.name) and p.is_file() and not _is_reparse_or_symlink(p):
             p.unlink()
 
 
@@ -981,7 +986,7 @@ def win_phase_end(*, win_to: Path | None, tx_id: str) -> None:
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise WinInstallError(f"cannot read Windows phase marker at {mp}: {exc}", code=3) from exc
         if isinstance(data, dict) and data.get("managed_by") == "heliograph-phase-installer" and data.get("tx_id") == tx_id:
-            _sweep_win_phase_temps(dest)
+            _sweep_win_phase_temps(dest, tx_id)
             try:
                 mp.unlink()
             except OSError as exc:
@@ -1045,8 +1050,8 @@ def win_phase_restore_prev(
         expected_sha = str(pre_previous.get("helio_exe_sha256") or "")
         if expected_sha and hashlib.sha256(restore_bytes).hexdigest() != expected_sha:
             raise WinInstallError("previous-generation backup hash mismatch for Windows restore", code=3)
-        _write_bytes_atomic(old_exe, restore_bytes)
-        _sweep_win_phase_temps(dest)
+        _write_bytes_atomic(old_exe, restore_bytes, tx_id=tx_id)
+        _sweep_win_phase_temps(dest, tx_id)
         manifest["previous"] = pre_previous
         _write_json_atomic(dest / WIN_MANIFEST_NAME, manifest)
 

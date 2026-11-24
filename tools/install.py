@@ -136,9 +136,10 @@ def fsync_dir(directory: Path) -> None:
         os.close(fd)
 
 
-def write_bytes_atomic(path: Path, data: bytes, mode: int | None = None) -> None:
+def write_bytes_atomic(path: Path, data: bytes, mode: int | None = None, *, tx_id: str | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.parent / f".{path.name}.tmp.{os.getpid()}.{secrets.token_hex(4)}"
+    tx_tag = f".tx-{tx_id}" if tx_id else ""
+    tmp = path.parent / f".{path.name}{tx_tag}.tmp.{os.getpid()}.{secrets.token_hex(4)}"
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode if mode is not None else 0o644)
     try:
         with os.fdopen(fd, "wb") as fh:
@@ -155,9 +156,9 @@ def write_bytes_atomic(path: Path, data: bytes, mode: int | None = None) -> None
         raise
 
 
-def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+def write_json_atomic(path: Path, payload: dict[str, Any], *, tx_id: str | None = None) -> None:
     raw = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    write_bytes_atomic(path, raw, mode=0o644)
+    write_bytes_atomic(path, raw, mode=0o644, tx_id=tx_id)
 
 
 def copy_to_staged(src: Path, dst: Path, mode: int = 0o755) -> None:

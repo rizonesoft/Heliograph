@@ -228,14 +228,16 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
     return sorted(pending)
 
 
-_WSL_PHASE_TMP_RE = re.compile(r"^\.(?:phase\.journal\.json|helio\.old|helio\.exe\.old)\.tmp\.[0-9]+\.[0-9a-f]{8}$")
-
-
-def _sweep_phase_journal_temps(to_dir: Path, install_mod: Any) -> None:
-    """Remove only atomic-writer `.<target>.tmp.<pid>.<8hex>` files left by a killed journal or rollback restore write."""
+def _sweep_phase_journal_temps(to_dir: Path, tx_id: str, install_mod: Any) -> None:
+    """Remove only this transaction's atomic-writer `.<target>.tx-<tx_id>.tmp.<pid>.<8hex>` files."""
+    if not tx_id or not re.fullmatch(r"[0-9a-f]{12}", tx_id):
+        return
+    pat = re.compile(
+        rf"^\.(?:phase\.journal\.json|helio\.old|helio\.exe\.old)\.tx-{re.escape(tx_id)}\.tmp\.[0-9]+\.[0-9a-f]{{8}}$"
+    )
     removed = False
     for p in to_dir.iterdir():
-        if _WSL_PHASE_TMP_RE.fullmatch(p.name) and p.is_file() and not p.is_symlink():
+        if pat.fullmatch(p.name) and p.is_file() and not p.is_symlink():
             p.unlink()
             removed = True
     if removed:
@@ -287,8 +289,9 @@ def _restore_wsl_previous(
     exp_e = str(pre_previous.get("helio_exe_sha256") or "")
     if (exp_h and hashlib.sha256(raw_h).hexdigest() != exp_h) or (exp_e and hashlib.sha256(raw_e).hexdigest() != exp_e):
         raise install_mod.InstallError(f"WSL phase previous backup hash mismatch for {to_dir}", code=3)
-    install_mod.write_bytes_atomic(to_dir / "helio.old", raw_h, mode=0o755)
-    install_mod.write_bytes_atomic(to_dir / "helio.exe.old", raw_e, mode=0o755)
+    j_tx = str(journal.get("tx_id") or "") or None
+    install_mod.write_bytes_atomic(to_dir / "helio.old", raw_h, mode=0o755, tx_id=j_tx)
+    install_mod.write_bytes_atomic(to_dir / "helio.exe.old", raw_e, mode=0o755, tx_id=j_tx)
     manifest["previous"] = pre_previous
     install_mod.write_json_atomic(to_dir / install_mod.MANIFEST_NAME, manifest)
 
@@ -903,7 +906,7 @@ def _rollback_phase_journal(
     reg_key = journal["reg_key"]
 
     journal["phase_state"] = "rolling_back"
-    install_mod.write_json_atomic(to_dir / PHASE_JOURNAL_NAME, journal)
+    install_mod.write_json_atomic(to_dir / PHASE_JOURNAL_NAME, journal, tx_id=str(journal.get("tx_id") or "") or None)
     if on_boundary:
         on_boundary("after_rollback_journal")
 
@@ -1107,7 +1110,7 @@ def _rollback_phase_journal(
     # Durable commit point for rollback: write `phase_state = "rolled_back"` FIRST while `.phase-active.json`
     # is still held so a crash before unlinking the WSL journal NEVER re-enters rollback!
     journal["phase_state"] = "rolled_back"
-    install_mod.write_json_atomic(to_dir / PHASE_JOURNAL_NAME, journal)
+    install_mod.write_json_atomic(to_dir / PHASE_JOURNAL_NAME, journal, tx_id=str(journal.get("tx_id") or "") or None)
 
     if tx_id:
         try:
@@ -1121,7 +1124,7 @@ def _rollback_phase_journal(
     if jp.exists():
         jp.unlink()
         install_mod.fsync_dir(to_dir)
-    _sweep_phase_journal_temps(to_dir, install_mod)
+    _sweep_phase_journal_temps(to_dir, tx_id, install_mod)
 
 
 _REQUIRED_PHASE_JOURNAL_KEYS = (
@@ -1268,7 +1271,7 @@ def _recover_pending_phase_journal(
         )
         jp.unlink()
         install_mod.fsync_dir(to_dir)
-        _sweep_phase_journal_temps(to_dir, install_mod)
+        _sweep_phase_journal_temps(to_dir, j_tx, install_mod)
         return None
     if state == "notifying":
         # Idempotently release any stranded Windows marker.
@@ -1293,7 +1296,7 @@ def _recover_pending_phase_journal(
         )
         jp.unlink()
         install_mod.fsync_dir(to_dir)
-        _sweep_phase_journal_temps(to_dir, install_mod)
+        _sweep_phase_journal_temps(to_dir, j_tx, install_mod)
         return {
             "phase": int(journal["phase"]),
             "commit": str(journal["commit"]),
@@ -1504,7 +1507,6 @@ def run_phase_install(
                 )
                 if resumed is not None and _resumed_matches_request(resumed, commit):
                     return resumed
-            _sweep_phase_journal_temps(to_dir, install_mod)
 
             # Write durable `acquiring` journal FIRST, THEN acquire the Windows phase marker, THEN probe
             # Windows pre-transaction state under that exclusive marker! This guarantees:
@@ -1540,7 +1542,7 @@ def run_phase_install(
                 "wsl_changed": False,
                 "win_changed": False,
             }
-            install_mod.write_json_atomic(to_dir / PHASE_JOURNAL_NAME, journal)
+            install_mod.write_json_atomic(to_dir / PHASE_JOURNAL_NAME, journal, tx_id=str(journal.get("tx_id") or "") or None)
             try:
                 _win_phase_marker_call(
                     python_exe,
@@ -1614,7 +1616,7 @@ def run_phase_install(
                         "win_pre_store": win_pre_cur.get("store", ""),
                     }
                 )
-                install_mod.write_json_atomic(to_dir / PHASE_JOURNAL_NAME, journal)
+                install_mod.write_json_atomic(to_dir / PHASE_JOURNAL_NAME, journal, tx_id=str(journal.get("tx_id") or "") or None)
                 if on_boundary:
                     on_boundary("after_phase_journal")
 
@@ -1629,7 +1631,7 @@ def run_phase_install(
                         else:
                             journal["wsl_pre_previous"] = None
                     journal["wsl_changed"] = True
-                    install_mod.write_json_atomic(to_dir / PHASE_JOURNAL_NAME, journal)
+                    install_mod.write_json_atomic(to_dir / PHASE_JOURNAL_NAME, journal, tx_id=str(journal.get("tx_id") or "") or None)
                     install_mod.install(
                         repo=repo,
                         to_dir=to_dir,
@@ -1642,7 +1644,7 @@ def run_phase_install(
                         allow_phase_journal=True,
                     )
                     journal["phase_state"] = "wsl_done"
-                    install_mod.write_json_atomic(to_dir / PHASE_JOURNAL_NAME, journal)
+                    install_mod.write_json_atomic(to_dir / PHASE_JOURNAL_NAME, journal, tx_id=str(journal.get("tx_id") or "") or None)
                     if on_boundary:
                         on_boundary("after_wsl_install")
 
@@ -1668,11 +1670,11 @@ def run_phase_install(
                                 raise install_mod.InstallError("Windows previous generation binary hash mismatch during snapshot", code=3)
                             journal["win_pre_previous"] = win_pre_prev
                             journal["win_pre_prev_exe_b64"] = b64_raw
-                            install_mod.write_json_atomic(to_dir / PHASE_JOURNAL_NAME, journal)
+                            install_mod.write_json_atomic(to_dir / PHASE_JOURNAL_NAME, journal, tx_id=str(journal.get("tx_id") or "") or None)
                         else:
                             journal["win_pre_previous"] = None
                     journal["win_changed"] = True
-                    install_mod.write_json_atomic(to_dir / PHASE_JOURNAL_NAME, journal)
+                    install_mod.write_json_atomic(to_dir / PHASE_JOURNAL_NAME, journal, tx_id=str(journal.get("tx_id") or "") or None)
                     win_snap_exe = win_mod.wsl_to_windows_path(snap_win)
                     win_args = [
                         "--source-exe",
@@ -1697,7 +1699,7 @@ def run_phase_install(
                             code=3,
                         )
                     journal["phase_state"] = "both_done"
-                    install_mod.write_json_atomic(to_dir / PHASE_JOURNAL_NAME, journal)
+                    install_mod.write_json_atomic(to_dir / PHASE_JOURNAL_NAME, journal, tx_id=str(journal.get("tx_id") or "") or None)
                     if on_boundary:
                         on_boundary("after_win_install")
 
@@ -1720,7 +1722,7 @@ def run_phase_install(
                 # Durable commit point: write `phase_state = "notifying"` FIRST while `.phase-active.json` is STILL held
                 # so rollback is permanently retired before any post-commit cleanup or marker release!
                 journal["phase_state"] = "notifying"
-                install_mod.write_json_atomic(to_dir / PHASE_JOURNAL_NAME, journal)
+                install_mod.write_json_atomic(to_dir / PHASE_JOURNAL_NAME, journal, tx_id=str(journal.get("tx_id") or "") or None)
             except BaseException as exc:
                 _rollback_phase_journal(
                     journal,
@@ -1751,7 +1753,7 @@ def run_phase_install(
             if jp.exists():
                 jp.unlink()
                 install_mod.fsync_dir(to_dir)
-            _sweep_phase_journal_temps(to_dir, install_mod)
+            _sweep_phase_journal_temps(to_dir, tx_id, install_mod)
 
             return {
                 "phase": phase,
