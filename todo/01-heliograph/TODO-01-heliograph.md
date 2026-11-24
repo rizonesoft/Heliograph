@@ -55,6 +55,8 @@ title: "TODO-01 -- Heliograph"
 
 ## 1. Steps that notice an archived job
 
+> **Started:** 2026-11-24T19:09Z
+
 Archiving removes files that `store_job` reads one by one. A reader that holds the post while the steps go away would see an open job and take it again. The rule: archiving removes the post first, and whoever reads or makes a step looks for the post again afterwards.
 
 **Phase:** 1
