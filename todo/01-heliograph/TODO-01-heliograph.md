@@ -84,6 +84,8 @@ Archiving removes files that `store_job` reads one by one. A reader that holds t
 
 ## 2. Move a closed message to its month
 
+> **Started:** 2026-11-24T19:55Z
+
 **Corrected 2026-11-24:** Per `§1` plan review finding 2, `engine/archive.c` (and `store_check` when an archive copy exists) also recognizes and sweeps any crash-orphaned live `<id>.link.*` or `<id>.seen.*` whose `<id>.post` is already in `archive/<year-month>/`, covering a writer killed between publishing a link and removing it.
 
 A job done or refused for 30 days moves to `archive/<year-month>`. The month comes from the message's own id, so the place needs no index. `helio archive` does it, and the first inbox of the day does at most 200.
