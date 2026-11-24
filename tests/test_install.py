@@ -2438,16 +2438,16 @@ class TestWindowsInstaller(unittest.TestCase):
                 # A directory junction to win_to earlier on Path resolves its parent to win_to -> healthy status 0!
                 junc_dir = root / "win_to_junction"
                 mkj = subprocess.run(["cmd.exe", "/c", "mklink", "/J", str(junc_dir), str(win_to)], capture_output=True, text=True)
-                if mkj.returncode == 0:
+                self.assertEqual(mkj.returncode, 0, mkj.stdout + mkj.stderr)
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_key, 0, winreg.KEY_SET_VALUE) as k:
+                    winreg.SetValueEx(k, "Path", 0, orig_rk, f"{junc_dir};{orig_rp}")
+                try:
+                    code_junc, lines_junc = self.win_mod.win_status(win_to=win_to, reg_key=reg_key)
+                    self.assertEqual(code_junc, 0, lines_junc)
+                finally:
                     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_key, 0, winreg.KEY_SET_VALUE) as k:
-                        winreg.SetValueEx(k, "Path", 0, orig_rk, f"{junc_dir};{orig_rp}")
-                    try:
-                        code_junc, lines_junc = self.win_mod.win_status(win_to=win_to, reg_key=reg_key)
-                        self.assertEqual(code_junc, 0, lines_junc)
-                    finally:
-                        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_key, 0, winreg.KEY_SET_VALUE) as k:
-                            winreg.SetValueEx(k, "Path", 0, orig_rk, orig_rp)
-                        subprocess.run(["cmd.exe", "/c", "rmdir", str(junc_dir)], capture_output=True, text=True)
+                        winreg.SetValueEx(k, "Path", 0, orig_rk, orig_rp)
+                    subprocess.run(["cmd.exe", "/c", "rmdir", str(junc_dir)], capture_output=True, text=True)
         finally:
             self._delete_reg_key(reg_key)
 
