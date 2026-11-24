@@ -484,7 +484,7 @@ class TestQuickInstaller(unittest.TestCase):
                 self.mod.recover_if_needed(ext_dir, ext_wrap)
             self.assertEqual(ctx.exception.code, 2)
 
-            # 5. Committed branch refuses to discard snapshots if wrapper is missing OR points to wrong store.
+            # 5. Committed branch refuses to discard snapshots if wrapper is missing, non-executable, OR points to wrong store.
             comm_dir = root / "comm_check"
             comm_wrap = root / "cw" / "helio"
             self.mod.install(repo=repo, to_dir=comm_dir, store_dir=store, wrapper_path=comm_wrap, prebuilt=(a_h, a_e))
@@ -495,18 +495,36 @@ class TestQuickInstaller(unittest.TestCase):
 
             with self.assertRaises(SimulatedCrash):
                 self.mod.install(repo=repo, to_dir=comm_dir, store_dir=store, wrapper_path=comm_wrap, prebuilt=(b_h, b_e), on_boundary=crash_after_manifest)
-            # Wrong store in wrapper for same destination -> committed branch refuses to discard snapshots.
-            comm_wrap.write_text(self.mod.render_wrapper(comm_dir, root / "wrong_store"), encoding="utf-8")
+            # 5a. Non-executable wrapper -> refuses to discard snapshots.
+            os.chmod(comm_wrap, 0o644)
             with self.assertRaises(self.mod.InstallError) as ctx:
                 self.mod.recover_if_needed(comm_dir, comm_wrap)
             self.assertEqual(ctx.exception.code, 3)
             self.assertTrue((comm_dir / self.mod.JOURNAL_NAME).exists())
+            os.chmod(comm_wrap, 0o755)
+            # 5b. Wrong store in wrapper -> refuses to discard snapshots.
+            saved_wrap_text = comm_wrap.read_text(encoding="utf-8")
+            comm_wrap.write_text(self.mod.render_wrapper(comm_dir, root / "wrong_store"), encoding="utf-8")
+            with self.assertRaises(self.mod.InstallError) as ctx:
+                self.mod.recover_if_needed(comm_dir, comm_wrap)
+            self.assertEqual(ctx.exception.code, 3)
+            # 5c. Missing wrapper -> refuses to discard snapshots.
+            comm_wrap.unlink()
+            with self.assertRaises(self.mod.InstallError) as ctx:
+                self.mod.recover_if_needed(comm_dir, comm_wrap)
+            self.assertEqual(ctx.exception.code, 3)
+            self.assertTrue((comm_dir / self.mod.JOURNAL_NAME).exists())
+            # Restore valid wrapper -> recovery now succeeds.
+            comm_wrap.write_text(saved_wrap_text, encoding="utf-8")
+            os.chmod(comm_wrap, 0o755)
+            self.assertTrue(self.mod.recover_if_needed(comm_dir, comm_wrap))
 
-            # 6. Hand-crafted foreign remove journal with matching SHA-256 of an unrelated file is refused.
+            # 6. Hand-crafted foreign remove AND foreign install journals with matching SHA-256 of an unrelated file are refused.
             frem_dir = root / "foreign_rem_hash"
             frem_dir.mkdir()
             unrelated_helio = frem_dir / "helio"
             unrelated_helio.write_text("unrelated user script\n", encoding="utf-8")
+            unrelated_sha = self.mod.sha256_file(unrelated_helio)
             (frem_dir / self.mod.JOURNAL_NAME).write_text(
                 json.dumps({
                     "schema_version": 1,
@@ -517,7 +535,7 @@ class TestQuickInstaller(unittest.TestCase):
                     "wrapper_path": str((root / "frw" / "helio").resolve()),
                     "saved_files": {},
                     "temp_files": [],
-                    "expected_hashes": {"helio": self.mod.sha256_file(unrelated_helio)},
+                    "expected_hashes": {"helio": unrelated_sha},
                 }),
                 encoding="utf-8",
             )
@@ -525,6 +543,42 @@ class TestQuickInstaller(unittest.TestCase):
                 self.mod.recover_if_needed(frem_dir, root / "frw" / "helio")
             self.assertEqual(ctx.exception.code, 2)
             self.assertEqual(unrelated_helio.read_text(encoding="utf-8"), "unrelated user script\n")
+
+            # Foreign install journal trying to unlink unrelated_helio when saved_files has existed=False.
+            (frem_dir / self.mod.JOURNAL_NAME).write_text(
+                json.dumps({
+                    "schema_version": 1,
+                    "op": "install",
+                    "phase": "publishing",
+                    "tx_id": "abcdef012345",
+                    "to_dir": str(frem_dir.resolve()),
+                    "wrapper_path": str((root / "frw" / "helio").resolve()),
+                    "had_manifest": False,
+                    "previous_manifest": None,
+                    "previous_wrapper_existed": False,
+                    "saved_files": {"helio": {"existed": False, "rec_name": None, "sha256": None}},
+                    "temp_files": [],
+                    "desired_manifest": {
+                        "schema_version": 1,
+                        "current": {"commit": "a" * 40, "helio_sha256": unrelated_sha, "helio_exe_sha256": unrelated_sha},
+                        "previous": None,
+                    },
+                }),
+                encoding="utf-8",
+            )
+            with self.assertRaises(self.mod.InstallError) as ctx:
+                self.mod.recover_if_needed(frem_dir, root / "frw" / "helio")
+            self.assertEqual(ctx.exception.code, 2)
+            self.assertEqual(unrelated_helio.read_text(encoding="utf-8"), "unrelated user script\n")
+
+            # 7. --back invoked via a third --wrapper path still removes B's recorded current wrapper.
+            w3_dir = root / "third_wrap_back"
+            wa, wb, wc = root / "w3a" / "helio", root / "w3b" / "helio", root / "w3c" / "helio"
+            self.mod.install(repo=repo, to_dir=w3_dir, store_dir=store, wrapper_path=wa, prebuilt=(a_h, a_e))
+            self.mod.install(repo=repo, to_dir=w3_dir, store_dir=store, wrapper_path=wb, prebuilt=(b_h, b_e))
+            self.mod.go_back(to_dir=w3_dir, wrapper_path=wc)
+            self.assertTrue(wa.is_file())
+            self.assertFalse(wb.exists())
 
     def test_legacy_adoption_symlinks_collisions_and_locks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -686,9 +740,10 @@ class TestQuickInstaller(unittest.TestCase):
                 self.assertEqual(self.mod.sha256_file(to_dir / "helio.old"), self.mod.sha256_file(exp_old_h))
                 self.assertEqual(self.mod.sha256_file(to_dir / "helio.exe.old"), self.mod.sha256_file(exp_old_e))
 
-            # --remove on a TWO-GENERATION installation across EVERY individual unlink boundary.
+            # --remove on a TWO-GENERATION, TWO-WRAPPER installation across EVERY individual unlink boundary.
             rem_boundaries = (
                 "after_journal",
+                "after_invocation_wrapper",
                 "after_wrapper",
                 "after_unlink_helio",
                 "after_unlink_helio_exe",
@@ -699,21 +754,23 @@ class TestQuickInstaller(unittest.TestCase):
             for boundary in rem_boundaries:
                 to_dir = root / f"rem2_{boundary}"
                 store = root / f"rstore2_{boundary}"
-                wrapper = root / f"w_rem2_{boundary}" / "helio"
-                self.mod.install(repo=repo, to_dir=to_dir, store_dir=store, wrapper_path=wrapper, prebuilt=(a_h, a_e))
-                self.mod.install(repo=repo, to_dir=to_dir, store_dir=store, wrapper_path=wrapper, prebuilt=(b_h, b_e))
+                wrap_inv = root / f"w_rem2_inv_{boundary}" / "helio"
+                wrap_rec = root / f"w_rem2_rec_{boundary}" / "helio-rec"
+                self.mod.install(repo=repo, to_dir=to_dir, store_dir=store, wrapper_path=wrap_inv, prebuilt=(a_h, a_e))
+                self.mod.install(repo=repo, to_dir=to_dir, store_dir=store, wrapper_path=wrap_rec, prebuilt=(b_h, b_e))
 
                 def fail_at(stage: str, target=boundary) -> None:
                     if stage == target:
                         raise SimulatedCrash(stage)
 
                 with self.assertRaises(SimulatedCrash):
-                    self.mod.remove(to_dir=to_dir, wrapper_path=wrapper, on_boundary=fail_at)
-                self.assertTrue(self.mod.recover_if_needed(to_dir, wrapper))
+                    self.mod.remove(to_dir=to_dir, wrapper_path=wrap_inv, on_boundary=fail_at)
+                self.assertTrue(self.mod.recover_if_needed(to_dir, wrap_inv))
                 for name in self.mod.BINARY_NAMES + self.mod.BACKUP_NAMES + (self.mod.MANIFEST_NAME,):
                     self.assertFalse((to_dir / name).exists())
-                self.assertFalse(wrapper.exists())
-                code, _ = self.mod.status(to_dir=to_dir, wrapper_path=wrapper)
+                self.assertFalse(wrap_inv.exists())
+                self.assertFalse(wrap_rec.exists())
+                code, _ = self.mod.status(to_dir=to_dir, wrapper_path=wrap_rec)
                 self.assertEqual(code, 1)
 
     def test_zero_gap_posix_replacement_and_busy_deferral(self) -> None:

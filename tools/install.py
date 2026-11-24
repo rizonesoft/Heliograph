@@ -455,9 +455,34 @@ def _cleanup_temp_files(to_dir: Path, temp_names: list[str], tx_id: str) -> None
         p = to_dir / name
         if p.parent.resolve() != resolved_to or p.is_symlink():
             continue
-        with contextlib.suppress(OSError):
+        try:
             p.unlink()
+        except FileNotFoundError:
+            pass
     fsync_dir(to_dir)
+
+
+def _discover_lock_wrappers(to_dir: Path, wrapper_path: Path) -> list[Path]:
+    """Discover every wrapper path referenced by manifest or journal while to_dir lock is held."""
+    found: list[Path] = [wrapper_path]
+    with contextlib.suppress(InstallError):
+        m = read_manifest(to_dir)
+        if m:
+            for section in ("current", "previous"):
+                rec = m.get(section)
+                if isinstance(rec, dict) and isinstance(rec.get("wrapper"), str) and rec["wrapper"]:
+                    with contextlib.suppress(InstallError):
+                        found.append(_normalize_wrapper_path(Path(rec["wrapper"])))
+    jp = to_dir / JOURNAL_NAME
+    if jp.exists() and not jp.is_symlink() and jp.is_file():
+        with contextlib.suppress(OSError, ValueError, InstallError):
+            j = json.loads(jp.read_text(encoding="utf-8"))
+            if isinstance(j, dict):
+                for key in ("wrapper_path", "alt_wrapper_path"):
+                    val = j.get(key)
+                    if isinstance(val, str) and val:
+                        found.append(_normalize_wrapper_path(Path(val)))
+    return found
 
 
 def _validate_journal_paths(journal: Any, to_dir: Path, wrapper_path: Path) -> dict[str, Any]:
@@ -522,11 +547,13 @@ def _validate_journal_paths(journal: Any, to_dir: Path, wrapper_path: Path) -> d
 
 
 def _verify_published_set(to_dir: Path, manifest: dict[str, Any]) -> bool:
-    """Confirm live binaries, recorded backups, exact wrapper text (target + store), and store all match the committed manifest."""
+    """Confirm live binaries, recorded backups, exact executable wrapper (target + store), and store all match."""
     cur = manifest["current"]
     for name, key in (("helio", "helio_sha256"), ("helio.exe", "helio_exe_sha256")):
         p = to_dir / name
         if p.is_symlink() or not p.is_file() or sha256_file(p) != cur[key]:
+            return False
+        if name == "helio" and os.name == "posix" and not os.access(p, os.X_OK):
             return False
     prev = manifest.get("previous")
     if prev is not None:
@@ -543,6 +570,8 @@ def _verify_published_set(to_dir: Path, manifest: dict[str, Any]) -> bool:
     if isinstance(w_raw, str) and w_raw:
         wp = _normalize_wrapper_path(Path(w_raw))
         if not wrapper_belongs_to(wp, to_dir):
+            return False
+        if os.name == "posix" and not os.access(wp, os.X_OK):
             return False
         if isinstance(s_raw, str) and s_raw:
             try:
@@ -672,6 +701,8 @@ def recover_if_needed(to_dir: Path, wrapper_path: Path) -> bool:
         allowed = {h for h in (saved.get(name, {}).get("sha256"), desired_hashes.get(name)) if h}
         if actual not in allowed:
             raise InstallError(f"recovery refusing to overwrite externally modified file at {target}", code=2)
+        if not _is_independently_owned_reserved_file(target, name):
+            raise InstallError(f"recovery refusing unowned file at {target}: not a Heliograph artifact", code=2)
 
     for name in BINARY_NAMES + BACKUP_NAMES:
         target = to_dir / name
@@ -885,155 +916,157 @@ def install(
 
         prev_handlers = _install_signal_handlers()
         try:
-            with acquire_ordered_locks(to_dir, wrapper_path):
-                recover_if_needed(to_dir, wrapper_path)
+            with acquire_lock(to_dir / LOCK_NAME, blocking=False):
+                lock_wrappers = _discover_lock_wrappers(to_dir, wrapper_path)
+                with acquire_wrapper_locks(to_dir, *lock_wrappers):
+                    recover_if_needed(to_dir, wrapper_path)
 
-                existing_manifest = read_manifest(to_dir)
-                # Require both live binaries intact whenever replacing an existing managed installation
-                # so every successful replacement guarantees a complete, verifiable previous pair.
-                adopting_legacy = verify_destination_ownership(
-                    to_dir,
-                    existing_manifest,
-                    require_live=existing_manifest is not None,
-                )
+                    existing_manifest = read_manifest(to_dir)
+                    # Require both live binaries intact whenever replacing an existing managed installation
+                    # so every successful replacement guarantees a complete, verifiable previous pair.
+                    adopting_legacy = verify_destination_ownership(
+                        to_dir,
+                        existing_manifest,
+                        require_live=existing_manifest is not None,
+                    )
 
-                wrap_kind, _ = parse_wrapper_ownership(wrapper_path)
-                if wrap_kind == "foreign":
-                    raise InstallError(f"refusing unowned wrapper at {wrapper_path}", code=2)
+                    wrap_kind, _ = parse_wrapper_ownership(wrapper_path)
+                    if wrap_kind == "foreign":
+                        raise InstallError(f"refusing unowned wrapper at {wrapper_path}", code=2)
 
-                prev_wrapper_existed = wrap_kind in ("managed", "legacy")
+                    prev_wrapper_existed = wrap_kind in ("managed", "legacy")
 
-                tx_id = secrets.token_hex(6)
-                temp_files = _planned_temp_names(tx_id)
+                    tx_id = secrets.token_hex(6)
+                    temp_files = _planned_temp_names(tx_id)
 
-                # Write staging journal BEFORE creating any .rec/.stage files so even SIGKILL during staging leaves zero leaks.
-                staging_journal = {
-                    "schema_version": 1,
-                    "op": "install",
-                    "phase": "staging",
-                    "tx_id": tx_id,
-                    "to_dir": str(to_dir),
-                    "wrapper_path": str(wrapper_path),
-                    "temp_files": temp_files,
-                }
-                write_json_atomic(to_dir / JOURNAL_NAME, staging_journal)
-
-                try:
-                    saved = _snapshot_files(to_dir, tx_id)
-                    if on_boundary:
-                        on_boundary("after_snapshot")
-
-                    stage_helio = to_dir / f".helio.{tx_id}.stage"
-                    stage_exe = to_dir / f".helio.exe.{tx_id}.stage"
-                    copy_to_staged(helio_src, stage_helio, mode=0o755)
-                    copy_to_staged(helio_exe_src, stage_exe, mode=0o755)
-
-                    rotate_live_to_old = False
-                    previous_entry: dict[str, Any] | None = None
-                    if existing_manifest is not None:
-                        prev_cur = existing_manifest["current"]
-                        previous_entry = {
-                            "commit": prev_cur["commit"],
-                            "dirty": bool(prev_cur.get("dirty", False)),
-                            "installed_at": prev_cur.get("installed_at"),
-                            "helio_sha256": prev_cur["helio_sha256"],
-                            "helio_exe_sha256": prev_cur["helio_exe_sha256"],
-                            "store": prev_cur.get("store", str(store_dir)),
-                            "wrapper": prev_cur.get("wrapper", str(wrapper_path)),
-                        }
-                        rotate_live_to_old = True
-                    elif adopting_legacy:
-                        previous_entry = {
-                            "commit": "legacy",
-                            "dirty": False,
-                            "installed_at": None,
-                            "helio_sha256": saved["helio"]["sha256"],
-                            "helio_exe_sha256": saved["helio.exe"]["sha256"],
-                            "store": str(store_dir),
-                            "wrapper": str(wrapper_path),
-                        }
-                        rotate_live_to_old = True
-
-                    desired_manifest = {
-                        "schema_version": 1,
-                        "current": {
-                            "commit": commit,
-                            "dirty": dirty,
-                            "installed_at": utc_now(),
-                            "helio_sha256": new_helio_sha,
-                            "helio_exe_sha256": new_exe_sha,
-                            "store": str(store_dir),
-                            "wrapper": str(wrapper_path),
-                        },
-                        "previous": previous_entry,
-                    }
-                    desired_wrapper = render_wrapper(to_dir, store_dir)
-
-                    journal = {
+                    # Write staging journal BEFORE creating any .rec/.stage files so even SIGKILL during staging leaves zero leaks.
+                    staging_journal = {
                         "schema_version": 1,
                         "op": "install",
-                        "phase": "publishing",
+                        "phase": "staging",
                         "tx_id": tx_id,
                         "to_dir": str(to_dir),
                         "wrapper_path": str(wrapper_path),
-                        "store_dir": str(store_dir),
-                        "had_manifest": existing_manifest is not None,
-                        "previous_manifest": existing_manifest,
-                        "previous_wrapper_existed": prev_wrapper_existed,
-                        "saved_files": saved,
                         "temp_files": temp_files,
-                        "desired_manifest": desired_manifest,
                     }
-                    write_json_atomic(to_dir / JOURNAL_NAME, journal)
-                    if on_boundary:
-                        on_boundary("after_journal")
+                    write_json_atomic(to_dir / JOURNAL_NAME, staging_journal)
 
-                    # 1. Rotate backups from saved live files.
-                    if rotate_live_to_old:
-                        bak_h = to_dir / f".helio.old.{tx_id}.stage"
-                        bak_e = to_dir / f".helio.exe.old.{tx_id}.stage"
-                        copy_to_staged(to_dir / saved["helio"]["rec_name"], bak_h, mode=0o755)
-                        replace_binary_atomic(bak_h, to_dir / "helio.old")
+                    try:
+                        saved = _snapshot_files(to_dir, tx_id)
                         if on_boundary:
-                            on_boundary("after_backup_helio")
-                        copy_to_staged(to_dir / saved["helio.exe"]["rec_name"], bak_e, mode=0o755)
-                        replace_binary_atomic(bak_e, to_dir / "helio.exe.old")
+                            on_boundary("after_snapshot")
+
+                        stage_helio = to_dir / f".helio.{tx_id}.stage"
+                        stage_exe = to_dir / f".helio.exe.{tx_id}.stage"
+                        copy_to_staged(helio_src, stage_helio, mode=0o755)
+                        copy_to_staged(helio_exe_src, stage_exe, mode=0o755)
+
+                        rotate_live_to_old = False
+                        previous_entry: dict[str, Any] | None = None
+                        if existing_manifest is not None:
+                            prev_cur = existing_manifest["current"]
+                            previous_entry = {
+                                "commit": prev_cur["commit"],
+                                "dirty": bool(prev_cur.get("dirty", False)),
+                                "installed_at": prev_cur.get("installed_at"),
+                                "helio_sha256": prev_cur["helio_sha256"],
+                                "helio_exe_sha256": prev_cur["helio_exe_sha256"],
+                                "store": prev_cur.get("store", str(store_dir)),
+                                "wrapper": prev_cur.get("wrapper", str(wrapper_path)),
+                            }
+                            rotate_live_to_old = True
+                        elif adopting_legacy:
+                            previous_entry = {
+                                "commit": "legacy",
+                                "dirty": False,
+                                "installed_at": None,
+                                "helio_sha256": saved["helio"]["sha256"],
+                                "helio_exe_sha256": saved["helio.exe"]["sha256"],
+                                "store": str(store_dir),
+                                "wrapper": str(wrapper_path),
+                            }
+                            rotate_live_to_old = True
+
+                        desired_manifest = {
+                            "schema_version": 1,
+                            "current": {
+                                "commit": commit,
+                                "dirty": dirty,
+                                "installed_at": utc_now(),
+                                "helio_sha256": new_helio_sha,
+                                "helio_exe_sha256": new_exe_sha,
+                                "store": str(store_dir),
+                                "wrapper": str(wrapper_path),
+                            },
+                            "previous": previous_entry,
+                        }
+                        desired_wrapper = render_wrapper(to_dir, store_dir)
+
+                        journal = {
+                            "schema_version": 1,
+                            "op": "install",
+                            "phase": "publishing",
+                            "tx_id": tx_id,
+                            "to_dir": str(to_dir),
+                            "wrapper_path": str(wrapper_path),
+                            "store_dir": str(store_dir),
+                            "had_manifest": existing_manifest is not None,
+                            "previous_manifest": existing_manifest,
+                            "previous_wrapper_existed": prev_wrapper_existed,
+                            "saved_files": saved,
+                            "temp_files": temp_files,
+                            "desired_manifest": desired_manifest,
+                        }
+                        write_json_atomic(to_dir / JOURNAL_NAME, journal)
                         if on_boundary:
-                            on_boundary("after_backup_exe")
+                            on_boundary("after_journal")
 
-                    # 2. Publish live executables atomically.
-                    replace_binary_atomic(stage_helio, to_dir / "helio")
-                    if on_boundary:
-                        on_boundary("after_helio")
+                        # 1. Rotate backups from saved live files.
+                        if rotate_live_to_old:
+                            bak_h = to_dir / f".helio.old.{tx_id}.stage"
+                            bak_e = to_dir / f".helio.exe.old.{tx_id}.stage"
+                            copy_to_staged(to_dir / saved["helio"]["rec_name"], bak_h, mode=0o755)
+                            replace_binary_atomic(bak_h, to_dir / "helio.old")
+                            if on_boundary:
+                                on_boundary("after_backup_helio")
+                            copy_to_staged(to_dir / saved["helio.exe"]["rec_name"], bak_e, mode=0o755)
+                            replace_binary_atomic(bak_e, to_dir / "helio.exe.old")
+                            if on_boundary:
+                                on_boundary("after_backup_exe")
 
-                    replace_binary_atomic(stage_exe, to_dir / "helio.exe")
-                    if on_boundary:
-                        on_boundary("after_helio_exe")
+                        # 2. Publish live executables atomically.
+                        replace_binary_atomic(stage_helio, to_dir / "helio")
+                        if on_boundary:
+                            on_boundary("after_helio")
 
-                    # 3. Publish destination-bound wrapper.
-                    write_bytes_atomic(wrapper_path, desired_wrapper.encode("utf-8"), mode=0o755)
-                    if on_boundary:
-                        on_boundary("after_wrapper")
+                        replace_binary_atomic(stage_exe, to_dir / "helio.exe")
+                        if on_boundary:
+                            on_boundary("after_helio_exe")
 
-                    # 4. Ensure store is initialized (never touching an already-initialized store).
-                    _ensure_store_ready(to_dir / "helio", store_dir)
+                        # 3. Publish destination-bound wrapper.
+                        write_bytes_atomic(wrapper_path, desired_wrapper.encode("utf-8"), mode=0o755)
+                        if on_boundary:
+                            on_boundary("after_wrapper")
 
-                    # 5. Commit manifest (atomic commit point).
-                    write_json_atomic(to_dir / MANIFEST_NAME, desired_manifest)
-                    if on_boundary:
-                        on_boundary("after_manifest")
+                        # 4. Ensure store is initialized (never touching an already-initialized store).
+                        _ensure_store_ready(to_dir / "helio", store_dir)
 
-                    # 6. Remove transaction temp files BEFORE unlinking the journal so a crash here leaves zero orphaned snapshots.
-                    _cleanup_temp_files(to_dir, temp_files, tx_id)
-                    (to_dir / JOURNAL_NAME).unlink()
-                    fsync_dir(to_dir)
-                    return desired_manifest
-                except BaseException as exc:
-                    if getattr(exc, "_leave_journal_for_test", False):
+                        # 5. Commit manifest (atomic commit point).
+                        write_json_atomic(to_dir / MANIFEST_NAME, desired_manifest)
+                        if on_boundary:
+                            on_boundary("after_manifest")
+
+                        # 6. Remove transaction temp files BEFORE unlinking the journal so a crash here leaves zero orphaned snapshots.
+                        _cleanup_temp_files(to_dir, temp_files, tx_id)
+                        (to_dir / JOURNAL_NAME).unlink()
+                        fsync_dir(to_dir)
+                        return desired_manifest
+                    except BaseException as exc:
+                        if getattr(exc, "_leave_journal_for_test", False):
+                            raise
+                        with contextlib.suppress(InstallError, OSError):
+                            recover_if_needed(to_dir, wrapper_path)
                         raise
-                    with contextlib.suppress(InstallError, OSError):
-                        recover_if_needed(to_dir, wrapper_path)
-                    raise
         finally:
             _restore_signal_handlers(prev_handlers)
 
@@ -1129,13 +1162,7 @@ def go_back(
     try:
         # Acquire destination lock FIRST, then inspect manifest/journal under that lock to discover all wrapper dirs.
         with acquire_lock(to_dir / LOCK_NAME, blocking=False):
-            lock_wrappers = [wrapper_path]
-            with contextlib.suppress(InstallError):
-                peek = read_manifest(to_dir)
-                if peek and isinstance(peek.get("previous"), dict) and isinstance(peek["previous"].get("wrapper"), str):
-                    lock_wrappers.append(_normalize_wrapper_path(Path(peek["previous"]["wrapper"])))
-                if peek and isinstance(peek.get("current"), dict) and isinstance(peek["current"].get("wrapper"), str):
-                    lock_wrappers.append(_normalize_wrapper_path(Path(peek["current"]["wrapper"])))
+            lock_wrappers = _discover_lock_wrappers(to_dir, wrapper_path)
             with acquire_wrapper_locks(to_dir, *lock_wrappers):
                 recover_if_needed(to_dir, wrapper_path)
 
@@ -1264,12 +1291,17 @@ def go_back(
                     if desired_wrapper_content is not None:
                         target_wrapper.parent.mkdir(parents=True, exist_ok=True)
                         write_bytes_atomic(target_wrapper, desired_wrapper_content.encode("utf-8"), mode=0o755)
-                        if target_wrapper != wrapper_path:
+                        old_wrappers = {wrapper_path}
+                        if isinstance(cur.get("wrapper"), str) and cur["wrapper"]:
+                            old_wrappers.add(_normalize_wrapper_path(Path(cur["wrapper"])))
+                        old_wrappers.discard(target_wrapper)
+                        if old_wrappers:
                             if on_boundary:
                                 on_boundary("after_target_wrapper")
-                            if wrapper_belongs_to(wrapper_path, to_dir):
-                                wrapper_path.unlink()
-                                fsync_dir(wrapper_path.parent)
+                            for ow in sorted(old_wrappers, key=str):
+                                if wrapper_belongs_to(ow, to_dir):
+                                    ow.unlink()
+                                    fsync_dir(ow.parent)
                     if on_boundary:
                         on_boundary("after_wrapper")
 
@@ -1314,11 +1346,7 @@ def remove(
     try:
         # Acquire destination lock FIRST, then inspect manifest under that lock to discover all wrapper dirs.
         with acquire_lock(to_dir / LOCK_NAME, blocking=False):
-            lock_wrappers = [wrapper_path]
-            with contextlib.suppress(InstallError):
-                peek = read_manifest(to_dir)
-                if peek and isinstance(peek.get("current"), dict) and isinstance(peek["current"].get("wrapper"), str):
-                    lock_wrappers.append(_normalize_wrapper_path(Path(peek["current"]["wrapper"])))
+            lock_wrappers = _discover_lock_wrappers(to_dir, wrapper_path)
             with acquire_wrapper_locks(to_dir, *lock_wrappers):
                 recovered = recover_if_needed(to_dir, wrapper_path)
                 manifest = read_manifest(to_dir)
@@ -1367,6 +1395,8 @@ def remove(
                     if wrapper_owned:
                         wrapper_path.unlink()
                         fsync_dir(wrapper_path.parent)
+                        if on_boundary:
+                            on_boundary("after_invocation_wrapper")
                     if recorded_wrapper_owned and recorded_wrapper is not None:
                         recorded_wrapper.unlink()
                         fsync_dir(recorded_wrapper.parent)
