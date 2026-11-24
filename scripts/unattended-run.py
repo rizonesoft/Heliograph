@@ -28,14 +28,16 @@ import argparse
 from datetime import datetime, timezone
 import importlib.util
 import json
+import locale
 import os
 from pathlib import Path
 import re
+import select
 import shlex
 import signal
 import subprocess
 import sys
-import threading
+import tempfile
 import time
 import uuid
 
@@ -244,70 +246,70 @@ def agent_command(root: Path, profile: dict, tag: str, resume_id: str | None) ->
     raise RunError(f"agent {agent!r} has no launch command")
 
 
-def _stream_pipe(pipe, lines: list[str], out) -> None:
-    """Drain `pipe` line by line into `lines`, mirroring each line to `out` immediately so long preflight checks
-    never leave the launcher terminal blank."""
-    try:
-        for line in pipe:
-            lines.append(line)
-            if out is not None:
-                out.write(line)
-                out.flush()
-    finally:
-        pipe.close()
-
-
-def _end_preflight(proc: subprocess.Popen, tag: str) -> None:
-    """Kill the preflight process group and all tagged descendants, reaping `proc` before waiting for the group to
-    clear (an unreaped zombie group leader otherwise keeps `killpg(pgid, 0)` true for the full KILL_WAIT_SECONDS)."""
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    for pid in tagged(tag):
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    proc.wait()
-    end_run_processes(tag, proc.pid, grace=0)
-
-
-def run_preflight(root: Path, resume_session: str | None, profile: dict, out=None) -> tuple[int, str]:
+def run_preflight(root: Path, resume_session: str | None, profile: dict, out) -> int:
     """Run the preflight in its own process group, given as long as its profile checks may take plus its own checks,
-    streaming each check's line to `out` as it completes, and ending the whole group when it overruns or the launcher
-    is interrupted."""
+    and end the whole group when it overruns or the launcher is interrupted. Each of its lines is printed as it comes:
+    a profile check may be a build of minutes, and a window that shows nothing until then reads as a start that hung."""
     # The preflight checks the run on the agent chosen (its CLI, version and Stop hook), not the profile's default.
     args = [sys.executable, str(HERE / "unattended-preflight.py"), "--root", str(root), "--agent", profile["agent"]]
     if resume_session:
         args += ["--resume-session", resume_session]
     limit = PREFLIGHT_SLACK_SECONDS + sum(check["timeout_seconds"] for check in profile["preflight"])
-    sink = Unfailing(out) if out is not None else None
-    if sink is not None:
-        print(f"start: running preflight for {profile['agent']}...", file=sink, flush=True)
     # Its profile checks run in sessions of their own, outside its group: the tag reaches them all.
     tag = f"preflight-{uuid.uuid4()}"
-    proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    hung = []  # the launcher's window closed: the checks run in sessions its hangup does not reach, so they are ended here
+    previous = signal.getsignal(signal.SIGHUP)
+    if previous == signal.SIG_DFL:
+        signal.signal(signal.SIGHUP, lambda *_: hung.append(True))
+    proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             start_new_session=True, env={**os.environ, TAG: tag}, creationflags=lib.windowless())
-    lines: list[str] = []
-    reader = threading.Thread(target=_stream_pipe, args=(proc.stdout, lines, sink), daemon=True)
-    reader.start()
+    deadline = time.monotonic() + limit
+    spoken = locale.getpreferredencoding(False)  # the preflight's own output encoding
+    pending, overran = b"", False
     try:
-        proc.wait(timeout=limit)
-    except subprocess.TimeoutExpired:
-        _end_preflight(proc, tag)
-        reader.join(timeout=10)
-        timeout_line = f"FAIL preflight: ran past {limit}s; it and its checks were ended"
-        if sink is not None:
-            print(timeout_line, file=sink, flush=True)
-        body = "".join(lines).rstrip()
-        return 1, (f"{body}\n{timeout_line}" if body else timeout_line)
+        with proc.stdout as pipe:
+            while True:
+                left = deadline - time.monotonic()  # read each time: a pipe that always has more holds no one past it
+                if left <= 0:
+                    overran = True
+                    break
+                if hung:
+                    raise SystemExit(129)
+                if not select.select([pipe], [], [], min(left, 0.5))[0]:
+                    continue
+                chunk = os.read(pipe.fileno(), 65536)
+                if not chunk:
+                    break
+                *lines, pending = (pending + chunk).split(b"\n")
+                for line in lines:
+                    print(line.decode(spoken, "replace").rstrip(), file=out, flush=True)
+            if pending:
+                print(pending.decode(spoken, "replace").rstrip(), file=out, flush=True)
+        if not overran:
+            try:
+                proc.wait(timeout=max(0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                overran = True
     except BaseException:
         _end_preflight(proc, tag)
-        reader.join(timeout=10)
         raise
-    reader.join(timeout=10)
-    return proc.returncode, "".join(lines).rstrip()
+    finally:
+        if previous == signal.SIG_DFL:
+            signal.signal(signal.SIGHUP, previous)
+    if overran or hung:
+        _end_preflight(proc, tag)
+    if hung:  # it arrived as the preflight ended: the operator who closed the window starts nothing
+        raise SystemExit(129)
+    if overran:
+        print(f"FAIL preflight: ran past {limit}s; it and its checks were ended", file=out, flush=True)
+        return 1
+    return proc.returncode
+
+
+def _end_preflight(proc: subprocess.Popen, tag: str) -> None:
+    proc.kill()
+    proc.wait()  # reaped first: its group counts as alive until then, and the end below would wait for it
+    end_run_processes(tag, proc.pid, grace=0)
 
 
 def _alive(name: str) -> bool | None:
@@ -386,6 +388,22 @@ def end_run_processes(session: str, pgid: int | None, grace: float = STOP_GRACE_
     return tagged(session) + ([pgid] if pgid and _group_alive(pgid) else [])
 
 
+def _without_menus(run_session: str) -> None:
+    """Give the run's session a key table of its own: the server's root table without its mouse menus, whose Kill and
+    Respawn rows ended a run of six hours from a right click made to paste (2026-11-24). The operator's other sessions
+    keep the menus, and the prefix keys still detach. A copy left by an earlier run is replaced."""
+    table = f"{run_session}-keys"  # this session's own: a second run's start never touches a live run's table
+    keys = tmux("list-keys", "-T", "root", check=True).stdout.splitlines()
+    kept = [line.replace("-T root", f"-T {table}", 1) for line in keys
+            if not ("display-menu" in line and re.search(r"-T root\s+\S*Mouse", line))]
+    tmux("unbind-key", "-a", "-q", "-T", table)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".tmux") as source:
+        source.write("\n".join(kept) + "\n")
+        source.flush()
+        tmux("source-file", source.name, check=True)
+    tmux("set-option", "-t", f"={run_session}:", "key-table", table, check=True)
+
+
 def _launch(root: Path, run_session: str, argv: list[str], session: str) -> int:
     """Start `argv` as the only window of the detached tmux session `run_session`, with a 50,000-line history (tmux
     applies history-limit to new windows only, so a placeholder window is replaced), inside the repository and with
@@ -399,6 +417,7 @@ def _launch(root: Path, run_session: str, argv: list[str], session: str) -> int:
         tmux("set-option", "-t", f"={run_session}:", "history-limit", str(HISTORY_LIMIT), check=True)
         # The mouse on, so an attached window scrolls the history with the wheel and selects with a drag.
         tmux("set-option", "-t", f"={run_session}:", "mouse", "on", check=True)
+        _without_menus(run_session)
         # The agent's window opens on a placeholder, keeps its pane on exit, and only then is the agent respawned into
         # it: an agent that exits at once is still there to read, not a window that vanished before the option was set.
         tmux("new-window", "-d", "-t", f"={run_session}:", "-n", "agent", "-c", str(root), "sleep 30", check=True)
@@ -484,9 +503,9 @@ def start(root: Path, out=None, supervise: bool = True, ships: int | None = None
             print(f"start: the crashed run was {old['agent']}, the profile now names {profile['agent']}; its "
                   f"session is not resumed, and a fresh {profile['agent']} session starts", file=out)
             resume = None
-        code, _ = run_preflight(root, old["session"] if old else None, profile, out=out)
+        code = run_preflight(root, old["session"] if old else None, profile, out)
         if code != 0:
-            print("start: the preflight refused the run (FAIL lines above); nothing was started", file=out, flush=True)
+            print("start: the preflight refused the run (FAIL lines above); nothing was started", file=out)
             return 1
         started = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         try:
@@ -1338,11 +1357,6 @@ def main(argv: list[str] | None = None) -> int:
     root = Path(args.root).resolve()
     try:
         if args.command == "start":
-            # Closing the launcher terminal mid-preflight sends SIGHUP; turning it into SystemExit lets
-            # run_preflight()'s BaseException cleanup end the detached preflight and its children instead of orphaning them.
-            def _on_hangup(_signum, _frame):
-                raise SystemExit(129)
-            signal.signal(signal.SIGHUP, _on_hangup)
             return start(root, supervise=not args.no_heartbeat, ships=args.ships, agent=args.agent)
         if args.command == "status":
             return status(root)

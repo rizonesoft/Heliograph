@@ -362,7 +362,7 @@
     },
     "docs/unattended-run.md": {
       "kit": "unattended",
-      "sha256": "5b76a2ea35c5b08b1642931726b2f53f2333ba1a0b54946c6db8e82ddc84dd4f"
+      "sha256": "fe5fdf252bcaf874c15945e669a787e09210313da27168da808a9f453ea70010"
     },
     "scripts/campaign-icon.py": {
       "kit": "launchers",
@@ -450,7 +450,7 @@
     },
     "scripts/tests/test_preflight.py": {
       "kit": "unattended",
-      "sha256": "c9fa33a086aef21519397b2e04dbd95fab204cd35b44e8e8bb068a383901ee3f"
+      "sha256": "970ee821679e858c8c4816f59a3d64cf311b8314b7ec10196525d97fe5ba122c"
     },
     "scripts/tests/test_project_shortcuts.py": {
       "kit": "launchers",
@@ -470,7 +470,7 @@
     },
     "scripts/tests/test_run.py": {
       "kit": "unattended",
-      "sha256": "c65f683508b2ad6cbb1929b5e2f47b0e4595a0545f660914377672cfd0330e78"
+      "sha256": "aac90004f9bc0e4c0c74f88c2f2e013939d1becbfb76536571e1925dbeb5d4f8"
     },
     "scripts/tests/test_shortcut.py": {
       "kit": "unattended",
@@ -490,11 +490,11 @@
     },
     "scripts/unattended-preflight.py": {
       "kit": "unattended",
-      "sha256": "08e5db14a355565b07bc3913464170fcd212f9c8da0ecadde70557b73d53d495"
+      "sha256": "e03babba088a2d9982799f2bcd777d504ef256db8fa60ef2a5b65e68c6019405"
     },
     "scripts/unattended-run.py": {
       "kit": "unattended",
-      "sha256": "8a29716e25860bdcb315538815bae117e810d6a87991322a844cb8eef2a49836"
+      "sha256": "d6b35613b51dcf8a6e8be242e4a3ae1838cfb4b24bfd65a7c528b0eaa698026b"
     },
     "scripts/unattended-shortcut.ps1": {
       "kit": "unattended",
@@ -569,7 +569,7 @@
         "codex"
       ],
       "host": null,
-      "sdk_commit": "b1eec74f3ca1f209ac23035b621a416c9d1db8db"
+      "sdk_commit": "18c6cd38f18052ba7ba013ac1bead92b767699c9"
     }
   },
   "schema_version": 1
