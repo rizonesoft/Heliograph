@@ -644,6 +644,42 @@ class TestQuickInstaller(unittest.TestCase):
             self.assertEqual(ctx.exception.code, 2)
             self.assertFalse((fman_dir / self.mod.MANIFEST_NAME).exists())
             self.assertFalse((existing_ext_dir / self.mod.WRAPPER_LOCK_NAME).exists())
+            self.assertFalse((existing_ext_dir / "helio").exists())
+
+            # 7c. Interrupted reinstall of C through A's wrapper (after A and B had distinct wrappers/stores) restores A's store (not B's!).
+            re_dir = root / "reinst_prev_wrap"
+            r_wa, r_wb = root / "r_wa" / "helio", root / "r_wb" / "helio"
+            r_sa, r_sb, r_sc = root / "r_sa", root / "r_sb", root / "r_sc"
+            self.mod.install(repo=repo, to_dir=re_dir, store_dir=r_sa, wrapper_path=r_wa, prebuilt=(a_h, a_e))
+            self.mod.install(repo=repo, to_dir=re_dir, store_dir=r_sb, wrapper_path=r_wb, prebuilt=(b_h, b_e))
+
+            def crash_after_wrap(stage: str) -> None:
+                if stage == "after_wrapper":
+                    raise SimulatedCrash(stage)
+
+            with self.assertRaises(SimulatedCrash):
+                self.mod.install(repo=repo, to_dir=re_dir, store_dir=r_sc, wrapper_path=r_wa, prebuilt=(a_h, a_e), on_boundary=crash_after_wrap)
+            self.assertTrue(self.mod.recover_if_needed(re_dir, r_wa))
+            self.assertEqual(r_wa.read_text(encoding="utf-8"), self.mod.render_wrapper(re_dir, r_sa))
+
+            # 7d. Interrupted --back with a pre-existing third wrapper C (and per-unlink boundary after_unlink_old_wrapper_0).
+            w3_dir = root / "back_preexist_c"
+            w3a, w3b, w3c = root / "w3a2" / "helio", root / "w3b2" / "helio", root / "w3c2" / "helio"
+            s3a, s3b, s3c = root / "s3a2", root / "s3b2", root / "s3c2"
+            self.mod.install(repo=repo, to_dir=w3_dir, store_dir=s3c, wrapper_path=w3c, prebuilt=(a_h, a_e))
+            self.mod.install(repo=repo, to_dir=w3_dir, store_dir=s3a, wrapper_path=w3a, prebuilt=(a_h, a_e))
+            self.mod.install(repo=repo, to_dir=w3_dir, store_dir=s3b, wrapper_path=w3b, prebuilt=(b_h, b_e))
+
+            def crash_at_unlink_0(stage: str) -> None:
+                if stage == "after_unlink_old_wrapper_0":
+                    raise SimulatedCrash(stage)
+
+            with self.assertRaises(SimulatedCrash):
+                self.mod.go_back(to_dir=w3_dir, wrapper_path=w3c, on_boundary=crash_at_unlink_0)
+            self.assertTrue(self.mod.recover_if_needed(w3_dir, w3c))
+            self.assertEqual(w3a.read_text(encoding="utf-8"), self.mod.render_wrapper(w3_dir, s3a))
+            self.assertEqual(w3b.read_text(encoding="utf-8"), self.mod.render_wrapper(w3_dir, s3b))
+            self.assertEqual(w3c.read_text(encoding="utf-8"), self.mod.render_wrapper(w3_dir, s3c))
 
             # 8. Foreign journal with an unrelated .rec copy and absent target is refused without publishing it,
             #    and a foreign journal naming a nonexistent external dir creates neither the dir nor a lock file.

@@ -462,23 +462,49 @@ def _cleanup_temp_files(to_dir: Path, temp_names: list[str], tx_id: str) -> None
     fsync_dir(to_dir)
 
 
+def parse_wrapper_store(wrapper_path: Path) -> str | None:
+    """Extract the configured default store path from a managed or legacy Heliograph wrapper."""
+    kind, _ = parse_wrapper_ownership(wrapper_path)
+    if kind not in ("managed", "legacy"):
+        return None
+    try:
+        text = wrapper_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("HELIO_STORE="):
+            rhs = stripped[len("HELIO_STORE="):]
+            if kind == "managed":
+                try:
+                    tokens = shlex.split(rhs)
+                except ValueError:
+                    return None
+                return tokens[0] if tokens else None
+            # Legacy form: HELIO_STORE="${HELIO_STORE:-<store>}" exec ...
+            if ":-" in rhs and "}" in rhs:
+                inner = rhs.split(":-", 1)[1].split("}", 1)[0]
+                return os.path.expandvars(inner)
+    return None
+
+
 def _discover_lock_wrappers(to_dir: Path, wrapper_path: Path) -> list[Path]:
     """Discover wrapper paths to lock while to_dir lock is held.
 
     Only trusts wrapper paths from an on-disk manifest whose live binaries are independently verified
-    Heliograph artifacts (never from an unverified journal), so a foreign journal can never create
-    external directories or lock files, while a real installation's deleted wrapper dir is still locked.
+    Heliograph artifacts matching either the current or previous generation recorded in that manifest.
     """
     found: list[Path] = [wrapper_path]
     with contextlib.suppress(InstallError):
         m = read_manifest(to_dir)
         if m:
-            cur = m["current"]
+            gens = [g for g in (m.get("current"), m.get("previous")) if isinstance(g, dict)]
             verified_live = any(
                 (to_dir / name).is_file()
                 and not (to_dir / name).is_symlink()
-                and sha256_file(to_dir / name) == cur[key]
+                and sha256_file(to_dir / name) == g.get(key)
                 and _is_independently_owned_reserved_file(to_dir / name, name)
+                for g in gens
                 for name, key in (("helio", "helio_sha256"), ("helio.exe", "helio_exe_sha256"))
             )
             if verified_live:
@@ -495,6 +521,9 @@ def _discover_lock_wrappers(to_dir: Path, wrapper_path: Path) -> list[Path]:
 def _validate_journal_paths(journal: Any, to_dir: Path, wrapper_path: Path) -> dict[str, Any]:
     if not isinstance(journal, dict):
         raise InstallError("corrupt or foreign install journal: not a JSON object", code=2)
+    sv = journal.get("schema_version")
+    if sv not in (1, 2):
+        raise InstallError("unrecognized install journal schema", code=2)
     allowed_keys = {
         "schema_version",
         "op",
@@ -505,7 +534,6 @@ def _validate_journal_paths(journal: Any, to_dir: Path, wrapper_path: Path) -> d
         "store_dir",
         "had_manifest",
         "previous_manifest",
-        "previous_wrapper_existed",
         "pre_wrappers",
         "remove_wrappers",
         "saved_files",
@@ -513,11 +541,17 @@ def _validate_journal_paths(journal: Any, to_dir: Path, wrapper_path: Path) -> d
         "expected_hashes",
         "desired_manifest",
     }
+    if sv == 1:
+        allowed_keys |= {
+            "previous_wrapper_existed",
+            "alt_wrapper_path",
+            "alt_wrapper_existed",
+            "prev_current_wrapper_path",
+            "prev_current_wrapper_existed",
+        }
     unknown_keys = set(journal) - allowed_keys
     if unknown_keys:
         raise InstallError(f"corrupt or foreign install journal: unknown keys {sorted(unknown_keys)}", code=2)
-    if journal.get("schema_version") != 1:
-        raise InstallError("unrecognized install journal schema", code=2)
     op = journal.get("op")
     if op not in ("install", "back", "remove"):
         raise InstallError("invalid install journal operation", code=2)
@@ -556,6 +590,13 @@ def _validate_journal_paths(journal: Any, to_dir: Path, wrapper_path: Path) -> d
                 rec = m.get(section)
                 if isinstance(rec, dict) and isinstance(rec.get("wrapper"), str) and rec["wrapper"]:
                     allowed_manifest_wrappers.add(_normalize_wrapper_path(Path(rec["wrapper"])))
+
+    if sv == 1:
+        for wkey in ("alt_wrapper_path", "prev_current_wrapper_path"):
+            wval = journal.get(wkey)
+            if wval is not None:
+                if op not in ("back", "remove") or _normalize_wrapper_path(Path(str(wval))) not in allowed_manifest_wrappers:
+                    raise InstallError(f"journal {wkey} is not bound to a recorded manifest wrapper", code=2)
 
     pre_wrappers = journal.get("pre_wrappers")
     if pre_wrappers is not None:
@@ -772,21 +813,12 @@ def recover_if_needed(to_dir: Path, wrapper_path: Path) -> bool:
                 target.unlink()
     fsync_dir(to_dir)
 
-    # Restore every touched wrapper once from the deduplicated pre_wrappers map, never clobbering another destination.
-    pre_wrappers: dict[str, str | None] = journal.get("pre_wrappers") or {}
-    for wp_str, store_val in pre_wrappers.items():
-        wp = _normalize_wrapper_path(Path(wp_str))
-        if store_val is not None:
-            _restore_wrapper_from_manifest(wp, to_dir, store_val)
-        elif wrapper_belongs_to(wp, to_dir):
-            wp.unlink()
-            fsync_dir(wp.parent)
-
-    # Restore manifest state only after verifying the restored live binaries are genuine Heliograph binaries matching it.
-    if journal.get("had_manifest") and isinstance(prev_manifest, dict):
-        pm_cur = prev_manifest.get("current") if isinstance(prev_manifest.get("current"), dict) else None
-        if pm_cur is None:
+    # Verify manifest restoration preconditions BEFORE mutating any wrapper or writing installed.json,
+    # so a foreign journal with no genuine Heliograph binaries is rejected with zero external writes.
+    if journal.get("had_manifest"):
+        if not isinstance(prev_manifest, dict) or not isinstance(prev_manifest.get("current"), dict):
             raise InstallError("recovery refusing invalid previous_manifest in journal", code=2)
+        pm_cur = prev_manifest["current"]
         for name, key in (("helio", "helio_sha256"), ("helio.exe", "helio_exe_sha256")):
             p = to_dir / name
             if (
@@ -796,6 +828,41 @@ def recover_if_needed(to_dir: Path, wrapper_path: Path) -> bool:
                 or not _is_independently_owned_reserved_file(p, name)
             ):
                 raise InstallError(f"recovery refusing to write manifest: {p} does not match verified Heliograph binary", code=2)
+
+    # Restore every touched wrapper once from the deduplicated pre_wrappers map (with v1 fallback).
+    pre_wrappers: dict[str, str | None]
+    if "pre_wrappers" in journal and isinstance(journal["pre_wrappers"], dict):
+        pre_wrappers = journal["pre_wrappers"]
+    else:
+        # Seamless recovery for v1 journals written before pre_wrappers existed.
+        pre_wrappers = {}
+        prev_store = prev_manifest["current"].get("store") if isinstance(prev_manifest, dict) else None
+        alt_store = (
+            prev_manifest["previous"].get("store")
+            if isinstance(prev_manifest, dict) and isinstance(prev_manifest.get("previous"), dict)
+            else None
+        )
+        if journal.get("previous_wrapper_existed") and prev_store:
+            pre_wrappers[str(wrapper_path)] = prev_store
+        else:
+            pre_wrappers[str(wrapper_path)] = None
+        if isinstance(journal.get("alt_wrapper_path"), str):
+            aw = str(_normalize_wrapper_path(Path(journal["alt_wrapper_path"])))
+            pre_wrappers[aw] = alt_store if journal.get("alt_wrapper_existed") else None
+        if isinstance(journal.get("prev_current_wrapper_path"), str):
+            pcw = str(_normalize_wrapper_path(Path(journal["prev_current_wrapper_path"])))
+            pre_wrappers[pcw] = prev_store if journal.get("prev_current_wrapper_existed") else None
+
+    for wp_str, store_val in pre_wrappers.items():
+        wp = _normalize_wrapper_path(Path(wp_str))
+        if store_val is not None:
+            _restore_wrapper_from_manifest(wp, to_dir, store_val)
+        elif wrapper_belongs_to(wp, to_dir):
+            wp.unlink()
+            fsync_dir(wp.parent)
+
+    # Restore manifest state (already verified above).
+    if journal.get("had_manifest") and isinstance(prev_manifest, dict):
         write_json_atomic(manifest_file, prev_manifest)
     else:
         if manifest_file.exists() and not manifest_file.is_symlink():
@@ -1049,14 +1116,9 @@ def install(
                         }
                         desired_wrapper = render_wrapper(to_dir, store_dir)
 
-                        prev_wrap_store: str | None = None
-                        if prev_wrapper_existed:
-                            if existing_manifest is not None and isinstance(existing_manifest["current"].get("store"), str):
-                                prev_wrap_store = existing_manifest["current"]["store"]
-                            else:
-                                prev_wrap_store = str(store_dir)
+                        prev_wrap_store: str | None = parse_wrapper_store(wrapper_path) if prev_wrapper_existed else None
                         journal = {
-                            "schema_version": 1,
+                            "schema_version": 2,
                             "op": "install",
                             "phase": "publishing",
                             "tx_id": tx_id,
@@ -1303,23 +1365,17 @@ def go_back(
                         if isinstance(cur.get("wrapper"), str) and cur["wrapper"]
                         else wrapper_path
                     )
-                    # Build one deduplicated pre_wrappers map capturing the exact pre-rollback store for every touched wrapper path.
-                    # Precedence for a path shared by both generations: current generation's store wins because it was written last.
+                    # Build one deduplicated pre_wrappers map by reading the actual pre-transaction store from each wrapper on disk.
                     pre_wrappers: dict[str, str | None] = {}
                     for wp in (target_wrapper, wrapper_path, cur_recorded_wrapper):
                         key = str(wp)
-                        if not wrapper_belongs_to(wp, to_dir):
-                            pre_wrappers[key] = None
-                        elif wp == cur_recorded_wrapper:
-                            pre_wrappers[key] = cur.get("store") or restored_store
-                        elif wp == target_wrapper:
-                            pre_wrappers[key] = previous.get("store") or restored_store
-                        else:
-                            pre_wrappers[key] = cur.get("store") or restored_store
+                        if key in pre_wrappers:
+                            continue
+                        pre_wrappers[key] = parse_wrapper_store(wp) if wrapper_belongs_to(wp, to_dir) else None
                     desired_wrapper_content = render_wrapper(to_dir, Path(restored_store)) if restored_store else None
 
                     journal = {
-                        "schema_version": 1,
+                        "schema_version": 2,
                         "op": "back",
                         "phase": "publishing",
                         "tx_id": tx_id,
