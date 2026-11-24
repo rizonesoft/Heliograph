@@ -40,6 +40,7 @@ LEGACY_MARKER = "# Heliograph with this machine's store."
 TARGET_PREFIX = "# target="
 MANIFEST_NAME = "installed.json"
 JOURNAL_NAME = "install.journal.json"
+PHASE_JOURNAL_NAME = "phase.journal.json"
 LOCK_NAME = ".install.lock"
 WRAPPER_LOCK_NAME = ".helio-install.lock"
 BUILD_LOCK_NAME = ".install-build.lock"
@@ -1055,6 +1056,18 @@ def _handle_op_failure(exc: BaseException, to_dir: Path, wrapper_path: Path) -> 
     raise exc
 
 
+def recover_destination(to_dir: Path, wrapper_path: Path) -> bool:
+    """Acquire destination/wrapper locks and recover any pending inner install/back/remove journal."""
+    to_dir = to_dir.resolve()
+    wrapper_path = _normalize_wrapper_path(wrapper_path)
+    if not to_dir.is_dir():
+        return False
+    with acquire_lock(to_dir / LOCK_NAME, blocking=False):
+        lock_wrappers = _discover_lock_wrappers(to_dir, wrapper_path)
+        with acquire_wrapper_locks(to_dir, *lock_wrappers):
+            return recover_if_needed(to_dir, wrapper_path)
+
+
 def install(
     *,
     repo: Path,
@@ -1065,6 +1078,7 @@ def install(
     prebuilt: tuple[Path, Path] | None = None,
     commit_override: str | None = None,
     dirty_override: bool | None = None,
+    allow_phase_journal: bool = False,
     on_boundary: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Build (unless prebuilt is supplied for internal/phase callers) and install Heliograph."""
@@ -1102,6 +1116,11 @@ def install(
         prev_handlers = _install_signal_handlers()
         try:
             with acquire_lock(to_dir / LOCK_NAME, blocking=False):
+                if not allow_phase_journal and (to_dir / PHASE_JOURNAL_NAME).exists():
+                    raise InstallError(
+                        f"refusing install while phase transaction is in progress ({to_dir / PHASE_JOURNAL_NAME}); re-run --phase to recover",
+                        code=3,
+                    )
                 lock_wrappers = _discover_lock_wrappers(to_dir, wrapper_path)
                 with acquire_wrapper_locks(to_dir, *lock_wrappers):
                     recover_if_needed(to_dir, wrapper_path)
@@ -1389,6 +1408,7 @@ def go_back(
     *,
     to_dir: Path,
     wrapper_path: Path,
+    allow_phase_journal: bool = False,
     on_boundary: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Restore the previous installed pair after validating ownership of both live and backup pairs."""
@@ -1401,6 +1421,11 @@ def go_back(
     try:
         # Acquire destination lock FIRST, then inspect manifest/journal under that lock to discover all wrapper dirs.
         with acquire_lock(to_dir / LOCK_NAME, blocking=False):
+            if not allow_phase_journal and (to_dir / PHASE_JOURNAL_NAME).exists():
+                raise InstallError(
+                    f"refusing --back while phase transaction is in progress ({to_dir / PHASE_JOURNAL_NAME}); re-run --phase to recover",
+                    code=3,
+                )
             lock_wrappers = _discover_lock_wrappers(to_dir, wrapper_path)
             with acquire_wrapper_locks(to_dir, *lock_wrappers):
                 recover_if_needed(to_dir, wrapper_path)
@@ -1570,6 +1595,7 @@ def remove(
     *,
     to_dir: Path,
     wrapper_path: Path,
+    allow_phase_journal: bool = False,
     on_boundary: Callable[[str], None] | None = None,
 ) -> bool:
     """Remove only installer-owned files in to_dir and bound wrapper(s). Leaves store untouched."""
@@ -1589,6 +1615,11 @@ def remove(
     try:
         # Acquire destination lock FIRST, then inspect manifest under that lock to discover all wrapper dirs.
         with acquire_lock(to_dir / LOCK_NAME, blocking=False):
+            if not allow_phase_journal and (to_dir / PHASE_JOURNAL_NAME).exists():
+                raise InstallError(
+                    f"refusing --remove while phase transaction is in progress ({to_dir / PHASE_JOURNAL_NAME}); re-run --phase to recover",
+                    code=3,
+                )
             lock_wrappers = _discover_lock_wrappers(to_dir, wrapper_path)
             with acquire_wrapper_locks(to_dir, *lock_wrappers):
                 recovered = recover_if_needed(to_dir, wrapper_path, allow_superseded_wrapper=True)

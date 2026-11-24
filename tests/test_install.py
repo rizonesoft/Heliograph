@@ -3245,6 +3245,23 @@ class TestPhaseInstaller(unittest.TestCase):
                 self.assertEqual(ctx.exception.code, 2)
                 self.assertIn("PARKED", str(ctx.exception))
 
+                # Older Closeout overridden by a newer dated run file with PARKED -> refused!
+                (checkout / "docs" / "phase-runs" / "2026-11-24-phase-0.md").write_text(
+                    "# Phase 0\n\n## Closeout run=old\n\nOld closeout.\n", encoding="utf-8"
+                )
+                (checkout / "docs" / "phase-runs" / "2026-11-25-phase-0.md").write_text(
+                    "# Phase 0\n\nPARKED 2026-11-25T00:00Z run=new reopened-and-parked\n", encoding="utf-8"
+                )
+                subprocess.run(["git", "-C", str(checkout), "add", "docs/phase-runs/2026-11-25-phase-0.md"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(checkout), "commit", "-am", "newer-parked"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(checkout), "push", "origin", "main"], check=True, capture_output=True)
+                with self.assertRaises(self.mod.InstallError) as ctx:
+                    call_phase(0)
+                self.assertEqual(ctx.exception.code, 2)
+                self.assertIn("PARKED", str(ctx.exception))
+                (checkout / "docs" / "phase-runs" / "2026-11-25-phase-0.md").unlink()
+                subprocess.run(["git", "-C", str(checkout), "rm", "docs/phase-runs/2026-11-25-phase-0.md"], check=True, capture_output=True)
+
                 # Restore Closeout, plant unpushed commit (HEAD != origin/main) -> refused
                 (checkout / "docs" / "phase-runs" / "2026-11-24-phase-0.md").write_text(
                     "# Phase 0\n\n## Closeout run=abc\n\nDone.\n", encoding="utf-8"
@@ -3523,18 +3540,48 @@ class TestPhaseInstaller(unittest.TestCase):
             store_dir = root / "store"
             wrapper = root / "local" / "helio"
             prev_dir = root / "prev"
-            cand_dir = root / "cand"
-            prev_h, prev_e = self._make_distinct_pair(prev_dir, b"PREV_COMPAT")
-            cand_h, cand_e = self._make_distinct_pair(cand_dir, b"CAND_COMPAT")
+            prev_dir.mkdir()
 
-            # Install previous, then replace with candidate.
+            # Build a GENUINE previous engine release from git commit `c4de2fe` (pre-Phase-0 baseline)
+            # so the backward-compatibility test exercises a truly older reader, not a tagged copy of the candidate!
+            prev_src = root / "prev_src"
+            prev_src.mkdir()
+            arch = subprocess.run(["git", "-C", str(REPO), "archive", "c4de2fe", "engine", "src"], capture_output=True, check=True)
+            subprocess.run(["tar", "-x", "-C", str(prev_src)], input=arch.stdout, check=True)
+            prev_h = prev_dir / "helio"
+            cc = shutil.which("cc") or shutil.which("gcc")
+            self.assertIsNotNone(cc, "C compiler required to build baseline c4de2fe engine")
+            c_files = sorted(str(p) for p in (prev_src / "engine").glob("*.c")) + [
+                str(prev_src / "src" / "main_linux.c"),
+                str(prev_src / "src" / "plat_linux.c"),
+            ]
+            subprocess.run(
+                [cc, "-std=c23", "-O2", f"-I{prev_src / 'engine'}", f"-I{prev_src / 'src'}", *c_files, "-o", str(prev_h)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            prev_e = prev_dir / "helio.exe"
+            make_distinct_binary(self.helio_exe, prev_e, b"PREV_COMPAT_EXE")
+
+            cand_h, cand_e = self.helio_bin, self.helio_exe
+            self.assertNotEqual(self.mod.sha256_file(prev_h), self.mod.sha256_file(cand_h))
+
+            # Clean env with HELIO_STORE stripped so ambient operator stores are NEVER touched!
+            clean_env = {
+                k: v
+                for k, v in os.environ.items()
+                if k not in ("HELIO_STORE", "HELIO_DEFAULT_STORE", "HELIO_DEFAULT_STORE_HEX", "HELIO_AS")
+            }
+
+            # Install genuine previous engine (c4de2fe), then replace with candidate.
             self.mod.install(
                 repo=REPO,
                 to_dir=to_dir,
                 store_dir=store_dir,
                 wrapper_path=wrapper,
                 prebuilt=(prev_h, prev_e),
-                commit_override="a" * 40,
+                commit_override="c4de2fe" + "0" * 33,
                 dirty_override=False,
             )
             self.mod.install(
@@ -3550,6 +3597,7 @@ class TestPhaseInstaller(unittest.TestCase):
             # Candidate populates the store: a heads-up, a taken+done job, and a keyed message.
             tell_id = subprocess.run(
                 [str(wrapper), "tell", "impossible/all", "compat heads-up", "--as", "impossible/a"],
+                env=clean_env,
                 input="hello from candidate\n",
                 capture_output=True,
                 text=True,
@@ -3557,15 +3605,17 @@ class TestPhaseInstaller(unittest.TestCase):
             ).stdout.strip().splitlines()[-1]
             job_id = subprocess.run(
                 [str(wrapper), "ask", "impossible/all", "compat job", "--as", "impossible/a"],
+                env=clean_env,
                 input="job body from candidate\n",
                 capture_output=True,
                 text=True,
                 check=True,
             ).stdout.strip().splitlines()[-1]
-            subprocess.run([str(wrapper), "take", job_id, "--as", "impossible/b"], check=True, capture_output=True, text=True)
-            subprocess.run([str(wrapper), "done", job_id, "finished", "--as", "impossible/b"], check=True, capture_output=True, text=True)
+            subprocess.run([str(wrapper), "take", job_id, "--as", "impossible/b"], env=clean_env, check=True, capture_output=True, text=True)
+            subprocess.run([str(wrapper), "done", job_id, "finished", "--as", "impossible/b"], env=clean_env, check=True, capture_output=True, text=True)
             keyed_id = subprocess.run(
                 [str(wrapper), "tell", "impossible/all", "compat keyed", "--as", "impossible/a", "--key", "compat-k1"],
+                env=clean_env,
                 input="keyed body\n",
                 capture_output=True,
                 text=True,
@@ -3574,23 +3624,24 @@ class TestPhaseInstaller(unittest.TestCase):
             msg_count_before = len(list((store_dir / "messages").glob("*.post")))
             self.assertEqual(msg_count_before, 3)
 
-            # Roll back to previous program and verify `check`, `show`, job state/taker, and keyed-send idempotence!
+            # Roll back to genuine previous engine (c4de2fe) and verify `check`, `show`, job state/taker, and keyed-send idempotence!
             self.mod.go_back(to_dir=to_dir, wrapper_path=wrapper)
             self.assertEqual(self.mod.sha256_file(to_dir / "helio"), self.mod.sha256_file(prev_h))
 
-            chk = subprocess.run([str(wrapper), "check"], capture_output=True, text=True)
+            chk = subprocess.run([str(wrapper), "check"], env=clean_env, capture_output=True, text=True)
             self.assertEqual(chk.returncode, 0, chk.stdout + chk.stderr)
 
-            show_tell = subprocess.run([str(wrapper), "show", tell_id, "--as", "impossible/b"], capture_output=True, text=True, check=True).stdout
+            show_tell = subprocess.run([str(wrapper), "show", tell_id, "--as", "impossible/b"], env=clean_env, capture_output=True, text=True, check=True).stdout
             self.assertIn("hello from candidate", show_tell)
 
-            show_job = subprocess.run([str(wrapper), "show", job_id, "--as", "impossible/b"], capture_output=True, text=True, check=True).stdout
+            show_job = subprocess.run([str(wrapper), "show", job_id, "--as", "impossible/b"], env=clean_env, capture_output=True, text=True, check=True).stdout
             self.assertIn("job body from candidate", show_job)
             self.assertIn("impossible/b", show_job)
             self.assertIn("done", show_job.lower())
 
             retry_keyed_id = subprocess.run(
                 [str(wrapper), "tell", "impossible/all", "compat keyed", "--as", "impossible/a", "--key", "compat-k1"],
+                env=clean_env,
                 input="keyed body\n",
                 capture_output=True,
                 text=True,
@@ -3772,6 +3823,59 @@ class TestPhaseInstaller(unittest.TestCase):
                 win_after = self.phase_mod._probe_win_state(self.python_exe, win_install_py_win, win_to, reg_key)
                 self.assertEqual(win_after["exe_sha"], v1_e_sha)
                 self.assertEqual(win_after["manifest"]["current"]["commit"], v1_commit)
+
+                # 4. Ordinary --back / --remove refused with exit 3 while phase.journal.json exists!
+                self.mod.write_json_atomic(to_dir / self.phase_mod.PHASE_JOURNAL_NAME, crashed_journal)
+                with self.assertRaises(self.mod.InstallError) as ctx_b:
+                    self.mod.go_back(to_dir=to_dir, wrapper_path=wrapper)
+                self.assertEqual(ctx_b.exception.code, 3)
+                with self.assertRaises(self.mod.InstallError) as ctx_r:
+                    self.mod.remove(to_dir=to_dir, wrapper_path=wrapper)
+                self.assertEqual(ctx_r.exception.code, 3)
+                (to_dir / self.phase_mod.PHASE_JOURNAL_NAME).unlink()
+
+                # 5. Legacy WSL pair without manifest: if phase install fails on Windows, rollback preserves
+                # the legacy binary instead of deleting it!
+                leg_to = root / "legacy_bin"
+                leg_to.mkdir()
+                leg_wrap = root / "leg_local" / "helio"
+                leg_store = root / "leg_store"
+                shutil.copy2(v1_h, leg_to / "helio")
+                shutil.copy2(v1_e, leg_to / "helio.exe")
+                with self.assertRaises(self.mod.InstallError) as ctx_leg:
+                    self.phase_mod.run_phase_install(
+                        repo=checkout,
+                        phase=0,
+                        to_dir=leg_to,
+                        store_dir=leg_store,
+                        wrapper_path=leg_wrap,
+                        win_to_raw=win_to,
+                        reg_key=reg_key,
+                        sdk_url="unused",
+                        install_mod=self.mod,
+                        on_verify=fail_after_win,
+                    )
+                self.assertEqual(ctx_leg.exception.code, 3)
+                self.assertTrue((leg_to / "helio").is_file())
+                self.assertEqual(self.mod.sha256_file(leg_to / "helio"), v1_h_sha)
+
+                # 6. Ambient WSL PATH shadowing triggers fresh-shell rollback!
+                shadow_dir = root / "earlier_wsl_shadow"
+                shadow_dir.mkdir()
+                shadow_helio = shadow_dir / "helio"
+                shadow_helio.write_text("#!/bin/sh\necho SHADOW\n", encoding="utf-8")
+                os.chmod(shadow_helio, 0o755)
+                ambient_path = f"{shadow_dir}:{wrapper.parent}:{os.environ.get('PATH', '/usr/bin:/bin')}"
+                with mock.patch.dict(os.environ, {"PATH": ambient_path}):
+                    with self.assertRaises(self.mod.InstallError) as ctx_sh:
+                        self.phase_mod._run_clean_wsl_helio(
+                            wrapper,
+                            ["check"],
+                            check_ambient_shadowing=True,
+                            install_mod=self.mod,
+                        )
+                    self.assertEqual(ctx_sh.exception.code, 3)
+                    self.assertIn("shadows", str(ctx_sh.exception))
 
                 # Clean up Windows installation cleanly
                 self.phase_mod._run_win_cli(self.python_exe, install_py_win, ["--remove", "--to", win_to, "--reg-key", reg_key])
