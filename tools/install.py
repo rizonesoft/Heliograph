@@ -530,12 +530,8 @@ def _validate_journal_paths(journal: Any, to_dir: Path, wrapper_path: Path) -> d
     schema_version = journal.get("schema_version")
     if schema_version == 2:
         pass
-    elif schema_version == 1 and (
-        phase == "staging"
-        or op == "remove"
-        or (op in ("install", "back") and isinstance(journal.get("pre_wrappers"), dict))
-    ):
-        # Accept v1 staging, v1 removal, and v1 install/back journals that carry explicit pre_wrappers.
+    elif schema_version == 1 and (phase == "staging" or op == "remove"):
+        # Accept v1 staging and v1 removal journals, which carry identical fields and recover losslessly.
         pass
     else:
         raise InstallError("unrecognized install journal schema", code=2)

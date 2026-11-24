@@ -875,7 +875,7 @@ class TestQuickInstaller(unittest.TestCase):
             self.assertFalse(v1_rem_wrap.exists())
             self.assertFalse((v1_rem_dir / self.mod.JOURNAL_NAME).exists())
 
-            # Schema version 1 back/install journals with pre_wrappers (e.g. 306302d) also recover losslessly.
+            # Unrecognized schema version 1 publish journal for install/back is refused without mutating wrappers.
             v1_back_dir = root / "v1_back_rec"
             v1_bw = root / "v1_bw" / "helio"
             v1_bs_old, v1_bs_new = root / "v1_bs_old", root / "v1_bs_new"
@@ -891,8 +891,12 @@ class TestQuickInstaller(unittest.TestCase):
             j_v1_back = json.loads((v1_back_dir / self.mod.JOURNAL_NAME).read_text(encoding="utf-8"))
             j_v1_back["schema_version"] = 1
             (v1_back_dir / self.mod.JOURNAL_NAME).write_text(json.dumps(j_v1_back), encoding="utf-8")
-            self.assertTrue(self.mod.recover_if_needed(v1_back_dir, v1_bw))
-            self.assertEqual(v1_bw.read_text(encoding="utf-8"), self.mod.render_wrapper(v1_back_dir, v1_bs_new))
+            before_wrap = v1_bw.read_text(encoding="utf-8")
+            with self.assertRaises(self.mod.InstallError) as ctx:
+                self.mod.recover_if_needed(v1_back_dir, v1_bw)
+            self.assertEqual(ctx.exception.code, 2)
+            self.assertIn("unrecognized install journal schema", str(ctx.exception))
+            self.assertEqual(v1_bw.read_text(encoding="utf-8"), before_wrap)
 
             # 9. Removing a two-wrapper installation through the CURRENT wrapper (wb) removes BOTH wa and wb.
             rem_cur_dir = root / "rem_via_current_wrap"
