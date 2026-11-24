@@ -1842,7 +1842,10 @@ def main(argv: list[str] | None = None) -> int:
             if args.windows or args.win_to is not None:
                 raise InstallError("--pending-phases cannot be combined with --windows or --win-to", code=2)
             phase_mod = _load_phase_install()
-            pending = phase_mod.find_closed_phases_missing_install(repo)
+            pending = phase_mod.find_closed_phases_missing_install(
+                repo,
+                install_mod=sys.modules.get(__name__) or types.SimpleNamespace(**globals()),
+            )
             print(json.dumps(pending))
             return 1 if pending else 0
         if args.phase is not None:

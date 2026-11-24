@@ -58,7 +58,7 @@ Read `todo/README.md` (the format every TODO edit keeps) before the first edit, 
 
 Ready means runnable now in this context: `query ready` already excludes rows waiting on dependencies, inactive files and people Needs; with `--have auto` it also excludes rows needing a host this session does not meet (`python scripts/todo-graph.py detect` prints the set), and `process-phase` re-checks each row with `resolve` rather than trusting a previous list.
 
-If no phase has a ready row, report the leftovers with their blockers and stop. That is a genuine halt.
+Before selecting a phase or stopping when no phase has a ready row, run `python3 tools/install.py --pending-phases`: if any closed phase lacks its committed `Installed commit: <40-hex-sha>` receipt, run `python3 tools/install.py --phase <n>` (idempotent if both manifests already match `HEAD`), commit `Installed commit: <sha>` in that phase's run file, and push first. If no phase has a ready row and `--pending-phases` is empty, report the leftovers with their blockers and stop. That is a genuine halt.
 
 ### Run guard
 

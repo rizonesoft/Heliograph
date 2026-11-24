@@ -4567,20 +4567,102 @@ class TestPhaseInstaller(unittest.TestCase):
                 self.assertEqual(st_win_a["status_code"], 0, st_win_a["status_lines"])
                 self.assertEqual(st_win_a["exe_sha"], a_e_sha)
                 self.assertEqual(st_win_a["manifest"]["current"]["commit"], a_commit)
+                # Also test FIRST upgrade (B sole generation, previous=None -> failed C): rollback must clear
+                # `previous` on BOTH hosts so ordinary `--back` refuses and never activates failed C!
+                sole_to = root / "sole_wsl_bin"
+                sole_wrap = root / "sole_local" / "helio"
+                sole_win_to = self._win_temp_dir("Helio Sole Gen")
+                sole_reg_key = self._new_reg_key()
+                try:
+                    self.mod.install(
+                        repo=checkout,
+                        to_dir=sole_to,
+                        store_dir=store_dir,
+                        wrapper_path=sole_wrap,
+                        prebuilt=(b_h, b_e),
+                        commit_override=b_commit,
+                        dirty_override=False,
+                    )
+                    rw_sole = self.phase_mod._run_win_cli(
+                        self.python_exe,
+                        install_py_win,
+                        [
+                            "--source-exe",
+                            self.win_mod.wsl_to_windows_path(b_e),
+                            "--source-sha256",
+                            b_e_sha,
+                            "--commit",
+                            b_commit,
+                            "--store",
+                            win_store,
+                            "--to",
+                            sole_win_to,
+                            "--reg-key",
+                            sole_reg_key,
+                        ],
+                    )
+                    self.assertEqual(rw_sole.returncode, 0, rw_sole.stdout + rw_sole.stderr)
+                    with self.assertRaises(self.mod.InstallError) as ctx_sole:
+                        self.phase_mod.run_phase_install(
+                            repo=checkout,
+                            phase=0,
+                            to_dir=sole_to,
+                            store_dir=store_dir,
+                            wrapper_path=sole_wrap,
+                            win_to_raw=sole_win_to,
+                            reg_key=sole_reg_key,
+                            sdk_url="unused",
+                            install_mod=self.mod,
+                            on_verify=fail_verify,
+                        )
+                    self.assertEqual(ctx_sole.exception.code, 3)
+                    # WSL: current=B, previous=None, helio.old absent, ordinary `--back` refuses!
+                    self.assertIsNone(self.mod.read_manifest(sole_to).get("previous"))
+                    self.assertFalse((sole_to / "helio.old").exists())
+                    with self.assertRaises(self.mod.InstallError):
+                        self.mod.go_back(to_dir=sole_to, wrapper_path=sole_wrap)
+                    # Windows: current=B, previous=None, ordinary `--back` refuses!
+                    st_sole_w = self.phase_mod._probe_win_state(self.python_exe, win_install_py_win, sole_win_to, sole_reg_key)
+                    self.assertEqual(st_sole_w["status_code"], 0, st_sole_w["status_lines"])
+                    self.assertEqual(st_sole_w["manifest"]["current"]["commit"], b_commit)
+                    self.assertIsNone(st_sole_w["manifest"].get("previous"))
+                    rb_sole_w = self.phase_mod._run_win_cli(
+                        self.python_exe, install_py_win, ["--back", "--to", sole_win_to, "--reg-key", sole_reg_key]
+                    )
+                    self.assertNotEqual(rb_sole_w.returncode, 0)
+                    self.phase_mod._run_win_cli(self.python_exe, install_py_win, ["--remove", "--to", sole_win_to, "--reg-key", sole_reg_key])
+                finally:
+                    self._delete_reg_key(sole_reg_key)
+                    self._cleanup_win_parent(sole_win_to)
+
                 self.phase_mod._run_win_cli(self.python_exe, install_py_win, ["--remove", "--to", win_to, "--reg-key", reg_key])
         finally:
             self._delete_reg_key(reg_key)
             self._cleanup_win_parent(win_to)
 
     def test_pending_phases_and_restart_after_closeout_or_install(self) -> None:
-        """Process-plan skills name --pending-phases, and restart finds closed phases missing their Installed commit receipt."""
+        """Process-plan skills check --pending-phases before stopping in Step 1 and Step 2; committed receipts only; failed plan query exits 3."""
         for rel in (
             ".agents/skills/process-plan/SKILL.md",
             ".claude/skills/process-plan/SKILL.md",
             ".codex/skills/process-plan/SKILL.md",
-            "docs/unattended-prompt.md",
         ):
-            self.assertIn("--pending-phases", (REPO / rel).read_text(encoding="utf-8"), rel)
+            txt = (REPO / rel).read_text(encoding="utf-8")
+            self.assertIn("--pending-phases", txt, rel)
+            # Step 1 must check --pending-phases BEFORE "If no phase has a ready row" so restart never stops early!
+            idx_pending = txt.find("--pending-phases")
+            idx_no_ready = txt.find("If no phase has a ready row")
+            self.assertTrue(0 <= idx_pending < idx_no_ready, f"{rel}: --pending-phases must precede Step 1 halt")
+        self.assertIn("--pending-phases", (REPO / "docs/unattended-prompt.md").read_text(encoding="utf-8"))
+
+        # Broken/non-repo HELIO_REPO must exit 3 (never silently return [] / exit 0)!
+        r_bad = subprocess.run(
+            [sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"],
+            env={**os.environ, "HELIO_REPO": "/usr"},
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(r_bad.returncode, 3, r_bad.stdout + r_bad.stderr)
 
         base_plan = {
             "phases": {"0": "Phase 0"},
@@ -4599,13 +4681,13 @@ class TestPhaseInstaller(unittest.TestCase):
                 win_install_py_win = self.win_mod.wsl_to_windows_path(REPO / "tools" / "win_install.py")
                 head_sha = subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip()
 
-                # Restart BEFORE install: closed phase lacks `Installed commit:` -> --pending-phases returns [0] (exit 1)!
+                # Restart BEFORE install: closed phase lacks committed `Installed commit:` -> --pending-phases returns [0] (exit 1)!
                 env = {**os.environ, "HELIO_REPO": str(checkout)}
                 r1 = subprocess.run([sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"], env=env, capture_output=True, text=True)
                 self.assertEqual(r1.returncode, 1, r1.stdout + r1.stderr)
                 self.assertEqual(json.loads(r1.stdout), [0])
 
-                # Run installation (now BOTH manifests match HEAD), simulate crash BEFORE recording `Installed commit:`!
+                # Run installation (now BOTH manifests match HEAD), simulate crash BEFORE committing `Installed commit:`!
                 path_with_wrapper = f"{wrapper.parent}:{os.environ.get('PATH', '')}"
                 with mock.patch.dict(os.environ, {"PATH": path_with_wrapper}):
                     res = self.phase_mod.run_phase_install(
@@ -4620,20 +4702,29 @@ class TestPhaseInstaller(unittest.TestCase):
                         install_mod=self.mod,
                     )
                 self.assertEqual(res["commit"], head_sha)
-                # Restart AFTER install, BEFORE receipt commit: --pending-phases STILL reports [0]!
+                # Uncommitted `Installed commit:` in working tree MUST STILL report [0] (exit 1)!
+                run_file = checkout / "docs" / "phase-runs" / "2026-11-24-phase-0.md"
+                run_file.write_text(run_file.read_text(encoding="utf-8") + f"\nInstalled commit: {head_sha}\n", encoding="utf-8")
                 r2 = subprocess.run([sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"], env=env, capture_output=True, text=True)
-                self.assertEqual(r2.returncode, 1)
+                self.assertEqual(r2.returncode, 1, r2.stdout + r2.stderr)
                 self.assertEqual(json.loads(r2.stdout), [0])
                 # Verify BOTH manifests carry the installed commit!
                 self.assertEqual(self.mod.read_manifest(to_dir)["current"]["commit"], head_sha)
                 st_win = self.phase_mod._probe_win_state(self.python_exe, win_install_py_win, win_to, reg_key)
                 self.assertEqual(st_win["manifest"]["current"]["commit"], head_sha)
-                # Record `Installed commit: <sha>` -> --pending-phases now returns [] (exit 0)!
-                run_file = checkout / "docs" / "phase-runs" / "2026-11-24-phase-0.md"
-                run_file.write_text(run_file.read_text(encoding="utf-8") + f"\nInstalled commit: {head_sha}\n", encoding="utf-8")
+                # Commit `Installed commit: <sha>` -> --pending-phases now returns [] (exit 0)!
+                subprocess.run(["git", "-C", str(checkout), "add", str(run_file)], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(checkout), "commit", "-m", "record installed commit"], check=True, capture_output=True)
                 r3 = subprocess.run([sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"], env=env, capture_output=True, text=True)
                 self.assertEqual(r3.returncode, 0, r3.stdout + r3.stderr)
                 self.assertEqual(json.loads(r3.stdout), [])
+                # A newer `## Closeout` after an older `Installed commit:` supersedes it -> returns [0] (exit 1)!
+                run_file.write_text(run_file.read_text(encoding="utf-8") + "\n## Closeout run=reopened\n\nRe-closed.\n", encoding="utf-8")
+                subprocess.run(["git", "-C", str(checkout), "add", str(run_file)], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(checkout), "commit", "-m", "new closeout"], check=True, capture_output=True)
+                r4 = subprocess.run([sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"], env=env, capture_output=True, text=True)
+                self.assertEqual(r4.returncode, 1, r4.stdout + r4.stderr)
+                self.assertEqual(json.loads(r4.stdout), [0])
                 self.phase_mod._run_win_cli(self.python_exe, install_py_win, ["--remove", "--to", win_to, "--reg-key", reg_key])
         finally:
             self._delete_reg_key(reg_key)
@@ -4664,13 +4755,44 @@ class TestPhaseInstaller(unittest.TestCase):
                 for racer_f in ("racer.c", "racer_linux.c", "racer_windows.c"):
                     shutil.copy2(REPO / "tests" / racer_f, checkout / "tests" / racer_f)
                 (checkout / "tests" / "test_smoke.py").write_text(
-                    "import os, pathlib, subprocess, unittest\n"
+                    "import os, pathlib, subprocess, tempfile, time, unittest\n"
                     "class Smoke(unittest.TestCase):\n"
                     "    def test_windows_and_linux_take_each_job_once(self):\n"
                     "        b = pathlib.Path(os.environ['IMPOSSIBLE_BUILD'])\n"
-                    "        exe = b / 'helio.exe' if os.name == 'nt' else b / 'linux' / 'helio'\n"
-                    "        r = subprocess.run([str(exe), 'help'], capture_output=True, text=True)\n"
-                    "        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)\n",
+                    "        if os.name == 'nt':\n"
+                    "            r = subprocess.run([str(b / 'helio.exe'), 'help'], capture_output=True, text=True)\n"
+                    "            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)\n"
+                    "            return\n"
+                    "        linux_h = b / 'linux' / 'helio'\n"
+                    "        linux_r = b / 'linux' / 'racer'\n"
+                    "        win_r = b / 'racer.exe'\n"
+                    "        with tempfile.TemporaryDirectory(prefix='sdk-race-') as td:\n"
+                    "            st = pathlib.Path(td) / 'store'\n"
+                    "            subprocess.run([str(linux_h), '--store', str(st), 'init'], check=True, capture_output=True)\n"
+                    "            ids = []\n"
+                    "            for i in range(20):\n"
+                    "                out = subprocess.run(\n"
+                    "                    [str(linux_h), '--store', str(st), 'ask', 'impossible/all', f'job {i}', '--as', 'impossible/a'],\n"
+                    "                    input='body\\n', text=True, capture_output=True, check=True,\n"
+                    "                ).stdout.strip().splitlines()[-1]\n"
+                    "                ids.append(out)\n"
+                    "            win_st = subprocess.check_output(['wslpath', '-w', str(st)], text=True).strip()\n"
+                    "            p_l = subprocess.Popen([str(linux_r), str(st), 'impossible/lin', *ids], stdin=subprocess.DEVNULL)\n"
+                    "            p_w = subprocess.Popen([str(win_r), win_st, 'impossible/win', *ids[::-1]], stdin=subprocess.DEVNULL)\n"
+                    "            try:\n"
+                    "                for _ in range(300):\n"
+                    "                    if len(list(st.glob('ready.*'))) == 2:\n"
+                    "                        break\n"
+                    "                    time.sleep(0.1)\n"
+                    "                (st / 'go').write_text('x', encoding='utf-8')\n"
+                    "                won = [p_l.wait(60), p_w.wait(60)]\n"
+                    "            finally:\n"
+                    "                for p in (p_l, p_w):\n"
+                    "                    if p.poll() is None:\n"
+                    "                        p.kill()\n"
+                    "            self.assertEqual(sum(won), len(ids), won)\n"
+                    "            log_out = subprocess.run([str(linux_h), '--store', str(st), 'log'], capture_output=True, text=True, check=True).stdout\n"
+                    "            self.assertEqual(log_out.count('request taken by'), len(ids))\n",
                     encoding="utf-8",
                 )
                 (checkout / "scripts").mkdir()
