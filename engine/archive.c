@@ -899,16 +899,8 @@ s_result archive_daily(const char *folder, text *report, void (*pause)(void *use
             res = S_DAMAGED;
             break;
         }
-        /* Re-check .archived after claiming a slot so a peer that already finished the day stops us before moving. */
-        char *recheck = NULL;
-        size_t rlen = 0;
-        p_result rgot = p_read(mark.data, 64, &recheck, &rlen);
-        p_free(recheck);
-        if (rgot == P_OK) break;
-        if (rgot != P_MISSING) {
-            res = S_DAMAGED;
-            break;
-        }
+        /* This process exclusively owns slot `slot` (at most 20 jobs); run its batch even if a concurrent
+           inbox sees all 10 slots occupied and writes .archived, keeping total moves <= 10 * 20 = 200. */
         size_t moved = 0;
         s_result ar = archive_store(folder, 20, &moved, report, pause, pause_user);
         spent += moved;

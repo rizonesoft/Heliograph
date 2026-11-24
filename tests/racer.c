@@ -149,6 +149,31 @@ int racer(int count, char **args) {
         int min_rounds = 0, live_count = 0;
         for (const char *p = args[3]; *p >= '0' && *p <= '9'; p++) min_rounds = min_rounds * 10 + (*p - '0');
         for (const char *p = args[4]; *p >= '0' && *p <= '9'; p++) live_count = live_count * 10 + (*p - '0');
+        /* Load all eligible IDs from <folder>/watch_old.txt (one ID per line) so every round checks all live
+           controls plus a rolling 1/10 slice of all 1,000 eligible IDs (100% coverage every 10 rounds). */
+        text wf = {0};
+        add(&wf, folder), add(&wf, "/watch_old.txt");
+        char *wdata = NULL;
+        size_t wlen = 0;
+        if (wf.failed || p_read(wf.data, 200000, &wdata, &wlen) != P_OK) {
+            text_free(&wf);
+            p_free(wdata);
+            return 103;
+        }
+        text_free(&wf);
+        size_t old_cap = 1024, old_n = 0;
+        char **old_ids = p_alloc(old_cap * sizeof(char *));
+        if (!old_ids) {
+            p_free(wdata);
+            return 103;
+        }
+        for (char *p = wdata; *p;) {
+            char *line = p;
+            while (*p && *p != '\n' && *p != '\r') p++;
+            if (*p) *p++ = 0;
+            while (*p == '\n' || *p == '\r') p++;
+            if (*line && old_n < old_cap) old_ids[old_n++] = line;
+        }
         text ready = {0}, go = {0}, done = {0};
         add(&ready, folder), add(&ready, "/ready."), add_number(&ready, p_tick(), 0);
         add(&go, folder), add(&go, "/go");
@@ -165,6 +190,8 @@ int racer(int count, char **args) {
             if (store_open(&s, folder) != S_OK) {
                 store_close(&s);
                 text_free(&done);
+                p_free(old_ids);
+                p_free(wdata);
                 return 3;
             }
             for (int k = 5; k < 5 + live_count && k < count; k++) {
@@ -173,21 +200,25 @@ int racer(int count, char **args) {
                 if (mr != S_OK) {
                     store_close(&s);
                     text_free(&done);
+                    p_free(old_ids);
+                    p_free(wdata);
                     return 4;
                 }
                 message_free(&m);
             }
-            /* Every watched eligible ID must be readable in EITHER live messages/ OR archive/<month>/ (never missing from both!). */
-            for (int k = 5 + live_count; k < count; k++) {
+            /* Check rolling 1/10 slice of ALL eligible IDs: every ID must be readable in live OR archive! */
+            size_t slice = (size_t)(i % 10);
+            for (size_t j = slice; j < old_n; j += 10) {
                 message m = {0};
-                s_result mr = store_message(&s, args[k], &m);
+                s_result mr = store_message(&s, old_ids[j], &m);
                 if (mr != S_OK) {
                     message_free(&m);
-                    mr = archive_read_message(&s, args[k], &m);
+                    mr = archive_read_message(&s, old_ids[j], &m);
                     if (mr != S_OK) {
-                        /* One re-check in case it moved between live and archive checks? Archive is written BEFORE live is removed! */
                         store_close(&s);
                         text_free(&done);
+                        p_free(old_ids);
+                        p_free(wdata);
                         return 5;
                     }
                 }
@@ -203,6 +234,8 @@ int racer(int count, char **args) {
             }
         }
         text_free(&done);
+        p_free(old_ids);
+        p_free(wdata);
         return 0;
     }
     if (count >= 2 && same(args[1], "--pause")) return run_pause(count, args);

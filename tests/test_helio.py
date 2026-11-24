@@ -1623,15 +1623,15 @@ class Archive(Base):
         lin_racer = str(RACER)
         # 2 archivers (limit=1 per round: Windows 300 rounds + Linux 1000 rounds, moving all 1,000 distinct eligible jobs),
         # 2 concurrent readers (Windows min 200 + Linux min 800 = 1,000+ rounds running until BOTH archivers finish,
-        # checking every live control ID AND 40 sampled eligible IDs are readable in live OR archive on EVERY round),
-        # and 2 racing takers (Windows + Linux).
-        watch_old = old_ids[::25]
-        take_ids = watch_old + live_ids
+        # checking every live control ID AND a rolling 1/10 slice of ALL 1,000 eligible IDs from watch_old.txt on every round,
+        # covering 100% of all 1,000 eligible IDs every 10 rounds), and 2 racing takers (Windows + Linux).
+        put(self.store / "watch_old.txt", "\n".join(old_ids) + "\n")
+        take_ids = old_ids[::25] + live_ids
         procs = [
             subprocess.Popen([win_racer, "--archive-loop", win_store, "300"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
             subprocess.Popen([lin_racer, "--archive-loop", str(self.store), "1000"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
-            subprocess.Popen([win_racer, "--read-loop", win_store, "200", str(len(live_ids)), *live_ids, *watch_old], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
-            subprocess.Popen([lin_racer, "--read-loop", str(self.store), "800", str(len(live_ids)), *live_ids, *watch_old], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
+            subprocess.Popen([win_racer, "--read-loop", win_store, "200", str(len(live_ids)), *live_ids], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
+            subprocess.Popen([lin_racer, "--read-loop", str(self.store), "800", str(len(live_ids)), *live_ids], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
             subprocess.Popen([win_racer, win_store, "os/win-taker", *take_ids[::-1]], stdin=subprocess.DEVNULL),
             subprocess.Popen([lin_racer, str(self.store), "os/lin-taker", *take_ids], stdin=subprocess.DEVNULL),
         ]
