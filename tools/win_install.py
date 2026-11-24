@@ -995,9 +995,9 @@ def win_phase_restore_prev(
     win_to: Path | None,
     tx_id: str,
     pre_previous: dict[str, Any] | None,
-    restore_exe: Path | None = None,
+    restore_bytes: bytes | None = None,
 ) -> None:
-    """Restore or clear bin\\helio.exe.old and installed.win.json['previous'] from a verified WSL-held backup file."""
+    """Restore or clear bin\\helio.exe.old and installed.win.json['previous'] from verified in-memory backup bytes."""
     dest = (win_to or default_win_to_dir()).resolve()
     with acquire_win_lock(_dest_lock_path(dest), blocking=False):
         _win_phase_marker_data(dest, tx_id)
@@ -1012,13 +1012,12 @@ def win_phase_restore_prev(
             manifest["previous"] = None
             _write_json_atomic(dest / WIN_MANIFEST_NAME, manifest)
             return
-        if restore_exe is None or _is_reparse_or_symlink(restore_exe) or not restore_exe.is_file():
-            raise WinInstallError(f"missing verified previous-generation backup at {restore_exe}", code=3)
-        body = restore_exe.read_bytes()
+        if restore_bytes is None:
+            raise WinInstallError("missing verified previous-generation backup bytes for Windows restore", code=3)
         expected_sha = str(pre_previous.get("helio_exe_sha256") or "")
-        if expected_sha and hashlib.sha256(body).hexdigest() != expected_sha:
-            raise WinInstallError(f"previous-generation backup hash mismatch at {restore_exe}", code=3)
-        _write_bytes_atomic(old_exe, body)
+        if expected_sha and hashlib.sha256(restore_bytes).hexdigest() != expected_sha:
+            raise WinInstallError("previous-generation backup hash mismatch for Windows restore", code=3)
+        _write_bytes_atomic(old_exe, restore_bytes)
         manifest["previous"] = pre_previous
         _write_json_atomic(dest / WIN_MANIFEST_NAME, manifest)
 

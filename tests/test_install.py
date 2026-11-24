@@ -4648,11 +4648,15 @@ class TestPhaseInstaller(unittest.TestCase):
                     self._delete_reg_key(sole_reg_key)
                     self._cleanup_win_parent(sole_win_to)
 
-                # Class-level regression (items 2 & 9): win_phase_snapshot_prev is pure read-only on Windows
-                # (creates ZERO files in win_to\bin\), so no crash can strand a Windows snapshot file AND any
-                # pre-existing foreign file in win_to\bin\ (byte-identical OR empty 0-byte) is preserved verbatim,
-                # while WSL-owned `.phase-prev-*` backup files in `to_dir` are cleaned up completely.
-                self.assertEqual(list(to_dir.glob(".phase-prev-*")), [])
+                # Class-level regression (items 2 & 9): previous-generation backups are stored inside
+                # `phase.journal.json` (zero separate `.phase-prev-*` or `..phase-prev-*` files created on
+                # EITHER WSL `to_dir` or Windows `win_to\bin\`), so no crash can strand a backup file AND any
+                # pre-existing foreign file in EITHER destination (byte-identical OR empty 0-byte) is preserved verbatim.
+                self.assertEqual([p.name for p in to_dir.iterdir() if "phase-prev" in p.name], [])
+                wsl_foreign_copy = to_dir / ".phase-prev-foreigncopy.helio.old"
+                wsl_foreign_empty = to_dir / ".phase-prev-foreignempty.helio.old"
+                wsl_foreign_copy.write_bytes(a_h.read_bytes())
+                wsl_foreign_empty.write_bytes(b"")
                 self.phase_mod._win_phase_marker_call(
                     self.python_exe, win_install_py_win, "begin", win_to, reg_key, "aa11bb22cc33", phase=0, commit=a_commit, install_mod=self.mod
                 )
@@ -4675,6 +4679,10 @@ class TestPhaseInstaller(unittest.TestCase):
                 self.phase_mod._win_phase_marker_call(
                     self.python_exe, win_install_py_win, "end", win_to, reg_key, "aa11bb22cc33", install_mod=self.mod
                 )
+                self.assertEqual(wsl_foreign_copy.read_bytes(), a_h.read_bytes())
+                self.assertEqual(wsl_foreign_empty.read_bytes(), b"")
+                wsl_foreign_copy.unlink()
+                wsl_foreign_empty.unlink()
                 check_foreign = (
                     "import pathlib, sys\n"
                     "b = pathlib.Path(sys.argv[1]) / 'bin'\n"

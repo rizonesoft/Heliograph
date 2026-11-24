@@ -228,28 +228,28 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
     return sorted(pending)
 
 
-def _wsl_phase_prev_paths(to_dir: Path, tx_id: str, install_mod: Any) -> tuple[Path, Path]:
-    if not tx_id or not re.fullmatch(r"[0-9a-f]{12}", tx_id):
-        raise install_mod.InstallError(f"invalid phase transaction id for WSL snapshot: {tx_id!r}", code=2)
-    return to_dir / f".phase-prev-{tx_id}.helio.old", to_dir / f".phase-prev-{tx_id}.helio.exe.old"
-
-
-def _snapshot_wsl_previous(to_dir: Path, tx_id: str, install_mod: Any) -> None:
-    """Copy helio.old and helio.exe.old into tx-scoped files so failed-phase rollback preserves previous generation A."""
+def _capture_wsl_previous_b64(to_dir: Path, pre_previous: dict[str, Any], install_mod: Any) -> tuple[str, str]:
+    """Read-only capture of helio.old and helio.exe.old as verified base64 strings stored inside phase.journal.json."""
     old_h = to_dir / "helio.old"
     old_e = to_dir / "helio.exe.old"
     if not old_h.is_file() or not old_e.is_file() or old_h.is_symlink() or old_e.is_symlink():
-        return
-    snap_h, snap_e = _wsl_phase_prev_paths(to_dir, tx_id, install_mod)
-    for sp in (snap_h, snap_e):
-        if sp.exists() or sp.is_symlink():
-            raise install_mod.InstallError(f"refusing existing or linked WSL phase snapshot at {sp}", code=2)
-    install_mod.write_bytes_atomic(snap_h, old_h.read_bytes(), mode=0o755)
-    install_mod.write_bytes_atomic(snap_e, old_e.read_bytes(), mode=0o755)
+        raise install_mod.InstallError(f"missing WSL previous generation files in {to_dir}", code=3)
+    raw_h = old_h.read_bytes()
+    raw_e = old_e.read_bytes()
+    exp_h = str(pre_previous.get("helio_sha256") or "")
+    exp_e = str(pre_previous.get("helio_exe_sha256") or "")
+    if (exp_h and hashlib.sha256(raw_h).hexdigest() != exp_h) or (exp_e and hashlib.sha256(raw_e).hexdigest() != exp_e):
+        raise install_mod.InstallError(f"WSL previous generation hash mismatch in {to_dir}", code=3)
+    return base64.b64encode(raw_h).decode("ascii"), base64.b64encode(raw_e).decode("ascii")
 
 
-def _restore_wsl_previous(to_dir: Path, tx_id: str, pre_previous: dict[str, Any] | None, install_mod: Any) -> None:
-    """Restore or clear helio.old, helio.exe.old, and installed.json['previous'] after failed-phase rollback."""
+def _restore_wsl_previous(
+    to_dir: Path,
+    journal: dict[str, Any],
+    pre_previous: dict[str, Any] | None,
+    install_mod: Any,
+) -> None:
+    """Restore or clear helio.old, helio.exe.old, and installed.json['previous'] from verified in-journal backup bytes."""
     manifest = install_mod.read_manifest(to_dir)
     if not isinstance(manifest, dict):
         raise install_mod.InstallError(f"missing WSL manifest in {to_dir} when restoring previous generation", code=3)
@@ -263,37 +263,20 @@ def _restore_wsl_previous(to_dir: Path, tx_id: str, pre_previous: dict[str, Any]
         install_mod.write_json_atomic(to_dir / install_mod.MANIFEST_NAME, manifest)
         install_mod.fsync_dir(to_dir)
         return
-    snap_h, snap_e = _wsl_phase_prev_paths(to_dir, tx_id, install_mod)
-    if snap_h.is_symlink() or snap_e.is_symlink() or not snap_h.is_file() or not snap_e.is_file():
-        raise install_mod.InstallError(f"missing WSL phase previous snapshot for {tx_id} in {to_dir}", code=3)
+    b64_h = journal.get("wsl_pre_prev_helio_b64")
+    b64_e = journal.get("wsl_pre_prev_helio_exe_b64")
+    if not isinstance(b64_h, str) or not b64_h or not isinstance(b64_e, str) or not b64_e:
+        raise install_mod.InstallError(f"missing WSL previous generation backup in phase journal for {to_dir}", code=3)
+    raw_h = base64.b64decode(b64_h.encode("ascii"))
+    raw_e = base64.b64decode(b64_e.encode("ascii"))
     exp_h = str(pre_previous.get("helio_sha256") or "")
     exp_e = str(pre_previous.get("helio_exe_sha256") or "")
-    if (exp_h and install_mod.sha256_file(snap_h) != exp_h) or (exp_e and install_mod.sha256_file(snap_e) != exp_e):
-        raise install_mod.InstallError(f"WSL phase previous snapshot hash mismatch for {tx_id} in {to_dir}", code=3)
-    install_mod.write_bytes_atomic(to_dir / "helio.old", snap_h.read_bytes(), mode=0o755)
-    install_mod.write_bytes_atomic(to_dir / "helio.exe.old", snap_e.read_bytes(), mode=0o755)
+    if (exp_h and hashlib.sha256(raw_h).hexdigest() != exp_h) or (exp_e and hashlib.sha256(raw_e).hexdigest() != exp_e):
+        raise install_mod.InstallError(f"WSL phase previous backup hash mismatch for {to_dir}", code=3)
+    install_mod.write_bytes_atomic(to_dir / "helio.old", raw_h, mode=0o755)
+    install_mod.write_bytes_atomic(to_dir / "helio.exe.old", raw_e, mode=0o755)
     manifest["previous"] = pre_previous
     install_mod.write_json_atomic(to_dir / install_mod.MANIFEST_NAME, manifest)
-
-
-def _win_phase_prev_path(to_dir: Path, tx_id: str, install_mod: Any) -> Path:
-    if not tx_id or not re.fullmatch(r"[0-9a-f]{12}", tx_id):
-        raise install_mod.InstallError(f"invalid phase transaction id for Windows snapshot: {tx_id!r}", code=2)
-    return to_dir / f".phase-prev-{tx_id}.win.helio.exe.old"
-
-
-def _cleanup_wsl_previous(to_dir: Path, tx_id: str, install_mod: Any) -> None:
-    if not tx_id or not re.fullmatch(r"[0-9a-f]{12}", tx_id):
-        return
-    snap_h, snap_e = _wsl_phase_prev_paths(to_dir, tx_id, install_mod)
-    snap_w = _win_phase_prev_path(to_dir, tx_id, install_mod)
-    removed = False
-    for sp in (snap_h, snap_e, snap_w):
-        if sp.is_file() and not sp.is_symlink():
-            sp.unlink()
-            removed = True
-    if removed:
-        install_mod.fsync_dir(to_dir)
 
 
 def _run(
@@ -544,6 +527,7 @@ def _win_phase_marker_call(
     phase: int = 0,
     commit: str = "",
     payload_json: str = "",
+    stdin_json: str | None = None,
     install_mod: Any | None = None,
 ) -> str:
     code = (
@@ -567,15 +551,17 @@ def _win_phase_marker_call(
         "        if raw is not None:\n"
         "            sys.stdout.write(base64.b64encode(raw).decode('ascii'))\n"
         "    elif action == 'restore_prev':\n"
-        "        data = json.loads(payload)\n"
-        "        rexe = Path(data['restore_exe']) if data.get('restore_exe') else None\n"
-        "        mod.win_phase_restore_prev(win_to=win_to, tx_id=tx_id, pre_previous=data.get('pre_previous'), restore_exe=rexe)\n"
+        "        data = json.loads(sys.stdin.read())\n"
+        "        rb64 = data.get('restore_b64')\n"
+        "        rbytes = base64.b64decode(rb64.encode('ascii')) if isinstance(rb64, str) and rb64 else None\n"
+        "        mod.win_phase_restore_prev(win_to=win_to, tx_id=tx_id, pre_previous=data.get('pre_previous'), restore_bytes=rbytes)\n"
         "except mod.WinInstallError as exc:\n"
         "    print(str(exc), file=sys.stderr)\n"
         "    sys.exit(exc.code)\n"
     )
     res = _run(
         [python_exe, "-B", "-c", code, win_install_py_win, action, win_to_raw or "", reg_key, tx_id, str(phase), commit, payload_json],
+        input_text=stdin_json,
         timeout=60,
         install_mod=install_mod,
     )
@@ -976,14 +962,9 @@ def _rollback_phase_journal(
                     # `current` is already B (including after an interruption between writing helio.exe.old and updating manifest,
                     # where status_code is 3 due to the backup hash mismatch!). Finish restoring/clearing `previous` and re-verify!
                     try:
-                        win_mod = install_mod._load_win_install()
                         restore_payload = {
                             "pre_previous": win_pre_prev,
-                            "restore_exe": (
-                                win_mod.wsl_to_windows_path(_win_phase_prev_path(to_dir, tx_id, install_mod))
-                                if isinstance(win_pre_prev, dict)
-                                else None
-                            ),
+                            "restore_b64": journal.get("win_pre_prev_exe_b64") if isinstance(win_pre_prev, dict) else None,
                         }
                         _win_phase_marker_call(
                             python_exe,
@@ -992,7 +973,7 @@ def _rollback_phase_journal(
                             win_to_raw,
                             reg_key,
                             tx_id,
-                            payload_json=json.dumps(restore_payload),
+                            stdin_json=json.dumps(restore_payload),
                             install_mod=install_mod,
                         )
                         post_win = _probe_win_state(python_exe, win_install_py_win, win_to_raw, reg_key, install_mod=install_mod)
@@ -1021,14 +1002,9 @@ def _rollback_phase_journal(
                     else:
                         try:
                             if journal.get("win_had_install") and win_has_pre_prev:
-                                win_mod = install_mod._load_win_install()
                                 restore_payload = {
                                     "pre_previous": win_pre_prev,
-                                    "restore_exe": (
-                                        win_mod.wsl_to_windows_path(_win_phase_prev_path(to_dir, tx_id, install_mod))
-                                        if isinstance(win_pre_prev, dict)
-                                        else None
-                                    ),
+                                    "restore_b64": journal.get("win_pre_prev_exe_b64") if isinstance(win_pre_prev, dict) else None,
                                 }
                                 _win_phase_marker_call(
                                     python_exe,
@@ -1037,7 +1013,7 @@ def _rollback_phase_journal(
                                     win_to_raw,
                                     reg_key,
                                     tx_id,
-                                    payload_json=json.dumps(restore_payload),
+                                    stdin_json=json.dumps(restore_payload),
                                     install_mod=install_mod,
                                 )
                             post_win = _probe_win_state(python_exe, win_install_py_win, win_to_raw, reg_key, install_mod=install_mod)
@@ -1089,7 +1065,7 @@ def _rollback_phase_journal(
                     and cur_wsl_c.get("commit") == journal.get("wsl_pre_commit", "")
                     and wsl_has_pre_prev
                 ):
-                    _restore_wsl_previous(to_dir, tx_id, wsl_pre_prev, install_mod)
+                    _restore_wsl_previous(to_dir, journal, wsl_pre_prev, install_mod)
                 elif not expected_wsl_sha or cur_wsl_c.get("commit") != journal.get("commit") or cur_wsl_sha != expected_wsl_sha:
                     errors.append(
                         f"refusing WSL rollback: live installation ({cur_wsl_c.get('commit')}) does not match phase publication ({journal.get('commit')})"
@@ -1097,7 +1073,7 @@ def _rollback_phase_journal(
                 elif journal.get("wsl_had_install") or journal.get("wsl_had_legacy"):
                     install_mod.go_back(to_dir=to_dir, wrapper_path=wrapper_path, allow_phase_journal=True)
                     if journal.get("wsl_had_install") and wsl_has_pre_prev:
-                        _restore_wsl_previous(to_dir, tx_id, wsl_pre_prev, install_mod)
+                        _restore_wsl_previous(to_dir, journal, wsl_pre_prev, install_mod)
                     live_sha = install_mod.sha256_file(to_dir / "helio")
                     if live_sha != journal.get("wsl_pre_helio_sha", ""):
                         errors.append("WSL rollback hash does not match pre-transaction binary")
@@ -1118,7 +1094,6 @@ def _rollback_phase_journal(
     # is still held so a crash before unlinking the WSL journal NEVER re-enters rollback!
     journal["phase_state"] = "rolled_back"
     install_mod.write_json_atomic(to_dir / PHASE_JOURNAL_NAME, journal)
-    _cleanup_wsl_previous(to_dir, tx_id, install_mod)
 
     if tx_id:
         try:
@@ -1266,8 +1241,7 @@ def _recover_pending_phase_journal(
     state = journal.get("phase_state")
     j_tx = str(journal["tx_id"])
     if state == "rolled_back":
-        # Rollback already completed durably; clean any remaining tx-scoped snapshot, release marker, and unlink journal.
-        _cleanup_wsl_previous(to_dir, j_tx, install_mod)
+        # Rollback already completed durably; release marker and unlink journal (which held all backup bytes).
         _win_phase_marker_call(
             python_exe,
             win_install_py_win,
@@ -1281,8 +1255,7 @@ def _recover_pending_phase_journal(
         install_mod.fsync_dir(to_dir)
         return None
     if state == "notifying":
-        # Clean any remaining tx-scoped snapshot and idempotently release any stranded Windows marker.
-        _cleanup_wsl_previous(to_dir, j_tx, install_mod)
+        # Idempotently release any stranded Windows marker.
         _win_phase_marker_call(
             python_exe,
             win_install_py_win,
@@ -1631,8 +1604,10 @@ def run_phase_install(
                     if wsl_had_install:
                         wsl_pre_prev = (wsl_pre_manifest or {}).get("previous")
                         if isinstance(wsl_pre_prev, dict):
-                            _snapshot_wsl_previous(to_dir, tx_id, install_mod)
+                            b64_h, b64_e = _capture_wsl_previous_b64(to_dir, wsl_pre_prev, install_mod)
                             journal["wsl_pre_previous"] = wsl_pre_prev
+                            journal["wsl_pre_prev_helio_b64"] = b64_h
+                            journal["wsl_pre_prev_helio_exe_b64"] = b64_e
                         else:
                             journal["wsl_pre_previous"] = None
                     journal["wsl_changed"] = True
@@ -1657,7 +1632,7 @@ def run_phase_install(
                     if win_had_install:
                         win_pre_prev = (win_pre_manifest or {}).get("previous")
                         if isinstance(win_pre_prev, dict):
-                            # Read-only capture of Windows bin\helio.exe.old into WSL-owned to_dir (zero files created in win_to!).
+                            # Read-only capture of Windows bin\helio.exe.old stored inside phase.journal.json (zero separate backup files on either host!).
                             b64_raw = _win_phase_marker_call(
                                 python_exe,
                                 win_install_py_win,
@@ -1673,11 +1648,8 @@ def run_phase_install(
                             exp_prev_sha = str(win_pre_prev.get("helio_exe_sha256") or "")
                             if exp_prev_sha and hashlib.sha256(raw_prev).hexdigest() != exp_prev_sha:
                                 raise install_mod.InstallError("Windows previous generation binary hash mismatch during snapshot", code=3)
-                            snap_w = _win_phase_prev_path(to_dir, tx_id, install_mod)
-                            if snap_w.exists() or snap_w.is_symlink():
-                                raise install_mod.InstallError(f"refusing existing or linked Windows phase snapshot at {snap_w}", code=2)
-                            install_mod.write_bytes_atomic(snap_w, raw_prev, mode=0o600)
                             journal["win_pre_previous"] = win_pre_prev
+                            journal["win_pre_prev_exe_b64"] = b64_raw
                             install_mod.write_json_atomic(to_dir / PHASE_JOURNAL_NAME, journal)
                         else:
                             journal["win_pre_previous"] = None
@@ -1742,9 +1714,8 @@ def run_phase_install(
                 )
                 raise install_mod.InstallError(f"phase install failed and rolled back: {exc}", code=3) from exc
 
-            # Post-commit cleanup & marker release live OUTSIDE the rollback try/except so a failure here
+            # Post-commit marker release lives OUTSIDE the rollback try/except so a failure here
             # never re-enters rollback; retrying resumes cleanly from `phase_state == "notifying"`.
-            _cleanup_wsl_previous(to_dir, tx_id, install_mod)
             _win_phase_marker_call(python_exe, win_install_py_win, "end", win_to_raw, reg_key, tx_id, install_mod=install_mod)
 
             # Post-verification notification: if this fails, keep `phase_state == "notifying"` so retry only re-sends.
