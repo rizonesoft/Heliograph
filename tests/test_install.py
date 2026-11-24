@@ -1830,7 +1830,9 @@ class TestQuickInstaller(unittest.TestCase):
                 self.assertIn("wslpath", stderr_buf.getvalue())
 
                 # Bare `helio` in BOTH Windows cmd.exe and PowerShell (with PATH derived from HKCU\<reg_key>
-                # appended to system PATH in real Windows user-PATH order) reads back the message sent from WSL!
+                # appended to system PATH in real Windows user-PATH order) resolves to <win_to>\helio.cmd
+                # AND reads back the message sent from WSL!
+                expected_cmd = win_to + "\\helio.cmd"
                 shell_probe = subprocess.run(
                     [
                         "python.exe",
@@ -1842,13 +1844,17 @@ class TestQuickInstaller(unittest.TestCase):
                             "env = dict(os.environ); env.pop('HELIO_STORE', None); "
                             "env['PATH'] = env.get('PATH', '') + ';' + reg_path; "
                             "cwd = os.environ.get('TEMP', 'C:\\\\Windows\\\\Temp'); "
+                            "w_cmd = subprocess.run(['cmd.exe', '/c', 'where', 'helio'], cwd=cwd, env=env, capture_output=True, text=True); "
                             "r_cmd = subprocess.run(['cmd.exe', '/c', 'helio', 'inbox', '--as', 'demo/win'], "
                             "cwd=cwd, env=env, capture_output=True, text=True); "
                             "ps = shutil.which('powershell.exe'); assert ps, 'powershell.exe missing'; "
+                            "w_ps = subprocess.run([ps, '-NoProfile', '-Command', '(Get-Command helio).Source'], cwd=cwd, env=env, capture_output=True, text=True); "
                             "r_ps = subprocess.run([ps, '-NoProfile', '-Command', 'helio inbox --as demo/win'], "
                             "cwd=cwd, env=env, capture_output=True, text=True); "
+                            "print('WCMD:', w_cmd.stdout.strip().splitlines()[0] if w_cmd.stdout.strip() else ''); "
+                            "print('WPS:', w_ps.stdout.strip()); "
                             "print('CMD:', r_cmd.stdout); print('PS:', r_ps.stdout); "
-                            "raise SystemExit(r_cmd.returncode or r_ps.returncode)"
+                            "raise SystemExit(w_cmd.returncode or r_cmd.returncode or w_ps.returncode or r_ps.returncode)"
                         ),
                     ],
                     stdin=subprocess.DEVNULL,
@@ -1856,7 +1862,12 @@ class TestQuickInstaller(unittest.TestCase):
                     text=True,
                 )
                 self.assertEqual(shell_probe.returncode, 0, shell_probe.stdout + shell_probe.stderr)
-                cmd_out, ps_out = shell_probe.stdout.split("PS:", 1)
+                wcmd_line = [ln for ln in shell_probe.stdout.splitlines() if ln.startswith("WCMD:")][0].split("WCMD:", 1)[1].strip()
+                wps_line = [ln for ln in shell_probe.stdout.splitlines() if ln.startswith("WPS:")][0].split("WPS:", 1)[1].strip()
+                self.assertEqual(wcmd_line.lower(), expected_cmd.lower())
+                self.assertEqual(wps_line.lower(), expected_cmd.lower())
+                _, after_cmd = shell_probe.stdout.split("\nCMD:", 1)
+                cmd_out, ps_out = after_cmd.split("\nPS:", 1)
                 self.assertIn(msg_subject, cmd_out)
                 self.assertIn(msg_subject, ps_out)
 
@@ -1972,7 +1983,10 @@ class TestWindowsInstaller(unittest.TestCase):
                 # Append the registry Path value after system PATH, matching real Windows new-session resolution order.
                 base_env["PATH"] = f"{base_env.get('PATH', '')};{reg_path_val}"
 
-                # Bare `helio` from cmd.exe outside win_to reaches default_store.
+                # Bare `helio` from cmd.exe outside win_to resolves to <win_to>\helio.cmd and reaches default_store.
+                w_cmd = subprocess.run(["cmd.exe", "/c", "where", "helio"], cwd=str(outside_cwd), env=base_env, capture_output=True, text=True)
+                self.assertEqual(w_cmd.returncode, 0, w_cmd.stderr)
+                self.assertEqual(w_cmd.stdout.strip().splitlines()[0].strip().lower(), str((win_to / "helio.cmd").resolve()).lower())
                 r_cmd = subprocess.run(
                     ["cmd.exe", "/c", "helio", "inbox", "--as", "demo/win"],
                     cwd=str(outside_cwd),
@@ -1983,10 +1997,13 @@ class TestWindowsInstaller(unittest.TestCase):
                 self.assertEqual(r_cmd.returncode, 0, r_cmd.stdout + r_cmd.stderr)
                 self.assertIn("msg-default", r_cmd.stdout)
 
-                # Bare `helio` from PowerShell outside win_to reaches default_store (required on Windows, never skipped).
+                # Bare `helio` from PowerShell outside win_to resolves to <win_to>\helio.cmd and reaches default_store.
                 ps = shutil.which("powershell.exe")
                 self.assertIsNotNone(ps, "powershell.exe is required for Windows command discovery test")
                 assert ps is not None
+                w_ps = subprocess.run([ps, "-NoProfile", "-Command", "(Get-Command helio).Source"], cwd=str(outside_cwd), env=base_env, capture_output=True, text=True)
+                self.assertEqual(w_ps.returncode, 0, w_ps.stderr)
+                self.assertEqual(w_ps.stdout.strip().lower(), str((win_to / "helio.cmd").resolve()).lower())
                 r_ps = subprocess.run(
                     [ps, "-NoProfile", "-Command", "helio inbox --as demo/win"],
                     cwd=str(outside_cwd),
@@ -2099,15 +2116,15 @@ class TestWindowsInstaller(unittest.TestCase):
                 )
                 self.assertEqual(r_ov2.returncode, 0, r_ov2.stderr)
 
-                # Failing command with an explicit reachable --store returns helio.exe's exact exit code
-                # and does NOT emit the offline default-WSL-distro diagnostic or exit 3!
+                # Failing command with an explicit reachable --store (including an empty quoted arg before --store!)
+                # returns helio.exe's exact exit code and does NOT emit the offline default-WSL-distro diagnostic or exit 3!
                 r_fail_direct = subprocess.run(
-                    [str(self.helio_exe), "show", "nonexistent-id-123", "--as", "demo/win", "--store", str(flag_store)],
+                    [str(self.helio_exe), "show", "nonexistent-id-123", "--as", "demo/win", "--about", "", "--store", str(flag_store)],
                     capture_output=True,
                     text=True,
                 )
                 r_fail_ov = subprocess.run(
-                    ["cmd.exe", "/c", "helio", "show", "nonexistent-id-123", "--as", "demo/win", "--store", str(flag_store)],
+                    ["cmd.exe", "/c", "helio", "show", "nonexistent-id-123", "--as", "demo/win", "--about", "", "--store", str(flag_store)],
                     cwd=str(outside_cwd),
                     env=base_env,
                     capture_output=True,
@@ -2117,6 +2134,17 @@ class TestWindowsInstaller(unittest.TestCase):
                 self.assertNotEqual(r_fail_ov.returncode, 0)
                 self.assertNotIn("WSL", r_fail_ov.stderr)
                 self.assertNotIn(bogus_distro, r_fail_ov.stderr)
+
+                # Store-independent `helio help` STILL succeeds (exit 0) even when the default WSL distro is offline!
+                r_help = subprocess.run(
+                    ["cmd.exe", "/c", "helio", "help"],
+                    cwd=str(outside_cwd),
+                    env=base_env,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(r_help.returncode, 0, r_help.stdout + r_help.stderr)
+                self.assertIn("helio", r_help.stdout.lower())
         finally:
             self._delete_reg_key(reg_key)
 
@@ -2181,6 +2209,18 @@ class TestWindowsInstaller(unittest.TestCase):
                 self.assertEqual(m3["retired"], {})
                 self.assertFalse(retired_file.exists())
                 self.assertEqual(m3["previous"]["helio_exe_sha256"], sha_a)
+
+                # Legacy list-format `retired: [name]` in manifest (from prior installer) is still owned and swept!
+                leg_ret_name = ".helio.exe.abcdef012345.retired"
+                leg_ret_file = win_to / "bin" / leg_ret_name
+                shutil.copy2(exe_a, leg_ret_file)
+                mp = win_to / self.win_mod.WIN_MANIFEST_NAME
+                m_leg_raw = json.loads(mp.read_text(encoding="utf-8"))
+                m_leg_raw["retired"] = [leg_ret_name]
+                mp.write_text(json.dumps(m_leg_raw), encoding="utf-8")
+                m4 = self.win_mod.win_install(source_exe=exe_b, source_sha256=sha_b, store_path=str(s2), commit="b" * 40, win_to=win_to, reg_key=reg_key)
+                self.assertEqual(m4["retired"], {})
+                self.assertFalse(leg_ret_file.exists())
 
                 # Status healthy -> 0; tamper checks (wrapper, empty store, top-level helio.exe shadow, wrong reg_key) -> 3.
                 code, _ = self.win_mod.win_status(win_to=win_to, reg_key=reg_key)
@@ -2432,6 +2472,22 @@ class TestWindowsInstaller(unittest.TestCase):
                     self.win_mod.recover_win_if_needed(ext_to, reg_key)
                 self.assertEqual(ctx.exception.code, 2)
                 self.assertEqual((ext_to / "helio.cmd").read_bytes(), b"@echo user restored script\r\n")
+
+                # Legacy list-format `retired: []` in a schema-2 publishing journal (from prior installer) recovers cleanly!
+                leg_j_to = root / "crash_legacy_list_journal"
+                self.win_mod.win_install(source_exe=exe_a, source_sha256=sha_a, store_path=str(store), commit="a" * 40, win_to=leg_j_to, reg_key=reg_key)
+                with self.assertRaises(SimulatedCrash):
+                    self.win_mod.win_install(
+                        source_exe=exe_b, source_sha256=sha_b, store_path=str(store), commit="b" * 40, win_to=leg_j_to, reg_key=reg_key,
+                        on_boundary=lambda st: (_ for _ in ()).throw(SimulatedCrash(st)) if st == "after_backup" else None,
+                    )
+                jp_leg = leg_j_to / self.win_mod.WIN_JOURNAL_NAME
+                j_leg_data = json.loads(jp_leg.read_text(encoding="utf-8"))
+                j_leg_data["retired"] = []
+                jp_leg.write_text(json.dumps(j_leg_data), encoding="utf-8")
+                self.assertTrue(self.win_mod.recover_win_if_needed(leg_j_to, reg_key))
+                self.assertEqual(self.win_mod.sha256_file(leg_j_to / "bin" / "helio.exe"), sha_a)
+                self.win_mod.win_remove(win_to=leg_j_to, reg_key=reg_key)
 
                 # Out-of-root journal key is refused by _validate_win_journal.
                 with self.assertRaises(self.win_mod.WinInstallError) as ctx:

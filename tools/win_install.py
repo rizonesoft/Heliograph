@@ -177,33 +177,39 @@ def render_win_cmd(default_store: str) -> str:
         "setlocal EnableExtensions",
         'set "_H_HAS_STORE="',
         'set "_H_SKIP="',
+        'set "_H_USED_DEFAULT="',
         ":scan_args",
-        'if "%~1"=="" goto :after_scan',
+        'if "%~1"=="" if "%1"=="" goto :after_scan',
         "if defined _H_SKIP (",
         '  set "_H_SKIP="',
         "  shift /1",
         "  goto :scan_args",
         ")",
-        'if "%~1"=="--store" set "_H_HAS_STORE=1"',
+        'if "%~1"=="--store" (',
+        '  set "_H_HAS_STORE=1"',
+        '  set "_H_SKIP=1"',
+        ")",
         'if "%~1"=="--as" set "_H_SKIP=1"',
+        'if "%~1"=="--session" set "_H_SKIP=1"',
         'if "%~1"=="--key" set "_H_SKIP=1"',
         'if "%~1"=="--due" set "_H_SKIP=1"',
-        'if "%~1"=="--kind" set "_H_SKIP=1"',
-        'if "%~1"=="--lane" set "_H_SKIP=1"',
-        'if "%~1"=="--file" set "_H_SKIP=1"',
-        'if "%~1"=="--reason" set "_H_SKIP=1"',
+        'if "%~1"=="--about" set "_H_SKIP=1"',
         "shift /1",
         "goto :scan_args",
         ":after_scan",
         "if not defined _H_HAS_STORE if not defined HELIO_STORE (",
         f'  set "HELIO_STORE={default_store}"',
+        '  set "_H_USED_DEFAULT=1"',
+        ")",
+        '"%~dp0bin\\helio.exe" %*',
+        'set "_H_RC=%ERRORLEVEL%"',
+        'if not "%_H_RC%"=="0" if defined _H_USED_DEFAULT (',
         f'  if not exist "{default_store}\\." (',
         f"    >&2 echo {err_msg}",
         "    exit /b 3",
         "  )",
         ")",
-        '"%~dp0bin\\helio.exe" %*',
-        "exit /b %ERRORLEVEL%",
+        "exit /b %_H_RC%",
     ]
     return "\r\n".join(lines) + "\r\n"
 
@@ -425,21 +431,28 @@ def _verify_win_ownership(win_to: Path, manifest: dict[str, Any] | None, *, requ
         ret_p = bin_dir / ret_name
         if _is_reparse_or_symlink(ret_p):
             raise WinInstallError(f"refusing symlink at tracked retired path {ret_p}", code=2)
-        if ret_p.exists() and (not ret_p.is_file() or sha256_file(ret_p) != ret_sha):
-            raise WinInstallError(f"refusing externally modified retired file {ret_p}", code=2)
+        if ret_p.exists():
+            if ret_sha is not None:
+                if not ret_p.is_file() or sha256_file(ret_p) != ret_sha:
+                    raise WinInstallError(f"refusing externally modified retired file {ret_p}", code=2)
+            elif not _is_heliograph_pe(ret_p):
+                raise WinInstallError(f"refusing non-Heliograph file at legacy retired path {ret_p}", code=2)
 
 
-def _normalize_retired_map(raw: Any) -> dict[str, str]:
+def _normalize_retired_map(raw: Any) -> dict[str, str | None]:
+    out: dict[str, str | None] = {}
     if isinstance(raw, dict):
-        out: dict[str, str] = {}
         for k, v in raw.items():
-            if isinstance(k, str) and WIN_RETIRED_RE.fullmatch(k) and isinstance(v, str) and len(v) == 64:
+            if isinstance(k, str) and WIN_RETIRED_RE.fullmatch(k) and (v is None or (isinstance(v, str) and len(v) == 64)):
                 out[k] = v
-        return out
-    return {}
+    elif isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, str) and WIN_RETIRED_RE.fullmatch(item):
+                out[item] = None
+    return out
 
 
-def _sweep_retired_exes(bin_dir: Path, retired_map: dict[str, str]) -> dict[str, str]:
+def _sweep_retired_exes(bin_dir: Path, retired_map: dict[str, str | None]) -> dict[str, str]:
     remaining: dict[str, str] = {}
     if not bin_dir.is_dir():
         return remaining
@@ -451,13 +464,19 @@ def _sweep_retired_exes(bin_dir: Path, retired_map: dict[str, str]) -> dict[str,
             raise WinInstallError(f"refusing symlink at tracked retired path {p}", code=2)
         if not p.exists():
             continue
-        if not p.is_file() or sha256_file(p) != exp_sha:
-            raise WinInstallError(f"refusing externally modified retired file {p}", code=2)
+        if exp_sha is not None:
+            if not p.is_file() or sha256_file(p) != exp_sha:
+                raise WinInstallError(f"refusing externally modified retired file {p}", code=2)
+            verified_sha = exp_sha
+        else:
+            if not _is_heliograph_pe(p):
+                raise WinInstallError(f"refusing non-Heliograph file at legacy retired path {p}", code=2)
+            verified_sha = sha256_file(p)
         try:
             p.unlink()
         except OSError as exc:
             if getattr(exc, "winerror", None) in (5, 32) or isinstance(exc, PermissionError):
-                remaining[name] = exp_sha
+                remaining[name] = verified_sha
             else:
                 raise
     return remaining
@@ -551,10 +570,16 @@ def _validate_win_journal(journal: Any, win_to: Path, reg_key: str) -> dict[str,
         if rec_name is not None and not _is_valid_win_temp(rec_name, tx_id):
             raise WinInstallError(f"Windows install journal rec_name is invalid: {rec_name}", code=2)
     retired = journal.get("retired", {})
-    if not isinstance(retired, dict) or any(
-        not isinstance(k, str) or not WIN_RETIRED_RE.fullmatch(k) or not isinstance(v, str) or len(v) != 64
-        for k, v in retired.items()
-    ):
+    if isinstance(retired, dict):
+        if any(
+            not isinstance(k, str) or not WIN_RETIRED_RE.fullmatch(k) or (v is not None and (not isinstance(v, str) or len(v) != 64))
+            for k, v in retired.items()
+        ):
+            raise WinInstallError("Windows install journal retired map contains invalid entries", code=2)
+    elif isinstance(retired, list):
+        if any(not isinstance(item, str) or not WIN_RETIRED_RE.fullmatch(item) for item in retired):
+            raise WinInstallError("Windows install journal retired list contains invalid entries", code=2)
+    else:
         raise WinInstallError("Windows install journal retired map contains invalid entries", code=2)
     return journal
 
