@@ -354,7 +354,9 @@ A path that no lane owns goes to whoever works in that repository, and to the ow
 
 ## 15. Quick installer
 
-> **Started:** 2026-11-23T23:17:30Z
+> **Started:** 2026-11-24T00:49Z
+
+**Corrected 2026-11-24:** re-planned with `todo-graph.py replan`; the build first began at 2026-11-23T23:17:30Z; its review chain is kept as `docs/reviews/01-heliograph/D01-T01-s15-chain1.md`. Clarified the journal schema contract: `tools/install.py` is first introduced in this section and writes `schema_version: 2` journals with explicit `pre_wrappers` for `install` and `--back` (while accepting `schema_version` 1 or 2 for `staging` and `--remove`), refusing unrecognized/incomplete `schema_version: 1` install/back journals with exit code 2 rather than attempting impossible migration of unshipped pre-release draft journals that never persisted overwritten wrapper stores.
 
 One command takes a checkout to a working `helio` in WSL. It records what it installed, so that §17 can compare and go back.
 
