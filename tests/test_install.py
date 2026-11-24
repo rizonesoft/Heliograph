@@ -527,7 +527,7 @@ class TestQuickInstaller(unittest.TestCase):
             unrelated_sha = self.mod.sha256_file(unrelated_helio)
             (frem_dir / self.mod.JOURNAL_NAME).write_text(
                 json.dumps({
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "op": "remove",
                     "phase": "publishing",
                     "tx_id": "abcdef012345",
@@ -542,12 +542,13 @@ class TestQuickInstaller(unittest.TestCase):
             with self.assertRaises(self.mod.InstallError) as ctx:
                 self.mod.recover_if_needed(frem_dir, root / "frw" / "helio")
             self.assertEqual(ctx.exception.code, 2)
+            self.assertIn("not a Heliograph artifact", str(ctx.exception))
             self.assertEqual(unrelated_helio.read_text(encoding="utf-8"), "unrelated user script\n")
 
             # Foreign install journal trying to unlink unrelated_helio when saved_files has existed=False.
             (frem_dir / self.mod.JOURNAL_NAME).write_text(
                 json.dumps({
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "op": "install",
                     "phase": "publishing",
                     "tx_id": "abcdef012345",
@@ -555,7 +556,7 @@ class TestQuickInstaller(unittest.TestCase):
                     "wrapper_path": str((root / "frw" / "helio").resolve()),
                     "had_manifest": False,
                     "previous_manifest": None,
-                    "previous_wrapper_existed": False,
+                    "pre_wrappers": {},
                     "saved_files": {"helio": {"existed": False, "rec_name": None, "sha256": None}},
                     "temp_files": [],
                     "desired_manifest": {
@@ -569,6 +570,7 @@ class TestQuickInstaller(unittest.TestCase):
             with self.assertRaises(self.mod.InstallError) as ctx:
                 self.mod.recover_if_needed(frem_dir, root / "frw" / "helio")
             self.assertEqual(ctx.exception.code, 2)
+            self.assertIn("not a Heliograph artifact", str(ctx.exception))
             self.assertEqual(unrelated_helio.read_text(encoding="utf-8"), "unrelated user script\n")
 
             # 7. Class-level regression for interrupted --back across ALL wrapper-aliasing combinations:
@@ -608,10 +610,14 @@ class TestQuickInstaller(unittest.TestCase):
 
             # 7b. Foreign rollback journal in a destination with GENUINE binaries and NO manifest cannot publish
             #     a foreign installed.json, create an external wrapper, or create an external lock/directory.
+            #     Populate saved_files and desired_manifest with matching hashes so only the had_manifest/absent-manifest
+            #     guard stops recovery (reverting that guard causes this test to fail).
             fman_dir = root / "foreign_manifest_pub"
             fman_dir.mkdir()
             make_distinct_binary(self.helio_bin, fman_dir / "helio", b"gen_legacy")
             make_distinct_binary(self.helio_exe, fman_dir / "helio.exe", b"gen_legacy")
+            fman_h_sha = self.mod.sha256_file(fman_dir / "helio")
+            fman_e_sha = self.mod.sha256_file(fman_dir / "helio.exe")
             existing_ext_dir = root / "existing_ext_dir"
             existing_ext_dir.mkdir()
             (fman_dir / self.mod.JOURNAL_NAME).write_text(
@@ -627,23 +633,37 @@ class TestQuickInstaller(unittest.TestCase):
                         "schema_version": 1,
                         "current": {
                             "commit": "a" * 40,
-                            "helio_sha256": self.mod.sha256_file(fman_dir / "helio"),
-                            "helio_exe_sha256": self.mod.sha256_file(fman_dir / "helio.exe"),
+                            "helio_sha256": fman_h_sha,
+                            "helio_exe_sha256": fman_e_sha,
                             "store": str(store),
                             "wrapper": str(existing_ext_dir / "helio"),
                         },
                         "previous": None,
                     },
                     "pre_wrappers": {str(existing_ext_dir / "helio"): str(store)},
-                    "saved_files": {},
+                    "saved_files": {
+                        "helio": {"existed": True, "rec_name": ".helio.abcdef012345.rec", "sha256": fman_h_sha},
+                        "helio.exe": {"existed": True, "rec_name": ".helio.exe.abcdef012345.rec", "sha256": fman_e_sha},
+                    },
                     "temp_files": [],
-                    "desired_manifest": None,
+                    "desired_manifest": {
+                        "schema_version": 1,
+                        "current": {
+                            "commit": "b" * 40,
+                            "helio_sha256": fman_h_sha,
+                            "helio_exe_sha256": fman_e_sha,
+                            "store": str(store),
+                            "wrapper": str((root / "fmw" / "helio").resolve()),
+                        },
+                        "previous": None,
+                    },
                 }),
                 encoding="utf-8",
             )
             with self.assertRaises(self.mod.InstallError) as ctx:
                 self.mod.install(repo=repo, to_dir=fman_dir, store_dir=store, wrapper_path=root / "fmw" / "helio", prebuilt=(a_h, a_e))
             self.assertEqual(ctx.exception.code, 2)
+            self.assertIn("absent", str(ctx.exception))
             self.assertFalse((fman_dir / self.mod.MANIFEST_NAME).exists())
             self.assertFalse((existing_ext_dir / self.mod.WRAPPER_LOCK_NAME).exists())
             self.assertFalse((existing_ext_dir / "helio").exists())
@@ -770,16 +790,15 @@ class TestQuickInstaller(unittest.TestCase):
             fake_ext_dir = root / "must_not_be_created_dir"
             (frec_dir / self.mod.JOURNAL_NAME).write_text(
                 json.dumps({
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "op": "install",
                     "phase": "publishing",
                     "tx_id": "abcdef012345",
                     "to_dir": str(frec_dir.resolve()),
                     "wrapper_path": str((root / "frec_w" / "helio").resolve()),
-                    "alt_wrapper_path": str(fake_ext_dir / "helio"),
                     "had_manifest": False,
                     "previous_manifest": None,
-                    "previous_wrapper_existed": False,
+                    "pre_wrappers": {str(fake_ext_dir / "helio"): str(store)},
                     "saved_files": {"helio": {"existed": True, "rec_name": fake_rec.name, "sha256": self.mod.sha256_file(fake_rec)}},
                     "temp_files": [fake_rec.name],
                     "desired_manifest": None,
@@ -789,17 +808,67 @@ class TestQuickInstaller(unittest.TestCase):
             with self.assertRaises(self.mod.InstallError) as ctx:
                 self.mod.install(repo=repo, to_dir=frec_dir, store_dir=store, wrapper_path=root / "frec_w" / "helio", prebuilt=(a_h, a_e))
             self.assertEqual(ctx.exception.code, 2)
+            self.assertIn("unowned path", str(ctx.exception))
             self.assertFalse((frec_dir / "helio").exists())
             self.assertFalse(fake_ext_dir.exists())
 
-            # Remove alt_wrapper_path so journal passes validation and hits the independent .rec identity check.
+            # Clear pre_wrappers so journal passes validation and hits the independent .rec identity check.
             j_only_rec = json.loads((frec_dir / self.mod.JOURNAL_NAME).read_text(encoding="utf-8"))
-            j_only_rec.pop("alt_wrapper_path")
+            j_only_rec["pre_wrappers"] = {}
             (frec_dir / self.mod.JOURNAL_NAME).write_text(json.dumps(j_only_rec), encoding="utf-8")
             with self.assertRaises(self.mod.InstallError) as ctx:
                 self.mod.recover_if_needed(frec_dir, root / "frec_w" / "helio")
             self.assertEqual(ctx.exception.code, 2)
+            self.assertIn("not a Heliograph artifact", str(ctx.exception))
             self.assertFalse((frec_dir / "helio").exists())
+
+            # 8b. Schema version 1 staging and removal journals still recover losslessly.
+            v1_stage_dir = root / "v1_stage_rec"
+            v1_stage_dir.mkdir()
+            v1_tmp = v1_stage_dir / ".helio.abcdef012345.rec"
+            v1_tmp.write_bytes(b"temp")
+            (v1_stage_dir / self.mod.JOURNAL_NAME).write_text(
+                json.dumps({
+                    "schema_version": 1,
+                    "op": "install",
+                    "phase": "staging",
+                    "tx_id": "abcdef012345",
+                    "to_dir": str(v1_stage_dir.resolve()),
+                    "wrapper_path": str((root / "v1_sw" / "helio").resolve()),
+                    "temp_files": [v1_tmp.name],
+                }),
+                encoding="utf-8",
+            )
+            self.assertTrue(self.mod.recover_if_needed(v1_stage_dir, root / "v1_sw" / "helio"))
+            self.assertFalse(v1_tmp.exists())
+            self.assertFalse((v1_stage_dir / self.mod.JOURNAL_NAME).exists())
+
+            v1_rem_dir = root / "v1_rem_rec"
+            v1_rem_wrap = root / "v1_rw" / "helio"
+            self.mod.install(repo=repo, to_dir=v1_rem_dir, store_dir=store, wrapper_path=v1_rem_wrap, prebuilt=(a_h, a_e))
+            (v1_rem_dir / self.mod.JOURNAL_NAME).write_text(
+                json.dumps({
+                    "schema_version": 1,
+                    "op": "remove",
+                    "phase": "publishing",
+                    "tx_id": "abcdef012345",
+                    "to_dir": str(v1_rem_dir.resolve()),
+                    "wrapper_path": str(v1_rem_wrap.resolve()),
+                    "remove_wrappers": [str(v1_rem_wrap.resolve())],
+                    "saved_files": {},
+                    "temp_files": [],
+                    "expected_hashes": {
+                        "helio": self.mod.sha256_file(v1_rem_dir / "helio"),
+                        "helio.exe": self.mod.sha256_file(v1_rem_dir / "helio.exe"),
+                        self.mod.MANIFEST_NAME: self.mod.sha256_file(v1_rem_dir / self.mod.MANIFEST_NAME),
+                    },
+                }),
+                encoding="utf-8",
+            )
+            self.assertTrue(self.mod.recover_if_needed(v1_rem_dir, v1_rem_wrap))
+            self.assertFalse((v1_rem_dir / "helio").exists())
+            self.assertFalse(v1_rem_wrap.exists())
+            self.assertFalse((v1_rem_dir / self.mod.JOURNAL_NAME).exists())
 
             # 9. Removing a two-wrapper installation through the CURRENT wrapper (wb) removes BOTH wa and wb.
             rem_cur_dir = root / "rem_via_current_wrap"

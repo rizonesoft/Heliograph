@@ -521,7 +521,19 @@ def _discover_lock_wrappers(to_dir: Path, wrapper_path: Path) -> list[Path]:
 def _validate_journal_paths(journal: Any, to_dir: Path, wrapper_path: Path) -> dict[str, Any]:
     if not isinstance(journal, dict):
         raise InstallError("corrupt or foreign install journal: not a JSON object", code=2)
-    if journal.get("schema_version") != 2:
+    op = journal.get("op")
+    if op not in ("install", "back", "remove"):
+        raise InstallError("invalid install journal operation", code=2)
+    phase = journal.get("phase", "publishing")
+    if phase not in ("staging", "publishing"):
+        raise InstallError("invalid install journal phase", code=2)
+    schema_version = journal.get("schema_version")
+    if schema_version == 2:
+        pass
+    elif schema_version == 1 and (phase == "staging" or op == "remove"):
+        # Staging and removal journals carry identical fields in v1 and v2 and recover losslessly.
+        pass
+    else:
         raise InstallError("unrecognized install journal schema", code=2)
     allowed_keys = {
         "schema_version",
@@ -543,12 +555,6 @@ def _validate_journal_paths(journal: Any, to_dir: Path, wrapper_path: Path) -> d
     unknown_keys = set(journal) - allowed_keys
     if unknown_keys:
         raise InstallError(f"corrupt or foreign install journal: unknown keys {sorted(unknown_keys)}", code=2)
-    op = journal.get("op")
-    if op not in ("install", "back", "remove"):
-        raise InstallError("invalid install journal operation", code=2)
-    phase = journal.get("phase", "publishing")
-    if phase not in ("staging", "publishing"):
-        raise InstallError("invalid install journal phase", code=2)
     tx_id = journal.get("tx_id")
     if not isinstance(tx_id, str) or not TX_ID_RE.fullmatch(tx_id):
         raise InstallError("invalid install journal tx_id", code=2)
