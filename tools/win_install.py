@@ -45,7 +45,7 @@ WIN_CMD_MARKER = "REM Managed by Heliograph installer"
 DEFAULT_REG_KEY = "Environment"
 HELIO_MARKERS = (b"HELIO_STORE", b"helio passes messages")
 TX_ID_RE = re.compile(r"^[0-9a-f]{12}$")
-WIN_RETIRED_RE = re.compile(r"^\.helio\.exe\.[0-9a-f]{12}\.retired$")
+WIN_RETIRED_RE = re.compile(r"^\.helio\.exe(?:\.old)?\.[0-9a-f]{12}\.retired$")
 WIN_RESERVED_ROOT = (WIN_CMD_NAME, WIN_EXE_NAME, WIN_MANIFEST_NAME, WIN_JOURNAL_NAME)
 WIN_RESERVED_BIN = (WIN_EXE_NAME, WIN_OLD_EXE_NAME)
 WIN_ALLOWED_SAVED_KEYS = {WIN_CMD_NAME, f"{WIN_BIN_SUBDIR}/{WIN_EXE_NAME}", f"{WIN_BIN_SUBDIR}/{WIN_OLD_EXE_NAME}"}
@@ -163,7 +163,7 @@ def _extract_wsl_distro(store_path: str) -> str | None:
 
 
 def render_win_cmd(default_store: str) -> str:
-    """Render helio.cmd (CRLF) forwarding %* directly (no double expansion) with WSL diagnostic."""
+    """Render helio.cmd (CRLF) forwarding %* directly (no call double-expansion) with WSL diagnostic."""
     if not default_store or any(ch in BATCH_FORBIDDEN for ch in default_store):
         raise WinInstallError(f"refusing unsafe store path for helio.cmd: {default_store!r}", code=2)
     distro = _extract_wsl_distro(default_store)
@@ -175,18 +175,35 @@ def render_win_cmd(default_store: str) -> str:
         "@echo off",
         WIN_CMD_MARKER,
         "setlocal EnableExtensions",
-        'set "_HELIO_USED_DEFAULT="',
-        "if not defined HELIO_STORE (",
+        'set "_H_HAS_STORE="',
+        'set "_H_SKIP="',
+        ":scan_args",
+        'if "%~1"=="" goto :after_scan',
+        "if defined _H_SKIP (",
+        '  set "_H_SKIP="',
+        "  shift /1",
+        "  goto :scan_args",
+        ")",
+        'if "%~1"=="--store" set "_H_HAS_STORE=1"',
+        'if "%~1"=="--as" set "_H_SKIP=1"',
+        'if "%~1"=="--key" set "_H_SKIP=1"',
+        'if "%~1"=="--due" set "_H_SKIP=1"',
+        'if "%~1"=="--kind" set "_H_SKIP=1"',
+        'if "%~1"=="--lane" set "_H_SKIP=1"',
+        'if "%~1"=="--file" set "_H_SKIP=1"',
+        'if "%~1"=="--reason" set "_H_SKIP=1"',
+        "shift /1",
+        "goto :scan_args",
+        ":after_scan",
+        "if not defined _H_HAS_STORE if not defined HELIO_STORE (",
         f'  set "HELIO_STORE={default_store}"',
-        '  set "_HELIO_USED_DEFAULT=1"',
+        f'  if not exist "{default_store}\\." (',
+        f"    >&2 echo {err_msg}",
+        "    exit /b 3",
+        "  )",
         ")",
         '"%~dp0bin\\helio.exe" %*',
-        'set "_HELIO_RC=%ERRORLEVEL%"',
-        'if not "%_HELIO_RC%"=="0" if defined _HELIO_USED_DEFAULT if not exist "' + default_store + '\\." (',
-        f"  >&2 echo {err_msg}",
-        "  exit /b 3",
-        ")",
-        "exit /b %_HELIO_RC%",
+        "exit /b %ERRORLEVEL%",
     ]
     return "\r\n".join(lines) + "\r\n"
 
@@ -300,9 +317,9 @@ def ensure_reg_path_entry(reg_key: str, folder: Path) -> tuple[bool, bool, int]:
         return False, existed, val_type
     if not raw_val:
         new_val = folder_str
-    elif raw_val.endswith(";"):
-        new_val = raw_val + folder_str
     else:
+        # Always append a ';' separator so a pre-existing trailing ';' (empty final segment)
+        # survives install -> remove verbatim.
         new_val = raw_val + ";" + folder_str
     write_kind = val_type if existed else int(winreg.REG_EXPAND_SZ)
     with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, reg_key, 0, winreg.KEY_SET_VALUE) as key:
@@ -404,22 +421,43 @@ def _verify_win_ownership(win_to: Path, manifest: dict[str, Any] | None, *, requ
         if sha256_file(old_p) != prev.get("helio_exe_sha256"):
             raise WinInstallError(f"refusing modified or unowned backup at {old_p}", code=2)
 
+    for ret_name, ret_sha in _normalize_retired_map(manifest.get("retired")).items():
+        ret_p = bin_dir / ret_name
+        if _is_reparse_or_symlink(ret_p):
+            raise WinInstallError(f"refusing symlink at tracked retired path {ret_p}", code=2)
+        if ret_p.exists() and (not ret_p.is_file() or sha256_file(ret_p) != ret_sha):
+            raise WinInstallError(f"refusing externally modified retired file {ret_p}", code=2)
 
-def _sweep_retired_exes(bin_dir: Path, retired_names: list[str]) -> list[str]:
-    remaining: list[str] = []
+
+def _normalize_retired_map(raw: Any) -> dict[str, str]:
+    if isinstance(raw, dict):
+        out: dict[str, str] = {}
+        for k, v in raw.items():
+            if isinstance(k, str) and WIN_RETIRED_RE.fullmatch(k) and isinstance(v, str) and len(v) == 64:
+                out[k] = v
+        return out
+    return {}
+
+
+def _sweep_retired_exes(bin_dir: Path, retired_map: dict[str, str]) -> dict[str, str]:
+    remaining: dict[str, str] = {}
     if not bin_dir.is_dir():
         return remaining
-    for name in retired_names:
+    for name, exp_sha in retired_map.items():
         if not isinstance(name, str) or not WIN_RETIRED_RE.fullmatch(name):
             continue
         p = bin_dir / name
-        if not p.exists() or _is_reparse_or_symlink(p):
+        if _is_reparse_or_symlink(p):
+            raise WinInstallError(f"refusing symlink at tracked retired path {p}", code=2)
+        if not p.exists():
             continue
+        if not p.is_file() or sha256_file(p) != exp_sha:
+            raise WinInstallError(f"refusing externally modified retired file {p}", code=2)
         try:
             p.unlink()
         except OSError as exc:
             if getattr(exc, "winerror", None) in (5, 32) or isinstance(exc, PermissionError):
-                remaining.append(name)
+                remaining[name] = exp_sha
             else:
                 raise
     return remaining
@@ -512,9 +550,12 @@ def _validate_win_journal(journal: Any, win_to: Path, reg_key: str) -> dict[str,
         rec_name = meta.get("rec_name")
         if rec_name is not None and not _is_valid_win_temp(rec_name, tx_id):
             raise WinInstallError(f"Windows install journal rec_name is invalid: {rec_name}", code=2)
-    retired = journal.get("retired", [])
-    if not isinstance(retired, list) or any(not isinstance(r, str) or not WIN_RETIRED_RE.fullmatch(r) for r in retired):
-        raise WinInstallError("Windows install journal retired list contains invalid entries", code=2)
+    retired = journal.get("retired", {})
+    if not isinstance(retired, dict) or any(
+        not isinstance(k, str) or not WIN_RETIRED_RE.fullmatch(k) or not isinstance(v, str) or len(v) != 64
+        for k, v in retired.items()
+    ):
+        raise WinInstallError("Windows install journal retired map contains invalid entries", code=2)
     return journal
 
 
@@ -566,12 +607,12 @@ def recover_win_if_needed(win_to: Path, reg_key: str) -> bool:
             p = win_to / rel
             if p.exists():
                 p.unlink()
-        still_busy = _sweep_retired_exes(win_to / WIN_BIN_SUBDIR, journal.get("retired", []))
+        still_busy = _sweep_retired_exes(win_to / WIN_BIN_SUBDIR, _normalize_retired_map(journal.get("retired")))
         if still_busy:
             journal["retired"] = still_busy
             _write_json_atomic(jp, journal)
             raise WinInstallError(
-                f"remove recovery paused: retired executable(s) still in use: {', '.join(still_busy)}",
+                f"remove recovery paused: retired executable(s) still in use: {', '.join(sorted(still_busy))}",
                 code=3,
             )
         jp.unlink()
@@ -608,7 +649,7 @@ def recover_win_if_needed(win_to: Path, reg_key: str) -> bool:
         if actual not in allowed:
             raise WinInstallError(f"recovery refusing externally created or modified file at {target}", code=2)
 
-    extra_retired: list[str] = list(journal.get("retired", []))
+    extra_retired: dict[str, str] = _normalize_retired_map(journal.get("retired"))
     for rel, meta in saved.items():
         target = win_to / rel
         if meta.get("existed"):
@@ -618,13 +659,14 @@ def recover_win_if_needed(win_to: Path, reg_key: str) -> bool:
                 continue
             if not rec_path.is_file() or sha256_file(rec_path) != exp_sha:
                 raise WinInstallError(f"recovery failed: cannot restore {target} from snapshot", code=3)
+            cur_target_sha = sha256_file(target) if target.exists() else None
             restore_tmp = target.parent / f".{target.name}.{tx_id}.restore"
             if restore_tmp.exists():
                 restore_tmp.unlink()
             _copy_to_staged(rec_path, restore_tmp)
             ret = _replace_win_exe(restore_tmp, target, tx_id)
-            if ret and ret not in extra_retired:
-                extra_retired.append(ret)
+            if ret and cur_target_sha:
+                extra_retired[ret] = cur_target_sha
         else:
             if target.exists():
                 target.unlink()
@@ -634,13 +676,12 @@ def recover_win_if_needed(win_to: Path, reg_key: str) -> bool:
 
     if journal.get("had_manifest") and isinstance(prev_manifest, dict):
         restored_manifest = dict(prev_manifest)
-        merged_retired = list(restored_manifest.get("retired", []))
-        for r in extra_retired:
-            if r not in merged_retired:
-                merged_retired.append(r)
+        merged_retired = _normalize_retired_map(restored_manifest.get("retired"))
+        merged_retired.update(extra_retired)
         restored_manifest["retired"] = _sweep_retired_exes(win_to / WIN_BIN_SUBDIR, merged_retired)
         _write_json_atomic(win_to / WIN_MANIFEST_NAME, restored_manifest)
     else:
+        _sweep_retired_exes(win_to / WIN_BIN_SUBDIR, extra_retired)
         mp = win_to / WIN_MANIFEST_NAME
         if mp.exists():
             mp.unlink()
@@ -713,7 +754,7 @@ def win_install(
                 )
             _verify_win_ownership(dest, existing, require_live=existing is not None)
 
-            prev_retired = list(existing.get("retired", [])) if existing else []
+            prev_retired = _normalize_retired_map(existing.get("retired")) if existing else {}
             remaining_retired = _sweep_retired_exes(bin_dir, prev_retired)
 
             tx_id = secrets.token_hex(6)
@@ -767,10 +808,12 @@ def win_install(
 
                 previous_entry: dict[str, Any] | None = None
                 rotate_old = False
+                same_install = False
                 if existing is not None:
                     prev_cur = existing["current"]
                     same_install = (
                         prev_cur.get("helio_exe_sha256") == actual_sha
+                        and prev_cur.get("helio_cmd_sha256") == cmd_sha
                         and prev_cur.get("store") == store_path
                         and prev_cur.get("commit") == commit
                         and bool(prev_cur.get("dirty", False)) == dirty
@@ -802,6 +845,16 @@ def win_install(
                 path_added_this_tx = not already_on_path
                 final_path_added = prior_path_added or path_added_this_tx
 
+                # Identical reinstall with Path already present: no-op without republishing files or bumping installed_at.
+                if existing is not None and same_install and not path_added_this_tx:
+                    result_manifest = dict(existing)
+                    if remaining_retired != prev_retired or not isinstance(existing.get("retired"), dict):
+                        result_manifest["retired"] = dict(remaining_retired)
+                        _write_json_atomic(dest / WIN_MANIFEST_NAME, result_manifest)
+                    _cleanup_win_temps(dest, temp_files, tx_id)
+                    (dest / WIN_JOURNAL_NAME).unlink()
+                    return result_manifest
+
                 desired_manifest: dict[str, Any] = {
                     "schema_version": 1,
                     "current": {
@@ -817,8 +870,17 @@ def win_install(
                     "path_had_value": prior_path_had_value,
                     "path_original_kind": path_kind_before,
                     "reg_key": reg_key,
-                    "retired": list(remaining_retired),
+                    "retired": dict(remaining_retired),
                 }
+
+                # Pre-record potential retired filenames + hashes BEFORE renaming any busy binary.
+                pre_retired = dict(remaining_retired)
+                old_rel = f"{WIN_BIN_SUBDIR}/{WIN_OLD_EXE_NAME}"
+                exe_rel = f"{WIN_BIN_SUBDIR}/{WIN_EXE_NAME}"
+                if rotate_old and saved[old_rel]["existed"] and saved[old_rel]["sha256"]:
+                    pre_retired[f".{WIN_OLD_EXE_NAME}.{tx_id}.retired"] = saved[old_rel]["sha256"]
+                if saved[exe_rel]["existed"] and saved[exe_rel]["sha256"]:
+                    pre_retired[f".{WIN_EXE_NAME}.{tx_id}.retired"] = saved[exe_rel]["sha256"]
 
                 journal = {
                     "schema_version": 2,
@@ -833,7 +895,7 @@ def win_install(
                     "path_had_value": prior_path_had_value,
                     "saved_files": saved,
                     "temp_files": temp_files,
-                    "retired": list(remaining_retired),
+                    "retired": pre_retired,
                     "desired_manifest": desired_manifest,
                 }
                 _write_json_atomic(dest / WIN_JOURNAL_NAME, journal)
@@ -842,15 +904,18 @@ def win_install(
 
                 if rotate_old:
                     stage_old = bin_dir / f".helio.exe.old.{tx_id}.stage"
-                    _copy_to_staged(dest / saved[f"{WIN_BIN_SUBDIR}/{WIN_EXE_NAME}"]["rec_name"], stage_old)
-                    _replace_win_exe(stage_old, bin_dir / WIN_OLD_EXE_NAME, tx_id)
+                    _copy_to_staged(dest / saved[exe_rel]["rec_name"], stage_old)
+                    retired_old = _replace_win_exe(stage_old, bin_dir / WIN_OLD_EXE_NAME, tx_id)
+                    if retired_old and saved[old_rel]["sha256"]:
+                        desired_manifest["retired"][retired_old] = saved[old_rel]["sha256"]
+                        journal["desired_manifest"] = desired_manifest
+                        _write_json_atomic(dest / WIN_JOURNAL_NAME, journal)
                     if on_boundary:
                         on_boundary("after_backup")
 
                 retired_name = _replace_win_exe(stage_exe, bin_dir / WIN_EXE_NAME, tx_id)
-                if retired_name:
-                    desired_manifest["retired"].append(retired_name)
-                    journal["retired"].append(retired_name)
+                if retired_name and saved[exe_rel]["sha256"]:
+                    desired_manifest["retired"][retired_name] = saved[exe_rel]["sha256"]
                     journal["desired_manifest"] = desired_manifest
                     _write_json_atomic(dest / WIN_JOURNAL_NAME, journal)
                 if on_boundary:
@@ -1029,7 +1094,7 @@ def win_back(
                     saved[rel] = {"existed": True, "rec_name": rec_rel, "sha256": sha256_file(dest / rec_rel)}
 
                 cur = manifest["current"]
-                swept_retired = _sweep_retired_exes(bin_dir, list(manifest.get("retired", [])))
+                swept_retired = _sweep_retired_exes(bin_dir, _normalize_retired_map(manifest.get("retired")))
                 desired_manifest = dict(manifest)
                 desired_manifest["current"] = {
                     "commit": prev["commit"],
@@ -1047,7 +1112,13 @@ def win_back(
                     "helio_cmd_sha256": cur["helio_cmd_sha256"],
                     "store": cur["store"],
                 }
-                desired_manifest["retired"] = list(swept_retired)
+                desired_manifest["retired"] = dict(swept_retired)
+
+                old_rel = f"{WIN_BIN_SUBDIR}/{WIN_OLD_EXE_NAME}"
+                exe_rel = f"{WIN_BIN_SUBDIR}/{WIN_EXE_NAME}"
+                pre_retired = dict(swept_retired)
+                pre_retired[f".{WIN_OLD_EXE_NAME}.{tx_id}.retired"] = saved[old_rel]["sha256"]
+                pre_retired[f".{WIN_EXE_NAME}.{tx_id}.retired"] = saved[exe_rel]["sha256"]
 
                 journal = {
                     "schema_version": 2,
@@ -1062,7 +1133,7 @@ def win_back(
                     "path_had_value": bool(manifest.get("path_had_value", True)),
                     "saved_files": saved,
                     "temp_files": temp_files,
-                    "retired": list(swept_retired),
+                    "retired": pre_retired,
                     "desired_manifest": desired_manifest,
                 }
                 _write_json_atomic(dest / WIN_JOURNAL_NAME, journal)
@@ -1071,14 +1142,16 @@ def win_back(
 
                 stage_exe = bin_dir / f".helio.exe.{tx_id}.stage"
                 stage_old = bin_dir / f".helio.exe.old.{tx_id}.stage"
-                _copy_to_staged(dest / saved[f"{WIN_BIN_SUBDIR}/{WIN_OLD_EXE_NAME}"]["rec_name"], stage_exe)
-                _copy_to_staged(dest / saved[f"{WIN_BIN_SUBDIR}/{WIN_EXE_NAME}"]["rec_name"], stage_old)
+                _copy_to_staged(dest / saved[old_rel]["rec_name"], stage_exe)
+                _copy_to_staged(dest / saved[exe_rel]["rec_name"], stage_old)
 
-                _replace_win_exe(stage_old, bin_dir / WIN_OLD_EXE_NAME, tx_id)
+                retired_old = _replace_win_exe(stage_old, bin_dir / WIN_OLD_EXE_NAME, tx_id)
                 retired_name = _replace_win_exe(stage_exe, bin_dir / WIN_EXE_NAME, tx_id)
-                if retired_name:
-                    desired_manifest["retired"].append(retired_name)
-                    journal["retired"].append(retired_name)
+                if retired_old or retired_name:
+                    if retired_old:
+                        desired_manifest["retired"][retired_old] = saved[old_rel]["sha256"]
+                    if retired_name:
+                        desired_manifest["retired"][retired_name] = saved[exe_rel]["sha256"]
                     journal["desired_manifest"] = desired_manifest
                     _write_json_atomic(dest / WIN_JOURNAL_NAME, journal)
                 if on_boundary:
@@ -1142,7 +1215,7 @@ def win_remove(
                 if p.exists():
                     expected[rel] = sha256_file(p)
 
-            retired_list = list(manifest.get("retired", []))
+            retired_map = _normalize_retired_map(manifest.get("retired"))
             path_added = bool(manifest.get("path_added", False))
             path_had_value = bool(manifest.get("path_had_value", True))
 
@@ -1156,7 +1229,7 @@ def win_remove(
                 "path_added": path_added,
                 "path_had_value": path_had_value,
                 "expected_hashes": expected,
-                "retired": retired_list,
+                "retired": retired_map,
                 "temp_files": [],
             }
             _write_json_atomic(dest / WIN_JOURNAL_NAME, journal)
@@ -1177,12 +1250,12 @@ def win_remove(
                     if on_boundary:
                         on_boundary(f"after_unlink_{rel.replace('/', '_').replace('.', '_')}")
 
-                still_busy = _sweep_retired_exes(bin_dir, retired_list)
+                still_busy = _sweep_retired_exes(bin_dir, retired_map)
                 if still_busy:
                     journal["retired"] = still_busy
                     _write_json_atomic(dest / WIN_JOURNAL_NAME, journal)
                     raise WinInstallError(
-                        f"removed active files, but retired executable(s) are still in use: {', '.join(still_busy)}; "
+                        f"removed active files, but retired executable(s) are still in use: {', '.join(sorted(still_busy))}; "
                         "rerun --windows --remove after they exit",
                         code=3,
                     )

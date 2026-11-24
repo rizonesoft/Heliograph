@@ -1829,26 +1829,36 @@ class TestQuickInstaller(unittest.TestCase):
                 self.assertEqual(rc_wp, 3)
                 self.assertIn("wslpath", stderr_buf.getvalue())
 
-                # Bare `helio` in Windows cmd.exe reads back the message sent from WSL!
-                cmd_probe = subprocess.run(
+                # Bare `helio` in BOTH Windows cmd.exe and PowerShell (with PATH derived from HKCU\<reg_key>
+                # appended to system PATH in real Windows user-PATH order) reads back the message sent from WSL!
+                shell_probe = subprocess.run(
                     [
                         "python.exe",
                         "-c",
                         (
-                            "import os, subprocess; "
-                            f"env = dict(os.environ); env.pop('HELIO_STORE', None); "
-                            f"env['PATH'] = {win_to!r} + ';' + env.get('PATH', ''); "
-                            "r = subprocess.run(['cmd.exe', '/c', 'helio', 'inbox', '--as', 'demo/win'], "
-                            "cwd=os.environ.get('TEMP', 'C:\\\\Windows\\\\Temp'), env=env, capture_output=True, text=True); "
-                            "print(r.stdout); raise SystemExit(r.returncode)"
+                            "import os, shutil, subprocess, winreg; "
+                            f"k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, {reg_key!r}); "
+                            "reg_path, _ = winreg.QueryValueEx(k, 'Path'); k.Close(); "
+                            "env = dict(os.environ); env.pop('HELIO_STORE', None); "
+                            "env['PATH'] = env.get('PATH', '') + ';' + reg_path; "
+                            "cwd = os.environ.get('TEMP', 'C:\\\\Windows\\\\Temp'); "
+                            "r_cmd = subprocess.run(['cmd.exe', '/c', 'helio', 'inbox', '--as', 'demo/win'], "
+                            "cwd=cwd, env=env, capture_output=True, text=True); "
+                            "ps = shutil.which('powershell.exe'); assert ps, 'powershell.exe missing'; "
+                            "r_ps = subprocess.run([ps, '-NoProfile', '-Command', 'helio inbox --as demo/win'], "
+                            "cwd=cwd, env=env, capture_output=True, text=True); "
+                            "print('CMD:', r_cmd.stdout); print('PS:', r_ps.stdout); "
+                            "raise SystemExit(r_cmd.returncode or r_ps.returncode)"
                         ),
                     ],
                     stdin=subprocess.DEVNULL,
                     capture_output=True,
                     text=True,
                 )
-                self.assertEqual(cmd_probe.returncode, 0, cmd_probe.stdout + cmd_probe.stderr)
-                self.assertIn(msg_subject, cmd_probe.stdout)
+                self.assertEqual(shell_probe.returncode, 0, shell_probe.stdout + shell_probe.stderr)
+                cmd_out, ps_out = shell_probe.stdout.split("PS:", 1)
+                self.assertIn(msg_subject, cmd_out)
+                self.assertIn(msg_subject, ps_out)
 
                 # Failed build from WSL leaves the existing Windows installation untouched!
                 fail_ws = root / "fail_ws"
@@ -1955,9 +1965,12 @@ class TestWindowsInstaller(unittest.TestCase):
                 self.assertFalse((win_to / "helio.exe").exists())
                 self.assertTrue((win_to / "bin" / "helio.exe").is_file())
 
+                existed_p, reg_path_val, _ = self.win_mod.read_reg_path(reg_key)
+                self.assertTrue(existed_p)
                 base_env = dict(os.environ)
                 base_env.pop("HELIO_STORE", None)
-                base_env["PATH"] = f"{win_to};{base_env.get('PATH', '')}"
+                # Append the registry Path value after system PATH, matching real Windows new-session resolution order.
+                base_env["PATH"] = f"{base_env.get('PATH', '')};{reg_path_val}"
 
                 # Bare `helio` from cmd.exe outside win_to reaches default_store.
                 r_cmd = subprocess.run(
@@ -2085,6 +2098,25 @@ class TestWindowsInstaller(unittest.TestCase):
                     text=True,
                 )
                 self.assertEqual(r_ov2.returncode, 0, r_ov2.stderr)
+
+                # Failing command with an explicit reachable --store returns helio.exe's exact exit code
+                # and does NOT emit the offline default-WSL-distro diagnostic or exit 3!
+                r_fail_direct = subprocess.run(
+                    [str(self.helio_exe), "show", "nonexistent-id-123", "--as", "demo/win", "--store", str(flag_store)],
+                    capture_output=True,
+                    text=True,
+                )
+                r_fail_ov = subprocess.run(
+                    ["cmd.exe", "/c", "helio", "show", "nonexistent-id-123", "--as", "demo/win", "--store", str(flag_store)],
+                    cwd=str(outside_cwd),
+                    env=base_env,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(r_fail_ov.returncode, r_fail_direct.returncode)
+                self.assertNotEqual(r_fail_ov.returncode, 0)
+                self.assertNotIn("WSL", r_fail_ov.stderr)
+                self.assertNotIn(bogus_distro, r_fail_ov.stderr)
         finally:
             self._delete_reg_key(reg_key)
 
@@ -2121,7 +2153,8 @@ class TestWindowsInstaller(unittest.TestCase):
                     m2 = self.win_mod.win_install(source_exe=exe_b, source_sha256=sha_b, store_path=str(s2), commit="b" * 40, win_to=win_to, reg_key=reg_key)
                     self.assertEqual(self.win_mod.sha256_file(win_to / "bin" / "helio.exe"), sha_b)
                     self.assertGreaterEqual(len(m2["retired"]), 1, "expected busy live helio.exe to be renamed to .retired")
-                    retired_file = win_to / "bin" / m2["retired"][0]
+                    retired_name = next(iter(m2["retired"].keys()))
+                    retired_file = win_to / "bin" / retired_name
                     self.assertTrue(retired_file.is_file())
                     _out, err = holder.communicate(input="body\n", timeout=30)
                     self.assertEqual(holder.returncode, 0, err)
@@ -2130,9 +2163,22 @@ class TestWindowsInstaller(unittest.TestCase):
                         holder.kill()
                         holder.communicate()
 
+                # Tampering with a tracked .retired file causes install/remove to refuse with exit 2 and preserve bytes!
+                orig_retired_bytes = retired_file.read_bytes()
+                retired_file.write_bytes(b"externally-modified-retired")
+                with self.assertRaises(self.win_mod.WinInstallError) as ctx:
+                    self.win_mod.win_install(source_exe=exe_b, source_sha256=sha_b, store_path=str(s2), commit="b" * 40, win_to=win_to, reg_key=reg_key)
+                self.assertEqual(ctx.exception.code, 2)
+                self.assertEqual(retired_file.read_bytes(), b"externally-modified-retired")
+                with self.assertRaises(self.win_mod.WinInstallError) as ctx:
+                    self.win_mod.win_remove(win_to=win_to, reg_key=reg_key)
+                self.assertEqual(ctx.exception.code, 2)
+                self.assertEqual(retired_file.read_bytes(), b"externally-modified-retired")
+                retired_file.write_bytes(orig_retired_bytes)
+
                 # Next install (identical to B) sweeps retired file AND preserves distinct rollback generation A!
                 m3 = self.win_mod.win_install(source_exe=exe_b, source_sha256=sha_b, store_path=str(s2), commit="b" * 40, win_to=win_to, reg_key=reg_key)
-                self.assertEqual(m3["retired"], [])
+                self.assertEqual(m3["retired"], {})
                 self.assertFalse(retired_file.exists())
                 self.assertEqual(m3["previous"]["helio_exe_sha256"], sha_a)
 
@@ -2222,18 +2268,21 @@ class TestWindowsInstaller(unittest.TestCase):
                 subprocess.run([str(self.helio_exe), "init", "--store", str(store)], check=True, capture_output=True)
                 exe_sha = self.win_mod.sha256_file(self.helio_exe)
 
-                # 1. Initially absent Path -> created as REG_EXPAND_SZ, broadcast called once; 2nd install does NOT broadcast; remove deletes Path.
+                # 1. Initially absent Path -> created as REG_EXPAND_SZ, broadcast called once; 2nd identical install is a true no-op; remove deletes Path.
                 with mock.patch.object(self.win_mod, "broadcast_environment_change", wraps=self.win_mod.broadcast_environment_change) as bcast:
-                    self.win_mod.win_install(source_exe=self.helio_exe, source_sha256=exe_sha, store_path=str(store), commit="a" * 40, win_to=win_to, reg_key=reg_key)
+                    m1 = self.win_mod.win_install(source_exe=self.helio_exe, source_sha256=exe_sha, store_path=str(store), commit="a" * 40, win_to=win_to, reg_key=reg_key)
                     self.assertEqual(bcast.call_count, 1)
                     existed, val, kind = self.win_mod.read_reg_path(reg_key)
                     self.assertTrue(existed)
                     self.assertEqual(kind, winreg.REG_EXPAND_SZ)
                     self.assertEqual(val, str(win_to.resolve()))
 
-                    # Second install changes nothing and skips broadcast.
-                    self.win_mod.win_install(source_exe=self.helio_exe, source_sha256=exe_sha, store_path=str(store), commit="a" * 40, win_to=win_to, reg_key=reg_key)
+                    # Second identical install is a true no-op (skips broadcast, does not bump installed_at or rewrite files).
+                    cmd_mtime = (win_to / "helio.cmd").stat().st_mtime_ns
+                    m2 = self.win_mod.win_install(source_exe=self.helio_exe, source_sha256=exe_sha, store_path=str(store), commit="a" * 40, win_to=win_to, reg_key=reg_key)
                     self.assertEqual(bcast.call_count, 1)
+                    self.assertEqual(m2["current"]["installed_at"], m1["current"]["installed_at"])
+                    self.assertEqual((win_to / "helio.cmd").stat().st_mtime_ns, cmd_mtime)
 
                     # Remove deletes Path value and folder completely.
                     self.assertTrue(self.win_mod.win_remove(win_to=win_to, reg_key=reg_key))
@@ -2241,6 +2290,14 @@ class TestWindowsInstaller(unittest.TestCase):
                     existed, _, _ = self.win_mod.read_reg_path(reg_key)
                     self.assertFalse(existed)
                     self.assertFalse(win_to.exists())
+
+                # 1b. Trailing semicolon (e.g. C:\Tools;) roundtrips verbatim through install + remove!
+                with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, reg_key, 0, winreg.KEY_SET_VALUE) as k:
+                    winreg.SetValueEx(k, "Path", 0, winreg.REG_EXPAND_SZ, r"C:\Tools;")
+                self.win_mod.win_install(source_exe=self.helio_exe, source_sha256=exe_sha, store_path=str(store), commit="a" * 40, win_to=win_to, reg_key=reg_key)
+                self.assertTrue(self.win_mod.win_remove(win_to=win_to, reg_key=reg_key))
+                existed_tr, val_tr, kind_tr = self.win_mod.read_reg_path(reg_key)
+                self.assertEqual((existed_tr, val_tr, kind_tr), (True, r"C:\Tools;", winreg.REG_EXPAND_SZ))
 
                 # 2. Existing REG_EXPAND_SZ with %USERPROFILE%\bin AND empty delimiters (;;) stays verbatim,
                 #    and intervening 3rd-party entry survives remove!
