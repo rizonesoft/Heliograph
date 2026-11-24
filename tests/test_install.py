@@ -4889,17 +4889,30 @@ class TestPhaseInstaller(unittest.TestCase):
             idx_pending = txt.find("--pending-phases")
             idx_no_ready = txt.find("If no phase has a ready row")
             self.assertTrue(0 <= idx_pending < idx_no_ready, f"{rel}: --pending-phases must precede Step 1 halt")
-            # Both Step 1 and Step 2 must synchronize HEAD with origin/main and re-check --pending-phases before --phase <n> (items 39 & 40)!
+            # Both Step 1 branch (c) and Step 2 must unconditionally synchronize HEAD with origin/main,
+            # re-check --pending-phases, and ONLY THEN run --phase <n> (items 39, 40, and 41)!
             step2_idx = txt.find("## 2. After a phase closeout or park")
             self.assertGreater(step2_idx, 0, f"{rel}: missing Step 2 heading")
             step1_txt = txt[:step2_idx]
             step2_txt = txt[step2_idx:]
-            for label, chunk in (("Step 1", step1_txt), ("Step 2", step2_txt)):
-                self.assertIn("git pull --rebase origin main && git push origin main", chunk, f"{rel} {label}")
-                self.assertGreaterEqual(chunk.count("--pending-phases"), 2, f"{rel} {label}: must re-check --pending-phases after sync")
+            c_start = step1_txt.find("(c) otherwise")
+            c_end = step1_txt.find("If no phase has a ready row", c_start)
+            self.assertTrue(0 <= c_start < c_end, f"{rel}: missing Step 1 branch (c)")
+            branch_c = step1_txt[c_start:c_end]
+            self.assertNotIn("if `HEAD` has unpushed", branch_c, f"{rel}: branch (c) sync must be unconditional")
+            for label, chunk in (("Step 1 branch (c)", branch_c), ("Step 2", step2_txt)):
+                i_sync = chunk.find("git pull --rebase origin main && git push origin main")
+                i_recheck = chunk.find("re-run `python3 tools/install.py --pending-phases`", max(i_sync, 0))
+                i_phase = chunk.find("tools/install.py --phase <n>", max(i_recheck, 0))
+                self.assertTrue(
+                    0 <= i_sync < i_recheck < i_phase,
+                    f"{rel} {label}: must sync -> re-run --pending-phases -> --phase <n> (got {i_sync}, {i_recheck}, {i_phase})",
+                )
         prompt_txt = (REPO / "docs/unattended-prompt.md").read_text(encoding="utf-8")
-        self.assertIn("git pull --rebase origin main && git push origin main", prompt_txt)
-        self.assertGreaterEqual(prompt_txt.count("--pending-phases"), 2)
+        p_sync = prompt_txt.find("synchronize `HEAD` with `git pull --rebase origin main && git push origin main`")
+        p_recheck = prompt_txt.find("re-run `python3 tools/install.py --pending-phases`", max(p_sync, 0))
+        p_phase = prompt_txt.find("run `--phase <n>`", max(p_recheck, 0))
+        self.assertTrue(0 <= p_sync < p_recheck < p_phase, f"unattended-prompt.md ordering: {p_sync}, {p_recheck}, {p_phase}")
 
         # Broken/non-repo HELIO_REPO must exit 3 (never silently return [] / exit 0)!
         r_bad = subprocess.run(
@@ -5152,10 +5165,13 @@ class TestPhaseInstaller(unittest.TestCase):
                 r_rf2_del = subprocess.run([sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"], env=env, capture_output=True, text=True)
                 self.assertEqual(r_rf2_del.returncode, 1, r_rf2_del.stdout + r_rf2_del.stderr)
                 self.assertEqual(json.loads(r_rf2_del.stdout), [0])
-                # Recover the unpublished deletion commit via branch (c): push preserving the deletion commit,
-                # run `run_phase_install`, record `Installed commit:` in the surviving run file, and push -> [] (exit 0) (item 39)!
+                # Recover the unpublished deletion commit via branch (c): sync with origin/main (preserving the deletion),
+                # re-check `--pending-phases` (still [0]), run `run_phase_install`, record `Installed commit:`, and push -> [] (items 39 & 41)!
                 subprocess.run(["git", "-C", str(checkout), "pull", "--rebase", "origin", "main"], check=True, capture_output=True)
                 subprocess.run(["git", "-C", str(checkout), "push", "origin", "main"], check=True, capture_output=True)
+                r_rf2_recheck = subprocess.run([sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"], env=env, capture_output=True, text=True)
+                self.assertEqual(r_rf2_recheck.returncode, 1, r_rf2_recheck.stdout + r_rf2_recheck.stderr)
+                self.assertEqual(json.loads(r_rf2_recheck.stdout), [0])
                 del_sha = subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip()
                 with mock.patch.dict(os.environ, {"PATH": path_with_wrapper}):
                     res_del = self.phase_mod.run_phase_install(
