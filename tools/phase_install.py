@@ -99,7 +99,7 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
         if fetch_res.returncode != 0:
             _fail(f"cannot fetch origin refs/heads/main in {repo}: {(fetch_res.stderr or fetch_res.stdout).strip()}")
 
-    def _scan_run_files(commit_ref: str, pnum: int) -> tuple[bool, bool, str | None, list[str]]:
+    def _scan_run_files(commit_ref: str, pnum: int) -> tuple[bool, bool, str | None, list[str], str, list[str]]:
         ls_r = subprocess.run(
             ["git", "-C", str(repo), "ls-tree", "-r", "--name-only", commit_ref, "docs/phase-runs"],
             stdin=subprocess.DEVNULL,
@@ -114,6 +114,8 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
         has_closeout = False
         has_open_park = False
         installed_sha: str | None = None
+        latest_co_file = ""
+        latest_co_lines: list[str] = []
         for rp in phase_files:
             show_r = subprocess.run(
                 ["git", "-C", str(repo), "show", f"{commit_ref}:{rp}"],
@@ -129,13 +131,19 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
                     has_closeout = True
                     has_open_park = False
                     installed_sha = None
+                    latest_co_file = rp
+                    latest_co_lines = [line.rstrip()]
                 elif line.startswith("PARKED "):
                     has_open_park = True
                 elif has_closeout and not has_open_park:
                     m = re.search(r"Installed commit:\s*`?([0-9a-f]{40})`?", line)
                     if m:
                         installed_sha = m.group(1)
-        return has_closeout, has_open_park, installed_sha, phase_files
+                    elif rp == latest_co_file:
+                        latest_co_lines.append(line.rstrip())
+        while latest_co_lines and latest_co_lines[-1] == "":
+            latest_co_lines.pop()
+        return has_closeout, has_open_park, installed_sha, phase_files, latest_co_file, latest_co_lines
 
     pending: list[int] = []
     declared_phases = data["phases"]
@@ -148,14 +156,16 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
         p_sections = [s for s in sections if isinstance(s, dict) and s.get("phase") == pnum]
         if not p_sections or not all(s.get("status") == "verified" for s in p_sections):
             continue
-        head_closed, head_parked, _head_installed_sha, head_files = _scan_run_files("HEAD", pnum)
+        head_closed, head_parked, _head_installed_sha, head_files, _head_co_file, _head_co_lines = _scan_run_files("HEAD", pnum)
         if not head_closed or head_parked:
             continue
         # Owning-layer Git truth: find the latest commit on HEAD touching this phase's run files.
         # If that commit is NOT an ancestor of origin/main (`rem_sha`), HEAD has unpushed closeout/receipt edits
         # (including amended same-heading closeouts or competing receipts) -> ALWAYS pending!
         # If it IS an ancestor of `rem_sha` (including stale checkouts strictly behind a newer receipted closeout
-        # and unrelated local commits touching other files), `origin/main`'s published receipt settles the phase.
+        # and unrelated local commits touching other files), `origin/main`'s published receipt settles the phase
+        # ONLY if the receipt's referenced commit is an ancestor of `rem_sha` AND already contained this exact
+        # latest closeout block (preventing a renewed closeout from inheriting an earlier closeout's installation).
         rl = subprocess.run(
             ["git", "-C", str(repo), "rev-list", "-1", "HEAD", "--", *head_files],
             stdin=subprocess.DEVNULL,
@@ -178,8 +188,22 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
         if anc.returncode != 0:
             pending.append(pnum)
             continue
-        rem_closed, rem_parked, rem_installed_sha, _rem_files = _scan_run_files(rem_sha, pnum)
+        rem_closed, rem_parked, rem_installed_sha, _rem_files, rem_co_file, rem_co_lines = _scan_run_files(rem_sha, pnum)
         if not (rem_closed and not rem_parked and bool(rem_installed_sha)):
+            pending.append(pnum)
+            continue
+        inst_anc = subprocess.run(
+            ["git", "-C", str(repo), "merge-base", "--is-ancestor", rem_installed_sha, rem_sha],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if inst_anc.returncode != 0:
+            pending.append(pnum)
+            continue
+        inst_closed, inst_parked, _inst_sha, _inst_files, inst_co_file, inst_co_lines = _scan_run_files(rem_installed_sha, pnum)
+        if not (inst_closed and not inst_parked and inst_co_file == rem_co_file and inst_co_lines == rem_co_lines):
             pending.append(pnum)
     return sorted(pending)
 
@@ -232,12 +256,19 @@ def _restore_wsl_previous(to_dir: Path, tx_id: str, pre_previous: dict[str, Any]
     install_mod.write_json_atomic(to_dir / install_mod.MANIFEST_NAME, manifest)
 
 
+def _win_phase_prev_path(to_dir: Path, tx_id: str, install_mod: Any) -> Path:
+    if not tx_id or not re.fullmatch(r"[0-9a-f]{12}", tx_id):
+        raise install_mod.InstallError(f"invalid phase transaction id for Windows snapshot: {tx_id!r}", code=2)
+    return to_dir / f".phase-prev-{tx_id}.win.helio.exe.old"
+
+
 def _cleanup_wsl_previous(to_dir: Path, tx_id: str, install_mod: Any) -> None:
     if not tx_id or not re.fullmatch(r"[0-9a-f]{12}", tx_id):
         return
     snap_h, snap_e = _wsl_phase_prev_paths(to_dir, tx_id, install_mod)
+    snap_w = _win_phase_prev_path(to_dir, tx_id, install_mod)
     removed = False
-    for sp in (snap_h, snap_e):
+    for sp in (snap_h, snap_e, snap_w):
         if sp.is_file() and not sp.is_symlink():
             sp.unlink()
             removed = True
@@ -494,9 +525,9 @@ def _win_phase_marker_call(
     commit: str = "",
     payload_json: str = "",
     install_mod: Any | None = None,
-) -> None:
+) -> str:
     code = (
-        "import importlib.util, json, sys\n"
+        "import base64, importlib.util, json, sys\n"
         "from pathlib import Path\n"
         "spec = importlib.util.spec_from_file_location('wi', sys.argv[1])\n"
         "mod = importlib.util.module_from_spec(spec)\n"
@@ -512,11 +543,13 @@ def _win_phase_marker_call(
         "    elif action == 'recover':\n"
         "        mod.win_recover(win_to=win_to, reg_key=reg_key, phase_tx_id=tx_id or None)\n"
         "    elif action == 'snapshot_prev':\n"
-        "        mod.win_phase_snapshot_prev(win_to=win_to, tx_id=tx_id)\n"
+        "        raw = mod.win_phase_snapshot_prev(win_to=win_to, tx_id=tx_id)\n"
+        "        if raw is not None:\n"
+        "            sys.stdout.write(base64.b64encode(raw).decode('ascii'))\n"
         "    elif action == 'restore_prev':\n"
-        "        mod.win_phase_restore_prev(win_to=win_to, tx_id=tx_id, pre_previous=json.loads(payload))\n"
-        "    elif action == 'cleanup_prev':\n"
-        "        mod.win_phase_cleanup_prev(win_to=win_to, tx_id=tx_id, expected_sha=payload)\n"
+        "        data = json.loads(payload)\n"
+        "        rexe = Path(data['restore_exe']) if data.get('restore_exe') else None\n"
+        "        mod.win_phase_restore_prev(win_to=win_to, tx_id=tx_id, pre_previous=data.get('pre_previous'), restore_exe=rexe)\n"
         "except mod.WinInstallError as exc:\n"
         "    print(str(exc), file=sys.stderr)\n"
         "    sys.exit(exc.code)\n"
@@ -531,6 +564,7 @@ def _win_phase_marker_call(
         if install_mod is not None:
             raise install_mod.InstallError(msg, code=3)
         raise RuntimeError(msg)
+    return res.stdout
 
 
 def _run_win_cli(
@@ -922,6 +956,15 @@ def _rollback_phase_journal(
                     # `current` is already B (including after an interruption between writing helio.exe.old and updating manifest,
                     # where status_code is 3 due to the backup hash mismatch!). Finish restoring/clearing `previous` and re-verify!
                     try:
+                        win_mod = install_mod._load_win_install()
+                        restore_payload = {
+                            "pre_previous": win_pre_prev,
+                            "restore_exe": (
+                                win_mod.wsl_to_windows_path(_win_phase_prev_path(to_dir, tx_id, install_mod))
+                                if isinstance(win_pre_prev, dict)
+                                else None
+                            ),
+                        }
                         _win_phase_marker_call(
                             python_exe,
                             win_install_py_win,
@@ -929,7 +972,7 @@ def _rollback_phase_journal(
                             win_to_raw,
                             reg_key,
                             tx_id,
-                            payload_json=json.dumps(win_pre_prev),
+                            payload_json=json.dumps(restore_payload),
                             install_mod=install_mod,
                         )
                         post_win = _probe_win_state(python_exe, win_install_py_win, win_to_raw, reg_key, install_mod=install_mod)
@@ -958,6 +1001,15 @@ def _rollback_phase_journal(
                     else:
                         try:
                             if journal.get("win_had_install") and win_has_pre_prev:
+                                win_mod = install_mod._load_win_install()
+                                restore_payload = {
+                                    "pre_previous": win_pre_prev,
+                                    "restore_exe": (
+                                        win_mod.wsl_to_windows_path(_win_phase_prev_path(to_dir, tx_id, install_mod))
+                                        if isinstance(win_pre_prev, dict)
+                                        else None
+                                    ),
+                                }
                                 _win_phase_marker_call(
                                     python_exe,
                                     win_install_py_win,
@@ -965,7 +1017,7 @@ def _rollback_phase_journal(
                                     win_to_raw,
                                     reg_key,
                                     tx_id,
-                                    payload_json=json.dumps(win_pre_prev),
+                                    payload_json=json.dumps(restore_payload),
                                     install_mod=install_mod,
                                 )
                             post_win = _probe_win_state(python_exe, win_install_py_win, win_to_raw, reg_key, install_mod=install_mod)
@@ -1047,11 +1099,6 @@ def _rollback_phase_journal(
     journal["phase_state"] = "rolled_back"
     install_mod.write_json_atomic(to_dir / PHASE_JOURNAL_NAME, journal)
     _cleanup_wsl_previous(to_dir, tx_id, install_mod)
-    if journal.get("win_prev_snapshotted"):
-        prev_sha = str((journal.get("win_pre_previous") or {}).get("helio_exe_sha256") or "")
-        _win_phase_marker_call(
-            python_exe, win_install_py_win, "cleanup_prev", win_to_raw, reg_key, tx_id, payload_json=prev_sha, install_mod=install_mod
-        )
 
     if tx_id:
         try:
@@ -1201,11 +1248,6 @@ def _recover_pending_phase_journal(
     if state == "rolled_back":
         # Rollback already completed durably; clean any remaining tx-scoped snapshot, release marker, and unlink journal.
         _cleanup_wsl_previous(to_dir, j_tx, install_mod)
-        if journal.get("win_prev_snapshotted"):
-            prev_sha = str((journal.get("win_pre_previous") or {}).get("helio_exe_sha256") or "")
-            _win_phase_marker_call(
-                python_exe, win_install_py_win, "cleanup_prev", journal.get("win_to_arg"), str(journal["reg_key"]), j_tx, payload_json=prev_sha, install_mod=install_mod
-            )
         _win_phase_marker_call(
             python_exe,
             win_install_py_win,
@@ -1221,11 +1263,6 @@ def _recover_pending_phase_journal(
     if state == "notifying":
         # Clean any remaining tx-scoped snapshot and idempotently release any stranded Windows marker.
         _cleanup_wsl_previous(to_dir, j_tx, install_mod)
-        if journal.get("win_prev_snapshotted"):
-            prev_sha = str((journal.get("win_pre_previous") or {}).get("helio_exe_sha256") or "")
-            _win_phase_marker_call(
-                python_exe, win_install_py_win, "cleanup_prev", journal.get("win_to_arg"), str(journal["reg_key"]), j_tx, payload_json=prev_sha, install_mod=install_mod
-            )
         _win_phase_marker_call(
             python_exe,
             win_install_py_win,
@@ -1600,12 +1637,8 @@ def run_phase_install(
                     if win_had_install:
                         win_pre_prev = (win_pre_manifest or {}).get("previous")
                         if isinstance(win_pre_prev, dict):
-                            # Persist `win_prev_snapshotted = True` BEFORE creating the Windows snapshot so a crash
-                            # right after Windows writes the file always cleans it up on rollback!
-                            journal["win_prev_snapshotted"] = True
-                            journal["win_pre_previous"] = win_pre_prev
-                            install_mod.write_json_atomic(to_dir / PHASE_JOURNAL_NAME, journal)
-                            _win_phase_marker_call(
+                            # Read-only capture of Windows bin\helio.exe.old into WSL-owned to_dir (zero files created in win_to!).
+                            b64_raw = _win_phase_marker_call(
                                 python_exe,
                                 win_install_py_win,
                                 "snapshot_prev",
@@ -1613,7 +1646,20 @@ def run_phase_install(
                                 reg_key,
                                 tx_id,
                                 install_mod=install_mod,
-                            )
+                            ).strip()
+                            if not b64_raw:
+                                raise install_mod.InstallError("missing Windows previous generation binary during snapshot", code=3)
+                            import base64
+                            raw_prev = base64.b64decode(b64_raw.encode("ascii"))
+                            exp_prev_sha = str(win_pre_prev.get("helio_exe_sha256") or "")
+                            if exp_prev_sha and hashlib.sha256(raw_prev).hexdigest() != exp_prev_sha:
+                                raise install_mod.InstallError("Windows previous generation binary hash mismatch during snapshot", code=3)
+                            snap_w = _win_phase_prev_path(to_dir, tx_id, install_mod)
+                            if snap_w.exists() or snap_w.is_symlink():
+                                raise install_mod.InstallError(f"refusing existing or linked Windows phase snapshot at {snap_w}", code=2)
+                            install_mod.write_bytes_atomic(snap_w, raw_prev, mode=0o600)
+                            journal["win_pre_previous"] = win_pre_prev
+                            install_mod.write_json_atomic(to_dir / PHASE_JOURNAL_NAME, journal)
                         else:
                             journal["win_pre_previous"] = None
                     journal["win_changed"] = True
@@ -1680,11 +1726,6 @@ def run_phase_install(
             # Post-commit cleanup & marker release live OUTSIDE the rollback try/except so a failure here
             # never re-enters rollback; retrying resumes cleanly from `phase_state == "notifying"`.
             _cleanup_wsl_previous(to_dir, tx_id, install_mod)
-            if journal.get("win_prev_snapshotted"):
-                prev_sha = str((journal.get("win_pre_previous") or {}).get("helio_exe_sha256") or "")
-                _win_phase_marker_call(
-                    python_exe, win_install_py_win, "cleanup_prev", win_to_raw, reg_key, tx_id, payload_json=prev_sha, install_mod=install_mod
-                )
             _win_phase_marker_call(python_exe, win_install_py_win, "end", win_to_raw, reg_key, tx_id, install_mod=install_mod)
 
             # Post-verification notification: if this fails, keep `phase_state == "notifying"` so retry only re-sends.

@@ -4636,65 +4636,48 @@ class TestPhaseInstaller(unittest.TestCase):
                     self._delete_reg_key(sole_reg_key)
                     self._cleanup_win_parent(sole_win_to)
 
-                # Verify cleanup_prev NEVER deletes a pre-existing untagged file EVEN IF its name was recorded in
-                # `.phase-active.json['snapshot_file']` AND its bytes match `a_e_sha` identically (item 9 race)!
+                # Class-level regression (items 2 & 9): win_phase_snapshot_prev is pure read-only on Windows
+                # (creates ZERO files in win_to\bin\), so no crash can strand a Windows snapshot file AND any
+                # pre-existing foreign file in win_to\bin\ (byte-identical OR empty 0-byte) is preserved verbatim,
+                # while WSL-owned `.phase-prev-*` backup files in `to_dir` are cleaned up completely.
+                self.assertEqual(list(to_dir.glob(".phase-prev-*")), [])
                 self.phase_mod._win_phase_marker_call(
                     self.python_exe, win_install_py_win, "begin", win_to, reg_key, "aa11bb22cc33", phase=0, commit=a_commit, install_mod=self.mod
                 )
-                foreign_snap_code = (
-                    "import json, pathlib, sys\n"
-                    "d = pathlib.Path(sys.argv[1])\n"
-                    "snap_name = '.phase-prev-foreignrace.helio.exe.old'\n"
-                    "(d / 'bin' / snap_name).write_bytes(pathlib.Path(sys.argv[2]).read_bytes())\n"
-                    "mp = d / '.phase-active.json'\n"
-                    "m = json.loads(mp.read_text(encoding='utf-8'))\n"
-                    "m['snapshot_file'] = snap_name\n"
-                    "mp.write_text(json.dumps(m), encoding='utf-8')\n"
-                )
-                subprocess.run(
-                    [self.python_exe, "-B", "-c", foreign_snap_code, win_to, self.win_mod.wsl_to_windows_path(a_e)],
-                    check=True,
-                    stdin=subprocess.DEVNULL,
-                )
-                self.phase_mod._win_phase_marker_call(
-                    self.python_exe, win_install_py_win, "cleanup_prev", win_to, reg_key, "aa11bb22cc33", payload_json=a_e_sha, install_mod=self.mod
-                )
-                check_snap_code = (
+                plant_foreign = (
                     "import pathlib, sys\n"
-                    "p = pathlib.Path(sys.argv[1]) / 'bin' / '.phase-prev-foreignrace.helio.exe.old'\n"
-                    "expected = pathlib.Path(sys.argv[2]).read_bytes()\n"
-                    "assert p.is_file() and p.read_bytes() == expected, 'untagged pre-existing file bytes must be preserved verbatim'\n"
-                    "p.unlink()\n"
+                    "b = pathlib.Path(sys.argv[1]) / 'bin'\n"
+                    "(b / '.phase-prev-foreigncopy.helio.exe.old').write_bytes(pathlib.Path(sys.argv[2]).read_bytes())\n"
+                    "(b / '.phase-prev-foreignempty.helio.exe.old').write_bytes(b'')\n"
                 )
                 subprocess.run(
-                    [self.python_exe, "-B", "-c", check_snap_code, win_to, self.win_mod.wsl_to_windows_path(a_e)],
+                    [self.python_exe, "-B", "-c", plant_foreign, win_to, self.win_mod.wsl_to_windows_path(a_e)],
                     check=True,
                     stdin=subprocess.DEVNULL,
                 )
-                # Also verify empty (0-byte) AND partial tx-tagged snapshots (crash mid-write) ARE cleaned up (item 2)!
-                for partial_tag, partial_bytes in (("empty", ""), ("partial", "HELIO-PHASE-SNAP:aa11bb22cc33\\nPARTIAL")):
-                    plant_partial = (
-                        "import json, pathlib, sys\n"
-                        "d = pathlib.Path(sys.argv[1])\n"
-                        "snap_name = f'.phase-prev-{sys.argv[2]}.helio.exe.old'\n"
-                        "(d / 'bin' / snap_name).write_bytes(sys.argv[3].encode('ascii').decode('unicode_escape').encode('ascii'))\n"
-                        "mp = d / '.phase-active.json'\n"
-                        "m = json.loads(mp.read_text(encoding='utf-8'))\n"
-                        "m['snapshot_file'] = snap_name\n"
-                        "mp.write_text(json.dumps(m), encoding='utf-8')\n"
-                    )
-                    subprocess.run([self.python_exe, "-B", "-c", plant_partial, win_to, partial_tag, partial_bytes], check=True, stdin=subprocess.DEVNULL)
-                    self.phase_mod._win_phase_marker_call(
-                        self.python_exe, win_install_py_win, "cleanup_prev", win_to, reg_key, "aa11bb22cc33", payload_json=a_e_sha, install_mod=self.mod
-                    )
-                    assert_gone = (
-                        "import pathlib, sys\n"
-                        "p = pathlib.Path(sys.argv[1]) / 'bin' / f'.phase-prev-{sys.argv[2]}.helio.exe.old'\n"
-                        "assert not p.exists(), f'partial snapshot {p} must be cleaned up'\n"
-                    )
-                    subprocess.run([self.python_exe, "-B", "-c", assert_gone, win_to, partial_tag], check=True, stdin=subprocess.DEVNULL)
+                b64_snap = self.phase_mod._win_phase_marker_call(
+                    self.python_exe, win_install_py_win, "snapshot_prev", win_to, reg_key, "aa11bb22cc33", install_mod=self.mod
+                ).strip()
+                import base64, hashlib
+                self.assertEqual(hashlib.sha256(base64.b64decode(b64_snap)).hexdigest(), b_e_sha)
                 self.phase_mod._win_phase_marker_call(
                     self.python_exe, win_install_py_win, "end", win_to, reg_key, "aa11bb22cc33", install_mod=self.mod
+                )
+                check_foreign = (
+                    "import pathlib, sys\n"
+                    "b = pathlib.Path(sys.argv[1]) / 'bin'\n"
+                    "expected = pathlib.Path(sys.argv[2]).read_bytes()\n"
+                    "p1 = b / '.phase-prev-foreigncopy.helio.exe.old'\n"
+                    "p2 = b / '.phase-prev-foreignempty.helio.exe.old'\n"
+                    "assert p1.is_file() and p1.read_bytes() == expected, 'foreign copy must be preserved verbatim'\n"
+                    "assert p2.is_file() and p2.read_bytes() == b'', 'foreign empty file must be preserved verbatim'\n"
+                    "assert sorted(p.name for p in b.glob('.phase-prev-*')) == ['.phase-prev-foreigncopy.helio.exe.old', '.phase-prev-foreignempty.helio.exe.old']\n"
+                    "p1.unlink(); p2.unlink()\n"
+                )
+                subprocess.run(
+                    [self.python_exe, "-B", "-c", check_foreign, win_to, self.win_mod.wsl_to_windows_path(a_e)],
+                    check=True,
+                    stdin=subprocess.DEVNULL,
                 )
 
                 self.phase_mod._run_win_cli(self.python_exe, install_py_win, ["--remove", "--to", win_to, "--reg-key", reg_key])
@@ -4805,28 +4788,55 @@ class TestPhaseInstaller(unittest.TestCase):
                 )
                 self.assertEqual(r_stale.returncode, 0, r_stale.stdout + r_stale.stderr)
                 self.assertEqual(json.loads(r_stale.stdout), [])
-                # Competing local receipt SHA: create a clean closeout with no receipt yet on origin/main,
-                # clone `comp_clone` there, have remote push a competing/stale receipt (`8*40`), while `comp_clone`
-                # commits the verified manifest SHA (`head_sha`, matching BOTH WSL and Windows manifests!).
-                # Resolving the genuine rebase conflict by keeping `head_sha` and pushing publishes `head_sha`!
-                self.assertEqual(self.mod.read_manifest(to_dir)["current"]["commit"], head_sha)
-                self.assertEqual(st_win["manifest"]["current"]["commit"], head_sha)
+                # Competing local receipt SHA (item 8) AND renewed closeout binding (item 18):
+                # 1. Push a renewed closeout `## Closeout run=competing` at `comp_closeout_sha` and genuinely install
+                #    `comp_closeout_sha` so BOTH WSL and Windows manifests carry `comp_closeout_sha`.
+                # 2. First verify item 18: publishing the PRECEDING closeout's SHA (`head_sha`) under the renewed
+                #    closeout MUST keep phase 0 pending ([0], exit 1)!
+                # 3. Then have `comp_clone` commit the manifest-verified `comp_closeout_sha`, force a genuine rebase
+                #    conflict against the competing remote receipt (`head_sha`), resolve by keeping `comp_closeout_sha`,
+                #    push, and assert --pending-phases == [] AND `comp_closeout_sha` on origin/main!
                 run_file.write_text(run_file.read_text(encoding="utf-8") + "\n## Closeout run=competing\n\nReady.\n", encoding="utf-8")
                 subprocess.run(["git", "-C", str(checkout), "add", str(run_file)], check=True, capture_output=True)
                 subprocess.run(["git", "-C", str(checkout), "commit", "-m", "closeout before competing receipts"], check=True, capture_output=True)
                 subprocess.run(["git", "-C", str(checkout), "push", "origin", "main"], check=True, capture_output=True)
+                comp_closeout_sha = subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip()
+                with mock.patch.dict(os.environ, {"PATH": path_with_wrapper}):
+                    res_comp = self.phase_mod.run_phase_install(
+                        repo=checkout,
+                        phase=0,
+                        to_dir=to_dir,
+                        store_dir=store_dir,
+                        wrapper_path=wrapper,
+                        win_to_raw=win_to,
+                        reg_key=reg_key,
+                        sdk_url="unused",
+                        install_mod=self.mod,
+                    )
+                self.assertEqual(res_comp["commit"], comp_closeout_sha)
+                self.assertEqual(self.mod.read_manifest(to_dir)["current"]["commit"], comp_closeout_sha)
+                st_win2 = self.phase_mod._probe_win_state(self.python_exe, win_install_py_win, win_to, reg_key)
+                self.assertEqual(st_win2["manifest"]["current"]["commit"], comp_closeout_sha)
                 comp_clone = root / "comp_clone"
                 subprocess.run(["git", "clone", str(checkout), str(comp_clone)], check=True, capture_output=True)
                 subprocess.run(["git", "-C", str(comp_clone), "remote", "set-url", "origin", str(checkout.parent / "origin.git")], check=True, capture_output=True)
                 comp_rf = comp_clone / "docs" / "phase-runs" / "2026-11-24-phase-0.md"
                 comp_base_text = comp_rf.read_text(encoding="utf-8")
-                # Remote advances with a competing receipt (`8*40`)
-                run_file.write_text(comp_base_text + f"\nInstalled commit: {'8' * 40}\n", encoding="utf-8")
+                # Remote advances with a stale/competing receipt carrying the preceding closeout's SHA (`head_sha`) -> item 18 MUST stay pending [0]!
+                run_file.write_text(comp_base_text + f"\nInstalled commit: {head_sha}\n", encoding="utf-8")
                 subprocess.run(["git", "-C", str(checkout), "add", str(run_file)], check=True, capture_output=True)
-                subprocess.run(["git", "-C", str(checkout), "commit", "-m", "competing remote receipt"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(checkout), "commit", "-m", "stale preceding receipt under renewed closeout"], check=True, capture_output=True)
                 subprocess.run(["git", "-C", str(checkout), "push", "origin", "main"], check=True, capture_output=True)
-                # Local checkout commits the verified manifest SHA (`head_sha`)
-                comp_rf.write_text(comp_base_text + f"\nInstalled commit: {head_sha}\n", encoding="utf-8")
+                r_item18 = subprocess.run(
+                    [sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(r_item18.returncode, 1, r_item18.stdout + r_item18.stderr)
+                self.assertEqual(json.loads(r_item18.stdout), [0])
+                # Local checkout commits the manifest-verified `comp_closeout_sha`
+                comp_rf.write_text(comp_base_text + f"\nInstalled commit: {comp_closeout_sha}\n", encoding="utf-8")
                 subprocess.run(["git", "-C", str(comp_clone), "config", "user.name", "Test"], check=True, capture_output=True)
                 subprocess.run(["git", "-C", str(comp_clone), "config", "user.email", "t@example.com"], check=True, capture_output=True)
                 subprocess.run(["git", "-C", str(comp_clone), "add", str(comp_rf)], check=True, capture_output=True)
@@ -4841,8 +4851,8 @@ class TestPhaseInstaller(unittest.TestCase):
                 self.assertEqual(json.loads(r_comp.stdout), [0])
                 rb_res = subprocess.run(["git", "-C", str(comp_clone), "pull", "--rebase", "origin", "main"], capture_output=True, text=True)
                 self.assertNotEqual(rb_res.returncode, 0, "competing receipt lines must trigger a genuine rebase conflict")
-                # Keep the verified manifest SHA (`head_sha`) and continue rebase!
-                comp_rf.write_text(comp_base_text + f"\nInstalled commit: {head_sha}\n", encoding="utf-8")
+                # Keep the manifest-verified `comp_closeout_sha` and continue rebase!
+                comp_rf.write_text(comp_base_text + f"\nInstalled commit: {comp_closeout_sha}\n", encoding="utf-8")
                 subprocess.run(["git", "-C", str(comp_clone), "add", str(comp_rf)], check=True, capture_output=True)
                 subprocess.run(["git", "-C", str(comp_clone), "rebase", "--continue"], env={**os.environ, "GIT_EDITOR": "true"}, check=True, capture_output=True)
                 subprocess.run(["git", "-C", str(comp_clone), "push", "origin", "main"], check=True, capture_output=True)
@@ -4858,21 +4868,24 @@ class TestPhaseInstaller(unittest.TestCase):
                     ["git", "-C", str(comp_clone), "show", "origin/main:docs/phase-runs/2026-11-24-phase-0.md"],
                     text=True,
                 )
-                self.assertIn(f"Installed commit: {head_sha}", published_rf.splitlines()[-1])
+                self.assertIn(f"Installed commit: {comp_closeout_sha}", published_rf.splitlines()[-1])
                 # Amended local closeout with the EXACT SAME heading (`## Closeout run=remoteA`) while origin/main
-                # has a receipt for the earlier version -> MUST report [0] (exit 1)!
-                # AND a stale checkout strictly behind a newer receipted remote closeout -> MUST report [] (exit 0)!
+                # has a genuine receipt for `remote_a_sha` -> MUST report [0] (exit 1)!
+                # AND a stale checkout strictly behind that newer receipted remote closeout -> MUST report [] (exit 0)!
                 subprocess.run(["git", "-C", str(checkout), "pull", "--rebase", "origin", "main"], check=True, capture_output=True)
-                older_co_sha = subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip()
                 div_clone = root / "div_clone"
                 subprocess.run(["git", "clone", str(checkout), str(div_clone)], check=True, capture_output=True)
                 subprocess.run(["git", "-C", str(div_clone), "remote", "set-url", "origin", str(checkout.parent / "origin.git")], check=True, capture_output=True)
                 subprocess.run(["git", "-C", str(div_clone), "config", "user.name", "Test"], check=True, capture_output=True)
                 subprocess.run(["git", "-C", str(div_clone), "config", "user.email", "t@example.com"], check=True, capture_output=True)
-                # Remote publishes renewed `## Closeout run=remoteA` + receipt
-                run_file.write_text(run_file.read_text(encoding="utf-8") + f"\n## Closeout run=remoteA\n\nInstalled commit: {'8' * 40}\n", encoding="utf-8")
+                # Remote publishes renewed `## Closeout run=remoteA` at `remote_a_sha`, then commits its receipt `Installed commit: remote_a_sha`!
+                run_file.write_text(run_file.read_text(encoding="utf-8") + "\n## Closeout run=remoteA\n\nRemote body.\n", encoding="utf-8")
                 subprocess.run(["git", "-C", str(checkout), "add", str(run_file)], check=True, capture_output=True)
                 subprocess.run(["git", "-C", str(checkout), "commit", "-m", "remote closeout A"], check=True, capture_output=True)
+                remote_a_sha = subprocess.check_output(["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True).strip()
+                run_file.write_text(run_file.read_text(encoding="utf-8") + f"\nInstalled commit: {remote_a_sha}\n", encoding="utf-8")
+                subprocess.run(["git", "-C", str(checkout), "add", str(run_file)], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(checkout), "commit", "-m", "remote closeout A receipt"], check=True, capture_output=True)
                 subprocess.run(["git", "-C", str(checkout), "push", "origin", "main"], check=True, capture_output=True)
                 # (1) Stale checkout at `older_co_sha` (strictly behind newer receipted `## Closeout run=remoteA`) -> [] (exit 0)!
                 r_behind = subprocess.run(

@@ -456,17 +456,29 @@ def _annotate_shadowing(manifest: dict[str, Any], reg_key: str, dest: Path) -> d
     return out
 
 
+def _wsl_share_reachable(store_path: str) -> bool:
+    """Return True if a WSL UNC store_path's distro share is reachable on Windows (handles WinError 64/53/67)."""
+    distro = _extract_wsl_distro(store_path)
+    if not distro:
+        return True
+    norm_s = store_path.replace("/", "\\")
+    prefix = "\\\\wsl.localhost\\" if norm_s.lower().startswith("\\\\wsl.localhost\\") else "\\\\wsl$\\"
+    try:
+        return Path(prefix + distro).is_dir()
+    except OSError:
+        return False
+
+
 def _store_needs_init(store_path: str) -> bool:
     """Return True if store_path is reachable on Windows and lacks an initialized messages/ directory."""
     if os.name != "nt":
         return False
-    distro = _extract_wsl_distro(store_path)
-    if distro:
-        norm_s = store_path.replace("/", "\\")
-        prefix = "\\\\wsl.localhost\\" if norm_s.lower().startswith("\\\\wsl.localhost\\") else "\\\\wsl$\\"
-        if not Path(prefix + distro).is_dir():
-            return False
-    return not (Path(store_path) / "messages").is_dir()
+    if not _wsl_share_reachable(store_path):
+        return False
+    try:
+        return not (Path(store_path) / "messages").is_dir()
+    except OSError:
+        return False
 
 
 def _verify_win_ownership(win_to: Path, manifest: dict[str, Any] | None, *, require_live: bool = False) -> None:
@@ -967,62 +979,28 @@ def _win_phase_marker_data(dest: Path, tx_id: str) -> dict[str, Any]:
     return json.loads(mp.read_text(encoding="utf-8"))
 
 
-def _win_phase_snap_header(tx_id: str) -> bytes:
-    return f"HELIO-PHASE-SNAP:{tx_id}\n".encode("ascii")
-
-
-def win_phase_snapshot_prev(*, win_to: Path | None, tx_id: str) -> None:
-    """Atomically create a brand-new O_EXCL tx-tagged snapshot of bin\\helio.exe.old and durably record its name in .phase-active.json."""
+def win_phase_snapshot_prev(*, win_to: Path | None, tx_id: str) -> bytes | None:
+    """Read-only capture of bin\\helio.exe.old bytes under the Windows destination lock; creates no files in win_to."""
     dest = (win_to or default_win_to_dir()).resolve()
     with acquire_win_lock(_dest_lock_path(dest), blocking=False):
-        marker = _win_phase_marker_data(dest, tx_id)
+        _win_phase_marker_data(dest, tx_id)
         old_exe = dest / WIN_BIN_SUBDIR / WIN_OLD_EXE_NAME
         if not old_exe.is_file() or _is_reparse_or_symlink(old_exe):
-            return
-        if isinstance(marker.get("snapshot_file"), str) and marker["snapshot_file"]:
-            return
-        payload = _win_phase_snap_header(tx_id) + old_exe.read_bytes()
-        snap_name = f".phase-prev-{secrets.token_hex(12)}.{WIN_OLD_EXE_NAME}"
-        snap_exe = dest / WIN_BIN_SUBDIR / snap_name
-        if snap_exe.exists() or _is_reparse_or_symlink(snap_exe):
-            raise WinInstallError(f"refusing existing or linked phase previous snapshot at {snap_exe}", code=2)
-        # Durably record the 96-bit random snapshot filename in `.phase-active.json` FIRST so a crash immediately
-        # after O_EXCL creation can never strand the file; the tx-tagged header ensures an untagged pre-existing
-        # file (even a byte-identical copy of helio.exe.old) is never unlinked by cleanup!
-        marker["snapshot_file"] = snap_name
-        _write_json_atomic(dest / WIN_PHASE_MARKER_NAME, marker)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
-        try:
-            fd = os.open(str(snap_exe), flags, 0o600)
-        except FileExistsError:
-            marker.pop("snapshot_file", None)
-            _write_json_atomic(dest / WIN_PHASE_MARKER_NAME, marker)
-            raise WinInstallError(f"refusing existing phase previous snapshot at {snap_exe}", code=2)
-        try:
-            view = memoryview(payload)
-            while view:
-                written = os.write(fd, view)
-                if written <= 0:
-                    raise OSError("short write while creating phase previous snapshot")
-                view = view[written:]
-            os.fsync(fd)
-        except BaseException:
-            os.close(fd)
-            try:
-                snap_exe.unlink()
-            except OSError:
-                pass
-            marker.pop("snapshot_file", None)
-            _write_json_atomic(dest / WIN_PHASE_MARKER_NAME, marker)
-            raise
-        os.close(fd)
+            return None
+        return old_exe.read_bytes()
 
 
-def win_phase_restore_prev(*, win_to: Path | None, tx_id: str, pre_previous: dict[str, Any] | None) -> None:
-    """Restore or clear bin\\helio.exe.old and installed.win.json['previous'] using the tx-tagged snapshot recorded in .phase-active.json."""
+def win_phase_restore_prev(
+    *,
+    win_to: Path | None,
+    tx_id: str,
+    pre_previous: dict[str, Any] | None,
+    restore_exe: Path | None = None,
+) -> None:
+    """Restore or clear bin\\helio.exe.old and installed.win.json['previous'] from a verified WSL-held backup file."""
     dest = (win_to or default_win_to_dir()).resolve()
     with acquire_win_lock(_dest_lock_path(dest), blocking=False):
-        marker = _win_phase_marker_data(dest, tx_id)
+        _win_phase_marker_data(dest, tx_id)
         old_exe = dest / WIN_BIN_SUBDIR / WIN_OLD_EXE_NAME
         manifest = read_win_manifest(dest)
         if not isinstance(manifest, dict):
@@ -1034,50 +1012,15 @@ def win_phase_restore_prev(*, win_to: Path | None, tx_id: str, pre_previous: dic
             manifest["previous"] = None
             _write_json_atomic(dest / WIN_MANIFEST_NAME, manifest)
             return
-        snap_name = marker.get("snapshot_file")
-        if not isinstance(snap_name, str) or not snap_name or "/" in snap_name or "\\" in snap_name:
-            raise WinInstallError(f"missing durable phase previous snapshot record in {dest / WIN_PHASE_MARKER_NAME}", code=3)
-        snap_exe = dest / WIN_BIN_SUBDIR / snap_name
-        if _is_reparse_or_symlink(snap_exe) or not snap_exe.is_file():
-            raise WinInstallError(f"missing phase previous snapshot at {snap_exe}", code=3)
-        raw = snap_exe.read_bytes()
-        hdr = _win_phase_snap_header(tx_id)
-        if not raw.startswith(hdr):
-            raise WinInstallError(f"phase previous snapshot header mismatch at {snap_exe}", code=3)
-        body = raw[len(hdr) :]
+        if restore_exe is None or _is_reparse_or_symlink(restore_exe) or not restore_exe.is_file():
+            raise WinInstallError(f"missing verified previous-generation backup at {restore_exe}", code=3)
+        body = restore_exe.read_bytes()
         expected_sha = str(pre_previous.get("helio_exe_sha256") or "")
         if expected_sha and hashlib.sha256(body).hexdigest() != expected_sha:
-            raise WinInstallError(f"phase previous snapshot hash mismatch at {snap_exe}", code=3)
+            raise WinInstallError(f"previous-generation backup hash mismatch at {restore_exe}", code=3)
         _write_bytes_atomic(old_exe, body)
         manifest["previous"] = pre_previous
         _write_json_atomic(dest / WIN_MANIFEST_NAME, manifest)
-
-
-def win_phase_cleanup_prev(*, win_to: Path | None, tx_id: str, expected_sha: str = "") -> None:
-    """Remove ONLY the tx-tagged snapshot file durably recorded by this transaction in .phase-active.json."""
-    dest = (win_to or default_win_to_dir()).resolve()
-    if not dest.is_dir():
-        return
-    mp = dest / WIN_PHASE_MARKER_NAME
-    if not mp.exists() and not _is_reparse_or_symlink(mp):
-        return
-    with acquire_win_lock(_dest_lock_path(dest), blocking=False):
-        if not mp.exists() and not _is_reparse_or_symlink(mp):
-            return
-        marker = _win_phase_marker_data(dest, tx_id)
-        snap_name = marker.get("snapshot_file")
-        if not isinstance(snap_name, str) or not snap_name or "/" in snap_name or "\\" in snap_name:
-            return
-        snap_exe = dest / WIN_BIN_SUBDIR / snap_name
-        if snap_exe.is_file() and not _is_reparse_or_symlink(snap_exe):
-            raw = snap_exe.read_bytes()
-            hdr = _win_phase_snap_header(tx_id)
-            # Unlink if empty (crash right after O_EXCL create), partial prefix of our tx header,
-            # or prefixed by our tx header (full or partial payload write); never unlink an untagged foreign file!
-            if raw == b"" or hdr.startswith(raw) or raw.startswith(hdr):
-                snap_exe.unlink()
-        marker.pop("snapshot_file", None)
-        _write_json_atomic(mp, marker)
 
 
 def win_install(
@@ -1194,12 +1137,7 @@ def win_install(
                 # Initialize a new/empty store directory (local Windows path OR reachable WSL UNC path)
                 # BEFORE modifying the live installation; refuse non-empty unrelated directories (exit 2).
                 if os.name == "nt":
-                    distro = _extract_wsl_distro(store_path)
-                    can_init = True
-                    if distro:
-                        norm_s = store_path.replace("/", "\\")
-                        prefix = "\\\\wsl.localhost\\" if norm_s.lower().startswith("\\\\wsl.localhost\\") else "\\\\wsl$\\"
-                        can_init = Path(prefix + distro).is_dir()
+                    can_init = _wsl_share_reachable(store_path)
                     if can_init:
                         sp = Path(store_path)
                         if sp.exists() and not sp.is_dir():
