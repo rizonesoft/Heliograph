@@ -530,7 +530,8 @@ class RunTest(unittest.TestCase):
         # Completion review of D02 T02 §5: profile checks run in sessions of their own, outside the preflight's group.
         pids = Path(self._tmp.name) / "check.pids"
         check = ("import os, subprocess, sys, time; "
-                 "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)']); "
+                 "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'], "
+                 "creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0); "
                  f"open({str(pids)!r}, 'w').write(f'{{os.getpid()}} {{c.pid}}'); time.sleep(300)")
         profile = {**PROFILE, "preflight": [{"name": "build", "command": [sys.executable, "-c", check],
                                              "timeout_seconds": 60}]}
@@ -544,6 +545,72 @@ class RunTest(unittest.TestCase):
         check_pid, child_pid = (int(p) for p in pids.read_text().split())
         self.assertTrue(self.wait_gone(check_pid), "the detached profile check outlived its preflight")
         self.assertTrue(self.wait_gone(child_pid), "the profile check's child outlived its preflight")
+
+    def test_run_preflight_streams_lines_before_preflight_finishes(self):
+        run = self.run_module()
+        fake = Path(self._tmp.name) / "stream-scripts"
+        fake.mkdir()
+        gate = Path(self._tmp.name) / "release.flag"
+        (fake / "unattended-preflight.py").write_text(
+            "from pathlib import Path\n"
+            "import time\n"
+            "print('PASS profile: live', flush=True)\n"
+            f"gate = Path({str(gate)!r})\n"
+            "deadline = time.monotonic() + 30\n"
+            "while not gate.exists() and time.monotonic() < deadline:\n"
+            "    time.sleep(0.05)\n"
+            "print('PASS check build: done', flush=True)\n", encoding="utf-8")
+        seen = []
+
+        class LiveStream:
+            def write(self, text):
+                seen.append(text)
+                if "PASS profile: live" in text:
+                    gate.write_text("go", encoding="utf-8")
+                return len(text)
+
+            def flush(self):
+                pass
+
+        with unittest.mock.patch.object(run, "HERE", fake):
+            code, report = run.run_preflight(self.root, None, PROFILE, out=LiveStream())
+        self.assertEqual(code, 0)
+        self.assertTrue(gate.exists(), "preflight output was buffered until exit instead of streaming live")
+        self.assertIn("PASS profile: live", report)
+        self.assertIn("PASS check build: done", report)
+        self.assertTrue(any("running preflight" in chunk for chunk in seen))
+
+    def test_start_sighup_ends_preflight_and_its_detached_children(self):
+        pids = Path(self._tmp.name) / "sighup-check.pids"
+        check = ("import os, subprocess, sys, time; "
+                 "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'], "
+                 "creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0); "
+                 f"open({str(pids)!r}, 'w').write(f'{{os.getpid()}} {{c.pid}}'); time.sleep(300)")
+        profile = {**PROFILE, "preflight": [{"name": "build", "command": [sys.executable, "-c", check],
+                                             "timeout_seconds": 120}]}
+        self.write_profile(**profile)
+        git(self.root, "commit", "-qam", "sighup check")
+        proc = subprocess.Popen([sys.executable, str(self.root / "scripts" / "unattended-run.py"),
+                                 "--root", str(self.root), "start"],
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=self.env,
+                                creationflags=windowless())
+        try:
+            deadline = time.monotonic() + 30
+            while not pids.exists() and time.monotonic() < deadline:
+                time.sleep(0.1)
+            self.assertTrue(pids.exists(), "preflight check did not start in time")
+            proc.send_signal(signal.SIGHUP)
+            proc.wait(timeout=15)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=10)
+            if proc.stdout is not None:
+                proc.stdout.close()
+        check_pid, child_pid = (int(p) for p in pids.read_text().split())
+        self.assertTrue(self.wait_gone(check_pid), "detached preflight check survived SIGHUP on start")
+        self.assertTrue(self.wait_gone(child_pid), "detached preflight child survived SIGHUP on start")
+
     def test_an_agent_that_exits_at_once_is_reported_and_leaves_nothing(self):
         done = self.launcher("start", env={**self.env, "STUB_EXIT": "1"})
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)

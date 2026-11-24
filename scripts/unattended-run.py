@@ -35,6 +35,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
 
@@ -243,29 +244,70 @@ def agent_command(root: Path, profile: dict, tag: str, resume_id: str | None) ->
     raise RunError(f"agent {agent!r} has no launch command")
 
 
-def run_preflight(root: Path, resume_session: str | None, profile: dict) -> tuple[int, str]:
+def _stream_pipe(pipe, lines: list[str], out) -> None:
+    """Drain `pipe` line by line into `lines`, mirroring each line to `out` immediately so long preflight checks
+    never leave the launcher terminal blank."""
+    try:
+        for line in pipe:
+            lines.append(line)
+            if out is not None:
+                out.write(line)
+                out.flush()
+    finally:
+        pipe.close()
+
+
+def _end_preflight(proc: subprocess.Popen, tag: str) -> None:
+    """Kill the preflight process group and all tagged descendants, reaping `proc` before waiting for the group to
+    clear (an unreaped zombie group leader otherwise keeps `killpg(pgid, 0)` true for the full KILL_WAIT_SECONDS)."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    for pid in tagged(tag):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    proc.wait()
+    end_run_processes(tag, proc.pid, grace=0)
+
+
+def run_preflight(root: Path, resume_session: str | None, profile: dict, out=None) -> tuple[int, str]:
     """Run the preflight in its own process group, given as long as its profile checks may take plus its own checks,
-    and end the whole group when it overruns or the launcher is interrupted."""
+    streaming each check's line to `out` as it completes, and ending the whole group when it overruns or the launcher
+    is interrupted."""
     # The preflight checks the run on the agent chosen (its CLI, version and Stop hook), not the profile's default.
     args = [sys.executable, str(HERE / "unattended-preflight.py"), "--root", str(root), "--agent", profile["agent"]]
     if resume_session:
         args += ["--resume-session", resume_session]
     limit = PREFLIGHT_SLACK_SECONDS + sum(check["timeout_seconds"] for check in profile["preflight"])
+    sink = Unfailing(out) if out is not None else None
+    if sink is not None:
+        print(f"start: running preflight for {profile['agent']}...", file=sink, flush=True)
     # Its profile checks run in sessions of their own, outside its group: the tag reaches them all.
     tag = f"preflight-{uuid.uuid4()}"
     proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                             start_new_session=True, env={**os.environ, TAG: tag}, creationflags=lib.windowless())
+    lines: list[str] = []
+    reader = threading.Thread(target=_stream_pipe, args=(proc.stdout, lines, sink), daemon=True)
+    reader.start()
     try:
-        report, _ = proc.communicate(timeout=limit)
+        proc.wait(timeout=limit)
     except subprocess.TimeoutExpired:
-        end_run_processes(tag, proc.pid, grace=0)
-        report, _ = proc.communicate()
-        return 1, (report or "").rstrip() + f"\nFAIL preflight: ran past {limit}s; it and its checks were ended"
+        _end_preflight(proc, tag)
+        reader.join(timeout=10)
+        timeout_line = f"FAIL preflight: ran past {limit}s; it and its checks were ended"
+        if sink is not None:
+            print(timeout_line, file=sink, flush=True)
+        body = "".join(lines).rstrip()
+        return 1, (f"{body}\n{timeout_line}" if body else timeout_line)
     except BaseException:
-        end_run_processes(tag, proc.pid, grace=0)
-        proc.communicate()
+        _end_preflight(proc, tag)
+        reader.join(timeout=10)
         raise
-    return proc.returncode, (report or "").rstrip()
+    reader.join(timeout=10)
+    return proc.returncode, "".join(lines).rstrip()
 
 
 def _alive(name: str) -> bool | None:
@@ -442,10 +484,9 @@ def start(root: Path, out=None, supervise: bool = True, ships: int | None = None
             print(f"start: the crashed run was {old['agent']}, the profile now names {profile['agent']}; its "
                   f"session is not resumed, and a fresh {profile['agent']} session starts", file=out)
             resume = None
-        code, report = run_preflight(root, old["session"] if old else None, profile)
-        print(report, file=out)
+        code, _ = run_preflight(root, old["session"] if old else None, profile, out=out)
         if code != 0:
-            print("start: the preflight refused the run (FAIL lines above); nothing was started", file=out)
+            print("start: the preflight refused the run (FAIL lines above); nothing was started", file=out, flush=True)
             return 1
         started = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         try:
@@ -1297,6 +1338,11 @@ def main(argv: list[str] | None = None) -> int:
     root = Path(args.root).resolve()
     try:
         if args.command == "start":
+            # Closing the launcher terminal mid-preflight sends SIGHUP; turning it into SystemExit lets
+            # run_preflight()'s BaseException cleanup end the detached preflight and its children instead of orphaning them.
+            def _on_hangup(_signum, _frame):
+                raise SystemExit(129)
+            signal.signal(signal.SIGHUP, _on_hangup)
             return start(root, supervise=not args.no_heartbeat, ships=args.ships, agent=args.agent)
         if args.command == "status":
             return status(root)
