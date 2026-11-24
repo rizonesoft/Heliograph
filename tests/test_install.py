@@ -2469,11 +2469,17 @@ class TestWindowsInstaller(unittest.TestCase):
                         text=True,
                     )
                     self.assertEqual(cli_both.returncode, 0, cli_both.stdout + cli_both.stderr)
-                    err_low = cli_both.stderr.lower()
-                    self.assertIn(str((win_to / "helio.cmd").resolve()).lower(), err_low, cli_both.stderr)
-                    self.assertIn(str(cmd_shadow_file.resolve()).lower(), err_low, cli_both.stderr)
-                    self.assertIn(str(win_to.resolve() / "helio").lower(), err_low, cli_both.stderr)
-                    self.assertIn(os.path.abspath(str(sh_shadow_file)).lower(), err_low, cli_both.stderr)
+                    err_lines = [ln.strip().lower() for ln in cli_both.stderr.splitlines()]
+                    expected_cmd_warn = (
+                        f"warning: another helio earlier on path shadows "
+                        f"{(win_to / 'helio.cmd').resolve()}: {cmd_shadow_file.resolve()}"
+                    ).lower()
+                    expected_sh_warn = (
+                        f"warning: another helio earlier on path shadows "
+                        f"{win_to.resolve() / 'helio'}: {os.path.abspath(str(sh_shadow_file))}"
+                    ).lower()
+                    self.assertIn(expected_cmd_warn, err_lines, cli_both.stderr)
+                    self.assertIn(expected_sh_warn, err_lines, cli_both.stderr)
                 finally:
                     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_key, 0, winreg.KEY_SET_VALUE) as k:
                         winreg.SetValueEx(k, "Path", 0, orig_rk, orig_rp)
