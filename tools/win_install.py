@@ -36,19 +36,21 @@ if os.name == "nt":
     winreg = _winreg
 
 WIN_CMD_NAME = "helio.cmd"
+WIN_SH_NAME = "helio"
 WIN_BIN_SUBDIR = "bin"
 WIN_EXE_NAME = "helio.exe"
 WIN_OLD_EXE_NAME = "helio.exe.old"
 WIN_MANIFEST_NAME = "installed.win.json"
 WIN_JOURNAL_NAME = "install.win.journal.json"
 WIN_CMD_MARKER = "REM Managed by Heliograph installer"
+WIN_SH_MARKER = "# Managed by Heliograph installer"
 DEFAULT_REG_KEY = "Environment"
 HELIO_MARKERS = (b"HELIO_STORE", b"helio passes messages")
 TX_ID_RE = re.compile(r"^[0-9a-f]{12}$")
-WIN_RETIRED_RE = re.compile(r"^\.helio\.exe(?:\.old)?\.[0-9a-f]{12}\.retired$")
-WIN_RESERVED_ROOT = (WIN_CMD_NAME, WIN_EXE_NAME, WIN_MANIFEST_NAME, WIN_JOURNAL_NAME)
+WIN_RETIRED_RE = re.compile(r"^\.helio\.exe(?:\.old)?\.[0-9a-f]{12}(?:\.rec)?\.retired$")
+WIN_RESERVED_ROOT = (WIN_CMD_NAME, WIN_SH_NAME, WIN_EXE_NAME, WIN_MANIFEST_NAME, WIN_JOURNAL_NAME)
 WIN_RESERVED_BIN = (WIN_EXE_NAME, WIN_OLD_EXE_NAME)
-WIN_ALLOWED_SAVED_KEYS = {WIN_CMD_NAME, f"{WIN_BIN_SUBDIR}/{WIN_EXE_NAME}", f"{WIN_BIN_SUBDIR}/{WIN_OLD_EXE_NAME}"}
+WIN_ALLOWED_SAVED_KEYS = {WIN_CMD_NAME, WIN_SH_NAME, f"{WIN_BIN_SUBDIR}/{WIN_EXE_NAME}", f"{WIN_BIN_SUBDIR}/{WIN_OLD_EXE_NAME}"}
 WIN_ALLOWED_EXPECTED_KEYS = WIN_ALLOWED_SAVED_KEYS | {WIN_MANIFEST_NAME}
 BATCH_FORBIDDEN = set('\r\n\x00"%!&|<>^()')
 
@@ -175,6 +177,19 @@ def render_win_cmd(default_store: str) -> str:
         "exit /b %ERRORLEVEL%",
     ]
     return "\r\n".join(lines) + "\r\n"
+
+
+def render_win_sh(default_store: str) -> str:
+    """Render companion Git Bash / POSIX shim `helio` (LF) so `command -v helio` and hooks work in Git Bash."""
+    if not default_store or any(ch in BATCH_FORBIDDEN for ch in default_store):
+        raise WinInstallError(f"refusing unsafe store path for helio shim: {default_store!r}", code=2)
+    sq = default_store.replace("'", "'\"'\"'")
+    lines = [
+        "#!/bin/sh",
+        WIN_SH_MARKER,
+        f"HELIO_DEFAULT_STORE='{sq}' exec \"$(dirname \"$0\")/bin/helio.exe\" \"$@\"",
+    ]
+    return "\n".join(lines) + "\n"
 
 
 def default_win_to_dir() -> Path:
@@ -310,10 +325,16 @@ def remove_reg_path_entry(reg_key: str, folder: Path, *, path_had_value: bool) -
     expand_existing = val_type == int(winreg.REG_EXPAND_SZ)
     segments = raw_val.split(";")
     removed_idx: int | None = None
+    # Prefer removing the exact literal entry written by the installer over a user-added %...% spelling.
     for idx, seg in enumerate(segments):
-        if seg.strip() and _norm_path_entry(seg, expand_env=expand_existing) == target_norm:
+        if seg.strip() and _norm_path_entry(seg, expand_env=False) == target_norm:
             removed_idx = idx
             break
+    if removed_idx is None and expand_existing:
+        for idx, seg in enumerate(segments):
+            if seg.strip() and _norm_path_entry(seg, expand_env=True) == target_norm:
+                removed_idx = idx
+                break
     if removed_idx is None:
         return False
     remaining = segments[:removed_idx] + segments[removed_idx + 1 :]
@@ -356,6 +377,42 @@ def _manifest_known_exe_shas(manifest: dict[str, Any] | None) -> set[str]:
     return shas
 
 
+def _find_winning_helio(reg_key: str, win_to: Path) -> Path | None:
+    """Return the first `helio` command resolved via Windows effective PATH (system + HKCU\\<reg_key>) and PATHEXT."""
+    if os.name != "nt" or winreg is None:
+        return None
+    dirs: list[str] = []
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+            0,
+            winreg.KEY_READ,
+        ) as key:
+            sys_val, sys_kind = winreg.QueryValueEx(key, "Path")
+            if isinstance(sys_val, str):
+                if int(sys_kind) == int(winreg.REG_EXPAND_SZ):
+                    sys_val = os.path.expandvars(sys_val)
+                dirs.extend(s.strip() for s in sys_val.split(";") if s.strip())
+    except OSError:
+        pass
+    _, usr_val, usr_kind = read_reg_path(reg_key)
+    if usr_val:
+        if usr_kind == int(winreg.REG_EXPAND_SZ):
+            usr_val = os.path.expandvars(usr_val)
+        dirs.extend(s.strip() for s in usr_val.split(";") if s.strip())
+    pathext = [e.strip().lower() for e in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";") if e.strip()]
+    for d in dirs:
+        dp = Path(d)
+        if not dp.is_dir():
+            continue
+        for ext in pathext:
+            cand = dp / f"helio{ext}"
+            if cand.is_file():
+                return cand.resolve()
+    return None
+
+
 def _verify_win_ownership(win_to: Path, manifest: dict[str, Any] | None, *, require_live: bool = False) -> None:
     for name in WIN_RESERVED_ROOT:
         _check_regular_or_absent(win_to / name)
@@ -371,7 +428,7 @@ def _verify_win_ownership(win_to: Path, manifest: dict[str, Any] | None, *, requ
         _check_regular_or_absent(bin_dir / name)
 
     if manifest is None:
-        for p in (win_to / WIN_CMD_NAME, bin_dir / WIN_EXE_NAME, bin_dir / WIN_OLD_EXE_NAME):
+        for p in (win_to / WIN_CMD_NAME, win_to / WIN_SH_NAME, bin_dir / WIN_EXE_NAME, bin_dir / WIN_OLD_EXE_NAME):
             if p.exists():
                 raise WinInstallError(f"refusing unowned file at {p} (no {WIN_MANIFEST_NAME})", code=2)
         return
@@ -392,6 +449,14 @@ def _verify_win_ownership(win_to: Path, manifest: dict[str, Any] | None, *, requ
     else:
         if sha256_file(cmd_p) != cur.get("helio_cmd_sha256"):
             raise WinInstallError(f"refusing modified or unowned wrapper at {cmd_p}", code=2)
+
+    sh_p = win_to / WIN_SH_NAME
+    if not sh_p.exists():
+        if require_live and cur.get("helio_sh_sha256"):
+            raise WinInstallError(f"missing live Git Bash shim {sh_p}", code=2)
+    else:
+        if sha256_file(sh_p) != cur.get("helio_sh_sha256"):
+            raise WinInstallError(f"refusing modified or unowned Git Bash shim at {sh_p}", code=2)
 
     prev = manifest.get("previous")
     old_p = bin_dir / WIN_OLD_EXE_NAME
@@ -443,7 +508,7 @@ def _sweep_retired_exes(bin_dir: Path, retired_map: dict[str, str]) -> dict[str,
     return remaining
 
 
-def _replace_win_exe(staged: Path, target: Path, tx_id: str) -> str | None:
+def _replace_win_exe(staged: Path, target: Path, tx_id: str, *, suffix: str = "") -> str | None:
     """Replace target with staged. If target is busy on Windows, rename it aside to a tracked .retired file."""
     try:
         os.replace(staged, target)
@@ -451,7 +516,7 @@ def _replace_win_exe(staged: Path, target: Path, tx_id: str) -> str | None:
     except OSError as exc:
         if getattr(exc, "winerror", None) not in (5, 32) and not isinstance(exc, PermissionError):
             raise
-        retired = target.parent / f".{target.name}.{tx_id}.retired"
+        retired = target.parent / f".{target.name}.{tx_id}{suffix}.retired"
         try:
             os.replace(target, retired)
         except OSError as ren_exc:
@@ -474,6 +539,7 @@ def _is_valid_win_temp(rel: str, tx_id: str) -> bool:
         return False
     allowed = {
         f".helio.cmd.{tx_id}.rec",
+        f".helio.{tx_id}.rec",
         f"bin/.helio.exe.{tx_id}.rec",
         f"bin/.helio.exe.{tx_id}.stage",
         f"bin/.helio.exe.{tx_id}.restore",
@@ -546,6 +612,7 @@ def _desired_win_hashes(desired: dict[str, Any] | None) -> dict[str, str | None]
     prev = desired.get("previous") or {}
     return {
         WIN_CMD_NAME: cur.get("helio_cmd_sha256"),
+        WIN_SH_NAME: cur.get("helio_sh_sha256"),
         f"{WIN_BIN_SUBDIR}/{WIN_EXE_NAME}": cur.get("helio_exe_sha256"),
         f"{WIN_BIN_SUBDIR}/{WIN_OLD_EXE_NAME}": prev.get("helio_exe_sha256"),
     }
@@ -671,7 +738,7 @@ def recover_win_if_needed(win_to: Path, reg_key: str) -> bool:
                 raise WinInstallError(f"recovery failed: cannot restore {target} from snapshot", code=3)
             cur_target_sha = sha256_file(target) if target.exists() else None
             if cur_target_sha and target.parent == win_to / WIN_BIN_SUBDIR and target.name in WIN_RESERVED_BIN:
-                potential_ret = f".{target.name}.{tx_id}.retired"
+                potential_ret = f".{target.name}.{tx_id}.rec.retired"
                 if extra_retired.get(potential_ret) != cur_target_sha:
                     extra_retired[potential_ret] = cur_target_sha
                     journal["retired"] = dict(extra_retired)
@@ -680,7 +747,7 @@ def recover_win_if_needed(win_to: Path, reg_key: str) -> bool:
             if restore_tmp.exists():
                 restore_tmp.unlink()
             _copy_to_staged(rec_path, restore_tmp)
-            ret = _replace_win_exe(restore_tmp, target, tx_id)
+            ret = _replace_win_exe(restore_tmp, target, tx_id, suffix=".rec")
             if ret and cur_target_sha:
                 extra_retired[ret] = cur_target_sha
         else:
@@ -757,6 +824,9 @@ def win_install(
     cmd_text = render_win_cmd(store_path)
     cmd_bytes = cmd_text.encode("utf-8")
     cmd_sha = hashlib.sha256(cmd_bytes).hexdigest()
+    sh_text = render_win_sh(store_path)
+    sh_bytes = sh_text.encode("utf-8")
+    sh_sha = hashlib.sha256(sh_bytes).hexdigest()
 
     dest = (win_to or default_win_to_dir()).resolve()
     bin_dir = dest / WIN_BIN_SUBDIR
@@ -780,6 +850,7 @@ def win_install(
             tx_id = secrets.token_hex(6)
             temp_files = [
                 f".helio.cmd.{tx_id}.rec",
+                f".helio.{tx_id}.rec",
                 f"bin/.helio.exe.{tx_id}.rec",
                 f"bin/.helio.exe.{tx_id}.stage",
                 f"bin/.helio.exe.{tx_id}.restore",
@@ -813,9 +884,30 @@ def win_install(
                         code=3,
                     )
 
+                # If store_path is a local Windows path (not a WSL UNC path) and not yet initialized, initialize it
+                # BEFORE modifying the live installation so first use works immediately or fails cleanly!
+                if os.name == "nt" and not _extract_wsl_distro(store_path):
+                    sp = Path(store_path)
+                    if not (sp / "messages").is_dir():
+                        create_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                        init_r = subprocess.run(
+                            [str(stage_exe), "init", "--store", store_path],
+                            stdin=subprocess.DEVNULL,
+                            capture_output=True,
+                            text=True,
+                            creationflags=create_no_window,
+                            timeout=30,
+                        )
+                        if init_r.returncode != 0:
+                            raise WinInstallError(
+                                f"failed to initialize Windows store {store_path}: {(init_r.stderr or init_r.stdout).strip()}",
+                                code=3,
+                            )
+
                 saved: dict[str, dict[str, Any]] = {}
                 for rel, rec_rel in (
                     (WIN_CMD_NAME, f".helio.cmd.{tx_id}.rec"),
+                    (WIN_SH_NAME, f".helio.{tx_id}.rec"),
                     (f"{WIN_BIN_SUBDIR}/{WIN_EXE_NAME}", f"bin/.helio.exe.{tx_id}.rec"),
                     (f"{WIN_BIN_SUBDIR}/{WIN_OLD_EXE_NAME}", f"bin/.helio.exe.old.{tx_id}.rec"),
                 ):
@@ -834,6 +926,7 @@ def win_install(
                     same_install = (
                         prev_cur.get("helio_exe_sha256") == actual_sha
                         and prev_cur.get("helio_cmd_sha256") == cmd_sha
+                        and prev_cur.get("helio_sh_sha256") == sh_sha
                         and prev_cur.get("store") == store_path
                         and prev_cur.get("commit") == commit
                         and bool(prev_cur.get("dirty", False)) == dirty
@@ -846,6 +939,9 @@ def win_install(
                         prev_cmd_text = prev_cur.get("helio_cmd_text")
                         if not isinstance(prev_cmd_text, str) and saved[WIN_CMD_NAME]["existed"]:
                             prev_cmd_text = (dest / saved[WIN_CMD_NAME]["rec_name"]).read_bytes().decode("utf-8")
+                        prev_sh_text = prev_cur.get("helio_sh_text")
+                        if not isinstance(prev_sh_text, str) and saved[WIN_SH_NAME]["existed"]:
+                            prev_sh_text = (dest / saved[WIN_SH_NAME]["rec_name"]).read_bytes().decode("utf-8")
                         previous_entry = {
                             "commit": prev_cur["commit"],
                             "dirty": bool(prev_cur.get("dirty", False)),
@@ -853,6 +949,8 @@ def win_install(
                             "helio_exe_sha256": prev_cur["helio_exe_sha256"],
                             "helio_cmd_sha256": prev_cur["helio_cmd_sha256"],
                             "helio_cmd_text": prev_cmd_text,
+                            "helio_sh_sha256": prev_cur.get("helio_sh_sha256"),
+                            "helio_sh_text": prev_sh_text,
                             "store": prev_cur["store"],
                         }
                         rotate_old = True
@@ -877,6 +975,10 @@ def win_install(
                         _write_json_atomic(dest / WIN_MANIFEST_NAME, result_manifest)
                     _cleanup_win_temps(dest, temp_files, tx_id)
                     (dest / WIN_JOURNAL_NAME).unlink()
+                    winner = _find_winning_helio(reg_key, dest)
+                    if winner is not None and winner != (dest / WIN_CMD_NAME).resolve():
+                        result_manifest = dict(result_manifest)
+                        result_manifest["shadowed_by"] = str(winner)
                     return result_manifest
 
                 desired_manifest: dict[str, Any] = {
@@ -888,6 +990,8 @@ def win_install(
                         "helio_exe_sha256": actual_sha,
                         "helio_cmd_sha256": cmd_sha,
                         "helio_cmd_text": cmd_text,
+                        "helio_sh_sha256": sh_sha,
+                        "helio_sh_text": sh_text,
                         "store": store_path,
                     },
                     "previous": previous_entry,
@@ -947,6 +1051,7 @@ def win_install(
                     on_boundary("after_exe")
 
                 _write_bytes_atomic(dest / WIN_CMD_NAME, cmd_bytes)
+                _write_bytes_atomic(dest / WIN_SH_NAME, sh_bytes)
                 if on_boundary:
                     on_boundary("after_cmd")
 
@@ -961,7 +1066,11 @@ def win_install(
 
                 _cleanup_win_temps(dest, temp_files, tx_id)
                 (dest / WIN_JOURNAL_NAME).unlink()
-                return desired_manifest
+                out_manifest = dict(desired_manifest)
+                winner = _find_winning_helio(reg_key, dest)
+                if winner is not None and winner != (dest / WIN_CMD_NAME).resolve():
+                    out_manifest["shadowed_by"] = str(winner)
+                return out_manifest
             except BaseException as exc:
                 _handle_win_failure(exc, dest, reg_key)
                 raise
@@ -980,7 +1089,7 @@ def win_status(*, win_to: Path | None = None, reg_key: str = DEFAULT_REG_KEY) ->
     if not (dest / WIN_MANIFEST_NAME).exists():
         present = [
             str(p)
-            for p in (dest / WIN_CMD_NAME, dest / WIN_EXE_NAME, bin_dir / WIN_EXE_NAME, bin_dir / WIN_OLD_EXE_NAME)
+            for p in (dest / WIN_CMD_NAME, dest / WIN_SH_NAME, dest / WIN_EXE_NAME, bin_dir / WIN_EXE_NAME, bin_dir / WIN_OLD_EXE_NAME)
             if p.exists() or _is_reparse_or_symlink(p)
         ]
         if not present:
@@ -1016,6 +1125,13 @@ def win_status(*, win_to: Path | None = None, reg_key: str = DEFAULT_REG_KEY) ->
     elif sha256_file(cmd_p) != cur.get("helio_cmd_sha256"):
         problems.append(f"wrapper content mismatch: {cmd_p}")
 
+    sh_p = dest / WIN_SH_NAME
+    if cur.get("helio_sh_sha256"):
+        if _is_reparse_or_symlink(sh_p) or not sh_p.is_file():
+            problems.append(f"missing or invalid Git Bash shim: {sh_p}")
+        elif sha256_file(sh_p) != cur.get("helio_sh_sha256"):
+            problems.append(f"Git Bash shim content mismatch: {sh_p}")
+
     prev = manifest.get("previous")
     old_p = bin_dir / WIN_OLD_EXE_NAME
     if isinstance(prev, dict):
@@ -1035,6 +1151,10 @@ def win_status(*, win_to: Path | None = None, reg_key: str = DEFAULT_REG_KEY) ->
         target_norm = _norm_path_entry(str(dest), expand_env=False)
         if not any(seg.strip() and _norm_path_entry(seg, expand_env=expand_existing) == target_norm for seg in (raw_path.split(";") if raw_path else [])):
             problems.append(f"missing from HKCU\\{reg_key}\\Path: {dest}")
+        else:
+            winner = _find_winning_helio(reg_key, dest)
+            if winner is not None and winner != cmd_p.resolve():
+                problems.append(f"another helio earlier on PATH shadows {cmd_p}: {winner}")
 
     store_p = Path(cur["store"])
     if not store_p.is_dir() or not (store_p / "messages").is_dir():
@@ -1093,9 +1213,23 @@ def win_back(
                 cmd_bytes = cmd_text.encode("utf-8")
                 cmd_sha = hashlib.sha256(cmd_bytes).hexdigest()
 
+            prev_sh_text = prev.get("helio_sh_text")
+            if isinstance(prev_sh_text, str):
+                cand_sh = prev_sh_text.encode("utf-8")
+                if hashlib.sha256(cand_sh).hexdigest() != prev.get("helio_sh_sha256"):
+                    raise WinInstallError("cannot roll back: recorded previous Git Bash shim text does not match its hash", code=2)
+                sh_text = prev_sh_text
+                sh_bytes = cand_sh
+                sh_sha = prev["helio_sh_sha256"]
+            else:
+                sh_text = render_win_sh(prev["store"])
+                sh_bytes = sh_text.encode("utf-8")
+                sh_sha = hashlib.sha256(sh_bytes).hexdigest()
+
             tx_id = secrets.token_hex(6)
             temp_files = [
                 f".helio.cmd.{tx_id}.rec",
+                f".helio.{tx_id}.rec",
                 f"bin/.helio.exe.{tx_id}.rec",
                 f"bin/.helio.exe.{tx_id}.stage",
                 f"bin/.helio.exe.{tx_id}.restore",
@@ -1119,17 +1253,24 @@ def win_back(
                 saved: dict[str, dict[str, Any]] = {}
                 for rel, rec_rel in (
                     (WIN_CMD_NAME, f".helio.cmd.{tx_id}.rec"),
+                    (WIN_SH_NAME, f".helio.{tx_id}.rec"),
                     (f"{WIN_BIN_SUBDIR}/{WIN_EXE_NAME}", f"bin/.helio.exe.{tx_id}.rec"),
                     (f"{WIN_BIN_SUBDIR}/{WIN_OLD_EXE_NAME}", f"bin/.helio.exe.old.{tx_id}.rec"),
                 ):
                     p = dest / rel
-                    _copy_to_staged(p, dest / rec_rel)
-                    saved[rel] = {"existed": True, "rec_name": rec_rel, "sha256": sha256_file(dest / rec_rel)}
+                    if p.exists():
+                        _copy_to_staged(p, dest / rec_rel)
+                        saved[rel] = {"existed": True, "rec_name": rec_rel, "sha256": sha256_file(dest / rec_rel)}
+                    else:
+                        saved[rel] = {"existed": False, "rec_name": None, "sha256": None}
 
                 cur = manifest["current"]
                 cur_cmd_text = cur.get("helio_cmd_text")
                 if not isinstance(cur_cmd_text, str):
                     cur_cmd_text = (dest / saved[WIN_CMD_NAME]["rec_name"]).read_bytes().decode("utf-8")
+                cur_sh_text = cur.get("helio_sh_text")
+                if not isinstance(cur_sh_text, str) and saved[WIN_SH_NAME]["existed"]:
+                    cur_sh_text = (dest / saved[WIN_SH_NAME]["rec_name"]).read_bytes().decode("utf-8")
                 swept_retired = _sweep_retired_exes(bin_dir, _normalize_retired_map(manifest.get("retired")))
                 desired_manifest = dict(manifest)
                 desired_manifest["current"] = {
@@ -1139,6 +1280,8 @@ def win_back(
                     "helio_exe_sha256": prev["helio_exe_sha256"],
                     "helio_cmd_sha256": cmd_sha,
                     "helio_cmd_text": cmd_text,
+                    "helio_sh_sha256": sh_sha,
+                    "helio_sh_text": sh_text,
                     "store": prev["store"],
                 }
                 desired_manifest["previous"] = {
@@ -1148,6 +1291,8 @@ def win_back(
                     "helio_exe_sha256": cur["helio_exe_sha256"],
                     "helio_cmd_sha256": cur["helio_cmd_sha256"],
                     "helio_cmd_text": cur_cmd_text,
+                    "helio_sh_sha256": cur.get("helio_sh_sha256"),
+                    "helio_sh_text": cur_sh_text,
                     "store": cur["store"],
                 }
                 desired_manifest["retired"] = dict(swept_retired)
@@ -1196,6 +1341,7 @@ def win_back(
                     on_boundary("after_exe")
 
                 _write_bytes_atomic(dest / WIN_CMD_NAME, cmd_bytes)
+                _write_bytes_atomic(dest / WIN_SH_NAME, sh_bytes)
                 if on_boundary:
                     on_boundary("after_cmd")
 
@@ -1230,6 +1376,7 @@ def win_remove(
             manifest = read_win_manifest(dest)
             owned_rels = [
                 WIN_CMD_NAME,
+                WIN_SH_NAME,
                 f"{WIN_BIN_SUBDIR}/{WIN_EXE_NAME}",
                 f"{WIN_BIN_SUBDIR}/{WIN_OLD_EXE_NAME}",
                 WIN_MANIFEST_NAME,

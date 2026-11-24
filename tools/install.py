@@ -1837,6 +1837,11 @@ def main(argv: list[str] | None = None) -> int:
                 label = f"{cur['commit']} (dirty)" if cur.get("dirty") else cur["commit"]
                 dest_dir = (win_to or win_mod.default_win_to_dir()).resolve()
                 print(f"installed {label} to {dest_dir} (store: {cur['store']})")
+                if manifest.get("shadowed_by"):
+                    print(
+                        f"warning: another helio earlier on PATH shadows {dest_dir / win_mod.WIN_CMD_NAME}: {manifest['shadowed_by']}",
+                        file=sys.stderr,
+                    )
                 print("open a new Windows terminal and run `helio check` to verify")
                 return 0
             except win_mod.WinInstallError as exc:

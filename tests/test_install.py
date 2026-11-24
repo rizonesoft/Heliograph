@@ -1794,6 +1794,28 @@ class TestQuickInstaller(unittest.TestCase):
                     f"shutil.copy2({str(self.helio_exe)!r}, repo / 'build' / 'linux' / 'helio.exe')\n",
                     encoding="utf-8",
                 )
+                # Documented NO-OVERRIDE `--windows` install (store_raw=None -> <repo.parent>/Heliograph-signals)
+                # initializes/uses the default WSL store and reads back a message sent from WSL!
+                def_wsl_store = ok_repo.parent / "Heliograph-signals"
+                subprocess.run([str(self.helio_bin), "init", "--store", str(def_wsl_store)], capture_output=True, text=True, check=True)
+                def_subj = f"wsl-default-{uuid.uuid4().hex[:8]}"
+                subprocess.run(
+                    [str(self.helio_bin), "tell", "demo/win", def_subj, "--as", "demo/wsl", "--store", str(def_wsl_store)],
+                    input="default store message from WSL\n",
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                rc_def = self.mod.run_windows_from_wsl(
+                    repo=ok_repo,
+                    mode="install",
+                    win_to_raw=win_to,
+                    store_raw=None,
+                    reg_key=reg_key,
+                )
+                self.assertEqual(rc_def, 0)
+
+                # Upgrade to explicit wsl_store (second generation -> enables CLI `--windows --back` proof below!).
                 rc = self.mod.run_windows_from_wsl(
                     repo=ok_repo,
                     mode="install",
@@ -1803,18 +1825,33 @@ class TestQuickInstaller(unittest.TestCase):
                 )
                 self.assertEqual(rc, 0)
 
-                # Explicit new WSL --store is initialized automatically by run_windows_from_wsl.
-                new_wsl_store = root / "brand_new_wsl_store"
+                # Explicit new Windows --store directory is initialized automatically on Windows and works on first use!
+                new_win_store = win_tmp_raw + "\\BrandNewWinStore"
                 win_to_new = win_tmp_raw + "\\HeliographNewStore"
                 rc_new = self.mod.run_windows_from_wsl(
                     repo=ok_repo,
                     mode="install",
                     win_to_raw=win_to_new,
-                    store_raw=str(new_wsl_store),
+                    store_raw=new_win_store,
                     reg_key=reg_key,
                 )
                 self.assertEqual(rc_new, 0)
-                self.assertTrue((new_wsl_store / "messages").is_dir())
+                win_store_chk = subprocess.run(
+                    [
+                        "python.exe",
+                        "-c",
+                        (
+                            "import os, subprocess; "
+                            f"r=subprocess.run([{win_to_new + '\\\\helio.cmd'!r}, 'check'], env={{k:v for k,v in os.environ.items() if k!='HELIO_STORE'}}, "
+                            "cwd=os.environ.get('TEMP', 'C:\\\\Windows\\\\Temp'), capture_output=True, text=True); "
+                            "print(r.stdout + r.stderr); raise SystemExit(r.returncode)"
+                        ),
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(win_store_chk.returncode, 0, win_store_chk.stdout + win_store_chk.stderr)
                 self.assertEqual(
                     self.mod.run_windows_from_wsl(repo=ok_repo, mode="remove", win_to_raw=win_to_new, store_raw=None, reg_key=reg_key),
                     0,
@@ -1851,7 +1888,7 @@ class TestQuickInstaller(unittest.TestCase):
                             "w_ps = subprocess.run([ps, '-NoProfile', '-Command', '(Get-Command helio).Source'], cwd=cwd, env=env, capture_output=True, text=True); "
                             "r_ps = subprocess.run([ps, '-NoProfile', '-Command', 'helio inbox --as demo/win'], "
                             "cwd=cwd, env=env, capture_output=True, text=True); "
-                            "print('WCMD:', w_cmd.stdout.strip().splitlines()[0] if w_cmd.stdout.strip() else ''); "
+                            "print('WCMD:', '|'.join(ln.strip() for ln in w_cmd.stdout.strip().splitlines() if ln.strip())); "
                             "print('WPS:', w_ps.stdout.strip()); "
                             "print('CMD:', r_cmd.stdout); print('PS:', r_ps.stdout); "
                             "raise SystemExit(w_cmd.returncode or r_cmd.returncode or w_ps.returncode or r_ps.returncode)"
@@ -1862,14 +1899,74 @@ class TestQuickInstaller(unittest.TestCase):
                     text=True,
                 )
                 self.assertEqual(shell_probe.returncode, 0, shell_probe.stdout + shell_probe.stderr)
-                wcmd_line = [ln for ln in shell_probe.stdout.splitlines() if ln.startswith("WCMD:")][0].split("WCMD:", 1)[1].strip()
+                wcmd_lines = [p.lower() for p in [ln for ln in shell_probe.stdout.splitlines() if ln.startswith("WCMD:")][0].split("WCMD:", 1)[1].strip().split("|") if p]
                 wps_line = [ln for ln in shell_probe.stdout.splitlines() if ln.startswith("WPS:")][0].split("WPS:", 1)[1].strip()
-                self.assertEqual(wcmd_line.lower(), expected_cmd.lower())
+                self.assertIn(expected_cmd.lower(), wcmd_lines)
+                self.assertTrue(wcmd_lines[0].startswith(win_to.lower() + "\\"), wcmd_lines)
                 self.assertEqual(wps_line.lower(), expected_cmd.lower())
                 _, after_cmd = shell_probe.stdout.split("\nCMD:", 1)
                 cmd_out, ps_out = after_cmd.split("\nPS:", 1)
                 self.assertIn(msg_subject, cmd_out)
                 self.assertIn(msg_subject, ps_out)
+
+                # Actual .claude/settings.json hook command executed in Windows Git Bash (where Claude Code runs hooks):
+                # displays the uniquely addressed WSL message within timeout AND stays quiet for an empty inbox!
+                settings = json.loads((REPO / ".claude" / "settings.json").read_text(encoding="utf-8"))
+                hook_cmd = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+                hook_probe = subprocess.run(
+                    [
+                        "python.exe",
+                        "-c",
+                        (
+                            "import os, subprocess, winreg; "
+                            "bash = r'C:\\Program Files\\Git\\bin\\bash.exe'; "
+                            "assert os.path.exists(bash), 'Git Bash required on Windows'; "
+                            f"k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, {reg_key!r}); "
+                            "reg_path, _ = winreg.QueryValueEx(k, 'Path'); k.Close(); "
+                            "env = dict(os.environ); env.pop('HELIO_STORE', None); "
+                            "env['PATH'] = env.get('PATH', '') + ';' + reg_path; "
+                            "cwd = os.environ.get('TEMP', 'C:\\\\Windows\\\\Temp'); "
+                            "env_msg = dict(env); env_msg['HELIO_AS'] = 'demo/win'; "
+                            f"r_msg = subprocess.run([bash, '-c', {hook_cmd!r}], cwd=cwd, env=env_msg, capture_output=True, text=True); "
+                            "env_empty = dict(env); env_empty['HELIO_AS'] = 'demo/nobody'; "
+                            f"r_empty = subprocess.run([bash, '-c', {hook_cmd!r}], cwd=cwd, env=env_empty, capture_output=True, text=True); "
+                            "print('HMSG:', r_msg.stdout); print('HEMPTY:', repr(r_empty.stdout)); "
+                            "raise SystemExit(r_msg.returncode or r_empty.returncode)"
+                        ),
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(hook_probe.returncode, 0, hook_probe.stdout + hook_probe.stderr)
+                self.assertIn(msg_subject, hook_probe.stdout)
+                self.assertIn("HEMPTY: ''", hook_probe.stdout)
+
+                # Documented CLI `--windows --back` rolls back to the default WSL store generation,
+                # and bare `helio` reads back `def_subj` from the previous store!
+                rc_back = self.mod.main(["--windows", "--back", "--to", win_to, "--reg-key", reg_key])
+                self.assertEqual(rc_back, 0)
+                back_probe = subprocess.run(
+                    [
+                        "python.exe",
+                        "-c",
+                        (
+                            "import os, subprocess, winreg; "
+                            f"k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, {reg_key!r}); "
+                            "reg_path, _ = winreg.QueryValueEx(k, 'Path'); k.Close(); "
+                            "env = dict(os.environ); env.pop('HELIO_STORE', None); "
+                            "env['PATH'] = env.get('PATH', '') + ';' + reg_path; "
+                            "r = subprocess.run(['cmd.exe', '/c', 'helio', 'inbox', '--as', 'demo/win'], "
+                            "cwd=os.environ.get('TEMP', 'C:\\\\Windows\\\\Temp'), env=env, capture_output=True, text=True); "
+                            "print(r.stdout); raise SystemExit(r.returncode)"
+                        ),
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(back_probe.returncode, 0, back_probe.stdout + back_probe.stderr)
+                self.assertIn(def_subj, back_probe.stdout)
 
                 # Reachable WSL directory that is NOT initialized (missing messages/) reports "there is no store here",
                 # NOT an offline WSL distro error!
@@ -2001,7 +2098,9 @@ class TestWindowsInstaller(unittest.TestCase):
                 # Bare `helio` from cmd.exe outside win_to resolves to <win_to>\helio.cmd and reaches default_store.
                 w_cmd = subprocess.run(["cmd.exe", "/c", "where", "helio"], cwd=str(outside_cwd), env=base_env, capture_output=True, text=True)
                 self.assertEqual(w_cmd.returncode, 0, w_cmd.stderr)
-                self.assertEqual(w_cmd.stdout.strip().splitlines()[0].strip().lower(), str((win_to / "helio.cmd").resolve()).lower())
+                where_lines = [ln.strip().lower() for ln in w_cmd.stdout.strip().splitlines() if ln.strip()]
+                self.assertIn(str((win_to / "helio.cmd").resolve()).lower(), where_lines)
+                self.assertTrue(where_lines[0].startswith(str(win_to.resolve()).lower() + "\\"), where_lines)
                 r_cmd = subprocess.run(
                     ["cmd.exe", "/c", "helio", "inbox", "--as", "demo/win"],
                     cwd=str(outside_cwd),
@@ -2286,6 +2385,8 @@ class TestWindowsInstaller(unittest.TestCase):
                 empty_s = root / "empty_store_dir"
                 empty_s.mkdir()
                 self.win_mod.win_install(source_exe=exe_b, source_sha256=sha_b, store_path=str(empty_s), commit="b" * 40, win_to=win_to, reg_key=reg_key)
+                self.assertTrue((empty_s / "messages").is_dir())
+                shutil.rmtree(empty_s / "messages")
                 code, lines = self.win_mod.win_status(win_to=win_to, reg_key=reg_key)
                 self.assertEqual(code, 3, lines)
                 self.win_mod.win_install(source_exe=exe_a, source_sha256=sha_a, store_path=str(s1), commit="a" * 40, win_to=win_to, reg_key=reg_key)
@@ -2434,6 +2535,18 @@ class TestWindowsInstaller(unittest.TestCase):
                         self.assertEqual(bcast.call_count, 0)
                     existed, val_pre_after, kind_pre_after = self.win_mod.read_reg_path(reg_key)
                     self.assertEqual((existed, val_pre_after, kind_pre_after), (True, pre_val, winreg.REG_EXPAND_SZ))
+
+                    # 4. User prepends an expandable spelling (%HELIO_TEST_WIN_TO%) AFTER install -> remove deletes
+                    #    ONLY the installer's exact literal entry and preserves the user's %HELIO_TEST_WIN_TO% verbatim!
+                    with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, reg_key, 0, winreg.KEY_SET_VALUE) as k:
+                        winreg.SetValueEx(k, "Path", 0, winreg.REG_EXPAND_SZ, r"C:\Tools")
+                    self.win_mod.win_install(source_exe=self.helio_exe, source_sha256=exe_sha, store_path=str(store), commit="a" * 40, win_to=win_to, reg_key=reg_key)
+                    _, cur_p, _ = self.win_mod.read_reg_path(reg_key)
+                    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_key, 0, winreg.KEY_SET_VALUE) as k:
+                        winreg.SetValueEx(k, "Path", 0, winreg.REG_EXPAND_SZ, r"%HELIO_TEST_WIN_TO%;" + cur_p)
+                    self.assertTrue(self.win_mod.win_remove(win_to=win_to, reg_key=reg_key))
+                    _, val_after_exp, kind_after_exp = self.win_mod.read_reg_path(reg_key)
+                    self.assertEqual((val_after_exp, kind_after_exp), (r"%HELIO_TEST_WIN_TO%;C:\Tools", winreg.REG_EXPAND_SZ))
                 finally:
                     os.environ.pop("HELIO_TEST_WIN_TO", None)
         finally:
@@ -2541,11 +2654,11 @@ class TestWindowsInstaller(unittest.TestCase):
                 jp_leg = leg_j_to / self.win_mod.WIN_JOURNAL_NAME
                 j_busy = json.loads(jp_leg.read_text(encoding="utf-8"))
                 tx_busy = j_busy["tx_id"]
-                ret_b_name = f".helio.exe.{tx_busy}.retired"
+                ret_b_name = f".helio.exe.{tx_busy}.rec.retired"
                 # Crash during recovery right after _replace_win_exe renamed B aside and restored A (BEFORE manifest write!).
                 real_replace = self.win_mod._replace_win_exe
-                def crash_after_restore_replace(staged, target, tid):
-                    res = real_replace(staged, target, tid)
+                def crash_after_restore_replace(staged, target, tid, **kwargs):
+                    res = real_replace(staged, target, tid, **kwargs)
                     if target.name == "helio.exe":
                         shutil.copy2(exe_b, target.parent / ret_b_name)
                         raise SimulatedCrash("after_restore_replace")
@@ -2579,16 +2692,58 @@ class TestWindowsInstaller(unittest.TestCase):
                     )
                 self.assertEqual(ctx.exception.code, 2)
 
-                # Concurrent installs to two different destinations sharing one registry key serialize cleanly.
+                # Real held-A-during-upgrade crash before manifest: A is retired to .<tx>.retired, B is live;
+                # releasing A and retrying recovery restores A, sweeps retired A, and clears journal without collision!
+                held_to = root / "crash_held_a_recovery"
+                self.win_mod.win_install(source_exe=exe_a, source_sha256=sha_a, store_path=str(store), commit="a" * 40, win_to=held_to, reg_key=reg_key)
+                create_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                holder_a = subprocess.Popen(
+                    [str(held_to / "bin" / "helio.exe"), "tell", "demo/lane", "held-a-rec", "--as", "demo/sender", "--store", str(store)],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    creationflags=create_no_window,
+                )
+                try:
+                    self.assertIsNone(holder_a.poll())
+                    with self.assertRaises(SimulatedCrash):
+                        self.win_mod.win_install(
+                            source_exe=exe_b, source_sha256=sha_b, store_path=str(store), commit="b" * 40, win_to=held_to, reg_key=reg_key,
+                            on_boundary=lambda st: (_ for _ in ()).throw(SimulatedCrash(st)) if st == "after_exe" else None,
+                        )
+                    _o, err_a = holder_a.communicate(input="body\n", timeout=30)
+                    self.assertEqual(holder_a.returncode, 0, err_a)
+                finally:
+                    if holder_a.poll() is None:
+                        holder_a.kill()
+                        holder_a.communicate()
+                self.assertTrue(self.win_mod.recover_win_if_needed(held_to, reg_key))
+                self.assertEqual(self.win_mod.sha256_file(held_to / "bin" / "helio.exe"), sha_a)
+                self.assertFalse((held_to / self.win_mod.WIN_JOURNAL_NAME).exists())
+                self.assertEqual([p.name for p in (held_to / "bin").glob("*.retired")], [])
+                self.win_mod.win_remove(win_to=held_to, reg_key=reg_key)
+
+                # Two destinations with distinct stores sharing one registry key:
+                # concurrent installs serialize cleanly, BOTH Path entries are preserved, and the shadowed
+                # second destination reports `shadowed_by` on install and exit 3 on win_status naming the winner!
                 d1, d2 = root / "conc1", root / "conc2"
+                s_d1, s_d2 = root / "store_d1", root / "store_d2"
                 with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-                    f1 = pool.submit(self.win_mod.win_install, source_exe=self.helio_exe, source_sha256=exe_sha, store_path=str(store), commit="a" * 40, win_to=d1, reg_key=reg_key)
-                    f2 = pool.submit(self.win_mod.win_install, source_exe=self.helio_exe, source_sha256=exe_sha, store_path=str(store), commit="a" * 40, win_to=d2, reg_key=reg_key)
-                    f1.result()
-                    f2.result()
+                    f1 = pool.submit(self.win_mod.win_install, source_exe=self.helio_exe, source_sha256=exe_sha, store_path=str(s_d1), commit="a" * 40, win_to=d1, reg_key=reg_key)
+                    f2 = pool.submit(self.win_mod.win_install, source_exe=self.helio_exe, source_sha256=exe_sha, store_path=str(s_d2), commit="a" * 40, win_to=d2, reg_key=reg_key)
+                    r1, r2 = f1.result(), f2.result()
                 _, val, _ = self.win_mod.read_reg_path(reg_key)
                 self.assertIn(str(d1.resolve()), val)
                 self.assertIn(str(d2.resolve()), val)
+                # Exactly one is first on Path (status 0); the second is shadowed (shadowed_by set + status 3 naming winner!).
+                first_d, second_d, second_res = (d1, d2, r2) if val.index(str(d1.resolve())) < val.index(str(d2.resolve())) else (d2, d1, r1)
+                self.assertEqual(Path(second_res["shadowed_by"]).resolve(), (first_d / "helio.cmd").resolve())
+                c_first, l_first = self.win_mod.win_status(win_to=first_d, reg_key=reg_key)
+                self.assertEqual(c_first, 0, l_first)
+                c_sec, l_sec = self.win_mod.win_status(win_to=second_d, reg_key=reg_key)
+                self.assertEqual(c_sec, 3, l_sec)
+                self.assertTrue(any(str((first_d / "helio.cmd").resolve()).lower() in ln.lower() for ln in l_sec), l_sec)
                 self.win_mod.win_remove(win_to=d1, reg_key=reg_key)
                 self.win_mod.win_remove(win_to=d2, reg_key=reg_key)
         finally:
