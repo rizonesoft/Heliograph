@@ -420,7 +420,11 @@ A Windows session has no `helio` on its `PATH`, so its hook finds nothing. The i
 
 ## 17. Installed program replaced after a tested phase
 
+> **Started:** 2026-11-24T04:31Z
+
 When a phase is closed and everything is tested, the program that the sessions use becomes the tested one, without anybody asking. It is never replaced by anything else.
+
+**Corrected 2026-11-24:** Added the external-file safety and rollback contract before plan review because `tools/install.py --phase <n>` replaces both the WSL installation (`--to`, `--wrapper`, `--store`) and the Windows installation (`--win-to`, `--reg-key`). It reuses the §15 and §16 locks, durable journals, ownership checks, and `--back` rollback mechanisms; takes SHA-256 digests and snapshots of `build/linux/linux/helio` and `build/linux/helio.exe` after `app_build.py` (verifying `test_windows_and_linux_take_each_job_once` ran and passed without skipping) and before `prove.py`, refusing if either binary or `HEAD`/working tree changes during `prove.py`; installs strictly from those proved snapshots without rebuilding; runs post-install verification on both installed programs (`helio check` on the real store plus a Windows-to-WSL `ask`/`take`/`done`/`check` roundtrip in an isolated temporary store); automatically rolls back both WSL and Windows installations (`--back`, or `--remove` when freshly installed with no prior generation) and exits 3 on any post-install verification fault; and sends one idempotent `helio tell impossible/all` notification keyed by commit (`--key install-phase-<n>-<commit>`) only after post-install verification succeeds.
 
 **Phase:** 0
 **Needs:** none
@@ -428,8 +432,8 @@ When a phase is closed and everything is tested, the program that the sessions u
 
 **Build order:**
 
-1. Write the conditions in `tools/install.py --phase <n>`. Done when: each one that does not hold refuses and says which.
-2. Make it a step of the phase's end. Done when: attended and unattended runs both reach it.
+1. Write the conditions, proved-snapshot installation, post-install verification with rollback, and idempotent notification in `tools/install.py --phase <n>`. Done when: each unmet condition refuses and says which, and a planted verification fault restores both previous programs and exits 3.
+2. Add the phase-end step to `AGENTS.md` and `docs/unattended-prompt.md`, and cover all conditions, rollback, backward store compatibility, and idempotent tell in `tests/test_install.py`. Done when: attended and unattended runs both reach it and `app_build.py` passes.
 
 - [ ] Refuse in `tools/install.py --phase` unless `scripts/todo-graph.py query plan` shows every section of the phase verified. Done when: one open section refuses. Cheaper substitute: the run's word.
 - [ ] Refuse unless the tree is clean, `HEAD` is on `origin/main`, `app_build.py` passes in WSL with the race against Windows run and not skipped, and `prove.py` passes, in `tools/install.py --phase`. Done when: each is planted and refuses with the installed program untouched. Cheaper substitute: a passing build.
