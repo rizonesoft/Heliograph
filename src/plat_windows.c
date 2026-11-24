@@ -24,7 +24,7 @@ bool plat_fail_flush = false;
 bool plat_fail_sync = false;
 uint64_t plat_now_override = 0;
 #endif
-static bool settle_win(const char *path) {
+static bool settle_win_ex(const char *path, bool allow_unc_enosys) {
 #ifdef HELIO_TEST_HOOKS
     if (plat_fail_flush) return false;
 #endif
@@ -52,9 +52,10 @@ static bool settle_win(const char *path) {
     bool ok = FlushFileBuffers(dir) != 0;
     DWORD err = ok ? 0 : GetLastError();
     CloseHandle(dir);
-    /* WORKAROUND: Windows 9p/UNC redirectors do not implement IRP_MJ_FLUSH_BUFFERS on directory handles; local NTFS requires strict FlushFileBuffers success. */
-    return ok || (is_unc && (err == ERROR_INVALID_FUNCTION || err == ERROR_NOT_SUPPORTED));
+    return ok || (allow_unc_enosys && is_unc && (err == ERROR_INVALID_FUNCTION || err == ERROR_NOT_SUPPORTED));
 }
+
+static bool settle_win(const char *path) { return settle_win_ex(path, false); }
 
 p_result p_remove(const char *path) {
     wchar_t *wide = im_wide(path);
@@ -77,7 +78,7 @@ p_result p_remove(const char *path) {
     return settle_win(path) ? P_OK : P_FAILED;
 }
 
-static bool sync_dir_win(const char *path) {
+static bool sync_dir_win(const char *path, bool allow_unc_enosys) {
 #ifdef HELIO_TEST_HOOKS
     if (plat_fail_flush) return false;
 #endif
@@ -90,8 +91,7 @@ static bool sync_dir_win(const char *path) {
     bool ok = FlushFileBuffers(dir) != 0;
     DWORD err = ok ? 0 : GetLastError();
     CloseHandle(dir);
-    /* WORKAROUND: Windows 9p/UNC redirectors do not implement IRP_MJ_FLUSH_BUFFERS on directory handles; local NTFS requires strict FlushFileBuffers success. */
-    return ok || (is_unc && (err == ERROR_INVALID_FUNCTION || err == ERROR_NOT_SUPPORTED));
+    return ok || (allow_unc_enosys && is_unc && (err == ERROR_INVALID_FUNCTION || err == ERROR_NOT_SUPPORTED));
 }
 
 p_result p_sync(const char *path) {
@@ -121,7 +121,9 @@ p_result p_folder(const char *path) {
     im_free(wide);
     if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY) || (attrs & FILE_ATTRIBUTE_REPARSE_POINT))
         return P_FAILED;
-    return settle_win(path) && sync_dir_win(path) ? P_OK : P_FAILED;
+    /* Non-destructive directory creation (init/summary/watch) tolerates UNC/9p ENOSYS on directory handles;
+       p_sync and p_remove call settle_win strictly so no live file is ever removed without a proven directory flush. */
+    return settle_win_ex(path, true) && sync_dir_win(path, true) ? P_OK : P_FAILED;
 }
 p_result p_input(size_t most, char **data, size_t *length) { return from(im_read_input(most, data, length)); }
 uint64_t p_now(void) {

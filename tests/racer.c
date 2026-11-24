@@ -89,6 +89,63 @@ static int run_pause(int count, char **args) {
     return (int)r;
 }
 
+typedef struct { char **names; size_t count, cap; } name_vec;
+
+static void name_vec_free(name_vec *v) {
+    for (size_t i = 0; i < v->count; i++) p_free(v->names[i]);
+    p_free(v->names);
+    *v = (name_vec){0};
+}
+
+static bool collect_post_names(void *user, const char *name) {
+    name_vec *dst = user;
+    size_t n = len(name);
+    if (n < 6 || !same(name + n - 5, ".post")) return true;
+    if (dst->count >= dst->cap) {
+        size_t next = dst->cap ? dst->cap * 2 : 128;
+        char **grown = p_alloc(next * sizeof(char *));
+        if (!grown) return false;
+        for (size_t i = 0; i < dst->count; i++) grown[i] = dst->names[i];
+        p_free(dst->names);
+        dst->names = grown;
+        dst->cap = next;
+    }
+    char *dup = copy(name, n);
+    if (!dup) return false;
+    dst->names[dst->count++] = dup;
+    return true;
+}
+
+static bool has_sorted_name(char *const *names, size_t count, const char *target) {
+    size_t lo = 0, hi = count;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        const char *a = names[mid], *b = target;
+        while (*a && *a == *b) a++, b++;
+        int cmp = (unsigned char)*a - (unsigned char)*b;
+        if (cmp == 0) return true;
+        if (cmp < 0) lo = mid + 1;
+        else hi = mid;
+    }
+    return false;
+}
+
+static void sort_names_simple(char **names, size_t count) {
+    for (size_t gap = count / 2; gap > 0; gap /= 2) {
+        for (size_t i = gap; i < count; i++) {
+            char *tmp = names[i];
+            size_t j = i;
+            for (; j >= gap; j -= gap) {
+                const char *a = names[j - gap], *b = tmp;
+                while (*a && *a == *b) a++, b++;
+                if ((unsigned char)*a <= (unsigned char)*b) break;
+                names[j] = names[j - gap];
+            }
+            names[j] = tmp;
+        }
+    }
+}
+
 int racer(int count, char **args) {
     if (count >= 3 && same(args[1], "--remove")) return (int)p_remove(args[2]);
 #ifdef HELIO_TEST_HOOKS
@@ -206,15 +263,37 @@ int racer(int count, char **args) {
                 }
                 message_free(&m);
             }
-            /* Check rolling 1/10 slice of ALL eligible IDs: every ID must be readable in live OR archive! */
-            size_t slice = (size_t)(i % 10);
-            for (size_t j = slice; j < old_n; j += 10) {
-                message m = {0};
-                s_result mr = store_message(&s, old_ids[j], &m);
-                if (mr != S_OK) {
+            /* Verify 100% of ALL eligible IDs on EVERY SINGLE ROUND via live store list + archive month list
+               (zero sampling, O(1) directory listings per round: every ID must be in messages/ OR archive/2025-02/!). */
+            text adir = {0};
+            add(&adir, folder), add(&adir, "/archive/2025-02");
+            name_vec arch = {0};
+            if (!adir.failed) {
+                p_result al = p_list(adir.data, collect_post_names, &arch);
+                if (al != P_OK && al != P_MISSING) {
+                    name_vec_free(&arch);
+                    text_free(&adir);
+                    store_close(&s);
+                    text_free(&done);
+                    p_free(old_ids);
+                    p_free(wdata);
+                    return 6;
+                }
+                sort_names_simple(arch.names, arch.count);
+            }
+            for (size_t j = 0; j < old_n; j++) {
+                text target = {0};
+                add(&target, old_ids[j]), add(&target, ".post");
+                bool found = !target.failed && (has_sorted_name(s.names, s.count, target.data) || has_sorted_name(arch.names, arch.count, target.data));
+                text_free(&target);
+                if (!found) {
+                    /* Re-check archive directly once in case it moved between the two directory listings! */
+                    message m = {0};
+                    s_result mr = archive_read_message(&s, old_ids[j], &m);
                     message_free(&m);
-                    mr = archive_read_message(&s, old_ids[j], &m);
                     if (mr != S_OK) {
+                        name_vec_free(&arch);
+                        text_free(&adir);
                         store_close(&s);
                         text_free(&done);
                         p_free(old_ids);
@@ -222,8 +301,9 @@ int racer(int count, char **args) {
                         return 5;
                     }
                 }
-                message_free(&m);
             }
+            name_vec_free(&arch);
+            text_free(&adir);
             store_close(&s);
             if (i + 1 >= min_rounds) {
                 char *dd = NULL;

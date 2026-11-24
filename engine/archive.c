@@ -171,6 +171,10 @@ static s_result copy_durable(const char *src, const char *dst, const char **why)
     text_free(&unique);
     if (w == P_OK) {
         p_free(data);
+        if (p_sync(dst) != P_OK) {
+            *why = "an archive copy cannot be flushed";
+            return S_DAMAGED;
+        }
         return S_OK;
     }
     if (w == P_EXISTS) {
@@ -888,6 +892,7 @@ s_result archive_daily(const char *folder, text *report, void (*pause)(void *use
 
     size_t spent = 0;
     s_result res = S_OK;
+    bool exhausted = false;
     for (unsigned slot = start_slot; slot < 10; slot++) {
         text sp = {0}, sbody = {0};
         add(&sp, sdir.data), add(&sp, "/"), add(&sp, day.data), add(&sp, ".slot."), add_number(&sp, slot, 0);
@@ -899,8 +904,8 @@ s_result archive_daily(const char *folder, text *report, void (*pause)(void *use
             res = S_DAMAGED;
             break;
         }
-        /* This process exclusively owns slot `slot` (at most 20 jobs); run its batch even if a concurrent
-           inbox sees all 10 slots occupied and writes .archived, keeping total moves <= 10 * 20 = 200. */
+        /* This process exclusively owns slot `slot` (at most 20 jobs); run its batch and write .done.<slot>
+           only on non-damaged completion so concurrent peers never publish .archived while a live slot runs. */
         size_t moved = 0;
         s_result ar = archive_store(folder, 20, &moved, report, pause, pause_user);
         spent += moved;
@@ -908,14 +913,61 @@ s_result archive_daily(const char *folder, text *report, void (*pause)(void *use
             res = S_DAMAGED;
             break;
         }
-        if (ar == S_NOTHING) break;
+        text dp = {0};
+        add(&dp, sdir.data), add(&dp, "/"), add(&dp, day.data), add(&dp, ".done."), add_number(&dp, slot, 0);
+        p_result dw = dp.failed ? P_FAILED : p_write(dp.data, "done\n", 5, false, unique.data);
+        text_free(&dp);
+        if (dw != P_OK && dw != P_EXISTS) {
+            res = S_DAMAGED;
+            break;
+        }
+        if (ar == S_NOTHING) {
+            exhausted = true;
+            break;
+        }
     }
     if (res == S_OK) {
-        text body = {0};
-        add_number(&body, (uint64_t)spent, 0), add(&body, "\n");
-        p_result wr = body.failed ? P_FAILED : p_write(mark.data, body.data, body.length, false, unique.data);
-        text_free(&body);
-        if (wr != P_OK && wr != P_EXISTS) res = S_DAMAGED;
+        /* Publish .archived only when the store is exhausted OR every slot in [start_slot..9] has either
+           completed (.done.<k>) or been abandoned past the stale threshold (60s), so a concurrent inbox
+           never publishes .archived while a live owner is still running slot 9. */
+        bool all_finished = exhausted;
+        if (!all_finished) {
+            all_finished = true;
+            uint64_t check_now = p_now();
+            for (unsigned slot = start_slot; slot < 10 && all_finished; slot++) {
+                text dp = {0};
+                add(&dp, sdir.data), add(&dp, "/"), add(&dp, day.data), add(&dp, ".done."), add_number(&dp, slot, 0);
+                char *dd = NULL;
+                size_t dl = 0;
+                p_result dr = dp.failed ? P_FAILED : p_read(dp.data, 32, &dd, &dl);
+                p_free(dd);
+                text_free(&dp);
+                if (dr == P_OK) continue;
+                text sp = {0};
+                add(&sp, sdir.data), add(&sp, "/"), add(&sp, day.data), add(&sp, ".slot."), add_number(&sp, slot, 0);
+                char *sd = NULL;
+                size_t sl = 0;
+                p_result sr = sp.failed ? P_FAILED : p_read(sp.data, 64, &sd, &sl);
+                text_free(&sp);
+                if (sr != P_OK) {
+                    p_free(sd);
+                    all_finished = false;
+                    break;
+                }
+                uint64_t sts = 0;
+                const char *p = sd;
+                while (*p >= '0' && *p <= '9') sts = sts * 10 + (uint64_t)(*p++ - '0');
+                p_free(sd);
+                if (!(check_now > sts && check_now - sts >= 60ull * 1000000ull)) all_finished = false;
+            }
+        }
+        if (all_finished) {
+            text body = {0};
+            add_number(&body, (uint64_t)spent, 0), add(&body, "\n");
+            p_result wr = body.failed ? P_FAILED : p_write(mark.data, body.data, body.length, false, unique.data);
+            text_free(&body);
+            if (wr != P_OK && wr != P_EXISTS) res = S_DAMAGED;
+        }
     }
     text_free(&day), text_free(&sdir), text_free(&mark), text_free(&unique);
     return res;
