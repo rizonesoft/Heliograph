@@ -571,28 +571,79 @@ class TestQuickInstaller(unittest.TestCase):
             self.assertEqual(ctx.exception.code, 2)
             self.assertEqual(unrelated_helio.read_text(encoding="utf-8"), "unrelated user script\n")
 
-            # 7. --back invoked via a third --wrapper path: interrupted after unlinking wrap_b restores wrap_b cleanly,
-            #    and completing --back removes wrap_b and activates wrap_a.
-            w3_dir = root / "third_wrap_back"
-            wa, wb, wc = root / "w3a" / "helio", root / "w3b" / "helio", root / "w3c" / "helio"
-            sa, sb = root / "s3a", root / "s3b"
-            self.mod.install(repo=repo, to_dir=w3_dir, store_dir=sa, wrapper_path=wa, prebuilt=(a_h, a_e))
-            self.mod.install(repo=repo, to_dir=w3_dir, store_dir=sb, wrapper_path=wb, prebuilt=(b_h, b_e))
+            # 7. Class-level regression for interrupted --back across ALL wrapper-aliasing combinations:
+            #    (X,X,X), (X,X,Y), (X,Y,Y), (X,Y,X), and (X,Y,Z), plus deleted wrapper parent dir locking.
+            for case_name, a_k, b_k, inv_k in (
+                ("shared_all", "X", "X", "X"),
+                ("shared_ab_other_inv", "X", "X", "Y"),
+                ("distinct_inv_b", "X", "Y", "Y"),
+                ("distinct_inv_a", "X", "Y", "X"),
+                ("three_distinct", "X", "Y", "Z"),
+            ):
+                wdir = root / f"back_class_{case_name}"
+                sa, sb = root / f"sa_{case_name}", root / f"sb_{case_name}"
+                wmap = {k: root / f"w_{case_name}_{k}" / "helio" for k in ("X", "Y", "Z")}
+                wa, wb, winv = wmap[a_k], wmap[b_k], wmap[inv_k]
+                self.mod.install(repo=repo, to_dir=wdir, store_dir=sa, wrapper_path=wa, prebuilt=(a_h, a_e))
+                self.mod.install(repo=repo, to_dir=wdir, store_dir=sb, wrapper_path=wb, prebuilt=(b_h, b_e))
 
-            def crash_after_unlink_wb(stage: str) -> None:
-                if stage == "after_unlink_old_wrapper_0":
-                    raise SimulatedCrash(stage)
+                def crash_before_manifest(stage: str) -> None:
+                    if stage == "after_wrapper":
+                        raise SimulatedCrash(stage)
 
-            with self.assertRaises(SimulatedCrash):
-                self.mod.go_back(to_dir=w3_dir, wrapper_path=wc, on_boundary=crash_after_unlink_wb)
-            self.assertTrue(self.mod.recover_if_needed(w3_dir, wc))
-            # B's recorded wrapper wb MUST be restored with store sb!
-            self.assertTrue(wb.is_file())
-            self.assertEqual(wb.read_text(encoding="utf-8"), self.mod.render_wrapper(w3_dir, sb))
-            # Now complete --back via wc.
-            self.mod.go_back(to_dir=w3_dir, wrapper_path=wc)
-            self.assertTrue(wa.is_file())
-            self.assertFalse(wb.exists())
+                with self.assertRaises(SimulatedCrash):
+                    self.mod.go_back(to_dir=wdir, wrapper_path=winv, on_boundary=crash_before_manifest)
+                self.assertTrue(self.mod.recover_if_needed(wdir, winv))
+                # Current generation B's wrapper MUST have store B (never overwritten by store A!).
+                self.assertEqual(wb.read_text(encoding="utf-8"), self.mod.render_wrapper(wdir, sb), case_name)
+                if wa != wb:
+                    self.assertEqual(wa.read_text(encoding="utf-8"), self.mod.render_wrapper(wdir, sa), case_name)
+                if winv not in (wa, wb):
+                    self.assertFalse(winv.exists(), case_name)
+                # Now complete --back cleanly.
+                self.mod.go_back(to_dir=wdir, wrapper_path=winv)
+                self.assertEqual(wa.read_text(encoding="utf-8"), self.mod.render_wrapper(wdir, sa), case_name)
+                if wb != wa:
+                    self.assertFalse(wb.exists(), case_name)
+
+            # 7b. Foreign rollback journal in a directory with NO manifest cannot publish a foreign installed.json,
+            #     and a foreign journal naming an EXISTING external dir creates NO lock file there.
+            fman_dir = root / "foreign_manifest_pub"
+            fman_dir.mkdir()
+            existing_ext_dir = root / "existing_ext_dir"
+            existing_ext_dir.mkdir()
+            (fman_dir / self.mod.JOURNAL_NAME).write_text(
+                json.dumps({
+                    "schema_version": 1,
+                    "op": "back",
+                    "phase": "publishing",
+                    "tx_id": "abcdef012345",
+                    "to_dir": str(fman_dir.resolve()),
+                    "wrapper_path": str((root / "fmw" / "helio").resolve()),
+                    "had_manifest": True,
+                    "previous_manifest": {
+                        "schema_version": 1,
+                        "current": {
+                            "commit": "a" * 40,
+                            "helio_sha256": "0" * 64,
+                            "helio_exe_sha256": "0" * 64,
+                            "store": str(store),
+                            "wrapper": str(existing_ext_dir / "helio"),
+                        },
+                        "previous": None,
+                    },
+                    "pre_wrappers": {str(existing_ext_dir / "helio"): str(store)},
+                    "saved_files": {},
+                    "temp_files": [],
+                    "desired_manifest": None,
+                }),
+                encoding="utf-8",
+            )
+            with self.assertRaises(self.mod.InstallError) as ctx:
+                self.mod.install(repo=repo, to_dir=fman_dir, store_dir=store, wrapper_path=root / "fmw" / "helio", prebuilt=(a_h, a_e))
+            self.assertEqual(ctx.exception.code, 2)
+            self.assertFalse((fman_dir / self.mod.MANIFEST_NAME).exists())
+            self.assertFalse((existing_ext_dir / self.mod.WRAPPER_LOCK_NAME).exists())
 
             # 8. Foreign journal with an unrelated .rec copy and absent target is refused without publishing it,
             #    and a foreign journal naming a nonexistent external dir creates neither the dir nor a lock file.
