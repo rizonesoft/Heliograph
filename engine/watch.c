@@ -138,7 +138,18 @@ s_result watch_summary(store *s) {
             char *id = copy(s->names[i], n - 5);
             message m = {0};
             job j;
-            if (!id || store_message(s, id, &m) != S_OK || (is_job(&m) && store_job(s, &m, &j) != S_OK)) damaged++;
+            s_result mr = id ? store_message(s, id, &m) : S_DAMAGED;
+            if (mr == S_REFUSED) {
+                p_free(id);
+                continue;
+            }
+            s_result jr = mr == S_OK && is_job(&m) ? store_job(s, &m, &j) : mr;
+            if (jr == S_REFUSED) {
+                message_free(&m);
+                p_free(id);
+                continue;
+            }
+            if (jr != S_OK) damaged++;
             else if (is_job(&m)) {
                 int part = is_overdue(&m, &j) ? 0 : j.state == OPEN ? 1 : j.state == TAKEN ? 2 : j.state == DONE ? 3 : 4;
                 if (part < 3 || j.when + 86400000000ull > now) {

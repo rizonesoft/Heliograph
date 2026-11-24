@@ -494,5 +494,289 @@ class Damage(Base):
         self.assertEqual(run(self.store / "nowhere", cwd=self.store).returncode, 3)
 
 
+class ArchivingGuards(Base):
+    def wait_for(self, path, timeout=15.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if path.exists():
+                return
+            time.sleep(0.02)
+        self.fail(f"timed out waiting for {path}")
+
+    def start_pause(self, op, stages, lane, msg_id):
+        return subprocess.Popen(
+            [str(RACER), "--pause", op, stages, str(self.store), lane, msg_id],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    def test_p_remove_deletes_file_preserves_neighbor_and_reports_missing_and_failure(self):
+        target = self.store / "target.txt"
+        neighbor = self.store / "neighbor.txt"
+        put(target, "remove me\n")
+        put(neighbor, "keep me\n")
+        r1 = subprocess.run([str(RACER), "--remove", str(target)], stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
+        self.assertEqual(r1.returncode, 0, r1.stderr)
+        self.assertFalse(target.exists())
+        self.assertEqual(neighbor.read_bytes(), b"keep me\n")
+        r2 = subprocess.run([str(RACER), "--remove", str(target)], stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
+        self.assertEqual(r2.returncode, 2, "P_MISSING expected on repeat")
+        subdir = self.store / "adir"
+        subdir.mkdir()
+        r3 = subprocess.run([str(RACER), "--remove", str(subdir)], stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
+        self.assertEqual(r3.returncode, 4, "P_FAILED expected when removing a directory")
+        if not ON_WINDOWS:
+            locked = self.store / "locked_dir"
+            locked.mkdir()
+            victim = locked / "victim.txt"
+            put(victim, "bye\n")
+            locked.chmod(0o300)
+            try:
+                r4 = subprocess.run([str(RACER), "--remove", str(victim)], stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
+                self.assertEqual(r4.returncode, 4, "P_FAILED expected when parent directory flush fails")
+            finally:
+                locked.chmod(0o700)
+
+    def test_store_job_second_look_notices_archived_post_with_populated_store_open(self):
+        job = self.send()
+        self.assertEqual(self.helio("take", job, me="os/userland").returncode, 0)
+        proc = self.start_pause("job", "read", "os/userland", job)
+        try:
+            self.wait_for(self.store / "paused.read")
+            (self.store / f"messages/{job}.post").unlink()
+            (self.store / f"messages/{job}.link.0000").unlink()
+            put(self.store / "resume.read", "go")
+            _, stderr = proc.communicate(timeout=30)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        self.assertEqual(proc.returncode, 2, stderr)
+        self.assertIn("it was archived", stderr)
+        self.assertEqual(list((self.store / "messages").iterdir()), [])
+
+        # Control: when the live post still exists, a genuine link gap still exits 3 (S_DAMAGED).
+        job2 = self.send()
+        self.assertEqual(self.helio("take", job2, me="os/userland").returncode, 0)
+        self.assertEqual(self.helio("release", job2, me="os/userland").returncode, 0)
+        (self.store / f"messages/{job2}.link.0000").unlink()
+        res_gap = subprocess.run(
+            [str(RACER), "--pause", "job", "", str(self.store), "os/userland", job2],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(res_gap.returncode, 3, res_gap.stderr)
+        self.assertIn("a step of this job is missing", res_gap.stderr)
+
+    def test_change_job_second_look_removes_orphan_step_and_handles_edge_cases(self):
+        # Case 1: post removed between store_job and add_link; link is created then removed cleanly.
+        job = self.send()
+        proc = self.start_pause("take", "write,after-write", "os/userland", job)
+        try:
+            self.wait_for(self.store / "paused.write")
+            (self.store / f"messages/{job}.post").unlink()
+            put(self.store / "resume.write", "go")
+            self.wait_for(self.store / "paused.after-write")
+            self.assertTrue((self.store / f"messages/{job}.link.0000").exists(), "writer must have published its link before second look")
+            put(self.store / "resume.after-write", "go")
+            _, stderr = proc.communicate(timeout=30)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        self.assertEqual(proc.returncode, 2, stderr)
+        self.assertIn("it was archived", stderr)
+        self.assertEqual(list((self.store / "messages").iterdir()), [])
+        for name in ("paused.write", "resume.write", "paused.after-write", "resume.after-write"):
+            (self.store / name).unlink(missing_ok=True)
+
+        # Case 2: already-removed link during rollback counts as clean S_REFUSED (exit 2).
+        job2 = self.send()
+        proc2 = self.start_pause("take", "write,after-write", "os/userland", job2)
+        try:
+            self.wait_for(self.store / "paused.write")
+            (self.store / f"messages/{job2}.post").unlink()
+            put(self.store / "resume.write", "go")
+            self.wait_for(self.store / "paused.after-write")
+            (self.store / f"messages/{job2}.link.0000").unlink()
+            put(self.store / "resume.after-write", "go")
+            _, stderr2 = proc2.communicate(timeout=30)
+        finally:
+            if proc2.poll() is None:
+                proc2.kill()
+        self.assertEqual(proc2.returncode, 2, stderr2)
+        self.assertIn("it was archived", stderr2)
+        for name in ("paused.write", "resume.write", "paused.after-write", "resume.after-write"):
+            (self.store / name).unlink(missing_ok=True)
+
+        # Case 3: P_EXISTS collision preserves the existing winner's link.
+        job3 = self.send(to="os/all")
+        proc3 = self.start_pause("take", "write", "os/userland", job3)
+        try:
+            self.wait_for(self.store / "paused.write")
+            self.assertEqual(self.helio("take", job3, me="os/apps").returncode, 0)
+            put(self.store / "resume.write", "go")
+            _, stderr3 = proc3.communicate(timeout=30)
+        finally:
+            if proc3.poll() is None:
+                proc3.kill()
+        self.assertEqual(proc3.returncode, 2, stderr3)
+        self.assertIn("already taken", stderr3)
+        winner_link = (self.store / f"messages/{job3}.link.0000").read_text()
+        self.assertIn("by: os/apps", winner_link)
+        for name in ("paused.write", "resume.write"):
+            (self.store / name).unlink(missing_ok=True)
+
+        # Case 4: unreadable post (IO error, not P_MISSING) surfaces as exit 3 and preserves our live link.
+        job4 = self.send()
+        proc4 = self.start_pause("take", "after-write", "os/userland", job4)
+        try:
+            self.wait_for(self.store / "paused.after-write")
+            post4 = self.store / f"messages/{job4}.post"
+            post4.unlink()
+            post4.mkdir()
+            put(self.store / "resume.after-write", "go")
+            _, stderr4 = proc4.communicate(timeout=30)
+        finally:
+            if proc4.poll() is None:
+                proc4.kill()
+        self.assertEqual(proc4.returncode, 3, stderr4)
+        self.assertTrue((self.store / f"messages/{job4}.link.0000").exists(), "IO error must not delete a live link")
+        for name in ("paused.after-write", "resume.after-write"):
+            (self.store / name).unlink(missing_ok=True)
+
+        # Case 5 (Linux): failed parent-folder flush during rollback surfaces as exit 3.
+        if not ON_WINDOWS:
+            job5 = self.send()
+            proc5 = self.start_pause("take", "write,after-write", "os/userland", job5)
+            msgs = self.store / "messages"
+            try:
+                self.wait_for(self.store / "paused.write")
+                (msgs / f"{job5}.post").unlink()
+                put(self.store / "resume.write", "go")
+                self.wait_for(self.store / "paused.after-write")
+                msgs.chmod(0o300)
+                put(self.store / "resume.after-write", "go")
+                _, stderr5 = proc5.communicate(timeout=30)
+            finally:
+                msgs.chmod(0o700)
+                if proc5.poll() is None:
+                    proc5.kill()
+            self.assertEqual(proc5.returncode, 3, stderr5)
+            self.assertIn("could not be removed", stderr5)
+
+    def test_store_seen_second_look_removes_orphan_seen_mark(self):
+        msg = self.send("tell", to="os/userland")
+        proc = self.start_pause("seen", "seen,after-seen", "os/userland", msg)
+        try:
+            self.wait_for(self.store / "paused.seen")
+            (self.store / f"messages/{msg}.post").unlink()
+            put(self.store / "resume.seen", "go")
+            self.wait_for(self.store / "paused.after-seen")
+            self.assertTrue((self.store / f"messages/{msg}.seen.os+userland").exists())
+            put(self.store / "resume.after-seen", "go")
+            _, stderr = proc.communicate(timeout=30)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        self.assertEqual(proc.returncode, 2, stderr)
+        self.assertIn("it was archived", stderr)
+        self.assertEqual(list((self.store / "messages").iterdir()), [])
+
+    def start_pause_cli(self, stages, *helio_args, me="os/userland"):
+        clean = {k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_SESSION", "CLAUDE_CODE_SESSION_ID")}
+        cmd = [str(RACER), "--pause-cli", stages, str(self.store), *helio_args, "--store", str(self.store)]
+        if me:
+            cmd.extend(["--as", me])
+        return subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=self.store,
+            env=clean,
+        )
+
+    def test_cli_readers_preserve_archived_refusal_without_false_damage(self):
+        # 1. Direct `show` gives exit 2 ("it was archived"), no body, and no orphan .seen.* file.
+        j_show = self.send(subject="vanish-show")
+        p_show = self.start_pause_cli("read", "show", j_show, me="os/userland")
+        try:
+            self.wait_for(self.store / "paused.read")
+            (self.store / f"messages/{j_show}.post").unlink()
+            put(self.store / "resume.read", "go")
+            out_s, err_s = p_show.communicate(timeout=30)
+        finally:
+            if p_show.poll() is None:
+                p_show.kill()
+        self.assertEqual(p_show.returncode, 2, err_s)
+        self.assertIn("it was archived", err_s)
+        self.assertEqual(out_s, "")
+        self.assertEqual(list((self.store / "messages").iterdir()), [])
+        for name in ("paused.read", "resume.read"):
+            (self.store / name).unlink(missing_ok=True)
+
+        # 2. `log` skips the concurrently-archived job, keeps showing unrelated jobs, and reports no damage.
+        j_arch = self.send(subject="vanish-log")
+        j_live = self.send(subject="stay-live")
+        p_log = self.start_pause_cli("read", "log", me=None)
+        try:
+            self.wait_for(self.store / "paused.read")
+            (self.store / f"messages/{j_arch}.post").unlink()
+            put(self.store / "resume.read", "go")
+            out_l, err_l = p_log.communicate(timeout=30)
+        finally:
+            if p_log.poll() is None:
+                p_log.kill()
+        self.assertEqual(p_log.returncode, 0, err_l)
+        self.assertIn("stay-live", out_l)
+        self.assertNotIn("vanish-log", out_l)
+        self.assertNotIn("damaged", out_l.lower() + err_l.lower())
+        for name in ("paused.read", "resume.read"):
+            (self.store / name).unlink(missing_ok=True)
+
+        # 3. `inbox` (including daily `watch_summary`) skips the archived job without damage warning.
+        j_arch2 = self.send(subject="vanish-inbox")
+        p_in = self.start_pause_cli("read", me="os/userland")
+        try:
+            self.wait_for(self.store / "paused.read")
+            (self.store / f"messages/{j_arch2}.post").unlink()
+            put(self.store / "resume.read", "go")
+            out_i, err_i = p_in.communicate(timeout=30)
+        finally:
+            if p_in.poll() is None:
+                p_in.kill()
+        self.assertEqual(p_in.returncode, 0, err_i)
+        self.assertIn("stay-live", out_i)
+        self.assertNotIn("vanish-inbox", out_i)
+        self.assertNotIn("damaged", out_i.lower() + err_i.lower())
+        summary_files = list((self.store / "summary").glob("*.md"))
+        self.assertEqual(len(summary_files), 1)
+        summary_text = summary_files[0].read_text()
+        self.assertIn("stay-live", summary_text)
+        self.assertNotIn("Damaged:", summary_text)
+        for name in ("paused.read", "resume.read"):
+            (self.store / name).unlink(missing_ok=True)
+
+        # 4. `hook claude` skips the archived job without damage warning.
+        j_arch3 = self.send(subject="vanish-hook")
+        p_hk = self.start_pause_cli("read", "hook", "claude", me="os/userland")
+        try:
+            self.wait_for(self.store / "paused.read")
+            (self.store / f"messages/{j_arch3}.post").unlink()
+            put(self.store / "resume.read", "go")
+            out_h, err_h = p_hk.communicate(timeout=30)
+        finally:
+            if p_hk.poll() is None:
+                p_hk.kill()
+        self.assertEqual(p_hk.returncode, 0, err_h)
+        self.assertIn("stay-live", out_h)
+        self.assertNotIn("vanish-hook", out_h)
+        self.assertNotIn("damaged", out_h.lower() + err_h.lower())
+
+
 if __name__ == "__main__":
     unittest.main()

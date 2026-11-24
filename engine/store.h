@@ -20,6 +20,8 @@ typedef struct store {
     size_t count, capacity;
     bool failed;
     const char *why; /* after S_REFUSED or S_DAMAGED */
+    void (*pause)(void *user, const char *stage);
+    void *pause_user;
 } store;
 
 /* Who acts. A lane may have several sessions after each other; when both the

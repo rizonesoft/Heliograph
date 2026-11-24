@@ -236,6 +236,24 @@ static s_result event_of(store *s, const char *id, const char *event, char **dat
     return result == P_OK ? S_OK : result == P_MISSING ? S_NOTHING : say(s, S_DAMAGED, "an event cannot be read");
 }
 
+static s_result live_post(store *s, const char *id) {
+    char *data = NULL;
+    s_result result = event_of(s, id, "post", &data);
+    p_free(data);
+    if (result == S_OK) return S_OK;
+    if (result == S_NOTHING) return say(s, S_REFUSED, "it was archived");
+    return say(s, S_DAMAGED, "the message cannot be read");
+}
+
+static s_result remove_event(store *s, const char *id, const char *event) {
+    text at = {0};
+    path(s, &at, id, event);
+    p_result result = at.failed ? P_FAILED : p_remove(at.data);
+    text_free(&at);
+    if (result == P_OK || result == P_MISSING) return S_OK;
+    return say(s, S_DAMAGED, "an archived step could not be removed");
+}
+
 /* The value of a field that must be there. */
 static bool keep(char *to, size_t room, char *data, const char *name) {
     for (char *line = data; *line;) {
@@ -292,7 +310,12 @@ s_result store_job(store *s, const message *m, job *out) {
         char *data = NULL, what[16], by[72], session[72], end[8], when[24];
         s_result result = name.failed ? say(s, S_DAMAGED, "out of memory") : event_of(s, m->id, name.data, &data);
         text_free(&name);
-        if (result == S_NOTHING) return gap(s, m->id, out->links) ? say(s, S_DAMAGED, "a step of this job is missing") : S_OK;
+        if (result == S_NOTHING) {
+            if (s->pause) s->pause(s->pause_user, "read");
+            s_result live = live_post(s, m->id);
+            if (live != S_OK) return live;
+            return gap(s, m->id, out->links) ? say(s, S_DAMAGED, "a step of this job is missing") : S_OK;
+        }
         if (result != S_OK) return result;
         bool good = keep(what, sizeof what, data, "state") && keep(by, sizeof by, data, "by") && address_ok(by, false)
                     && keep(session, sizeof session, data, "session") && keep(when, sizeof when, data, "time") && read_time(when, &out->when) && keep(end, sizeof end, data, "end") && same(end, "yes");
@@ -304,7 +327,8 @@ s_result store_job(store *s, const message *m, job *out) {
         bool open = out->state == OPEN;
         copy_to(out->by, open ? "" : by), copy_to(out->session, open ? "" : session);
     }
-    return S_OK;
+    if (s->pause) s->pause(s->pause_user, "read");
+    return live_post(s, m->id);
 }
 
 static bool secret(const char *t) {
@@ -491,7 +515,25 @@ static s_result change_job(store *s, const char *id, actor me, change what, cons
         }
         before = now.links;
         const char *why = objection(&m, &now, me, what);
-        result = why ? say(s, S_REFUSED, why) : add_link(s, id, &now, me, states[what], note);
+        if (why) {
+            result = say(s, S_REFUSED, why);
+        } else {
+            if (s->pause) s->pause(s->pause_user, "write");
+            result = add_link(s, id, &now, me, states[what], note);
+            if (result == S_OK) {
+                if (s->pause) s->pause(s->pause_user, "after-write");
+                s_result live = live_post(s, id);
+                if (live == S_REFUSED) {
+                    text name = {0};
+                    link_name(&name, now.links);
+                    s_result rm = name.failed ? say(s, S_DAMAGED, "out of memory") : remove_event(s, id, name.data);
+                    text_free(&name);
+                    result = rm == S_OK ? say(s, S_REFUSED, "it was archived") : rm;
+                } else if (live != S_OK) {
+                    result = live;
+                }
+            }
+        }
         if (result != S_NOTHING) break;
         result = S_OK; /* the chain grew: decide again from the new end */
     }
@@ -507,9 +549,23 @@ s_result store_seen(store *s, const char *id, const char *me) {
     if (!address_ok(me, false)) return say(s, S_REFUSED, "say who you are: --as project/lane");
     text event = {0};
     seen_name(&event, me);
-    s_result result = event.failed ? say(s, S_DAMAGED, "out of memory") : make(s, id, event.data, SEEN);
+    if (event.failed) return text_free(&event), say(s, S_DAMAGED, "out of memory");
+    if (s->pause) s->pause(s->pause_user, "seen");
+    s_result result = make(s, id, event.data, SEEN);
+    if (result == S_OK) {
+        if (s->pause) s->pause(s->pause_user, "after-seen");
+        s_result live = live_post(s, id);
+        if (live == S_REFUSED) {
+            s_result rm = remove_event(s, id, event.data);
+            result = rm == S_OK ? say(s, S_REFUSED, "it was archived") : rm;
+        } else if (live != S_OK) {
+            result = live;
+        }
+    } else if (result == S_NOTHING) {
+        result = S_OK;
+    }
     text_free(&event);
-    return result == S_NOTHING ? S_OK : result;
+    return result;
 }
 
 s_result store_check(store *s, text *report) {

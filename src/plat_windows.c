@@ -12,6 +12,64 @@ void *p_alloc(size_t bytes) { return im_alloc(bytes); }
 void p_free(void *memory) { im_free(memory); }
 p_result p_read(const char *path, size_t most, char **data, size_t *length) { return from(im_read(path, most, data, length)); }
 p_result p_write(const char *path, const char *data, size_t length, bool replace, const char *unique) { return from(im_write(path, data, length, replace, unique)); }
+
+static bool passing_win(int attempt, DWORD error) {
+    if (attempt >= 50 || (error != ERROR_SHARING_VIOLATION && error != ERROR_ACCESS_DENIED && error != ERROR_LOCK_VIOLATION)) return false;
+    Sleep(4);
+    return true;
+}
+
+static bool settle_win(const char *path) {
+    size_t n = im_length(path);
+    size_t slash = n;
+    while (slash > 0 && path[slash - 1] != '/' && path[slash - 1] != '\\') slash--;
+    const char *dir_utf8 = ".";
+    char *copy = NULL;
+    if (slash > 0) {
+        size_t dlen = slash;
+        if (dlen > 1 && !(dlen == 3 && path[1] == ':')) dlen--;
+        copy = im_alloc(dlen + 1);
+        if (!copy) return false;
+        for (size_t i = 0; i < dlen; i++) copy[i] = path[i];
+        copy[dlen] = 0;
+        dir_utf8 = copy;
+    }
+    wchar_t *wide = im_wide(dir_utf8);
+    im_free(copy);
+    if (!wide) return false;
+    HANDLE dir = CreateFileW(wide, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    im_free(wide);
+    if (dir == INVALID_HANDLE_VALUE) {
+        DWORD err = GetLastError();
+        return err == ERROR_ACCESS_DENIED || err == ERROR_INVALID_FUNCTION || err == ERROR_NOT_SUPPORTED || err == ERROR_INVALID_PARAMETER;
+    }
+    bool ok = FlushFileBuffers(dir) != 0;
+    DWORD err = ok ? 0 : GetLastError();
+    CloseHandle(dir);
+    return ok || err == ERROR_ACCESS_DENIED || err == ERROR_INVALID_FUNCTION || err == ERROR_NOT_SUPPORTED || err == ERROR_INVALID_PARAMETER;
+}
+
+p_result p_remove(const char *path) {
+    wchar_t *wide = im_wide(path);
+    if (!wide) return P_FAILED;
+    DWORD err = 0;
+    bool deleted = false;
+    for (int attempt = 0;; attempt++) {
+        if (DeleteFileW(wide)) {
+            deleted = true;
+            break;
+        }
+        err = GetLastError();
+        if (!passing_win(attempt, err)) break;
+    }
+    im_free(wide);
+    if (!deleted) {
+        if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) return P_MISSING;
+        return P_FAILED;
+    }
+    return settle_win(path) ? P_OK : P_FAILED;
+}
+
 p_result p_folder(const char *path) { return from(im_make_folder(path)); }
 p_result p_input(size_t most, char **data, size_t *length) { return from(im_read_input(most, data, length)); }
 uint64_t p_now(void) { return im_now(); }

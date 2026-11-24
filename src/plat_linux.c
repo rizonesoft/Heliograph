@@ -84,6 +84,11 @@ p_result p_write(const char *path, const char *data, size_t length, bool replace
     return result;
 }
 
+p_result p_remove(const char *path) {
+    if (unlink(path)) return why();
+    return settle(path) ? P_OK : P_FAILED;
+}
+
 p_result p_folder(const char *path) {
     struct stat info;
     if (!mkdir(path, 0700)) return P_OK;
