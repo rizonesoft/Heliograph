@@ -487,7 +487,14 @@ s_result store_post(store *s, const message *m, const char *key, text *id) {
             }
         }
         if (result == S_OK) {
-            add(&out, "id: "), add(&out, id->data), add(&out, "\ntime: "), add_time(&out, now);
+            uint64_t stamp = now;
+            if (*key && id->data) {
+                uint64_t parsed = 0;
+                const char *p = id->data;
+                while (*p >= '0' && *p <= '9') parsed = parsed * 10 + (uint64_t)(*p++ - '0');
+                if (*p == '-' && parsed) stamp = parsed;
+            }
+            add(&out, "id: "), add(&out, id->data), add(&out, "\ntime: "), add_time(&out, stamp);
             add(&out, "\nfrom: "), add(&out, m->from), add(&out, "\nto: "), add(&out, m->to), add(&out, "\nkind: "), add(&out, m->kind);
             add(&out, "\nabout: "), add(&out, about.data ? about.data : ""), add(&out, "\nurgency: "), add(&out, m->urgency);
             add(&out, "\nre: "), add(&out, m->re), add(&out, "\ndue: ");
@@ -587,10 +594,11 @@ static s_result change_job(store *s, const char *id, actor me, change what, cons
     if (result != S_OK) return result;
     if (!is_job(&m)) result = say(s, S_REFUSED, "only a request or a handoff can be taken");
     if (result == S_OK) {
-        /* Refuse immediately if an archived terminal copy already exists (even if a killed keyed retry left a duplicate live post).
-           Ignore S_DAMAGED here: an ordinary concurrent or interrupted archive that has only copied the post so far must not fail a healthy live job. */
-        if (archive_has_terminal_job(s->folder, id, NULL) == S_OK)
-            result = say(s, S_REFUSED, "it was archived");
+        /* Refuse if an archived terminal copy already exists; fail closed on archive I/O or parse errors (S_DAMAGED);
+           allow ordinary in-progress archival (S_REFUSED = valid archived post without terminal links yet) to proceed. */
+        s_result ar = archive_has_terminal_job(s->folder, id, NULL);
+        if (ar == S_OK) result = say(s, S_REFUSED, "it was archived");
+        else if (ar == S_DAMAGED) result = say(s, S_DAMAGED, "an archived job cannot be read");
     }
     unsigned before = MOST_LINKS + 1;
     while (result == S_OK) {
@@ -612,14 +620,18 @@ static s_result change_job(store *s, const char *id, actor me, change what, cons
                 if (s->pause) s->pause(s->pause_user, "after-write");
                 const char *write_why = s->why;
                 s_result live = live_post(s, id);
-                bool archived = live == S_REFUSED || archive_has_terminal_job(s->folder, id, NULL) == S_OK;
-                if (archived) {
+                s_result ar = live == S_OK ? archive_has_terminal_job(s->folder, id, NULL) : S_NOTHING;
+                if (live == S_REFUSED || ar == S_OK || ar == S_DAMAGED) {
                     text name = {0};
                     link_name(&name, now.links);
                     s_result rm = name.failed ? say(s, S_DAMAGED, "out of memory") : remove_event(s, id, name.data);
                     text_free(&name);
-                    if (result == S_OK) result = rm == S_OK ? say(s, S_REFUSED, "it was archived") : rm;
-                    else if (rm == S_OK) s->why = write_why;
+                    if (result == S_OK) {
+                        if (ar == S_DAMAGED) result = rm == S_OK ? say(s, S_DAMAGED, "an archived job cannot be read") : rm;
+                        else result = rm == S_OK ? say(s, S_REFUSED, "it was archived") : rm;
+                    } else if (rm == S_OK) {
+                        s->why = write_why;
+                    }
                 } else if (live != S_OK) {
                     result = live;
                 } else if (result != S_OK) {

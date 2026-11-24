@@ -144,13 +144,15 @@ int racer(int count, char **args) {
         }
         return 0;
     }
-    if (count >= 5 && same(args[1], "--read-loop")) {
+    if (count >= 6 && same(args[1], "--read-loop")) {
         const char *folder = args[2];
-        int rounds = 0;
-        for (const char *p = args[3]; *p >= '0' && *p <= '9'; p++) rounds = rounds * 10 + (*p - '0');
-        text ready = {0}, go = {0};
+        int min_rounds = 0, live_count = 0;
+        for (const char *p = args[3]; *p >= '0' && *p <= '9'; p++) min_rounds = min_rounds * 10 + (*p - '0');
+        for (const char *p = args[4]; *p >= '0' && *p <= '9'; p++) live_count = live_count * 10 + (*p - '0');
+        text ready = {0}, go = {0}, done = {0};
         add(&ready, folder), add(&ready, "/ready."), add_number(&ready, p_tick(), 0);
         add(&go, folder), add(&go, "/go");
+        add(&done, folder), add(&done, "/done");
         if (p_write(ready.data, "x", 1, false, "r") != P_OK) return 100;
         char *gdata = NULL;
         size_t glen = 0;
@@ -158,23 +160,49 @@ int racer(int count, char **args) {
             if (p_now() > until) return 101;
         p_free(gdata);
         text_free(&ready), text_free(&go);
-        for (int i = 0; i < rounds; i++) {
+        for (int i = 0;; i++) {
             store s = {0};
             if (store_open(&s, folder) != S_OK) {
                 store_close(&s);
+                text_free(&done);
                 return 3;
             }
-            for (int k = 4; k < count; k++) {
+            for (int k = 5; k < 5 + live_count && k < count; k++) {
                 message m = {0};
                 s_result mr = store_message(&s, args[k], &m);
                 if (mr != S_OK) {
                     store_close(&s);
+                    text_free(&done);
                     return 4;
                 }
                 message_free(&m);
             }
+            /* Every watched eligible ID must be readable in EITHER live messages/ OR archive/<month>/ (never missing from both!). */
+            for (int k = 5 + live_count; k < count; k++) {
+                message m = {0};
+                s_result mr = store_message(&s, args[k], &m);
+                if (mr != S_OK) {
+                    message_free(&m);
+                    mr = archive_read_message(&s, args[k], &m);
+                    if (mr != S_OK) {
+                        /* One re-check in case it moved between live and archive checks? Archive is written BEFORE live is removed! */
+                        store_close(&s);
+                        text_free(&done);
+                        return 5;
+                    }
+                }
+                message_free(&m);
+            }
             store_close(&s);
+            if (i + 1 >= min_rounds) {
+                char *dd = NULL;
+                size_t dl = 0;
+                p_result dr = p_read(done.data, 9, &dd, &dl);
+                p_free(dd);
+                if (dr == P_OK) break;
+            }
         }
+        text_free(&done);
         return 0;
     }
     if (count >= 2 && same(args[1], "--pause")) return run_pause(count, args);

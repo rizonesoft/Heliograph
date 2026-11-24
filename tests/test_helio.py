@@ -1410,12 +1410,10 @@ class Archive(Base):
             put(self.store / f"messages/{job_inf}.link.0000", l0_txt)
             put(self.store / f"messages/{job_inf}.link.0001", l1_txt)
             self.assertEqual(self.helio("archive", me=None).returncode, 0)
-            # Simulate a killed keyed retry leaving a duplicate live post (at a later second) while archived terminal job exists!
+            # Simulate a killed keyed retry leaving a byte-identical duplicate live post while archived terminal job exists!
             arch_post = next((self.store / "archive").glob(f"*/{job_inf}.post"))
             orig_arch_bytes = arch_post.read_bytes()
-            dup_lines = arch_post.read_text().splitlines(keepends=True)
-            dup_txt = "".join("time: 2026-12-31T23:59:59Z\n" if ln.startswith("time: ") else ln for ln in dup_lines)
-            put(self.store / f"messages/{job_inf}.post", dup_txt)
+            put(self.store / f"messages/{job_inf}.post", orig_arch_bytes.decode())
             put(self.store / "resume.write", "go")
             _, err_t = proc_t.communicate(timeout=30)
         finally:
@@ -1424,19 +1422,30 @@ class Archive(Base):
         self.assertEqual(proc_t.returncode, 2, err_t)
         self.assertIn(b"archived", err_t)
         self.assertFalse((self.store / f"messages/{job_inf}.link.0000").exists(), "rolled-back take must leave no link.0000")
+        # A byte-different live post (even differing only in time:) MUST be refused (exit 3) and both files preserved!
+        dup_lines = orig_arch_bytes.decode().splitlines(keepends=True)
+        diff_txt = "".join("time: 2026-12-31T23:59:59Z\n" if ln.startswith("time: ") else ln for ln in dup_lines)
+        put(self.store / f"messages/{job_inf}.post", diff_txt)
+        self.assertEqual(self.helio("archive", me=None).returncode, 3)
+        self.assertTrue((self.store / f"messages/{job_inf}.post").exists(), "byte-different live post must be preserved")
+        self.assertEqual(arch_post.read_bytes(), orig_arch_bytes)
+        # Restoring exact archived bytes sweeps cleanly!
+        put(self.store / f"messages/{job_inf}.post", orig_arch_bytes.decode())
         self.assertEqual(self.helio("archive", me=None).returncode, 0)
         self.assertFalse((self.store / f"messages/{job_inf}.post").exists())
         self.assertEqual(arch_post.read_bytes(), orig_arch_bytes, "original archived post must remain untouched")
         for name in ("paused.write", "resume.write"):
             (self.store / name).unlink(missing_ok=True)
 
-        # P2 regression (in-progress partial archive must NOT cause healthy live job mutation to report damaged!):
+        # P2 regression (in-progress partial archive in the job's REAL month must NOT cause healthy live job mutation to report damaged!):
         live_part = self.send(to="os/userland", subject="partial-archive-live")
-        (self.store / "archive/2025-02").mkdir(parents=True, exist_ok=True)
-        put(self.store / f"archive/2025-02/{live_part}.post", (self.store / f"messages/{live_part}.post").read_text())
+        live_us = int(live_part.split("-", 1)[0])
+        live_month = time.strftime("%Y-%m", time.gmtime(live_us / 1_000_000))
+        (self.store / f"archive/{live_month}").mkdir(parents=True, exist_ok=True)
+        put(self.store / f"archive/{live_month}/{live_part}.post", (self.store / f"messages/{live_part}.post").read_text())
         take_part = self.helio("take", live_part, me="os/userland")
         self.assertEqual(take_part.returncode, 0, take_part.stderr)
-        (self.store / f"archive/2025-02/{live_part}.post").unlink()
+        (self.store / f"archive/{live_month}/{live_part}.post").unlink()
 
     def test_daily_200_limit_hook_first_concurrent_archive_and_overfull_recovery(self):
         # Create 201 eligible closed jobs + 1 open job.
@@ -1532,6 +1541,40 @@ class Archive(Base):
             self.assertIn(run(st, "inbox", me="os/userland").returncode, (0, 1))
             self.assertEqual(len(list((st / "archive/2025-02").glob("*.post"))), moved_sim)
 
+        # Upgrade continuity: legacy summary/<today>.claiming with 100 prior moves caps remaining budget to 100!
+        with tempfile.TemporaryDirectory() as tmp:
+            st = Path(tmp)
+            put(st / "helio.conf", "project: os\n")
+            self.assertEqual(run(st, "init", me=None).returncode, 0)
+            today_iso = time.strftime("%Y-%m-%d", time.gmtime())
+            (st / "summary").mkdir(exist_ok=True)
+            put(st / f"summary/{today_iso}.claiming", "1 100\n")
+            for i in range(150):
+                j = f"{feb_us + 3000 + i:016d}-f{i:05x}"
+                put(st / f"messages/{j}.post", f"id: {j}\ntime: 2025-02-15T00:00:00Z\nfrom: os/main\nto: os/userland\nkind: request\nabout: \nurgency: next\nre: \ndue: \nlength: 4\nsubject: f\n\nbody")
+                put(st / f"messages/{j}.link.0000", "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: taken\nnote: \nend: yes\n")
+                put(st / f"messages/{j}.link.0001", "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: done\nnote: ok\nend: yes\n")
+            self.assertIn(run(st, "inbox", me="os/userland").returncode, (0, 1))
+            self.assertEqual(len(list((st / "archive/2025-02").glob("*.post"))), 100)
+            self.assertTrue((st / f"summary/{today_iso}.archived").exists())
+
+        # Crash after slot 9 without .archived: next inbox moves 0 and publishes .archived!
+        with tempfile.TemporaryDirectory() as tmp:
+            st = Path(tmp)
+            put(st / "helio.conf", "project: os\n")
+            self.assertEqual(run(st, "init", me=None).returncode, 0)
+            today_iso = time.strftime("%Y-%m-%d", time.gmtime())
+            (st / "summary").mkdir(exist_ok=True)
+            for s_idx in range(10):
+                put(st / f"summary/{today_iso}.slot.{s_idx}", "1\n")
+            j = f"{feb_us + 4000:016d}-a04000"
+            put(st / f"messages/{j}.post", f"id: {j}\ntime: 2025-02-15T00:00:00Z\nfrom: os/main\nto: os/userland\nkind: request\nabout: \nurgency: next\nre: \ndue: \nlength: 4\nsubject: s9\n\nbody")
+            put(st / f"messages/{j}.link.0000", "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: taken\nnote: \nend: yes\n")
+            put(st / f"messages/{j}.link.0001", "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: done\nnote: ok\nend: yes\n")
+            self.assertIn(run(st, "inbox", me="os/userland").returncode, (0, 1))
+            self.assertTrue((st / f"messages/{j}.post").exists())
+            self.assertTrue((st / f"summary/{today_iso}.archived").exists())
+
         # Overfull-store recovery via --max-names: inbox refuses, archive drains, inbox recovers!
         with tempfile.TemporaryDirectory() as tmp:
             st = Path(tmp)
@@ -1578,15 +1621,17 @@ class Archive(Base):
         win_store = subprocess.run(["wslpath", "-w", str(self.store)], capture_output=True, text=True, check=True, timeout=30).stdout.strip()
         win_racer = str(BUILD / "racer.exe")
         lin_racer = str(RACER)
-        # 2 archivers (limit=1 per round: Windows 200 rounds + Linux 800 rounds = 1,000 real moves across 1,000 rounds),
-        # 2 concurrent readers (Windows 200 rounds + Linux 800 rounds = 1,000 visibility rounds verifying every live control),
-        # and 2 racing takers (Windows + Linux) over live controls + sample eligible old jobs.
-        take_ids = old_ids[:40] + live_ids
+        # 2 archivers (limit=1 per round: Windows 300 rounds + Linux 1000 rounds, moving all 1,000 distinct eligible jobs),
+        # 2 concurrent readers (Windows min 200 + Linux min 800 = 1,000+ rounds running until BOTH archivers finish,
+        # checking every live control ID AND 40 sampled eligible IDs are readable in live OR archive on EVERY round),
+        # and 2 racing takers (Windows + Linux).
+        watch_old = old_ids[::25]
+        take_ids = watch_old + live_ids
         procs = [
             subprocess.Popen([win_racer, "--archive-loop", win_store, "300"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
             subprocess.Popen([lin_racer, "--archive-loop", str(self.store), "1000"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
-            subprocess.Popen([win_racer, "--read-loop", win_store, "200", *live_ids], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
-            subprocess.Popen([lin_racer, "--read-loop", str(self.store), "800", *live_ids], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
+            subprocess.Popen([win_racer, "--read-loop", win_store, "200", str(len(live_ids)), *live_ids, *watch_old], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
+            subprocess.Popen([lin_racer, "--read-loop", str(self.store), "800", str(len(live_ids)), *live_ids, *watch_old], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
             subprocess.Popen([win_racer, win_store, "os/win-taker", *take_ids[::-1]], stdin=subprocess.DEVNULL),
             subprocess.Popen([lin_racer, str(self.store), "os/lin-taker", *take_ids], stdin=subprocess.DEVNULL),
         ]
@@ -1598,10 +1643,12 @@ class Archive(Base):
             put(self.store / "go", "x")
             _, arch_win_err = procs[0].communicate(timeout=180)
             _, arch_lin_err = procs[1].communicate(timeout=180)
-            _, read_win_err = procs[2].communicate(timeout=180)
-            _, read_lin_err = procs[3].communicate(timeout=180)
             arch_win_rc = procs[0].returncode
             arch_lin_rc = procs[1].returncode
+            # Signal readers ONLY AFTER both archivers have finished all 1,000 moves!
+            put(self.store / "done", "x")
+            _, read_win_err = procs[2].communicate(timeout=180)
+            _, read_lin_err = procs[3].communicate(timeout=180)
             read_win_rc = procs[2].returncode
             read_lin_rc = procs[3].returncode
             win_won = procs[4].wait(180)

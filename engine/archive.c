@@ -121,7 +121,8 @@ s_result archive_has_terminal_job(const char *folder, const char *id, unsigned *
         }
     }
     message_free(&m);
-    if (!ok || (now.state != DONE && now.state != REFUSED)) return S_DAMAGED;
+    if (!ok) return S_DAMAGED;
+    if (now.state != DONE && now.state != REFUSED) return S_REFUSED;
     if (links_out) *links_out = now.links;
     return S_OK;
 }
@@ -526,26 +527,8 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
         p_result ar = dst_post.failed ? P_FAILED : p_read(dst_post.data, MOST_FILE, &adata, &alen);
         bool equal = ar == P_OK && alen == plen;
         for (size_t k = 0; equal && k < plen; k++) equal = adata[k] == pdata[k];
-        if (!equal && ar == P_OK) {
-            /* A killed keyed retry can republish the same message at a later second (different time: header only).
-               Accept and sweep the duplicate live post if every semantic field matches the archived post. */
-            message am = {0}, pm = {0};
-            const char *awhy = NULL, *pwhy = NULL;
-            s_result pa = store_parse_post(adata, alen, it->id, &am, &awhy);
-            s_result pp = store_parse_post(pdata, plen, it->id, &pm, &pwhy);
-            if (pa == S_OK && pp == S_OK) {
-                equal = same(am.from, pm.from) && same(am.to, pm.to) && same(am.kind, pm.kind) &&
-                        same(am.about, pm.about) && same(am.urgency, pm.urgency) && same(am.re, pm.re) &&
-                        am.due == pm.due && same(am.subject, pm.subject) && same(am.body, pm.body);
-            }
-            message_free(&am);
-            message_free(&pm);
-            adata = NULL;
-            pdata = NULL;
-        } else {
-            p_free(adata);
-            p_free(pdata);
-        }
+        p_free(adata);
+        p_free(pdata);
         if (!equal) {
             text_free(&dst_post), text_free(&post_p);
             add_report(report, it->id, "archive copy differs from live file");
@@ -876,14 +859,36 @@ s_result archive_daily(const char *folder, text *report, void (*pause)(void *use
     }
 
     /* Partition today's 200-job budget into 10 immutable exclusive-create slots of 20 jobs each
-       (summary/<YYYY-MM-DD>.slot.0 .. slot.9). Because slots are created with overwrite=false and never
-       deleted on the same date, at most 10 slots x 20 = 200 jobs can ever be moved across all concurrent
-       starts, crashes, and recoveries on this date. */
+       (summary/<YYYY-MM-DD>.slot.0 .. slot.9). Honor any legacy .claiming debit left by an interrupted
+       predecessor binary on the same UTC date by skipping already-debited slots. */
     if (pause) pause(pause_user, "before-daily-claim");
+    unsigned start_slot = 0;
+    text legacy = {0};
+    add(&legacy, sdir.data), add(&legacy, "/"), add(&legacy, day.data), add(&legacy, ".claiming");
+    char *ldata = NULL;
+    size_t llen = 0;
+    p_result lgot = legacy.failed ? P_FAILED : p_read(legacy.data, 128, &ldata, &llen);
+    text_free(&legacy);
+    if (lgot == P_OK) {
+        const char *p = ldata;
+        while (*p >= '0' && *p <= '9') p++;
+        size_t prior = 200;
+        if (*p == ' ' && p[1] >= '0' && p[1] <= '9') {
+            prior = 0;
+            for (p++; *p >= '0' && *p <= '9' && prior < 200; p++) prior = prior * 10 + (size_t)(*p - '0');
+        }
+        p_free(ldata);
+        start_slot = (unsigned)((prior + 19) / 20);
+        if (start_slot > 10) start_slot = 10;
+    } else if (lgot != P_MISSING) {
+        p_free(ldata);
+        text_free(&day), text_free(&sdir), text_free(&mark), text_free(&unique);
+        return S_DAMAGED;
+    }
+
     size_t spent = 0;
     s_result res = S_OK;
-    bool exhausted = false;
-    for (unsigned slot = 0; slot < 10; slot++) {
+    for (unsigned slot = start_slot; slot < 10; slot++) {
         text sp = {0}, sbody = {0};
         add(&sp, sdir.data), add(&sp, "/"), add(&sp, day.data), add(&sp, ".slot."), add_number(&sp, slot, 0);
         add_number(&sbody, p_now(), 0), add(&sbody, "\n");
@@ -899,10 +904,7 @@ s_result archive_daily(const char *folder, text *report, void (*pause)(void *use
         size_t rlen = 0;
         p_result rgot = p_read(mark.data, 64, &recheck, &rlen);
         p_free(recheck);
-        if (rgot == P_OK) {
-            exhausted = true;
-            break;
-        }
+        if (rgot == P_OK) break;
         if (rgot != P_MISSING) {
             res = S_DAMAGED;
             break;
@@ -914,12 +916,9 @@ s_result archive_daily(const char *folder, text *report, void (*pause)(void *use
             res = S_DAMAGED;
             break;
         }
-        if (ar == S_NOTHING) {
-            exhausted = true;
-            break;
-        }
+        if (ar == S_NOTHING) break;
     }
-    if (res == S_OK && (exhausted || spent > 0)) {
+    if (res == S_OK) {
         text body = {0};
         add_number(&body, (uint64_t)spent, 0), add(&body, "\n");
         p_result wr = body.failed ? P_FAILED : p_write(mark.data, body.data, body.length, false, unique.data);
