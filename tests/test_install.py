@@ -679,7 +679,76 @@ class TestQuickInstaller(unittest.TestCase):
             self.assertTrue(self.mod.recover_if_needed(w3_dir, w3c))
             self.assertEqual(w3a.read_text(encoding="utf-8"), self.mod.render_wrapper(w3_dir, s3a))
             self.assertEqual(w3b.read_text(encoding="utf-8"), self.mod.render_wrapper(w3_dir, s3b))
-            self.assertEqual(w3c.read_text(encoding="utf-8"), self.mod.render_wrapper(w3_dir, s3c))
+            # 7e. Foreign journal with had_manifest=False cannot write an external wrapper or create its parent dir.
+            fnom_dir = root / "foreign_no_manifest"
+            fnom_dir.mkdir()
+            absent_ext_dir = root / "absent_ext_dir_no_manifest"
+            (fnom_dir / self.mod.JOURNAL_NAME).write_text(
+                json.dumps({
+                    "schema_version": 2,
+                    "op": "install",
+                    "phase": "publishing",
+                    "tx_id": "abcdef012345",
+                    "to_dir": str(fnom_dir.resolve()),
+                    "wrapper_path": str((root / "fnom_w" / "helio").resolve()),
+                    "had_manifest": False,
+                    "previous_manifest": None,
+                    "pre_wrappers": {str(absent_ext_dir / "helio"): str(store)},
+                    "saved_files": {},
+                    "temp_files": [],
+                    "desired_manifest": {
+                        "schema_version": 1,
+                        "current": {
+                            "commit": "a" * 40,
+                            "helio_sha256": "0" * 64,
+                            "helio_exe_sha256": "0" * 64,
+                            "store": str(store),
+                            "wrapper": str(absent_ext_dir / "helio"),
+                        },
+                        "previous": None,
+                    },
+                }),
+                encoding="utf-8",
+            )
+            with self.assertRaises(self.mod.InstallError) as ctx:
+                self.mod.recover_if_needed(fnom_dir, root / "fnom_w" / "helio")
+            self.assertEqual(ctx.exception.code, 2)
+            self.assertFalse(absent_ext_dir.exists())
+
+            # 7f. Interrupted --back whose wrapper is acquired by another destination reports exit 3 without clobbering the other destination.
+            sup_a, sup_d = root / "sup_a", root / "sup_d"
+            sup_wa, sup_wb = root / "sup_wa" / "helio", root / "sup_wb" / "helio"
+            self.mod.install(repo=repo, to_dir=sup_a, store_dir=r_sa, wrapper_path=sup_wa, prebuilt=(a_h, a_e))
+            self.mod.install(repo=repo, to_dir=sup_a, store_dir=r_sb, wrapper_path=sup_wb, prebuilt=(b_h, b_e))
+
+            with self.assertRaises(SimulatedCrash):
+                self.mod.go_back(to_dir=sup_a, wrapper_path=sup_wb, on_boundary=crash_after_wrap)
+            # Another destination D legitimately takes vacant sup_wb.
+            self.mod.install(repo=repo, to_dir=sup_d, store_dir=r_sc, wrapper_path=sup_wb, prebuilt=(a_h, a_e))
+            with self.assertRaises(self.mod.InstallError) as ctx:
+                self.mod.recover_if_needed(sup_a, sup_wb)
+            self.assertEqual(ctx.exception.code, 3)
+            self.assertTrue(self.mod.wrapper_belongs_to(sup_wb, sup_d))
+
+            # 7g. Legacy adoption with a different --store preserves the legacy wrapper's store in previous.store for --back.
+            leg2_dir = root / "legacy_diff_store"
+            leg2_dir.mkdir()
+            leg2_old_store = root / "legacy_old_store"
+            leg2_new_store = root / "legacy_new_store"
+            leg2_wrap = root / "leg2_w" / "helio"
+            leg2_wrap.parent.mkdir(parents=True)
+            make_distinct_binary(self.helio_bin, leg2_dir / "helio", b"leg2")
+            make_distinct_binary(self.helio_exe, leg2_dir / "helio.exe", b"leg2")
+            leg2_wrap.write_text(
+                f"#!/bin/sh\n# Heliograph with this machine's store. HELIO_STORE or --store overrides it.\n"
+                f'HELIO_STORE="${{HELIO_STORE:-{leg2_old_store}}}" exec "{leg2_dir}/helio" "$@"\n',
+                encoding="utf-8",
+            )
+            os.chmod(leg2_wrap, 0o755)
+            m_leg2 = self.mod.install(repo=repo, to_dir=leg2_dir, store_dir=leg2_new_store, wrapper_path=leg2_wrap, prebuilt=(b_h, b_e))
+            self.assertEqual(m_leg2["previous"]["store"], str(leg2_old_store))
+            self.mod.go_back(to_dir=leg2_dir, wrapper_path=leg2_wrap)
+            self.assertEqual(leg2_wrap.read_text(encoding="utf-8"), self.mod.render_wrapper(leg2_dir, leg2_old_store))
 
             # 8. Foreign journal with an unrelated .rec copy and absent target is refused without publishing it,
             #    and a foreign journal naming a nonexistent external dir creates neither the dir nor a lock file.

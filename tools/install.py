@@ -681,16 +681,21 @@ def _is_independently_owned_reserved_file(path: Path, name: str) -> bool:
     return False
 
 
-def _restore_wrapper_from_manifest(wrapper_path: Path, to_dir: Path, store_str: str | None) -> None:
-    """Restore a wrapper deterministically from validated (to_dir, store), never arbitrary journal text."""
+def _restore_wrapper_from_manifest(wrapper_path: Path, to_dir: Path, store_str: str | None) -> bool:
+    """Restore a wrapper deterministically from validated (to_dir, store).
+
+    Returns True if restored, False if another destination owns wrapper_path (never clobbered).
+    """
     if not store_str:
-        return
+        return True
     if _wrapper_is_available_for(wrapper_path, to_dir):
         content = render_wrapper(to_dir, Path(store_str))
         write_bytes_atomic(wrapper_path, content.encode("utf-8"), mode=0o755)
+        return True
+    return False
 
 
-def recover_if_needed(to_dir: Path, wrapper_path: Path) -> bool:
+def recover_if_needed(to_dir: Path, wrapper_path: Path, *, allow_superseded_wrapper: bool = False) -> bool:
     """Recover from a leftover install.journal.json. Returns True if recovery ran."""
     journal_path = to_dir / JOURNAL_NAME
     if not journal_path.exists() and not journal_path.is_symlink():
@@ -836,14 +841,21 @@ def recover_if_needed(to_dir: Path, wrapper_path: Path) -> bool:
     else:
         # Seamless recovery for v1 journals written before pre_wrappers existed.
         pre_wrappers = {}
-        prev_store = prev_manifest["current"].get("store") if isinstance(prev_manifest, dict) else None
-        alt_store = (
-            prev_manifest["previous"].get("store")
-            if isinstance(prev_manifest, dict) and isinstance(prev_manifest.get("previous"), dict)
+        prev_cur = prev_manifest.get("current") if isinstance(prev_manifest, dict) and isinstance(prev_manifest.get("current"), dict) else None
+        prev_prev = prev_manifest.get("previous") if isinstance(prev_manifest, dict) and isinstance(prev_manifest.get("previous"), dict) else None
+        prev_store = prev_cur.get("store") if prev_cur else None
+        alt_store = prev_prev.get("store") if prev_prev else None
+        prev_prev_wrap = (
+            _normalize_wrapper_path(Path(prev_prev["wrapper"]))
+            if prev_prev and isinstance(prev_prev.get("wrapper"), str) and prev_prev["wrapper"]
             else None
         )
-        if journal.get("previous_wrapper_existed") and prev_store:
-            pre_wrappers[str(wrapper_path)] = prev_store
+        if journal.get("previous_wrapper_existed"):
+            if prev_prev_wrap is not None and wrapper_path == prev_prev_wrap and alt_store:
+                pre_wrappers[str(wrapper_path)] = alt_store
+            elif prev_store:
+                pre_wrappers[str(wrapper_path)] = prev_store
+            # Legacy adoption without previous_manifest: keep existing wrapper untouched rather than deleting it.
         else:
             pre_wrappers[str(wrapper_path)] = None
         if isinstance(journal.get("alt_wrapper_path"), str):
@@ -853,10 +865,21 @@ def recover_if_needed(to_dir: Path, wrapper_path: Path) -> bool:
             pcw = str(_normalize_wrapper_path(Path(journal["prev_current_wrapper_path"])))
             pre_wrappers[pcw] = prev_store if journal.get("prev_current_wrapper_existed") else None
 
+    # When had_manifest is False, never allow a journal to create a new external directory or wrapper:
+    # only an already-owned wrapper at the caller's own wrapper_path may be restored or unlinked.
+    if not journal.get("had_manifest"):
+        for wp_str, store_val in pre_wrappers.items():
+            wp = _normalize_wrapper_path(Path(wp_str))
+            if store_val is not None:
+                if wp != wrapper_path or not wrapper_belongs_to(wp, to_dir):
+                    raise InstallError(f"recovery refusing to write external wrapper {wp} without a verified manifest", code=2)
+
+    superseded_wrappers: list[Path] = []
     for wp_str, store_val in pre_wrappers.items():
         wp = _normalize_wrapper_path(Path(wp_str))
         if store_val is not None:
-            _restore_wrapper_from_manifest(wp, to_dir, store_val)
+            if not _restore_wrapper_from_manifest(wp, to_dir, store_val):
+                superseded_wrappers.append(wp)
         elif wrapper_belongs_to(wp, to_dir):
             wp.unlink()
             fsync_dir(wp.parent)
@@ -872,6 +895,12 @@ def recover_if_needed(to_dir: Path, wrapper_path: Path) -> bool:
     _cleanup_temp_files(to_dir, temp_files, tx_id)
     journal_path.unlink()
     fsync_dir(to_dir)
+    if superseded_wrappers and not allow_superseded_wrapper:
+        names = ", ".join(str(p) for p in superseded_wrappers)
+        raise InstallError(
+            f"recovery restored {to_dir}, but required wrapper path is now owned by another installation: {names}",
+            code=3,
+        )
     return True
 
 
@@ -1096,7 +1125,7 @@ def install(
                                 "installed_at": None,
                                 "helio_sha256": saved["helio"]["sha256"],
                                 "helio_exe_sha256": saved["helio.exe"]["sha256"],
-                                "store": str(store_dir),
+                                "store": parse_wrapper_store(wrapper_path) or str(store_dir),
                                 "wrapper": str(wrapper_path),
                             }
                             rotate_live_to_old = True
@@ -1473,7 +1502,7 @@ def remove(
         with acquire_lock(to_dir / LOCK_NAME, blocking=False):
             lock_wrappers = _discover_lock_wrappers(to_dir, wrapper_path)
             with acquire_wrapper_locks(to_dir, *lock_wrappers):
-                recovered = recover_if_needed(to_dir, wrapper_path)
+                recovered = recover_if_needed(to_dir, wrapper_path, allow_superseded_wrapper=True)
                 manifest = read_manifest(to_dir)
                 candidate_wrappers: list[Path] = [wrapper_path]
                 if manifest:
