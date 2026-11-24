@@ -2398,8 +2398,10 @@ class TestWindowsInstaller(unittest.TestCase):
                         reg_key=reg_key,
                     )
                     self.assertTrue((uni_store / "messages").is_dir())
-                    self.assertEqual(os.path.normcase(m_sh_shadow["shadowed_by"]), os.path.normcase(os.path.abspath(str(sh_shadow_file))))
-                    self.assertEqual(os.path.normcase(m_sh_shadow["shadowed_target"]), os.path.normcase(os.path.abspath(str(win_to / "helio"))))
+                    sh_shadow_expected = str(sh_shadow_file.parent.resolve() / sh_shadow_file.name)
+                    win_sh_expected = str(win_to.resolve() / "helio")
+                    self.assertEqual(os.path.normcase(m_sh_shadow["shadowed_by"]), os.path.normcase(sh_shadow_expected))
+                    self.assertEqual(os.path.normcase(m_sh_shadow["shadowed_target"]), os.path.normcase(win_sh_expected))
                     code_shs, lines_shs = self.win_mod.win_status(win_to=win_to, reg_key=reg_key)
                     self.assertEqual(code_shs, 3, lines_shs)
                     self.assertTrue(any(str(sh_shadow_file.resolve()).lower() in ln.lower() for ln in lines_shs), lines_shs)
@@ -2414,7 +2416,7 @@ class TestWindowsInstaller(unittest.TestCase):
                         sh_shadow_file.write_text("#!/bin/sh\necho LINK\n", encoding="utf-8")
                     w_link = self.win_mod._find_winning_helio_sh(reg_key, win_to)
                     self.assertIsNotNone(w_link)
-                    self.assertEqual(os.path.normcase(str(w_link)), os.path.normcase(os.path.abspath(str(sh_shadow_file))))
+                    self.assertEqual(os.path.normcase(str(w_link)), os.path.normcase(sh_shadow_expected))
                     code_lnk, _ = self.win_mod.win_status(win_to=win_to, reg_key=reg_key)
                     self.assertEqual(code_lnk, 3)
 
@@ -2443,7 +2445,7 @@ class TestWindowsInstaller(unittest.TestCase):
                         m_both,
                     )
                     self.assertIn(
-                        (os.path.normcase(str(win_to.resolve() / "helio")), os.path.normcase(os.path.abspath(str(sh_shadow_file)))),
+                        (os.path.normcase(win_sh_expected), os.path.normcase(sh_shadow_expected)),
                         pairs,
                         m_both,
                     )
@@ -2476,7 +2478,7 @@ class TestWindowsInstaller(unittest.TestCase):
                     ).lower()
                     expected_sh_warn = (
                         f"warning: another helio earlier on path shadows "
-                        f"{win_to.resolve() / 'helio'}: {os.path.abspath(str(sh_shadow_file))}"
+                        f"{win_sh_expected}: {sh_shadow_expected}"
                     ).lower()
                     self.assertIn(expected_cmd_warn, err_lines, cli_both.stderr)
                     self.assertIn(expected_sh_warn, err_lines, cli_both.stderr)
