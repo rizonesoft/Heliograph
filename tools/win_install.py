@@ -376,10 +376,9 @@ def _manifest_known_exe_shas(manifest: dict[str, Any] | None) -> set[str]:
     return shas
 
 
-def _find_winning_helio(reg_key: str, win_to: Path) -> Path | None:
-    """Return the first `helio` command resolved via Windows effective PATH (system + HKCU\\<reg_key>) and PATHEXT."""
+def _effective_win_path_dirs(reg_key: str) -> list[str]:
     if os.name != "nt" or winreg is None:
-        return None
+        return []
     dirs: list[str] = []
     try:
         with winreg.OpenKey(
@@ -400,6 +399,14 @@ def _find_winning_helio(reg_key: str, win_to: Path) -> Path | None:
         if usr_kind == int(winreg.REG_EXPAND_SZ):
             usr_val = os.path.expandvars(usr_val)
         dirs.extend(s.strip() for s in usr_val.split(";") if s.strip())
+    return dirs
+
+
+def _find_winning_helio(reg_key: str, win_to: Path) -> Path | None:
+    """Return the first `helio` command resolved via Windows effective PATH (system + HKCU\\<reg_key>) and PATHEXT."""
+    dirs = _effective_win_path_dirs(reg_key)
+    if not dirs:
+        return None
     pathext = [e.strip().lower() for e in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";") if e.strip()]
     for d in dirs:
         dp = Path(d)
@@ -410,6 +417,31 @@ def _find_winning_helio(reg_key: str, win_to: Path) -> Path | None:
             if cand.is_file():
                 return cand.resolve()
     return None
+
+
+def _find_winning_helio_sh(reg_key: str, win_to: Path) -> Path | None:
+    """Return the first extensionless `helio` (Git Bash / POSIX shim) resolved via Windows effective PATH."""
+    for d in _effective_win_path_dirs(reg_key):
+        dp = Path(d)
+        if not dp.is_dir():
+            continue
+        cand = dp / WIN_SH_NAME
+        if cand.is_file():
+            return cand.resolve()
+    return None
+
+
+def _store_needs_init(store_path: str) -> bool:
+    """Return True if store_path is reachable on Windows and lacks an initialized messages/ directory."""
+    if os.name != "nt":
+        return False
+    distro = _extract_wsl_distro(store_path)
+    if distro:
+        norm_s = store_path.replace("/", "\\")
+        prefix = "\\\\wsl.localhost\\" if norm_s.lower().startswith("\\\\wsl.localhost\\") else "\\\\wsl$\\"
+        if not Path(prefix + distro).is_dir():
+            return False
+    return not (Path(store_path) / "messages").is_dir()
 
 
 def _verify_win_ownership(win_to: Path, manifest: dict[str, Any] | None, *, require_live: bool = False) -> None:
@@ -864,8 +896,8 @@ def win_install(
             )
             path_added_this_tx = not already_on_path
 
-            # Fast no-op check BEFORE staging or snapshotting files when nothing changed and Path is already present.
-            if existing is not None and not path_added_this_tx:
+            # Fast no-op check BEFORE staging or snapshotting files when nothing changed, Path is present, and store is ready.
+            if existing is not None and not path_added_this_tx and not _store_needs_init(store_path):
                 src_sha_fast = sha256_file(source_exe)
                 if source_sha256 is None or src_sha_fast == source_sha256:
                     prev_cur = existing["current"]
@@ -883,12 +915,16 @@ def win_install(
                             result_manifest["retired"] = dict(remaining_retired)
                             _write_json_atomic(dest / WIN_MANIFEST_NAME, result_manifest)
                         winner = _find_winning_helio(reg_key, dest)
+                        winner_sh = _find_winning_helio_sh(reg_key, dest)
                         if winner is None:
                             result_manifest = dict(result_manifest)
                             result_manifest["shadowed_by"] = "none (.CMD missing from PATHEXT)"
                         elif winner != (dest / WIN_CMD_NAME).resolve():
                             result_manifest = dict(result_manifest)
                             result_manifest["shadowed_by"] = str(winner)
+                        elif winner_sh is not None and winner_sh != (dest / WIN_SH_NAME).resolve():
+                            result_manifest = dict(result_manifest)
+                            result_manifest["shadowed_by"] = str(winner_sh)
                         return result_manifest
 
             tx_id = secrets.token_hex(6)
@@ -1126,10 +1162,13 @@ def win_install(
                 (dest / WIN_JOURNAL_NAME).unlink()
                 out_manifest = dict(desired_manifest)
                 winner = _find_winning_helio(reg_key, dest)
+                winner_sh = _find_winning_helio_sh(reg_key, dest)
                 if winner is None:
                     out_manifest["shadowed_by"] = "none (.CMD missing from PATHEXT)"
                 elif winner != (dest / WIN_CMD_NAME).resolve():
                     out_manifest["shadowed_by"] = str(winner)
+                elif winner_sh is not None and winner_sh != (dest / WIN_SH_NAME).resolve():
+                    out_manifest["shadowed_by"] = str(winner_sh)
                 return out_manifest
             except BaseException as exc:
                 _handle_win_failure(exc, dest, reg_key)
@@ -1217,6 +1256,10 @@ def win_status(*, win_to: Path | None = None, reg_key: str = DEFAULT_REG_KEY) ->
                 problems.append(f"helio command cannot resolve via PATHEXT (check that .CMD is in PATHEXT): {cmd_p}")
             elif winner != cmd_p.resolve():
                 problems.append(f"another helio earlier on PATH shadows {cmd_p}: {winner}")
+            if cur.get("helio_sh_sha256"):
+                winner_sh = _find_winning_helio_sh(reg_key, dest)
+                if winner_sh is not None and winner_sh != sh_p.resolve():
+                    problems.append(f"another extensionless helio earlier on PATH shadows Git Bash shim {sh_p}: {winner_sh}")
 
     store_p = Path(cur["store"])
     if not store_p.is_dir() or not (store_p / "messages").is_dir():

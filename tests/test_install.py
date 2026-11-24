@@ -2359,6 +2359,51 @@ class TestWindowsInstaller(unittest.TestCase):
                     code_pe, lines_pe = self.win_mod.win_status(win_to=win_to, reg_key=reg_key)
                     self.assertEqual(code_pe, 3, lines_pe)
                     self.assertTrue(any("PATHEXT" in ln for ln in lines_pe), lines_pe)
+
+                # Deleting local store and repeating an identical win_install re-initializes the store so status is 0!
+                shutil.rmtree(uni_store)
+                self.assertFalse(uni_store.exists())
+                self.win_mod.win_install(
+                    source_exe=self.helio_exe,
+                    source_sha256=exe_sha,
+                    store_path=str(uni_store),
+                    commit="c" * 40,
+                    win_to=win_to,
+                    reg_key=reg_key,
+                )
+                self.assertTrue((uni_store / "messages").is_dir())
+                code_reinit, lines_reinit = self.win_mod.win_status(win_to=win_to, reg_key=reg_key)
+                self.assertEqual(code_reinit, 0, lines_reinit)
+
+                # An earlier extensionless `helio` script on HKCU\<reg_key>\Path shadows the Git Bash shim:
+                # win_install reports `shadowed_by` naming it and win_status exits 3 naming it; removing it restores exit 0!
+                import winreg
+
+                sh_shadow_dir = root / "sh_shadow_earlier"
+                sh_shadow_dir.mkdir()
+                sh_shadow_file = sh_shadow_dir / "helio"
+                sh_shadow_file.write_text("#!/bin/sh\necho SHADOW\n", encoding="utf-8")
+                _, orig_rp, orig_rk = self.win_mod.read_reg_path(reg_key)
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_key, 0, winreg.KEY_SET_VALUE) as k:
+                    winreg.SetValueEx(k, "Path", 0, orig_rk, f"{sh_shadow_dir};{orig_rp}")
+                try:
+                    m_sh_shadow = self.win_mod.win_install(
+                        source_exe=self.helio_exe,
+                        source_sha256=exe_sha,
+                        store_path=str(uni_store),
+                        commit="c" * 40,
+                        win_to=win_to,
+                        reg_key=reg_key,
+                    )
+                    self.assertEqual(Path(m_sh_shadow["shadowed_by"]).resolve(), sh_shadow_file.resolve())
+                    code_shs, lines_shs = self.win_mod.win_status(win_to=win_to, reg_key=reg_key)
+                    self.assertEqual(code_shs, 3, lines_shs)
+                    self.assertTrue(any(str(sh_shadow_file.resolve()).lower() in ln.lower() for ln in lines_shs), lines_shs)
+                finally:
+                    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_key, 0, winreg.KEY_SET_VALUE) as k:
+                        winreg.SetValueEx(k, "Path", 0, orig_rk, orig_rp)
+                code_sh_ok, lines_sh_ok = self.win_mod.win_status(win_to=win_to, reg_key=reg_key)
+                self.assertEqual(code_sh_ok, 0, lines_sh_ok)
         finally:
             self._delete_reg_key(reg_key)
 
