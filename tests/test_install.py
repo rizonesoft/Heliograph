@@ -4889,7 +4889,17 @@ class TestPhaseInstaller(unittest.TestCase):
             idx_pending = txt.find("--pending-phases")
             idx_no_ready = txt.find("If no phase has a ready row")
             self.assertTrue(0 <= idx_pending < idx_no_ready, f"{rel}: --pending-phases must precede Step 1 halt")
-        self.assertIn("--pending-phases", (REPO / "docs/unattended-prompt.md").read_text(encoding="utf-8"))
+            # Both Step 1 and Step 2 must synchronize HEAD with origin/main and re-check --pending-phases before --phase <n> (items 39 & 40)!
+            step2_idx = txt.find("## 2. After a phase closeout or park")
+            self.assertGreater(step2_idx, 0, f"{rel}: missing Step 2 heading")
+            step1_txt = txt[:step2_idx]
+            step2_txt = txt[step2_idx:]
+            for label, chunk in (("Step 1", step1_txt), ("Step 2", step2_txt)):
+                self.assertIn("git pull --rebase origin main && git push origin main", chunk, f"{rel} {label}")
+                self.assertGreaterEqual(chunk.count("--pending-phases"), 2, f"{rel} {label}: must re-check --pending-phases after sync")
+        prompt_txt = (REPO / "docs/unattended-prompt.md").read_text(encoding="utf-8")
+        self.assertIn("git pull --rebase origin main && git push origin main", prompt_txt)
+        self.assertGreaterEqual(prompt_txt.count("--pending-phases"), 2)
 
         # Broken/non-repo HELIO_REPO must exit 3 (never silently return [] / exit 0)!
         r_bad = subprocess.run(
