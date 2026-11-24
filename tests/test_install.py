@@ -4749,16 +4749,41 @@ class TestPhaseInstaller(unittest.TestCase):
                     self._delete_reg_key(sole_reg_key)
                     self._cleanup_win_parent(sole_win_to)
 
-                # Verify `_create_initial_phase_journal` creates ONLY the canonical `phase.journal.json`
-                # directly via O_CREAT|O_EXCL with zero `.tmp.` files (item 2 initial-write crash class)!
-                init_dir = root / "init_journal_check"
-                init_dir.mkdir(parents=True, exist_ok=True)
-                self.phase_mod._create_initial_phase_journal(
-                    init_dir / self.phase_mod.PHASE_JOURNAL_NAME,
-                    {"tx_id": "aabbccddeeff", "phase_state": "acquiring"},
-                    self.mod,
-                )
-                self.assertEqual([p.name for p in init_dir.iterdir()], [self.phase_mod.PHASE_JOURNAL_NAME])
+                # Verify first-write crash recovery via reserved `.phase.journal.init.json` (items 2 & 32):
+                # 1) Simulate a kill right before `os.replace` leaves `.phase.journal.init.json` on disk with
+                #    `phase.journal.json` absent;
+                # 2) Simulate a 0-byte `.phase.journal.init.json` (kill right after O_CREAT);
+                # In both cases recovery cleans `.phase.journal.init.json` and completes without leaving any
+                # orphan temp file or corrupt `phase.journal.json`!
+                init_jp = to_dir / self.phase_mod.PHASE_JOURNAL_INIT_NAME
+                with mock.patch.object(os, "replace", side_effect=lambda _s, _d: None):
+                    self.phase_mod._create_initial_phase_journal(
+                        to_dir / self.phase_mod.PHASE_JOURNAL_NAME,
+                        {"tx_id": "aabbccddeeff", "phase_state": "acquiring"},
+                        self.mod,
+                    )
+                self.assertTrue(init_jp.is_file(), "interrupted initial journal write must leave reserved init file")
+                self.assertFalse((to_dir / self.phase_mod.PHASE_JOURNAL_NAME).exists())
+                # Retry through full `run_phase_install` (here planted to fail at verification so we verify recovery + cleanup)
+                with self.assertRaises(self.mod.InstallError):
+                    self.phase_mod.run_phase_install(
+                        repo=checkout,
+                        phase=0,
+                        to_dir=to_dir,
+                        store_dir=store_dir,
+                        wrapper_path=wrapper,
+                        win_to_raw=win_to,
+                        reg_key=reg_key,
+                        sdk_url="unused",
+                        install_mod=self.mod,
+                        on_verify=fail_verify,
+                    )
+                self.assertFalse(init_jp.exists(), "retry must clean leftover .phase.journal.init.json")
+                self.assertFalse((to_dir / self.phase_mod.PHASE_JOURNAL_NAME).exists())
+                # Also verify 0-byte empty `.phase.journal.init.json` is cleaned cleanly on retry!
+                init_jp.write_bytes(b"")
+                self.phase_mod._cleanup_initial_phase_journal(to_dir, self.mod)
+                self.assertFalse(init_jp.exists())
 
                 # Also verify `_store_needs_init` uses `os.stat` (preserving OS errors even on Python 3.14!)
                 # and propagates PermissionError for local Windows stores, reachable WSL shares, AND WSL
