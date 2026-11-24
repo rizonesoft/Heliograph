@@ -19,7 +19,13 @@ static bool passing_win(int attempt, DWORD error) {
     return true;
 }
 
+#ifdef HELIO_TEST_HOOKS
+bool plat_fail_flush = false;
+#endif
 static bool settle_win(const char *path) {
+#ifdef HELIO_TEST_HOOKS
+    if (plat_fail_flush) return false;
+#endif
     size_t n = im_length(path);
     size_t slash = n;
     while (slash > 0 && path[slash - 1] != '/' && path[slash - 1] != '\\') slash--;
@@ -38,10 +44,10 @@ static bool settle_win(const char *path) {
     im_free(copy);
     if (!wide) return false;
     HANDLE dir = CreateFileW(wide, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    DWORD open_err = dir == INVALID_HANDLE_VALUE ? GetLastError() : 0;
     im_free(wide);
     if (dir == INVALID_HANDLE_VALUE) {
-        DWORD err = GetLastError();
-        return err == ERROR_ACCESS_DENIED || err == ERROR_INVALID_FUNCTION || err == ERROR_NOT_SUPPORTED || err == ERROR_INVALID_PARAMETER;
+        return open_err == ERROR_ACCESS_DENIED || open_err == ERROR_INVALID_FUNCTION || open_err == ERROR_NOT_SUPPORTED || open_err == ERROR_INVALID_PARAMETER;
     }
     bool ok = FlushFileBuffers(dir) != 0;
     DWORD err = ok ? 0 : GetLastError();

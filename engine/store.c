@@ -304,6 +304,7 @@ s_result store_job(store *s, const message *m, job *out) {
     static const char *const states[] = {"taken", "released", "done", "refused"};
     static const job_state after[] = {TAKEN, OPEN, DONE, REFUSED};
     *out = (job){.state = OPEN};
+    if (s->pause) s->pause(s->pause_user, "before-read");
     for (; out->links < MOST_LINKS; out->links++) {
         text name = {0};
         link_name(&name, out->links);
@@ -562,7 +563,7 @@ s_result store_seen(store *s, const char *id, const char *me) {
             result = live;
         }
     } else if (result == S_NOTHING) {
-        result = S_OK;
+        result = live_post(s, id);
     }
     text_free(&event);
     return result;
@@ -579,12 +580,30 @@ s_result store_check(store *s, text *report) {
         job now;
         if (!id) return say(s, S_DAMAGED, "out of memory");
         if (same(id, "key")) {}
-        else if (store_message(s, id, &m) != S_OK) why = s->why;
-        else if (same(dot, ".post") && is_job(&m) && store_job(s, &m, &now) != S_OK) why = s->why;
-        else if (starts(dot, ".seen.")) {
-            char *data = NULL;
-            if (event_of(s, id, dot + 1, &data) != S_OK || !same(data, SEEN)) why = "a seen mark is damaged";
-            p_free(data);
+        else {
+            s_result mr = store_message(s, id, &m);
+            if (mr == S_REFUSED && same(s->why, "there is no such message")) {
+                if (!same(dot, ".post")) {
+                    char *probe = NULL;
+                    s_result er = *dot ? event_of(s, id, dot + 1, &probe) : S_DAMAGED;
+                    p_free(probe);
+                    if (er != S_NOTHING) why = "there is no such message";
+                }
+            } else if (mr != S_OK) {
+                why = s->why;
+            } else if (same(dot, ".post") && is_job(&m)) {
+                s_result jr = store_job(s, &m, &now);
+                if (jr != S_OK && jr != S_REFUSED) why = s->why;
+            } else if (starts(dot, ".seen.")) {
+                char *data = NULL;
+                s_result er = event_of(s, id, dot + 1, &data);
+                if (er == S_NOTHING) {
+                    if (live_post(s, id) == S_OK) why = "a seen mark is damaged";
+                } else if (er != S_OK || !same(data, SEEN)) {
+                    why = "a seen mark is damaged";
+                }
+                p_free(data);
+            }
         }
         if (why) {
             text line = {0};

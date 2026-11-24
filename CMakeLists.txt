@@ -8,6 +8,7 @@ set(CORE ${STORE} engine/place.c engine/watch.c engine/helio.c)
 impossible_add_program(helio CONSOLE TIER 0 SOURCES src/main.c src/plat_windows.c src/helio.rc ${CORE})
 set_source_files_properties(src/helio.rc PROPERTIES OBJECT_DEPENDS "${CMAKE_SOURCE_DIR}/brand/icon.ico")
 impossible_add_program(racer CONSOLE TIER 0 SOURCES tests/racer.c tests/racer_windows.c src/plat_windows.c ${CORE})
+target_compile_definitions(racer PRIVATE HELIO_TEST_HOOKS)
 
 # WSL sessions use the native program, so they never wait for WSL's bridge to Windows.
 if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux")
@@ -15,13 +16,17 @@ if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux")
     function(add_linux_program name)
         set(program "${CMAKE_BINARY_DIR}/linux/${name}")
         set(sources)
+        set(extra_flags)
+        if(name STREQUAL "racer")
+            list(APPEND extra_flags -DHELIO_TEST_HOOKS)
+        endif()
         foreach(source IN LISTS ARGN)
             list(APPEND sources "${CMAKE_SOURCE_DIR}/${source}")
         endforeach()
         add_custom_command(OUTPUT "${program}"
             COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_BINARY_DIR}/linux"
             COMMAND cc -std=gnu23 -O2 -Wall -Wextra -Werror -fstack-protector-strong -D_FORTIFY_SOURCE=2
-                -I "${CMAKE_SOURCE_DIR}/engine" ${sources} -o "${program}"
+                ${extra_flags} -I "${CMAKE_SOURCE_DIR}/engine" ${sources} -o "${program}"
             DEPENDS ${sources} ${headers} VERBATIM)
         add_custom_target(${name}-linux ALL DEPENDS "${program}")
     endfunction()

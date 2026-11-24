@@ -139,12 +139,12 @@ s_result watch_summary(store *s) {
             message m = {0};
             job j;
             s_result mr = id ? store_message(s, id, &m) : S_DAMAGED;
-            if (mr == S_REFUSED) {
+            if (mr == S_REFUSED && same(s->why, "there is no such message")) {
                 p_free(id);
                 continue;
             }
             s_result jr = mr == S_OK && is_job(&m) ? store_job(s, &m, &j) : mr;
-            if (jr == S_REFUSED) {
+            if (mr == S_OK && jr == S_REFUSED) {
                 message_free(&m);
                 p_free(id);
                 continue;

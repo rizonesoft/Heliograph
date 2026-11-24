@@ -8,6 +8,10 @@
 #include "helio.h"
 #include "store.h"
 
+#ifdef HELIO_TEST_HOOKS
+extern bool plat_fail_flush;
+#endif
+
 typedef struct {
     const char *folder;
     const char *stages;
@@ -83,6 +87,12 @@ static int run_pause(int count, char **args) {
 
 int racer(int count, char **args) {
     if (count >= 3 && same(args[1], "--remove")) return (int)p_remove(args[2]);
+#ifdef HELIO_TEST_HOOKS
+    if (count >= 3 && same(args[1], "--remove-fail-flush")) {
+        plat_fail_flush = true;
+        return (int)p_remove(args[2]);
+    }
+#endif
     if (count >= 2 && same(args[1], "--pause")) return run_pause(count, args);
     if (count >= 4 && same(args[1], "--pause-cli")) {
         pause_ctx ctx = {args[3], args[2]};

@@ -97,6 +97,19 @@ static bool parse(options *o, int count, char **args) {
     return true;
 }
 
+static void format_line(text *out, const message *m, const job *now, bool good) {
+    add(out, m->id), add(out, "  "), add(out, m->time), add(out, "  "), add(out, m->from), add(out, " to "), add(out, m->to);
+    add(out, "  "), add(out, m->kind);
+    if (is_job(m)) {
+        static const char *const names[] = {" open", " taken by ", " done by ", " refused by "};
+        if (good) add(out, names[now->state]), add(out, now->by);
+        else add(out, " damaged");
+        if (good && is_overdue(m, now)) add(out, " OVERDUE");
+    }
+    if (same(m->urgency, "now")) add(out, "  NOW");
+    add(out, ": "), clean(out, m->subject, true), add(out, "\n");
+}
+
 /* S_REFUSED when archived concurrently; S_DAMAGED when the job's chain is damaged. */
 static s_result line(text *out, store *s, const message *m) {
     s_result jr = S_OK;
@@ -105,16 +118,7 @@ static s_result line(text *out, store *s, const message *m) {
         jr = store_job(s, m, &now);
         if (jr == S_REFUSED) return S_REFUSED;
     }
-    add(out, m->id), add(out, "  "), add(out, m->time), add(out, "  "), add(out, m->from), add(out, " to "), add(out, m->to);
-    add(out, "  "), add(out, m->kind);
-    if (is_job(m)) {
-        static const char *const names[] = {" open", " taken by ", " done by ", " refused by "};
-        if (jr == S_OK) add(out, names[now.state]), add(out, now.by);
-        else add(out, " damaged");
-        if (jr == S_OK && is_overdue(m, &now)) add(out, " OVERDUE");
-    }
-    if (same(m->urgency, "now")) add(out, "  NOW");
-    add(out, ": "), clean(out, m->subject, true), add(out, "\n");
+    format_line(out, m, &now, jr == S_OK);
     return jr;
 }
 
@@ -128,7 +132,7 @@ static size_t every(store *s, void (*each)(store *s, const message *m, void *use
         message m = {0};
         s_result mr = id ? store_message(s, id, &m) : S_DAMAGED;
         if (mr == S_OK) each(s, &m, user);
-        else if (mr != S_REFUSED) damaged++;
+        else if (!(mr == S_REFUSED && same(s->why, "there is no such message"))) damaged++;
         message_free(&m);
         p_free(id);
     }
@@ -161,7 +165,8 @@ static void into_log(store *s, const message *m, void *user) {
 static void into_inbox(store *s, const message *m, void *user) {
     listing *l = user;
     if (!same(m->urgency, l->urgency)) return;
-    job now;
+    job now = {0};
+    bool good = true;
     bool mine = is_for(m, l->me);
     bool back = is_job(m) && m->due && (same(m->from, l->me) || owns(l->me, m)); /* an overdue job goes to who asked and to the owner */
     if (!mine && !back) return;
@@ -170,16 +175,15 @@ static void into_inbox(store *s, const message *m, void *user) {
     } else {
         s_result jr = store_job(s, m, &now);
         if (jr == S_REFUSED) return;
-        if (jr != S_OK) l->damaged = true; /* shown, so it is not mistaken for nothing */
-        else if (!(back && is_overdue(m, &now)) && !(mine && (now.state == OPEN || (now.state == TAKEN && same(now.by, l->me))))) return;
+        if (jr != S_OK) {
+            good = false;
+            l->damaged = true; /* shown, so it is not mistaken for nothing */
+        } else if (!(back && is_overdue(m, &now)) && !(mine && (now.state == OPEN || (now.state == TAKEN && same(now.by, l->me))))) {
+            return;
+        }
     }
     text one = {0};
-    s_result lr = line(&one, s, m);
-    if (lr == S_REFUSED) {
-        text_free(&one);
-        return;
-    }
-    if (lr != S_OK) l->damaged = true;
+    format_line(&one, m, &now, good);
     if (!l->all && (l->shown >= SHOW_MESSAGES || l->out.length + one.length > SHOW_BYTES)) l->held++;
     else add(&l->out, one.data ? one.data : ""), l->shown++;
     if (one.failed) l->out.failed = true;

@@ -47,13 +47,23 @@ p_result p_read(const char *path, size_t most, char **data, size_t *length) {
 p_result p_input(size_t most, char **data, size_t *length) { return all(0, most, data, length); }
 
 /* The name is on the disk too, not only the bytes. */
+#ifdef HELIO_TEST_HOOKS
+bool plat_fail_flush = false;
+#endif
 static bool settle(const char *path) {
+#ifdef HELIO_TEST_HOOKS
+    if (plat_fail_flush) return false;
+#endif
     char folder[4096];
     const char *slash = strrchr(path, '/');
-    size_t n = slash ? (size_t)(slash - path) : 0;
-    if (n >= sizeof folder) return false;
-    memcpy(folder, n ? path : ".", n ? n : 1);
-    folder[n ? n : 1] = 0;
+    if (slash == path) {
+        folder[0] = '/', folder[1] = 0;
+    } else {
+        size_t n = slash ? (size_t)(slash - path) : 0;
+        if (n >= sizeof folder) return false;
+        memcpy(folder, n ? path : ".", n ? n : 1);
+        folder[n ? n : 1] = 0;
+    }
     int file = open(folder, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (file < 0) return false;
     bool good = !fsync(file) || errno == EINVAL || errno == ENOTSUP; /* a mount that cannot */

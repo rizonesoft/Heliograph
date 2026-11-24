@@ -527,6 +527,12 @@ class ArchivingGuards(Base):
         subdir.mkdir()
         r3 = subprocess.run([str(RACER), "--remove", str(subdir)], stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
         self.assertEqual(r3.returncode, 4, "P_FAILED expected when removing a directory")
+        # Both Linux and Windows must return P_FAILED when the required parent-folder flush fails after deletion.
+        flush_victim = self.store / "flush_victim.txt"
+        put(flush_victim, "bye\n")
+        r_flush = subprocess.run([str(RACER), "--remove-fail-flush", str(flush_victim)], stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
+        self.assertEqual(r_flush.returncode, 4, "P_FAILED expected when parent-folder flush fails on Linux or Windows")
+        self.assertFalse(flush_victim.exists())
         if not ON_WINDOWS:
             locked = self.store / "locked_dir"
             locked.mkdir()
@@ -535,19 +541,23 @@ class ArchivingGuards(Base):
             locked.chmod(0o300)
             try:
                 r4 = subprocess.run([str(RACER), "--remove", str(victim)], stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
-                self.assertEqual(r4.returncode, 4, "P_FAILED expected when parent directory flush fails")
+                self.assertEqual(r4.returncode, 4, "P_FAILED expected when real OS parent directory flush fails")
             finally:
                 locked.chmod(0o700)
 
     def test_store_job_second_look_notices_archived_post_with_populated_store_open(self):
+        # Populate snapshot with link.0000 AND link.0001, pause before reading link.0000, remove post + link.0000
+        # while link.0001 remains in snapshot so gap() would be true if checked before live_post!
         job = self.send()
         self.assertEqual(self.helio("take", job, me="os/userland").returncode, 0)
-        proc = self.start_pause("job", "read", "os/userland", job)
+        self.assertEqual(self.helio("release", job, me="os/userland").returncode, 0)
+        proc = self.start_pause("job", "before-read", "os/userland", job)
         try:
-            self.wait_for(self.store / "paused.read")
+            self.wait_for(self.store / "paused.before-read")
             (self.store / f"messages/{job}.post").unlink()
             (self.store / f"messages/{job}.link.0000").unlink()
-            put(self.store / "resume.read", "go")
+            (self.store / f"messages/{job}.link.0001").unlink()
+            put(self.store / "resume.before-read", "go")
             _, stderr = proc.communicate(timeout=30)
         finally:
             if proc.poll() is None:
@@ -684,6 +694,26 @@ class ArchivingGuards(Base):
         self.assertEqual(proc.returncode, 2, stderr)
         self.assertIn("it was archived", stderr)
         self.assertEqual(list((self.store / "messages").iterdir()), [])
+        for name in ("paused.seen", "resume.seen", "paused.after-seen", "resume.after-seen"):
+            (self.store / name).unlink(missing_ok=True)
+
+        # Seen-mark collision: existing mark survives, but show/store_seen still refuses when post vanished.
+        msg2 = self.send("tell", to="os/userland")
+        self.assertEqual(self.helio("show", msg2, me="os/userland").returncode, 0)
+        seen_file = self.store / f"messages/{msg2}.seen.os+userland"
+        self.assertTrue(seen_file.exists())
+        proc2 = self.start_pause("seen", "seen", "os/userland", msg2)
+        try:
+            self.wait_for(self.store / "paused.seen")
+            (self.store / f"messages/{msg2}.post").unlink()
+            put(self.store / "resume.seen", "go")
+            _, stderr2 = proc2.communicate(timeout=30)
+        finally:
+            if proc2.poll() is None:
+                proc2.kill()
+        self.assertEqual(proc2.returncode, 2, stderr2)
+        self.assertIn("it was archived", stderr2)
+        self.assertTrue(seen_file.exists(), "collision branch must leave existing seen mark intact")
 
     def start_pause_cli(self, stages, *helio_args, me="os/userland"):
         clean = {k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_SESSION", "CLAUDE_CODE_SESSION_ID")}
@@ -738,8 +768,11 @@ class ArchivingGuards(Base):
         for name in ("paused.read", "resume.read"):
             (self.store / name).unlink(missing_ok=True)
 
-        # 3. `inbox` (including daily `watch_summary`) skips the archived job without damage warning.
-        j_arch2 = self.send(subject="vanish-inbox")
+        # 3. `watch_summary` + `inbox`: create j_arch2 FIRST so it is enumerated first during watch_summary!
+        for p in list((self.store / "messages").iterdir()):
+            p.unlink()
+        j_arch2 = self.send(subject="vanish-summary")
+        j_live2 = self.send(subject="stay-live-2")
         p_in = self.start_pause_cli("read", me="os/userland")
         try:
             self.wait_for(self.store / "paused.read")
@@ -750,32 +783,83 @@ class ArchivingGuards(Base):
             if p_in.poll() is None:
                 p_in.kill()
         self.assertEqual(p_in.returncode, 0, err_i)
-        self.assertIn("stay-live", out_i)
-        self.assertNotIn("vanish-inbox", out_i)
+        self.assertIn("stay-live-2", out_i)
+        self.assertNotIn("vanish-summary", out_i)
         self.assertNotIn("damaged", out_i.lower() + err_i.lower())
         summary_files = list((self.store / "summary").glob("*.md"))
         self.assertEqual(len(summary_files), 1)
         summary_text = summary_files[0].read_text()
-        self.assertIn("stay-live", summary_text)
+        self.assertIn("stay-live-2", summary_text)
         self.assertNotIn("Damaged:", summary_text)
         for name in ("paused.read", "resume.read"):
             (self.store / name).unlink(missing_ok=True)
 
-        # 4. `hook claude` skips the archived job without damage warning.
-        j_arch3 = self.send(subject="vanish-hook")
-        p_hk = self.start_pause_cli("read", "hook", "claude", me="os/userland")
+        # 4. `inbox` (summary already exists today, so pause happens directly inside into_inbox on j_arch3!).
+        for p in list((self.store / "messages").iterdir()):
+            p.unlink()
+        j_arch3 = self.send(subject="vanish-inbox")
+        j_live3 = self.send(subject="stay-live-3")
+        p_in2 = self.start_pause_cli("read", me="os/userland")
         try:
             self.wait_for(self.store / "paused.read")
             (self.store / f"messages/{j_arch3}.post").unlink()
+            put(self.store / "resume.read", "go")
+            out_i2, err_i2 = p_in2.communicate(timeout=30)
+        finally:
+            if p_in2.poll() is None:
+                p_in2.kill()
+        self.assertEqual(p_in2.returncode, 0, err_i2)
+        self.assertIn("stay-live-3", out_i2)
+        self.assertNotIn("vanish-inbox", out_i2)
+        self.assertNotIn("damaged", out_i2.lower() + err_i2.lower())
+        for name in ("paused.read", "resume.read"):
+            (self.store / name).unlink(missing_ok=True)
+
+        # 5. `hook claude` (j_arch4 created first so pause happens directly inside hook's fill_inbox on j_arch4!).
+        for p in list((self.store / "messages").iterdir()):
+            p.unlink()
+        j_arch4 = self.send(subject="vanish-hook")
+        j_live4 = self.send(subject="stay-live-4")
+        p_hk = self.start_pause_cli("read", "hook", "claude", me="os/userland")
+        try:
+            self.wait_for(self.store / "paused.read")
+            (self.store / f"messages/{j_arch4}.post").unlink()
             put(self.store / "resume.read", "go")
             out_h, err_h = p_hk.communicate(timeout=30)
         finally:
             if p_hk.poll() is None:
                 p_hk.kill()
         self.assertEqual(p_hk.returncode, 0, err_h)
-        self.assertIn("stay-live", out_h)
+        self.assertIn("stay-live-4", out_h)
         self.assertNotIn("vanish-hook", out_h)
         self.assertNotIn("damaged", out_h.lower() + err_h.lower())
+        for name in ("paused.read", "resume.read"):
+            (self.store / name).unlink(missing_ok=True)
+
+        # 6. `helio check` during archive removal reports no damage when post and steps vanish together.
+        j_chk = self.send(subject="vanish-check")
+        self.assertEqual(self.helio("take", j_chk, me="os/userland").returncode, 0)
+        p_chk = self.start_pause_cli("read", "check", me=None)
+        try:
+            self.wait_for(self.store / "paused.read")
+            (self.store / f"messages/{j_chk}.post").unlink()
+            (self.store / f"messages/{j_chk}.link.0000").unlink()
+            put(self.store / "resume.read", "go")
+            out_c, err_c = p_chk.communicate(timeout=30)
+        finally:
+            if p_chk.poll() is None:
+                p_chk.kill()
+        self.assertEqual(p_chk.returncode, 0, out_c + err_c)
+        self.assertEqual(out_c, "")
+
+        # 7. Malformed post name (messages/bad.post) is NOT treated as vanished: log exits 3 and summary counts damage.
+        put(self.store / "messages/bad.post", "x")
+        self.assertEqual(self.helio("log", me=None).returncode, 3)
+        for sf in list((self.store / "summary").glob("*.md")):
+            sf.unlink()
+        self.helio(me="os/userland")
+        summary_bad = list((self.store / "summary").glob("*.md"))[0].read_text()
+        self.assertIn("Damaged: 1", summary_bad)
 
 
 if __name__ == "__main__":
