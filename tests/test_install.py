@@ -4902,8 +4902,12 @@ class TestPhaseInstaller(unittest.TestCase):
             b_start = step1_txt.find("(b) if", max(a_start, 0))
             self.assertTrue(0 <= a_start < b_start < c_start, f"{rel}: missing Step 1 branches (a)/(b)/(c)")
             branch_a = step1_txt[a_start:b_start]
-            self.assertIn("git pull --rebase origin main", branch_a, f"{rel}: branch (a) must pull --rebase before push (item 7)")
-            self.assertIn("git rebase --continue", branch_a, f"{rel}: branch (a) must handle competing receipt conflict (item 7)")
+            branch_b = step1_txt[b_start:c_start]
+            for br_label, br_chunk in (("branch (a)", branch_a), ("branch (b)", branch_b)):
+                self.assertIn("git pull --rebase origin main", br_chunk, f"{rel} {br_label}: must pull --rebase before push")
+                self.assertIn("verified manifests", br_chunk, f"{rel} {br_label}: must keep manifest-verified SHA")
+                self.assertIn("GIT_EDITOR=true git rebase --continue", br_chunk, f"{rel} {br_label}: must continue rebase noninteractively")
+                self.assertIn("git push origin main", br_chunk, f"{rel} {br_label}: must push after rebase")
             branch_c = step1_txt[c_start:c_end]
             self.assertNotIn("if `HEAD` has unpushed", branch_c, f"{rel}: branch (c) sync must be unconditional")
             for label, chunk in (("Step 1 branch (c)", branch_c), ("Step 2", step2_txt)):
@@ -4915,10 +4919,16 @@ class TestPhaseInstaller(unittest.TestCase):
                     f"{rel} {label}: must sync -> re-run --pending-phases -> --phase <n> (got {i_sync}, {i_recheck}, {i_phase})",
                 )
         prompt_txt = (REPO / "docs/unattended-prompt.md").read_text(encoding="utf-8")
-        self.assertIn("(a)", prompt_txt)
-        self.assertIn("(b)", prompt_txt)
-        self.assertIn("git rebase --continue", prompt_txt, "unattended-prompt.md must cover competing receipt conflict resolution (item 8)")
-        p_sync = prompt_txt.find("synchronize `HEAD` with `git pull --rebase origin main && git push origin main`")
+        pa = prompt_txt.find("(a)")
+        pb = prompt_txt.find("(b)", max(pa, 0))
+        pc = prompt_txt.find("(c)", max(pb, 0))
+        self.assertTrue(0 <= pa < pb < pc, "unattended-prompt.md must define branches (a), (b), (c)")
+        for br_label, br_chunk in (("unattended (a)", prompt_txt[pa:pb]), ("unattended (b)", prompt_txt[pb:pc])):
+            self.assertIn("git pull --rebase origin main", br_chunk, f"{br_label}: must pull --rebase")
+            self.assertIn("verified manifests", br_chunk, f"{br_label}: must keep manifest-verified SHA")
+            self.assertIn("GIT_EDITOR=true git rebase --continue", br_chunk, f"{br_label}: must use noninteractive rebase --continue (items 8 & 42)")
+            self.assertIn("git push origin main", br_chunk, f"{br_label}: must push")
+        p_sync = prompt_txt.find("synchronize `HEAD` with `git pull --rebase origin main && git push origin main`", pc)
         p_recheck = prompt_txt.find("re-run `python3 tools/install.py --pending-phases`", max(p_sync, 0))
         p_phase = prompt_txt.find("run `--phase <n>`", max(p_recheck, 0))
         self.assertTrue(0 <= p_sync < p_recheck < p_phase, f"unattended-prompt.md ordering: {p_sync}, {p_recheck}, {p_phase}")
