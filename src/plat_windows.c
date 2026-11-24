@@ -76,7 +76,34 @@ p_result p_remove(const char *path) {
     return settle_win(path) ? P_OK : P_FAILED;
 }
 
-p_result p_folder(const char *path) { return from(im_make_folder(path)); }
+p_result p_sync(const char *path) {
+#ifdef HELIO_TEST_HOOKS
+    if (plat_fail_flush) return P_FAILED;
+#endif
+    wchar_t *wide = im_wide(path);
+    if (!wide) return P_FAILED;
+    HANDLE file = CreateFileW(wide, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+    DWORD open_err = file == INVALID_HANDLE_VALUE ? GetLastError() : 0;
+    im_free(wide);
+    if (file == INVALID_HANDLE_VALUE) {
+        if (open_err == ERROR_FILE_NOT_FOUND || open_err == ERROR_PATH_NOT_FOUND) return P_MISSING;
+        if (open_err != ERROR_ACCESS_DENIED && open_err != ERROR_INVALID_FUNCTION && open_err != ERROR_NOT_SUPPORTED && open_err != ERROR_INVALID_PARAMETER)
+            return P_FAILED;
+        return settle_win(path) ? P_OK : P_FAILED;
+    }
+    bool ok = FlushFileBuffers(file) != 0;
+    DWORD err = ok ? 0 : GetLastError();
+    CloseHandle(file);
+    if (!ok && err != ERROR_ACCESS_DENIED && err != ERROR_INVALID_FUNCTION && err != ERROR_NOT_SUPPORTED && err != ERROR_INVALID_PARAMETER)
+        return P_FAILED;
+    return settle_win(path) ? P_OK : P_FAILED;
+}
+
+p_result p_folder(const char *path) {
+    p_result r = from(im_make_folder(path));
+    if (r != P_OK) return r;
+    return settle_win(path) ? P_OK : P_FAILED;
+}
 p_result p_input(size_t most, char **data, size_t *length) { return from(im_read_input(most, data, length)); }
 uint64_t p_now(void) { return im_now(); }
 bool p_print(const char *text) { return im_print(text); }

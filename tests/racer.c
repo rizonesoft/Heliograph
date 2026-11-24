@@ -5,11 +5,13 @@
    named store stage (writing paused.<stage> and waiting for resume.<stage>),
    prints s.why to stderr on non-OK, and exits with s_result.
    racer --pause-cli <stages> <store> <helio-args...>: runs helio_paused. */
+#include "archive.h"
 #include "helio.h"
 #include "store.h"
 
 #ifdef HELIO_TEST_HOOKS
 extern bool plat_fail_flush;
+extern size_t store_max_names;
 #endif
 
 typedef struct {
@@ -92,7 +94,44 @@ int racer(int count, char **args) {
         plat_fail_flush = true;
         return (int)p_remove(args[2]);
     }
+    if (count >= 3 && same(args[1], "--fail-flush-cli")) {
+        plat_fail_flush = true;
+        return helio(count - 1, args + 1);
+    }
+    if (count >= 4 && same(args[1], "--max-names")) {
+        size_t lim = 0;
+        for (const char *p = args[2]; *p >= '0' && *p <= '9'; p++) lim = lim * 10 + (size_t)(*p - '0');
+        store_max_names = lim;
+        return helio(count - 2, args + 2);
+    }
 #endif
+    if (count >= 4 && same(args[1], "--archive-loop")) {
+        const char *folder = args[2];
+        int rounds = 0;
+        for (const char *p = args[3]; *p >= '0' && *p <= '9'; p++) rounds = rounds * 10 + (*p - '0');
+        text ready = {0}, go = {0};
+        add(&ready, folder), add(&ready, "/ready."), add_number(&ready, p_tick(), 0);
+        add(&go, folder), add(&go, "/go");
+        if (p_write(ready.data, "x", 1, false, "r") != P_OK) return 100;
+        char *gdata = NULL;
+        size_t glen = 0;
+        for (uint64_t until = p_now() + 30000000; p_read(go.data, 9, &gdata, &glen) != P_OK;)
+            if (p_now() > until) return 101;
+        p_free(gdata);
+        text_free(&ready), text_free(&go);
+        for (int i = 0; i < rounds; i++) {
+            size_t moved = 0;
+            text rep = {0};
+            s_result r = archive_store(folder, 0, &moved, &rep, NULL, NULL);
+            if (r == S_DAMAGED) {
+                if (rep.length) p_error(rep.data);
+                text_free(&rep);
+                return 3;
+            }
+            text_free(&rep);
+        }
+        return 0;
+    }
     if (count >= 2 && same(args[1], "--pause")) return run_pause(count, args);
     if (count >= 4 && same(args[1], "--pause-cli")) {
         pause_ctx ctx = {args[3], args[2]};

@@ -1,4 +1,11 @@
+#include "archive.h"
 #include "store.h"
+
+#ifdef HELIO_TEST_HOOKS
+size_t store_max_names = MOST_NAMES;
+#else
+#define store_max_names MOST_NAMES
+#endif
 
 typedef enum { TAKE, RELEASE, FINISH, REFUSE } change;
 
@@ -42,7 +49,7 @@ static bool gather(void *user, const char *name) {
     store *s = user;
     size_t n = len(name);
     if (n > 5 && same(name + n - 5, ".part")) return true; /* being written, or left by a crash */
-    if (s->count >= MOST_NAMES) {
+    if (s->count >= store_max_names) {
         s->failed = true;
         return false;
     }
@@ -82,7 +89,7 @@ s_result store_open(store *s, const char *folder) {
     p_result result = p_list(at.data, gather, s);
     text_free(&at);
     if (result == P_MISSING) return say(s, S_DAMAGED, "there is no store here: run helio init");
-    if (result != P_OK || s->failed) return say(s, S_DAMAGED, s->count >= MOST_NAMES ? "the store is too full: archive it" : "the store cannot be read");
+    if (result != P_OK || s->failed) return say(s, S_DAMAGED, s->count >= store_max_names ? "the store is too full: archive it" : "the store cannot be read");
     for (size_t i = s->count / 2; i-- > 0;) sift(s->names, i, s->count);
     for (size_t n = s->count; n > 1;) {
         char *swap = s->names[0];
@@ -423,7 +430,7 @@ s_result store_post(store *s, const message *m, const char *key, text *id) {
     if (!address_ok(m->from, false)) return say(s, S_REFUSED, "say who you are: --as project/lane");
     if (!address_ok(m->to, true)) return say(s, S_REFUSED, "the reader is project/lane, or project/all");
     if (!one_of(m->kind, kinds)) return say(s, S_REFUSED, "the kind is request, handoff, answer, finding or headsup");
-    if (s->count >= MOST_NAMES / 2) return say(s, S_REFUSED, "the store is full: archive it first");
+    if (s->count >= store_max_names / 2) return say(s, S_REFUSED, "the store is full: archive it first");
     if (!one_of(m->urgency, urgencies)) return say(s, S_REFUSED, "the urgency is now, next or whenever");
     if (len(m->subject) > 120 || len(m->about) > 1000 || len(m->body) > MOST_BODY) return say(s, S_REFUSED, "the message is too long");
     if (*m->re) {
@@ -447,6 +454,22 @@ s_result store_post(store *s, const message *m, const char *key, text *id) {
         uint64_t now = p_now();
         fresh(id, now);
         result = id->failed ? say(s, S_DAMAGED, "out of memory") : *key ? reserve(s, m, key, id) : S_OK;
+        if (result == S_OK && *key) {
+            message arch = {0};
+            s_result ar = archive_read_message(s, id->data, &arch);
+            if (ar == S_OK) {
+                if (!(same(arch.from, m->from) && same(arch.to, m->to) && same(arch.kind, m->kind) && same(arch.subject, subject.data) && same(arch.body, body.data)))
+                    result = say(s, S_REFUSED, "that key stands for another message");
+                message_free(&arch);
+                text_free(&subject), text_free(&about), text_free(&body), text_free(&out);
+                return result;
+            }
+            message_free(&arch);
+            if (ar == S_DAMAGED) {
+                text_free(&subject), text_free(&about), text_free(&body), text_free(&out);
+                return S_DAMAGED;
+            }
+        }
         if (result == S_OK) {
             add(&out, "id: "), add(&out, id->data), add(&out, "\ntime: "), add_time(&out, now);
             add(&out, "\nfrom: "), add(&out, m->from), add(&out, "\nto: "), add(&out, m->to), add(&out, "\nkind: "), add(&out, m->kind);
@@ -611,7 +634,7 @@ s_result store_check(store *s, text *report) {
                     char *probe = NULL;
                     s_result er = *dot ? event_of(s, id, dot + 1, &probe) : S_DAMAGED;
                     p_free(probe);
-                    if (er != S_NOTHING) why = "there is no such message";
+                    if (er != S_NOTHING && !archive_has_terminal_job(s->folder, id)) why = "there is no such message";
                 }
             } else if (mr != S_OK) {
                 why = s->why;

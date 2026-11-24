@@ -1,3 +1,4 @@
+#include "archive.h"
 #include "helio.h"
 #include "watch.h"
 
@@ -13,7 +14,7 @@ static const char help[] =
     "  helio show <id>      helio take <id>     helio release <id>\n"
     "  helio done <id> [note]                   helio refuse <id> [note]\n"
     "  helio working <paths>                            what I touch, for the overlap warning\n"
-    "  helio log            helio check         helio init\n"
+    "  helio log            helio check         helio archive       helio init\n"
     "\n"
     "Options: --as <project/lane>, --about <paths>, --now or --whenever, --store <folder>,\n--key <text> (sending the same key again sends nothing new), --session <name>, --all,\n--due <minutes> (an overdue job goes back to its sender and the owner).\n"
     "HELIO_AS and HELIO_STORE give two of them. <to> is project/lane, project/all or path:<file>.\n"
@@ -361,6 +362,19 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
     if (same(command, "help")) return p_print(help) ? 0 : 3;
     if (!*o->folder) return fail("say where the store is: --store or HELIO_STORE", 2);
     if (same(command, "init")) return o->count == 1 ? init(o->folder, o->from_default) : fail("init takes no words", 2);
+    if (same(command, "archive")) {
+        if (o->count != 1) return fail("archive takes no words", 2);
+        size_t moved = 0;
+        text report = {0};
+        s_result ar = archive_store(o->folder, 0, &moved, &report, pause, pause_user);
+        if (report.length && !report.failed) p_error(report.data);
+        text_free(&report);
+        if (ar == S_DAMAGED) return fail("archive stopped with errors", 3);
+        if (ar == S_NOTHING) return 1;
+        text out = {0};
+        add_number(&out, (uint64_t)moved, 0), add(&out, " archived\n");
+        return print(&out) ? 0 : fail("the output cannot be written", 3);
+    }
 
     static const struct { const char *name; int least, most; } commands[] = {
         {"inbox", 0, 1}, {"log", 1, 1}, {"check", 1, 1}, {"show", 2, 2}, {"take", 2, 2}, {"release", 2, 2}, {"done", 2, 3},
@@ -381,6 +395,7 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
     s.pause = pause;
     s.pause_user = pause_user;
     if ((which == 0 || which == 8) && watch_summary(&s) != S_OK) fail(s.why, 3); /* the inbox is shown all the same */
+    if (which == 0 && archive_daily(o->folder, pause, pause_user) != S_OK) fail("daily archive failed", 3);
     actor me = {o->me, o->session};
     const char *note = o->count == 3 ? o->words[2] : "";
     int code;
