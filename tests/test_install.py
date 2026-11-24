@@ -571,14 +571,77 @@ class TestQuickInstaller(unittest.TestCase):
             self.assertEqual(ctx.exception.code, 2)
             self.assertEqual(unrelated_helio.read_text(encoding="utf-8"), "unrelated user script\n")
 
-            # 7. --back invoked via a third --wrapper path still removes B's recorded current wrapper.
+            # 7. --back invoked via a third --wrapper path: interrupted after unlinking wrap_b restores wrap_b cleanly,
+            #    and completing --back removes wrap_b and activates wrap_a.
             w3_dir = root / "third_wrap_back"
             wa, wb, wc = root / "w3a" / "helio", root / "w3b" / "helio", root / "w3c" / "helio"
-            self.mod.install(repo=repo, to_dir=w3_dir, store_dir=store, wrapper_path=wa, prebuilt=(a_h, a_e))
-            self.mod.install(repo=repo, to_dir=w3_dir, store_dir=store, wrapper_path=wb, prebuilt=(b_h, b_e))
+            sa, sb = root / "s3a", root / "s3b"
+            self.mod.install(repo=repo, to_dir=w3_dir, store_dir=sa, wrapper_path=wa, prebuilt=(a_h, a_e))
+            self.mod.install(repo=repo, to_dir=w3_dir, store_dir=sb, wrapper_path=wb, prebuilt=(b_h, b_e))
+
+            def crash_after_unlink_wb(stage: str) -> None:
+                if stage == "after_unlink_old_wrapper_0":
+                    raise SimulatedCrash(stage)
+
+            with self.assertRaises(SimulatedCrash):
+                self.mod.go_back(to_dir=w3_dir, wrapper_path=wc, on_boundary=crash_after_unlink_wb)
+            self.assertTrue(self.mod.recover_if_needed(w3_dir, wc))
+            # B's recorded wrapper wb MUST be restored with store sb!
+            self.assertTrue(wb.is_file())
+            self.assertEqual(wb.read_text(encoding="utf-8"), self.mod.render_wrapper(w3_dir, sb))
+            # Now complete --back via wc.
             self.mod.go_back(to_dir=w3_dir, wrapper_path=wc)
             self.assertTrue(wa.is_file())
             self.assertFalse(wb.exists())
+
+            # 8. Foreign journal with an unrelated .rec copy and absent target is refused without publishing it,
+            #    and a foreign journal naming a nonexistent external dir creates neither the dir nor a lock file.
+            frec_dir = root / "foreign_rec_src"
+            frec_dir.mkdir()
+            fake_rec = frec_dir / ".helio.abcdef012345.rec"
+            fake_rec.write_text("unrelated binary payload\n", encoding="utf-8")
+            fake_ext_dir = root / "must_not_be_created_dir"
+            (frec_dir / self.mod.JOURNAL_NAME).write_text(
+                json.dumps({
+                    "schema_version": 1,
+                    "op": "install",
+                    "phase": "publishing",
+                    "tx_id": "abcdef012345",
+                    "to_dir": str(frec_dir.resolve()),
+                    "wrapper_path": str((root / "frec_w" / "helio").resolve()),
+                    "alt_wrapper_path": str(fake_ext_dir / "helio"),
+                    "had_manifest": False,
+                    "previous_manifest": None,
+                    "previous_wrapper_existed": False,
+                    "saved_files": {"helio": {"existed": True, "rec_name": fake_rec.name, "sha256": self.mod.sha256_file(fake_rec)}},
+                    "temp_files": [fake_rec.name],
+                    "desired_manifest": None,
+                }),
+                encoding="utf-8",
+            )
+            with self.assertRaises(self.mod.InstallError) as ctx:
+                self.mod.install(repo=repo, to_dir=frec_dir, store_dir=store, wrapper_path=root / "frec_w" / "helio", prebuilt=(a_h, a_e))
+            self.assertEqual(ctx.exception.code, 2)
+            self.assertFalse((frec_dir / "helio").exists())
+            self.assertFalse(fake_ext_dir.exists())
+
+            # Remove alt_wrapper_path so journal passes validation and hits the independent .rec identity check.
+            j_only_rec = json.loads((frec_dir / self.mod.JOURNAL_NAME).read_text(encoding="utf-8"))
+            j_only_rec.pop("alt_wrapper_path")
+            (frec_dir / self.mod.JOURNAL_NAME).write_text(json.dumps(j_only_rec), encoding="utf-8")
+            with self.assertRaises(self.mod.InstallError) as ctx:
+                self.mod.recover_if_needed(frec_dir, root / "frec_w" / "helio")
+            self.assertEqual(ctx.exception.code, 2)
+            self.assertFalse((frec_dir / "helio").exists())
+
+            # 9. Removing a two-wrapper installation through the CURRENT wrapper (wb) removes BOTH wa and wb.
+            rem_cur_dir = root / "rem_via_current_wrap"
+            rwa, rwb = root / "rwa" / "helio", root / "rwb" / "helio"
+            self.mod.install(repo=repo, to_dir=rem_cur_dir, store_dir=sa, wrapper_path=rwa, prebuilt=(a_h, a_e))
+            self.mod.install(repo=repo, to_dir=rem_cur_dir, store_dir=sb, wrapper_path=rwb, prebuilt=(b_h, b_e))
+            self.assertTrue(self.mod.remove(to_dir=rem_cur_dir, wrapper_path=rwb))
+            self.assertFalse(rwa.exists())
+            self.assertFalse(rwb.exists())
 
     def test_legacy_adoption_symlinks_collisions_and_locks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

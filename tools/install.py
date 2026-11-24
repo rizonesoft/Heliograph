@@ -463,7 +463,7 @@ def _cleanup_temp_files(to_dir: Path, temp_names: list[str], tx_id: str) -> None
 
 
 def _discover_lock_wrappers(to_dir: Path, wrapper_path: Path) -> list[Path]:
-    """Discover every wrapper path referenced by manifest or journal while to_dir lock is held."""
+    """Discover every wrapper path referenced by manifest or validated journal while to_dir lock is held."""
     found: list[Path] = [wrapper_path]
     with contextlib.suppress(InstallError):
         m = read_manifest(to_dir)
@@ -472,16 +472,24 @@ def _discover_lock_wrappers(to_dir: Path, wrapper_path: Path) -> list[Path]:
                 rec = m.get(section)
                 if isinstance(rec, dict) and isinstance(rec.get("wrapper"), str) and rec["wrapper"]:
                     with contextlib.suppress(InstallError):
-                        found.append(_normalize_wrapper_path(Path(rec["wrapper"])))
+                        wp = _normalize_wrapper_path(Path(rec["wrapper"]))
+                        if wp.parent.is_dir():
+                            found.append(wp)
     jp = to_dir / JOURNAL_NAME
     if jp.exists() and not jp.is_symlink() and jp.is_file():
         with contextlib.suppress(OSError, ValueError, InstallError):
-            j = json.loads(jp.read_text(encoding="utf-8"))
-            if isinstance(j, dict):
-                for key in ("wrapper_path", "alt_wrapper_path"):
-                    val = j.get(key)
-                    if isinstance(val, str) and val:
-                        found.append(_normalize_wrapper_path(Path(val)))
+            j = _validate_journal_paths(json.loads(jp.read_text(encoding="utf-8")), to_dir, wrapper_path)
+            for key in ("wrapper_path", "alt_wrapper_path", "prev_current_wrapper_path"):
+                val = j.get(key)
+                if isinstance(val, str) and val:
+                    wp = _normalize_wrapper_path(Path(val))
+                    if wp.parent.is_dir():
+                        found.append(wp)
+            for val in j.get("remove_wrappers", []):
+                if isinstance(val, str) and val:
+                    wp = _normalize_wrapper_path(Path(val))
+                    if wp.parent.is_dir():
+                        found.append(wp)
     return found
 
 
@@ -520,18 +528,30 @@ def _validate_journal_paths(journal: Any, to_dir: Path, wrapper_path: Path) -> d
         rec_name = meta.get("rec_name")
         if rec_name is not None and rec_name != f".{name}.{tx_id}.rec":
             raise InstallError(f"install journal recovery path invalid: {rec_name}", code=2)
-    alt_wrapper = journal.get("alt_wrapper_path")
-    if alt_wrapper is not None:
-        if op not in ("back", "remove"):
-            raise InstallError("install journal may not specify alt_wrapper_path", code=2)
-        alt_norm = _normalize_wrapper_path(Path(str(alt_wrapper)))
-        allowed_alts: set[Path] = set()
-        for mkey in ("previous_manifest", "desired_manifest"):
-            m = journal.get(mkey)
-            if isinstance(m, dict) and isinstance(m.get("current"), dict) and isinstance(m["current"].get("wrapper"), str):
-                allowed_alts.add(_normalize_wrapper_path(Path(m["current"]["wrapper"])))
-        if alt_norm not in allowed_alts:
-            raise InstallError("journal alt_wrapper_path is not bound to a recorded manifest wrapper", code=2)
+    allowed_manifest_wrappers: set[Path] = {wrapper_path}
+    for mkey in ("previous_manifest", "desired_manifest"):
+        m = journal.get(mkey)
+        if isinstance(m, dict):
+            for section in ("current", "previous"):
+                rec = m.get(section)
+                if isinstance(rec, dict) and isinstance(rec.get("wrapper"), str) and rec["wrapper"]:
+                    allowed_manifest_wrappers.add(_normalize_wrapper_path(Path(rec["wrapper"])))
+
+    for wkey in ("alt_wrapper_path", "prev_current_wrapper_path"):
+        wval = journal.get(wkey)
+        if wval is not None:
+            if op not in ("back", "remove"):
+                raise InstallError(f"install journal may not specify {wkey}", code=2)
+            if _normalize_wrapper_path(Path(str(wval))) not in allowed_manifest_wrappers:
+                raise InstallError(f"journal {wkey} is not bound to a recorded manifest wrapper", code=2)
+
+    rem_wrappers = journal.get("remove_wrappers")
+    if rem_wrappers is not None:
+        if op != "remove" or not isinstance(rem_wrappers, list):
+            raise InstallError("invalid remove_wrappers in journal", code=2)
+        for rw in rem_wrappers:
+            if not isinstance(rw, str) or _normalize_wrapper_path(Path(rw)) not in allowed_manifest_wrappers:
+                raise InstallError("journal remove_wrappers contains unowned path", code=2)
     if op == "remove":
         if temp_files:
             raise InstallError("remove journal may not list temp_files for deletion", code=2)
@@ -648,11 +668,16 @@ def recover_if_needed(to_dir: Path, wrapper_path: Path) -> bool:
             p = to_dir / name
             if p.exists():
                 p.unlink()
-        wrappers_to_clean = [wrapper_path]
-        if isinstance(journal.get("alt_wrapper_path"), str):
-            alt_wp = _normalize_wrapper_path(Path(journal["alt_wrapper_path"]))
-            if alt_wp != wrapper_path:
-                wrappers_to_clean.append(alt_wp)
+        wrappers_to_clean: list[Path] = [wrapper_path]
+        for key in ("alt_wrapper_path",):
+            if isinstance(journal.get(key), str):
+                wp = _normalize_wrapper_path(Path(journal[key]))
+                if wp not in wrappers_to_clean:
+                    wrappers_to_clean.append(wp)
+        for rw in journal.get("remove_wrappers", []):
+            wp = _normalize_wrapper_path(Path(rw))
+            if wp not in wrappers_to_clean:
+                wrappers_to_clean.append(wp)
         for wp in wrappers_to_clean:
             if wrapper_belongs_to(wp, to_dir):
                 wp.unlink()
@@ -712,7 +737,9 @@ def recover_if_needed(to_dir: Path, wrapper_path: Path) -> bool:
             expected_hash = meta["sha256"]
             if target.exists() and sha256_file(target) == expected_hash:
                 pass
-            elif rec_path.exists() and sha256_file(rec_path) == expected_hash:
+            elif rec_path.exists() and not rec_path.is_symlink() and sha256_file(rec_path) == expected_hash:
+                if not _is_independently_owned_reserved_file(rec_path, name):
+                    raise InstallError(f"recovery refusing unowned snapshot {rec_path}: not a Heliograph artifact", code=2)
                 staged_restore = to_dir / f".{name}.{tx_id}.restore"
                 copy_to_staged(rec_path, staged_restore, mode=0o755)
                 replace_binary_atomic(staged_restore, target)
@@ -731,6 +758,11 @@ def recover_if_needed(to_dir: Path, wrapper_path: Path) -> bool:
         if wrapper_belongs_to(wrapper_path, to_dir):
             wrapper_path.unlink()
             fsync_dir(wrapper_path.parent)
+
+    if op == "back" and isinstance(journal.get("prev_current_wrapper_path"), str):
+        pc_wp = _normalize_wrapper_path(Path(journal["prev_current_wrapper_path"]))
+        if pc_wp != wrapper_path and prev_store and journal.get("prev_current_wrapper_existed"):
+            _restore_wrapper_from_manifest(pc_wp, to_dir, prev_store)
 
     if op == "back" and isinstance(journal.get("alt_wrapper_path"), str):
         alt_wp = _normalize_wrapper_path(Path(journal["alt_wrapper_path"]))
@@ -1246,6 +1278,12 @@ def go_back(
                     }
 
                     prev_wrapper_existed = wrapper_belongs_to(wrapper_path, to_dir)
+                    cur_recorded_wrapper = (
+                        _normalize_wrapper_path(Path(cur["wrapper"]))
+                        if isinstance(cur.get("wrapper"), str) and cur["wrapper"]
+                        else wrapper_path
+                    )
+                    prev_cur_wrapper_existed = wrapper_belongs_to(cur_recorded_wrapper, to_dir)
                     alt_wrapper_existed = wrapper_belongs_to(target_wrapper, to_dir) if target_wrapper != wrapper_path else False
                     desired_wrapper_content = render_wrapper(to_dir, Path(restored_store)) if restored_store else None
 
@@ -1258,6 +1296,8 @@ def go_back(
                         "wrapper_path": str(wrapper_path),
                         "alt_wrapper_path": str(target_wrapper) if target_wrapper != wrapper_path else None,
                         "alt_wrapper_existed": alt_wrapper_existed,
+                        "prev_current_wrapper_path": str(cur_recorded_wrapper) if cur_recorded_wrapper != wrapper_path else None,
+                        "prev_current_wrapper_existed": prev_cur_wrapper_existed,
                         "store_dir": restored_store,
                         "had_manifest": True,
                         "previous_manifest": manifest,
@@ -1298,10 +1338,12 @@ def go_back(
                         if old_wrappers:
                             if on_boundary:
                                 on_boundary("after_target_wrapper")
-                            for ow in sorted(old_wrappers, key=str):
+                            for idx, ow in enumerate(sorted(old_wrappers, key=str)):
                                 if wrapper_belongs_to(ow, to_dir):
                                     ow.unlink()
                                     fsync_dir(ow.parent)
+                                if on_boundary:
+                                    on_boundary(f"after_unlink_old_wrapper_{idx}")
                     if on_boundary:
                         on_boundary("after_wrapper")
 
@@ -1350,16 +1392,18 @@ def remove(
             with acquire_wrapper_locks(to_dir, *lock_wrappers):
                 recovered = recover_if_needed(to_dir, wrapper_path)
                 manifest = read_manifest(to_dir)
-                recorded_wrapper: Path | None = None
-                if manifest and isinstance(manifest["current"].get("wrapper"), str):
-                    rw = _normalize_wrapper_path(Path(manifest["current"]["wrapper"]))
-                    if rw != wrapper_path:
-                        recorded_wrapper = rw
+                candidate_wrappers: list[Path] = [wrapper_path]
+                if manifest:
+                    for section in ("current", "previous"):
+                        rec = manifest.get(section)
+                        if isinstance(rec, dict) and isinstance(rec.get("wrapper"), str) and rec["wrapper"]:
+                            rw = _normalize_wrapper_path(Path(rec["wrapper"]))
+                            if rw not in candidate_wrappers:
+                                candidate_wrappers.append(rw)
 
+                owned_wrappers = [wp for wp in candidate_wrappers if wrapper_belongs_to(wp, to_dir)]
                 any_owned = any((to_dir / n).exists() for n in BINARY_NAMES + BACKUP_NAMES + (MANIFEST_NAME,))
-                wrapper_owned = wrapper_belongs_to(wrapper_path, to_dir)
-                recorded_wrapper_owned = recorded_wrapper is not None and wrapper_belongs_to(recorded_wrapper, to_dir)
-                if not any_owned and not wrapper_owned and not recorded_wrapper_owned:
+                if not any_owned and not owned_wrappers:
                     return recovered
 
                 verify_destination_ownership(to_dir, manifest)
@@ -1377,11 +1421,11 @@ def remove(
                     "tx_id": secrets.token_hex(6),
                     "to_dir": str(to_dir),
                     "wrapper_path": str(wrapper_path),
-                    "alt_wrapper_path": str(recorded_wrapper) if recorded_wrapper_owned else None,
+                    "remove_wrappers": [str(wp) for wp in owned_wrappers],
                     "store_dir": "",
                     "had_manifest": manifest is not None,
                     "previous_manifest": manifest,
-                    "previous_wrapper_existed": wrapper_owned,
+                    "previous_wrapper_existed": wrapper_path in owned_wrappers,
                     "saved_files": {},
                     "temp_files": [],
                     "expected_hashes": expected_hashes,
@@ -1392,14 +1436,11 @@ def remove(
                     on_boundary("after_journal")
 
                 try:
-                    if wrapper_owned:
-                        wrapper_path.unlink()
-                        fsync_dir(wrapper_path.parent)
-                        if on_boundary:
+                    for idx, wp in enumerate(owned_wrappers):
+                        wp.unlink()
+                        fsync_dir(wp.parent)
+                        if idx == 0 and on_boundary:
                             on_boundary("after_invocation_wrapper")
-                    if recorded_wrapper_owned and recorded_wrapper is not None:
-                        recorded_wrapper.unlink()
-                        fsync_dir(recorded_wrapper.parent)
                     if on_boundary:
                         on_boundary("after_wrapper")
 
