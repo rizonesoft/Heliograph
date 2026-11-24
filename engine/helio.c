@@ -395,13 +395,22 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
     s.pause = pause;
     s.pause_user = pause_user;
     if ((which == 0 || which == 8) && watch_summary(&s) != S_OK) fail(s.why, 3); /* the inbox is shown all the same */
-    if (which == 0 && archive_daily(o->folder, pause, pause_user) != S_OK) fail("daily archive failed", 3);
+    bool daily_err = false;
+    if (which == 0) {
+        text drep = {0};
+        if (archive_daily(o->folder, &drep, pause, pause_user) != S_OK) {
+            if (drep.length && !drep.failed) p_error(drep.data);
+            fail("daily archive failed", 3);
+            daily_err = true;
+        }
+        text_free(&drep);
+    }
     actor me = {o->me, o->session};
     const char *note = o->count == 3 ? o->words[2] : "";
     int code;
     s_result result;
     switch (which) {
-    case 0: code = inbox(&s, o->me, o->all); break;
+    case 0: code = inbox(&s, o->me, o->all); if (daily_err) code = 3; break;
     case 1: code = whole_log(&s); break;
     case 2: code = check(&s); break;
     case 3: code = show(&s, o->words[1], o->me); break;

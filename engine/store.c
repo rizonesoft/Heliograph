@@ -138,25 +138,18 @@ static bool one_of(const char *value, const char *const *list) {
     return false;
 }
 
-s_result store_message(store *s, const char *id, message *out) {
-    *out = (message){0};
-    if (!id_ok(id)) return say(s, S_REFUSED, "that is not a message id");
-    text at = {0};
-    path(s, &at, id, "post");
-    char *data = NULL;
-    size_t length = 0;
-    p_result result = at.failed ? P_FAILED : p_read(at.data, MOST_FILE, &data, &length);
-    text_free(&at);
-    if (result == P_MISSING) return say(s, S_REFUSED, "there is no such message");
-    if (result != P_OK || len(data) != length) {
-        if (result == P_OK) p_free(data);
-        return say(s, S_DAMAGED, "the message cannot be read");
+s_result store_parse_post(char *data, size_t length, const char *id, message *out, const char **why) {
+    if (len(data) != length) {
+        p_free(data);
+        if (why) *why = "the message cannot be read";
+        return S_DAMAGED;
     }
     size_t split = 0;
     while (data[split] && !(data[split] == '\n' && data[split + 1] == '\n')) split++;
     if (!data[split]) {
         p_free(data);
-        return say(s, S_DAMAGED, "the message has no body");
+        if (why) *why = "the message has no body";
+        return S_DAMAGED;
     }
     data[split + 1] = 0;
     uint64_t body = 0;
@@ -171,9 +164,24 @@ s_result store_message(store *s, const char *id, message *out) {
     if (!same(out->id, id) || !address_ok(out->from, false) || !address_ok(out->to, true) || !*out->subject
         || !due_ok || !time_ok(out->time) || (*out->re && !id_ok(out->re)) || !one_of(out->kind, kinds) || !one_of(out->urgency, urgencies) || !*out->body || len(out->body) != body) {
         message_free(out);
-        return say(s, S_DAMAGED, "the message is not what its name says");
+        if (why) *why = "the message is not what its name says";
+        return S_DAMAGED;
     }
     return S_OK;
+}
+
+s_result store_message(store *s, const char *id, message *out) {
+    *out = (message){0};
+    if (!id_ok(id)) return say(s, S_REFUSED, "that is not a message id");
+    text at = {0};
+    path(s, &at, id, "post");
+    char *data = NULL;
+    size_t length = 0;
+    p_result result = at.failed ? P_FAILED : p_read(at.data, MOST_FILE, &data, &length);
+    text_free(&at);
+    if (result == P_MISSING) return say(s, S_REFUSED, "there is no such message");
+    if (result != P_OK) return say(s, S_DAMAGED, "the message cannot be read");
+    return store_parse_post(data, length, id, out, &s->why);
 }
 
 bool is_job(const message *m) { return same(m->kind, "request") || same(m->kind, "handoff"); }
@@ -318,17 +326,31 @@ static bool gap(const store *s, const char *id, unsigned links) {
     return found;
 }
 
+bool store_apply_step(const message *m, job *now, char *data) {
+    static const char *const states[] = {"taken", "released", "done", "refused"};
+    static const job_state after[] = {TAKEN, OPEN, DONE, REFUSED};
+    char what[16], by[72], session[72], end[8], when[24];
+    bool good = keep(what, sizeof what, data, "state") && keep(by, sizeof by, data, "by") && address_ok(by, false)
+                && keep(session, sizeof session, data, "session") && keep(when, sizeof when, data, "time")
+                && read_time(when, &now->when) && keep(end, sizeof end, data, "end") && same(end, "yes");
+    int step = 0;
+    while (good && step < 4 && !same(what, states[step])) step++;
+    if (!good || step == 4 || objection(m, now, (actor){by, session}, (change)step)) return false;
+    now->state = after[step];
+    bool open = now->state == OPEN;
+    copy_to(now->by, open ? "" : by), copy_to(now->session, open ? "" : session);
+    return true;
+}
+
 /* Replays the chain from the disk, because others write meanwhile. A step counts
    only if its actor was allowed to make it: the rules are those of a new step. */
 s_result store_job(store *s, const message *m, job *out) {
-    static const char *const states[] = {"taken", "released", "done", "refused"};
-    static const job_state after[] = {TAKEN, OPEN, DONE, REFUSED};
     *out = (job){.state = OPEN};
     if (s->pause) s->pause(s->pause_user, "before-read");
     for (; out->links < MOST_LINKS; out->links++) {
         text name = {0};
         link_name(&name, out->links);
-        char *data = NULL, what[16], by[72], session[72], end[8], when[24];
+        char *data = NULL;
         s_result result = name.failed ? say(s, S_DAMAGED, "out of memory") : event_of(s, m->id, name.data, &data);
         text_free(&name);
         if (result == S_NOTHING) {
@@ -338,15 +360,9 @@ s_result store_job(store *s, const message *m, job *out) {
             return gap(s, m->id, out->links) ? say(s, S_DAMAGED, "a step of this job is missing") : S_OK;
         }
         if (result != S_OK) return result;
-        bool good = keep(what, sizeof what, data, "state") && keep(by, sizeof by, data, "by") && address_ok(by, false)
-                    && keep(session, sizeof session, data, "session") && keep(when, sizeof when, data, "time") && read_time(when, &out->when) && keep(end, sizeof end, data, "end") && same(end, "yes");
+        bool ok = store_apply_step(m, out, data);
         p_free(data);
-        int step = 0;
-        while (good && step < 4 && !same(what, states[step])) step++;
-        if (!good || step == 4 || objection(m, out, (actor){by, session}, (change)step)) return say(s, S_DAMAGED, "a step of this job is damaged");
-        out->state = after[step];
-        bool open = out->state == OPEN;
-        copy_to(out->by, open ? "" : by), copy_to(out->session, open ? "" : session);
+        if (!ok) return say(s, S_DAMAGED, "a step of this job is damaged");
     }
     if (s->pause) s->pause(s->pause_user, "read");
     return live_post(s, m->id);
@@ -478,8 +494,28 @@ s_result store_post(store *s, const message *m, const char *key, text *id) {
             if (m->due) add_number(&out, m->due, 0);
             add(&out, "\nlength: "), add_number(&out, body.length, 0);
             add(&out, "\nsubject: "), add(&out, subject.data), add(&out, "\n\n"), add(&out, body.data);
-            result = out.failed ? say(s, S_DAMAGED, "out of memory") : make(s, id->data, "post", out.data);
-            if (result == S_NOTHING && *key) {
+            if (*key && s->pause) s->pause(s->pause_user, "post-write");
+            bool published = false;
+            result = out.failed ? say(s, S_DAMAGED, "out of memory") : make_ex(s, id->data, "post", out.data, &published);
+            if (published && *key) {
+                /* Second look after publication: if the keyed message was archived while we raced, remove our
+                   late live post so the closed job can never reopen as open. */
+                message arch = {0};
+                const char *write_why = s->why;
+                s_result ar = archive_read_message(s, id->data, &arch);
+                if (ar == S_OK) {
+                    s_result rm = remove_event(s, id->data, "post");
+                    bool match = same(arch.from, m->from) && same(arch.to, m->to) && same(arch.kind, m->kind) && same(arch.subject, subject.data) && same(arch.body, body.data);
+                    message_free(&arch);
+                    if (rm != S_OK) result = rm;
+                    else if (!match) result = say(s, S_REFUSED, "that key stands for another message");
+                    else if (result != S_OK) s->why = write_why;
+                } else {
+                    message_free(&arch);
+                    if (ar == S_DAMAGED) result = S_DAMAGED;
+                    else if (result != S_OK) s->why = write_why;
+                }
+            } else if (result == S_NOTHING && *key) {
                 message there;
                 result = store_message(s, id->data, &there);
                 if (result == S_OK && !(same(there.from, m->from) && same(there.to, m->to) && same(there.kind, m->kind) && same(there.subject, subject.data) && same(there.body, body.data)))
@@ -632,9 +668,17 @@ s_result store_check(store *s, text *report) {
             if (mr == S_REFUSED && same(s->why, "there is no such message")) {
                 if (!same(dot, ".post")) {
                     char *probe = NULL;
-                    s_result er = *dot ? event_of(s, id, dot + 1, &probe) : S_DAMAGED;
-                    p_free(probe);
-                    if (er != S_NOTHING && !archive_has_terminal_job(s->folder, id)) why = "there is no such message";
+                    size_t plen = 0;
+                    text evp = {0};
+                    if (*dot) path(s, &evp, id, dot + 1);
+                    p_result pr = !*dot || evp.failed ? P_FAILED : p_read(evp.data, MOST_FILE, &probe, &plen);
+                    text_free(&evp);
+                    if (pr == P_OK) {
+                        if (!archive_is_clean_remnant(s->folder, id, dot + 1, probe, plen)) why = "there is no such message";
+                        p_free(probe);
+                    } else if (pr != P_MISSING) {
+                        why = "an event cannot be read";
+                    }
                 }
             } else if (mr != S_OK) {
                 why = s->why;

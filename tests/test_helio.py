@@ -1028,12 +1028,21 @@ class Archive(Base):
         taken_job = self.send(subject="stay-taken")
         self.assertEqual(self.helio("take", taken_job, me="os/userland").returncode, 0)
         now_s = int(time.time())
-        recent_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_s - 30 * 86400 + 60))
+        recent_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_s - 30 * 86400 + 2))
+        exact_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_s - 30 * 86400 - 1))
         future_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_s + 3600))
         recent_done = self.make_aged_closed_job(closed_iso=recent_iso, state="done", subject="recent-done")
         recent_refused = self.make_aged_closed_job(closed_iso=recent_iso, state="refused", subject="recent-refused")
         future_done = self.make_aged_closed_job(closed_iso=future_iso, state="done", subject="future-done")
         self.assertEqual(self.helio("archive", me=None).returncode, 1)
+
+        # Exact 30-day boundary (30d+1s) moves for both done and refused!
+        exact_done = self.make_aged_closed_job(closed_iso=exact_iso, state="done", subject="exact-done")
+        exact_refused = self.make_aged_closed_job(closed_iso=exact_iso, state="refused", subject="exact-refused")
+        res_exact = self.helio("archive", me=None)
+        self.assertEqual(res_exact.returncode, 0, res_exact.stderr)
+        self.assertFalse((self.store / f"messages/{exact_done}.post").exists())
+        self.assertFalse((self.store / f"messages/{exact_refused}.post").exists())
 
         # Eligible: created in 2025-02, closed in 2025-04 -> must land in archive/2025-02/ (ID's month!).
         feb_us = 1739577600_000_000  # 2025-02-15T00:00:00Z
@@ -1127,7 +1136,46 @@ class Archive(Base):
                         self.assertEqual((st / "archive/2025-02" / name).read_bytes(), expected)
                     self.assertEqual(run(st, "check", me=None).returncode, 0)
 
-        # Control: archived post WITHOUT terminal chain + missing live post MUST NOT sweep live link and check exits 3.
+        # Control 1: intermediate link removal cut (link.0001 already removed, link.0000 survives) -> check 0, retry finishes!
+        with tempfile.TemporaryDirectory() as tmp:
+            st = Path(tmp)
+            put(st / "helio.conf", "project: os\n")
+            self.assertEqual(run(st, "init", me=None).returncode, 0)
+            jm = f"{feb_us + 88:016d}-a00088"
+            (st / "archive/2025-02").mkdir(parents=True, exist_ok=True)
+            post_t = f"id: {jm}\ntime: 2025-02-15T00:00:00Z\nfrom: os/main\nto: os/userland\nkind: request\nabout: \nurgency: next\nre: \ndue: \nlength: 4\nsubject: mid\n\nbody"
+            l0 = "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: taken\nnote: \nend: yes\n"
+            l1 = "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: done\nnote: ok\nend: yes\n"
+            put(st / f"archive/2025-02/{jm}.post", post_t)
+            put(st / f"archive/2025-02/{jm}.link.0000", l0)
+            put(st / f"archive/2025-02/{jm}.link.0001", l1)
+            put(st / f"messages/{jm}.link.0000", l0)
+            self.assertEqual(run(st, "check", me=None).returncode, 0)
+            self.assertEqual(run(st, "archive", me=None).returncode, 0)
+            self.assertEqual(list((st / "messages").iterdir()), [])
+            self.assertEqual(run(st, "check", me=None).returncode, 0)
+
+        # Control 2: differing live step or malformed live seen mark during recovery MUST fail check and archive (exit 3)!
+        with tempfile.TemporaryDirectory() as tmp:
+            st = Path(tmp)
+            put(st / "helio.conf", "project: os\n")
+            self.assertEqual(run(st, "init", me=None).returncode, 0)
+            jd = f"{feb_us + 89:016d}-a00089"
+            (st / "archive/2025-02").mkdir(parents=True, exist_ok=True)
+            put(st / f"archive/2025-02/{jd}.post", f"id: {jd}\ntime: 2025-02-15T00:00:00Z\nfrom: os/main\nto: os/userland\nkind: request\nabout: \nurgency: next\nre: \ndue: \nlength: 4\nsubject: diff\n\nbody")
+            put(st / f"archive/2025-02/{jd}.link.0000", "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: taken\nnote: \nend: yes\n")
+            put(st / f"archive/2025-02/{jd}.link.0001", "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: done\nnote: ok\nend: yes\n")
+            put(st / f"messages/{jd}.link.0000", "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: taken\nnote: DIFF\nend: yes\n")
+            self.assertEqual(run(st, "check", me=None).returncode, 3)
+            self.assertEqual(run(st, "archive", me=None).returncode, 3)
+            self.assertTrue((st / f"messages/{jd}.link.0000").exists())
+            (st / f"messages/{jd}.link.0000").unlink()
+            put(st / f"messages/{jd}.seen.os+userland", "trunc")
+            self.assertEqual(run(st, "check", me=None).returncode, 3)
+            self.assertEqual(run(st, "archive", me=None).returncode, 3)
+            self.assertTrue((st / f"messages/{jd}.seen.os+userland").exists())
+
+        # Control 3: archived post WITHOUT terminal chain + missing live post MUST exit 3 in BOTH check AND archive!
         job_bad = f"{feb_us + 99:016d}-bad099"
         (self.store / "archive/2025-02").mkdir(parents=True, exist_ok=True)
         put(
@@ -1137,7 +1185,9 @@ class Archive(Base):
         )
         put(self.store / f"messages/{job_bad}.link.0000", "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: taken\nnote: \nend: yes\n")
         self.assertEqual(self.helio("check", me=None).returncode, 3)
-        self.assertEqual(self.helio("archive", me=None).returncode, 1)
+        r_bad_arch = self.helio("archive", me=None)
+        self.assertEqual(r_bad_arch.returncode, 3)
+        self.assertIn(job_bad.encode(), r_bad_arch.stderr)
         self.assertTrue((self.store / f"messages/{job_bad}.link.0000").exists())
 
     def test_late_seen_mark_preserved_conflict_refused_and_flush_failure_safe(self):
@@ -1178,15 +1228,38 @@ class Archive(Base):
         self.assertEqual((self.store / f"archive/2025-02/{job2}.post").read_bytes(), b"different bytes\n")
         (self.store / f"archive/2025-02/{job2}.post").unlink()
 
-        # 3. Failed flush during archive exits 3 and retains live source.
-        r_ff = subprocess.run(
-            [str(RACER), "--fail-flush-cli", "archive", "--store", str(self.store)],
+        # 3. Targeted p_sync failure on identical pre-existing archive copy MUST exit 3 and retain live source!
+        put(self.store / f"archive/2025-02/{job2}.post", (self.store / f"messages/{job2}.post").read_text())
+        r_sync = subprocess.run(
+            [str(RACER), "--fail-sync-cli", "archive", "--store", str(self.store)],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             timeout=30,
         )
-        self.assertEqual(r_ff.returncode, 3)
+        self.assertEqual(r_sync.returncode, 3)
         self.assertTrue((self.store / f"messages/{job2}.post").exists())
+        # 4. Daily inbox archive error MUST surface exit 3 (never exit 0!).
+        r_in_err = subprocess.run(
+            [str(RACER), "--fail-sync-cli", "inbox", "--store", str(self.store), "--as", "os/userland"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=30,
+        )
+        self.assertEqual(r_in_err.returncode, 3)
+        # 5. Symlinked archive month directory pointing back to messages/ MUST be refused (exit 3, live files preserved)!
+        if not ON_WINDOWS:
+            with tempfile.TemporaryDirectory() as tmp:
+                st = Path(tmp)
+                put(st / "helio.conf", "project: os\n")
+                self.assertEqual(run(st, "init", me=None).returncode, 0)
+                jsym = f"{feb_us + 77:016d}-a00077"
+                put(st / f"messages/{jsym}.post", f"id: {jsym}\ntime: 2025-02-15T00:00:00Z\nfrom: os/main\nto: os/userland\nkind: request\nabout: \nurgency: next\nre: \ndue: \nlength: 4\nsubject: sym\n\nbody")
+                put(st / f"messages/{jsym}.link.0000", "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: taken\nnote: \nend: yes\n")
+                put(st / f"messages/{jsym}.link.0001", "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: done\nnote: ok\nend: yes\n")
+                (st / "archive").mkdir()
+                os.symlink(st / "messages", st / "archive/2025-02")
+                self.assertEqual(run(st, "archive", me=None).returncode, 3)
+                self.assertTrue((st / f"messages/{jsym}.post").exists())
         # Normal archive recovers cleanly afterwards.
         self.assertEqual(self.helio("archive", me=None).returncode, 0)
         self.assertFalse((self.store / f"messages/{job2}.post").exists())
@@ -1205,6 +1278,33 @@ class Archive(Base):
         bad_retry = self.helio("ask", "os/userland", "keyed-job", "--key", "k-arch-1", me="os/main", body="other body")
         self.assertEqual(bad_retry.returncode, 2)
 
+        # P1 race: suspend keyed retry after initial archive lookup returns missing, archive completely, then resume!
+        job_r = self.make_aged_closed_job(closed_iso="2025-04-15T12:00:00Z", state="done", subject="keyed-race", key="k-race-1")
+        clean = {k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_SESSION", "CLAUDE_CODE_SESSION_ID")}
+        proc = subprocess.Popen(
+            [str(RACER), "--pause-cli", "post-write", str(self.store), "ask", "os/userland", "keyed-race", "--key", "k-race-1", "--store", str(self.store), "--as", "os/main"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=self.store,
+            env=clean,
+        )
+        try:
+            proc.stdin.write(b"body text")
+            proc.stdin.close()
+            self.wait_for(self.store / "paused.post-write")
+            self.assertEqual(self.helio("archive", me=None).returncode, 0)
+            self.assertFalse((self.store / f"messages/{job_r}.post").exists())
+            put(self.store / "resume.post-write", "go")
+            out_r, err_r = proc.communicate(timeout=30)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        self.assertEqual(proc.returncode, 0, err_r)
+        self.assertEqual(out_r.decode().strip(), job_r)
+        self.assertFalse((self.store / f"messages/{job_r}.post").exists(), "racing keyed retry must not leave a reopened live post")
+        self.assertEqual(self.helio("take", job_r, me="os/userland").returncode, 2)
+
     def test_daily_200_limit_hook_first_concurrent_archive_and_overfull_recovery(self):
         # Create 201 eligible closed jobs + 1 open job.
         feb_us = 1739577600_000_000
@@ -1214,8 +1314,10 @@ class Archive(Base):
         # Hook runs first -> writes summary/<today>.md, does NOT archive.
         self.assertEqual(self.helio("hook", "claude", me="os/userland").returncode, 0)
         self.assertEqual(len(list((self.store / "archive/2025-02").glob("*.post"))) if (self.store / "archive/2025-02").exists() else 0, 0)
-        # First inbox of the day archives at most 200.
-        self.assertEqual(self.helio(me="os/userland").returncode, 0)
+        # Simultaneous first inboxes on 201 eligible jobs MUST NOT exceed 200 total!
+        with ThreadPoolExecutor(2) as pool:
+            in_codes = list(pool.map(lambda _: self.helio(me="os/userland").returncode, range(2)))
+        self.assertEqual(in_codes, [0, 0])
         self.assertEqual(len(list((self.store / "archive/2025-02").glob("*.post"))), 200)
         self.assertEqual(len(list((self.store / "messages").glob("*.post"))), 2)  # 1 remaining eligible + 1 open
         # Second inbox on the same day archives 0 more.
@@ -1310,8 +1412,12 @@ class Archive(Base):
         self.assertEqual(reader_errors, [])
         self.assertEqual(arch_win_rc, 0, arch_win_err)
         self.assertEqual(arch_lin_rc, 0, arch_lin_err)
-        # Every live control job taken exactly once; zero eligible old jobs taken!
+        # Every live control job taken exactly once (per-job check, not aggregate!) and zero eligible old jobs taken!
         self.assertEqual(win_won + lin_won, len(live_ids), (win_won, lin_won))
+        for lid in live_ids:
+            self.assertTrue((self.store / f"messages/{lid}.post").exists(), lid)
+            links = sorted(self.store.glob(f"messages/{lid}.link.*"))
+            self.assertEqual([p.name for p in links], [f"{lid}.link.0000"], lid)
         # Every eligible old job moved to archive/2025-02 with its complete terminal chain and gone from messages/.
         arch_dir = self.store / "archive/2025-02"
         for oid in old_ids:
@@ -1319,8 +1425,6 @@ class Archive(Base):
             self.assertTrue((arch_dir / f"{oid}.post").exists(), oid)
             self.assertTrue((arch_dir / f"{oid}.link.0000").exists(), oid)
             self.assertTrue((arch_dir / f"{oid}.link.0001").exists(), oid)
-        for lid in live_ids:
-            self.assertTrue((self.store / f"messages/{lid}.post").exists(), lid)
         self.assertEqual(self.helio("check", me=None).returncode, 0)
 
 

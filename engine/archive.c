@@ -1,6 +1,7 @@
 #include "archive.h"
 
 static const uint64_t ARCHIVE_AGE_US = 30ull * 86400ull * 1000000ull;
+static const uint64_t CLAIM_STALE_US = 60ull * 1000000ull;
 static const char ARCHIVE_SEEN[] = "seen\n";
 
 bool archive_month(const char *id, char out[8]) {
@@ -51,64 +52,17 @@ static void link_suffix(text *out, unsigned n) {
     add(out, "link."), add_number(out, n, 4);
 }
 
-static const char *msg_field(char *head, const char *name) {
-    for (char *line = head; *line;) {
-        char *end = line;
-        while (*end && *end != '\n') end++;
-        if (starts(line, name) && line[len(name)] == ':' && line[len(name) + 1] == ' ') {
-            char *value = line + len(name) + 2;
-            return value <= end ? value : "";
-        }
-        line = *end ? end + 1 : end;
+static bool parse_link_index(const char *ev, unsigned *out) {
+    if (!starts(ev, "link.")) return false;
+    const char *p = ev + 5;
+    if (!*p) return false;
+    unsigned v = 0;
+    for (; *p; p++) {
+        if (*p < '0' || *p > '9' || v > 100000) return false;
+        v = v * 10 + (unsigned)(*p - '0');
     }
-    return "";
-}
-
-static void msg_cut(const char *value) {
-    char *at = (char *)value;
-    while (*at && *at != '\n') at++;
-    if (*at) *at = 0;
-}
-
-static bool one_of(const char *value, const char *const *list) {
-    for (; *list; list++) if (same(value, *list)) return true;
-    return false;
-}
-
-static s_result parse_post_bytes(char *data, size_t length, const char *id, message *out, const char **why) {
-    static const char *const kinds[] = {"request", "handoff", "answer", "finding", "headsup", NULL};
-    static const char *const urgencies[] = {"now", "next", "whenever", NULL};
-    if (len(data) != length) {
-        p_free(data);
-        *why = "the message cannot be read";
-        return S_DAMAGED;
-    }
-    size_t split = 0;
-    while (data[split] && !(data[split] == '\n' && data[split + 1] == '\n')) split++;
-    if (!data[split]) {
-        p_free(data);
-        *why = "the message has no body";
-        return S_DAMAGED;
-    }
-    data[split + 1] = 0;
-    uint64_t body = 0;
-    for (const char *d = msg_field(data, "length"); *d >= '0' && *d <= '9' && body < MOST_FILE; d++) body = body * 10 + (uint64_t)(*d - '0');
-    *out = (message){data, msg_field(data, "id"), msg_field(data, "time"), msg_field(data, "from"), msg_field(data, "to"), msg_field(data, "kind"),
-                     msg_field(data, "about"), msg_field(data, "urgency"), msg_field(data, "re"), msg_field(data, "subject"), data + split + 2, 0};
-    const char *due = msg_field(data, "due");
-    for (int digits = 0; *due >= '0' && *due <= '9' && digits < 17; digits++) out->due = out->due * 10 + (uint64_t)(*due++ - '0');
-    bool due_ok = !*due || *due == '\n';
-    const char *all[] = {out->id, out->time, out->from, out->to, out->kind, out->about, out->urgency, out->re, out->subject};
-    for (size_t i = 0; i < sizeof all / sizeof *all; i++) if (*all[i]) msg_cut(all[i]);
-    uint64_t when = 0;
-    if (!same(out->id, id) || !address_ok(out->from, false) || !address_ok(out->to, true) || !*out->subject
-        || !due_ok || !read_time(out->time, &when) || (*out->re && !valid_id(out->re))
-        || !one_of(out->kind, kinds) || !one_of(out->urgency, urgencies) || !*out->body || len(out->body) != body) {
-        message_free(out);
-        *why = "the message is not what its name says";
-        return S_DAMAGED;
-    }
-    return S_OK;
+    *out = v;
+    return true;
 }
 
 s_result archive_read_message(store *s, const char *id, message *out) {
@@ -126,48 +80,24 @@ s_result archive_read_message(store *s, const char *id, message *out) {
         s->why = "an archived message cannot be read";
         return S_DAMAGED;
     }
-    return parse_post_bytes(data, length, id, out, &s->why);
+    return store_parse_post(data, length, id, out, &s->why);
 }
 
-static bool keep_field(char *to, size_t room, char *data, const char *name) {
-    for (char *line = data; *line;) {
-        char *end = line;
-        while (*end && *end != '\n') end++;
-        size_t skip = len(name) + 2;
-        if (*end && starts(line, name) && line[skip - 2] == ':' && line[skip - 1] == ' ') {
-            size_t n = (size_t)(end - line) - skip;
-            if (n >= room) return false;
-            memcpy(to, line + skip, n);
-            to[n] = 0;
-            return true;
-        }
-        line = *end ? end + 1 : end;
-    }
-    return false;
-}
-
-static bool valid_step_transition(const message *m, const job *now, const char *by, const char *session, int step) {
-    bool taker = now->state == TAKEN && same(now->by, by) && (!*now->session || same(now->session, session));
-    if (now->state == DONE || now->state == REFUSED) return false;
-    switch (step) {
-    case 0: return now->state != TAKEN && is_for(m, by);
-    case 1: return now->state == TAKEN && (taker || owns(by, m));
-    case 2: return now->state == TAKEN && taker;
-    default: return taker || same(m->from, by) || owns(by, m) || (now->state == OPEN && is_for(m, by));
-    }
-}
-
-bool archive_has_terminal_job(const char *folder, const char *id) {
+s_result archive_has_terminal_job(const char *folder, const char *id, unsigned *links_out) {
+    if (links_out) *links_out = 0;
     char month[8];
-    if (!valid_id(id) || !archive_month(id, month)) return false;
+    if (!valid_id(id) || !archive_month(id, month)) return S_NOTHING;
     store tmp = {.folder = folder};
     message m = {0};
-    if (archive_read_message(&tmp, id, &m) != S_OK || !is_job(&m)) {
+    s_result mr = archive_read_message(&tmp, id, &m);
+    if (mr != S_OK) {
         message_free(&m);
-        return false;
+        return mr;
     }
-    static const char *const states[] = {"taken", "released", "done", "refused"};
-    static const job_state after[] = {TAKEN, OPEN, DONE, REFUSED};
+    if (!is_job(&m)) {
+        message_free(&m);
+        return S_DAMAGED;
+    }
     job now = {.state = OPEN};
     bool ok = true;
     for (; now.links < MOST_LINKS; now.links++) {
@@ -184,34 +114,45 @@ bool archive_has_terminal_job(const char *folder, const char *id) {
             ok = false;
             break;
         }
-        char what[16], by[72], session[72], end[8], when[24];
-        bool good = keep_field(what, sizeof what, data, "state") && keep_field(by, sizeof by, data, "by") && address_ok(by, false)
-                    && keep_field(session, sizeof session, data, "session") && keep_field(when, sizeof when, data, "time")
-                    && read_time(when, &now.when) && keep_field(end, sizeof end, data, "end") && same(end, "yes");
+        bool good = store_apply_step(&m, &now, data);
         p_free(data);
-        int step = 0;
-        while (good && step < 4 && !same(what, states[step])) step++;
-        if (!good || step == 4 || !valid_step_transition(&m, &now, by, session, step)) {
+        if (!good) {
             ok = false;
             break;
         }
-        now.state = after[step];
-        bool open = now.state == OPEN;
-        const char *nb = open ? "" : by, *ns = open ? "" : session;
-        memcpy(now.by, nb, len(nb) + 1);
-        memcpy(now.session, ns, len(ns) + 1);
     }
     message_free(&m);
-    return ok && (now.state == DONE || now.state == REFUSED);
+    if (!ok || (now.state != DONE && now.state != REFUSED)) return S_DAMAGED;
+    if (links_out) *links_out = now.links;
+    return S_OK;
 }
 
-/* Durable copy of src -> dst; refuses on differing existing dst, syncs identical existing dst. */
+bool archive_is_clean_remnant(const char *folder, const char *id, const char *event, const char *data, size_t length) {
+    unsigned arch_links = 0;
+    if (archive_has_terminal_job(folder, id, &arch_links) != S_OK) return false;
+    if (starts(event, "seen.")) return length == len(ARCHIVE_SEEN) && same(data, ARCHIVE_SEEN);
+    unsigned idx = 0;
+    if (!parse_link_index(event, &idx)) return false;
+    if (idx >= arch_links) return true; /* late step from a writer that raced post removal */
+    char month[8];
+    if (!archive_month(id, month)) return false;
+    text dst = {0};
+    arch_path(folder, month, &dst, id, event);
+    char *adata = NULL;
+    size_t alen = 0;
+    p_result r = dst.failed ? P_FAILED : p_read(dst.data, MOST_FILE, &adata, &alen);
+    text_free(&dst);
+    bool equal = r == P_OK && alen == length;
+    for (size_t i = 0; equal && i < length; i++) equal = adata[i] == data[i];
+    p_free(adata);
+    return equal;
+}
+
 static s_result copy_durable(const char *src, const char *dst, const char **why) {
     char *data = NULL;
     size_t length = 0;
     p_result r = p_read(src, MOST_FILE, &data, &length);
     if (r == P_MISSING) {
-        /* A concurrent peer may have already archived and removed src: verify dst exists. */
         char *there = NULL;
         size_t tlen = 0;
         p_result dr = p_read(dst, MOST_FILE, &there, &tlen);
@@ -270,7 +211,7 @@ static void list_free(str_list *l) {
 static bool list_push(str_list *l, const char *s, size_t n) {
     if (l->cap_limit && l->count >= l->cap_limit) return false;
     if (l->count == l->capacity) {
-        size_t cap = l->capacity ? l->capacity * 2 : 64;
+        size_t cap = l->capacity ? l->capacity * 2 : 16;
         if (l->cap_limit && cap > l->cap_limit) cap = l->cap_limit;
         char **next = p_alloc(cap * sizeof *next);
         if (!next) return l->failed = true, false;
@@ -302,42 +243,70 @@ static void sort_list(str_list *l) {
 }
 
 typedef struct {
-    const char *id;
-    size_t id_len;
+    char *id;
+    char month[8];
     str_list seen;
     str_list links;
-    bool has_other;
-} id_events;
+    unsigned arch_links;
+    bool post_removed;
+    bool peer_moved;
+} batch_item;
 
-static bool gather_id_events(void *user, const char *name) {
-    id_events *e = user;
-    size_t n = len(name);
-    if (n > 5 && same(name + n - 5, ".part")) return true;
-    if (n <= e->id_len + 1 || name[e->id_len] != '.') return true;
-    for (size_t i = 0; i < e->id_len; i++) if (name[i] != e->id[i]) return true;
-    const char *ev = name + e->id_len + 1;
-    if (same(ev, "post")) return true;
-    if (starts(ev, "seen.")) list_push(&e->seen, ev, len(ev));
-    else if (starts(ev, "link.")) list_push(&e->links, ev, len(ev));
-    else e->has_other = true;
-    return !e->seen.failed && !e->links.failed;
+typedef struct {
+    batch_item *items;
+    size_t count;
+    bool failed;
+} batch_events;
+
+static int find_batch_id(const batch_events *be, const char *id, size_t id_len) {
+    size_t low = 0, high = be->count;
+    while (low < high) {
+        size_t mid = low + (high - low) / 2;
+        const char *cand = be->items[mid].id;
+        int ord = 0;
+        for (size_t i = 0; i < id_len && !ord; i++) ord = (unsigned char)cand[i] - (unsigned char)id[i];
+        if (!ord) ord = (unsigned char)cand[id_len];
+        if (!ord) return (int)mid;
+        if (ord < 0) low = mid + 1;
+        else high = mid;
+    }
+    return -1;
 }
 
-static bool collect_id_events(const char *folder, const char *id, id_events *e) {
-    *e = (id_events){.id = id, .id_len = len(id)};
-    text dir = {0};
-    add(&dir, folder), add(&dir, "/messages");
-    p_result r = dir.failed ? P_FAILED : p_list(dir.data, gather_id_events, e);
-    text_free(&dir);
-    if (r != P_OK || e->seen.failed || e->links.failed) return false;
-    sort_list(&e->seen);
-    sort_list(&e->links);
+static bool attach_events(void *user, const char *name) {
+    batch_events *be = user;
+    size_t n = len(name);
+    if (n > 5 && same(name + n - 5, ".part")) return true;
+    const char *dot = name;
+    while (*dot && *dot != '.') dot++;
+    if (!*dot) return true;
+    size_t id_len = (size_t)(dot - name);
+    int idx = find_batch_id(be, name, id_len);
+    if (idx < 0) return true;
+    const char *ev = dot + 1;
+    if (same(ev, "post")) return true;
+    if (starts(ev, "seen.")) list_push(&be->items[idx].seen, ev, len(ev));
+    else if (starts(ev, "link.")) list_push(&be->items[idx].links, ev, len(ev));
+    if (be->items[idx].seen.failed || be->items[idx].links.failed) return be->failed = true, false;
     return true;
 }
 
-static void free_id_events(id_events *e) {
-    list_free(&e->seen);
-    list_free(&e->links);
+static bool populate_batch_events(const char *folder, batch_events *be) {
+    for (size_t i = 0; i < be->count; i++) {
+        list_free(&be->items[i].seen);
+        list_free(&be->items[i].links);
+    }
+    be->failed = false;
+    text dir = {0};
+    add(&dir, folder), add(&dir, "/messages");
+    p_result r = dir.failed ? P_FAILED : p_list(dir.data, attach_events, be);
+    text_free(&dir);
+    if (r != P_OK || be->failed) return false;
+    for (size_t i = 0; i < be->count; i++) {
+        sort_list(&be->items[i].seen);
+        sort_list(&be->items[i].links);
+    }
+    return true;
 }
 
 static void add_report(text *report, const char *id, const char *why) {
@@ -348,7 +317,6 @@ static void add_report(text *report, const char *id, const char *why) {
     text_free(&clean_id);
 }
 
-/* Ensures archive/ and archive/<month> exist durably. */
 static bool ensure_archive_month(const char *folder, const char *month) {
     text a = {0}, m = {0};
     add(&a, folder), add(&a, "/archive");
@@ -358,34 +326,32 @@ static bool ensure_archive_month(const char *folder, const char *month) {
     return ok;
 }
 
-/* Copies valid late .seen.* marks to archive then removes live .seen.*, then removes live .link.* last-to-first. */
-static s_result sweep_live_tail(const char *folder, const char *month, const char *id,
+/* Verifies and removes live .seen.* (copying valid late marks first) and live .link.* (last-to-first,
+   verifying byte-equality against archive copies before removing). */
+static s_result sweep_item_tail(const char *folder, const batch_item *it,
                                 void (*pause)(void *user, const char *stage), void *pause_user, const char **why) {
-    id_events ev;
-    if (!collect_id_events(folder, id, &ev)) {
-        free_id_events(&ev);
-        *why = "the store cannot be read";
-        return S_DAMAGED;
-    }
     s_result res = S_OK;
-    for (size_t i = 0; res == S_OK && i < ev.seen.count; i++) {
+    for (size_t i = 0; res == S_OK && i < it->seen.count; i++) {
         text src = {0}, dst = {0};
-        live_path(folder, &src, id, ev.seen.items[i]);
-        arch_path(folder, month, &dst, id, ev.seen.items[i]);
+        live_path(folder, &src, it->id, it->seen.items[i]);
+        arch_path(folder, it->month, &dst, it->id, it->seen.items[i]);
         char *data = NULL;
         size_t length = 0;
         p_result sr = src.failed || dst.failed ? P_FAILED : p_read(src.data, MOST_FILE, &data, &length);
         if (sr == P_OK) {
             bool valid_seen = length == len(ARCHIVE_SEEN) && same(data, ARCHIVE_SEEN);
             p_free(data);
-            if (valid_seen) {
+            if (!valid_seen) {
+                *why = "a seen mark is damaged";
+                res = S_DAMAGED;
+            } else {
                 s_result cr = copy_durable(src.data, dst.data, why);
                 if (cr == S_DAMAGED) res = S_DAMAGED;
-            }
-            if (res == S_OK) {
-                if (pause) pause(pause_user, "before-remove-seen");
-                p_result rm = p_remove(src.data);
-                if (rm != P_OK && rm != P_MISSING) *why = "a seen mark could not be removed", res = S_DAMAGED;
+                else {
+                    if (pause) pause(pause_user, "before-remove-seen");
+                    p_result rm = p_remove(src.data);
+                    if (rm != P_OK && rm != P_MISSING) *why = "a seen mark could not be removed", res = S_DAMAGED;
+                }
             }
         } else if (sr != P_MISSING) {
             *why = "a seen mark cannot be read";
@@ -394,21 +360,67 @@ static s_result sweep_live_tail(const char *folder, const char *month, const cha
         text_free(&src), text_free(&dst);
     }
     if (res == S_OK && pause) pause(pause_user, "after-remove-seen");
-    for (size_t i = ev.links.count; res == S_OK && i-- > 0;) {
-        text src = {0};
-        live_path(folder, &src, id, ev.links.items[i]);
+    for (size_t i = it->links.count; res == S_OK && i-- > 0;) {
+        const char *ev = it->links.items[i];
+        text src = {0}, dst = {0};
+        live_path(folder, &src, it->id, ev);
+        arch_path(folder, it->month, &dst, it->id, ev);
+        char *ldata = NULL;
+        size_t llen = 0;
+        p_result lr = src.failed || dst.failed ? P_FAILED : p_read(src.data, MOST_FILE, &ldata, &llen);
+        if (lr == P_MISSING) {
+            text_free(&src), text_free(&dst);
+            continue;
+        }
+        if (lr != P_OK) {
+            *why = "a live step cannot be read";
+            res = S_DAMAGED;
+            text_free(&src), text_free(&dst);
+            break;
+        }
+        unsigned idx = 0;
+        bool known_idx = parse_link_index(ev, &idx);
+        if (!known_idx) {
+            p_free(ldata);
+            *why = "a step name is damaged";
+            res = S_DAMAGED;
+            text_free(&src), text_free(&dst);
+            break;
+        }
+        if (idx < it->arch_links) {
+            char *adata = NULL;
+            size_t alen = 0;
+            p_result ar = p_read(dst.data, MOST_FILE, &adata, &alen);
+            bool equal = ar == P_OK && alen == llen;
+            for (size_t k = 0; equal && k < llen; k++) equal = adata[k] == ldata[k];
+            p_free(adata);
+            if (!equal) {
+                p_free(ldata);
+                *why = "archive copy differs from live step";
+                res = S_DAMAGED;
+                text_free(&src), text_free(&dst);
+                break;
+            }
+            if (p_sync(dst.data) != P_OK) {
+                p_free(ldata);
+                *why = "an archive copy cannot be flushed";
+                res = S_DAMAGED;
+                text_free(&src), text_free(&dst);
+                break;
+            }
+        }
+        p_free(ldata);
         if (pause) pause(pause_user, "before-remove-link");
-        p_result rm = src.failed ? P_FAILED : p_remove(src.data);
-        text_free(&src);
+        p_result rm = p_remove(src.data);
+        text_free(&src), text_free(&dst);
         if (rm != P_OK && rm != P_MISSING) *why = "a step could not be removed", res = S_DAMAGED;
     }
-    free_id_events(&ev);
     return res;
 }
 
 typedef struct {
     str_list ids;
-    const char *after; /* resume strictly after this ID on next bounded batch */
+    const char *after;
     bool truncated;
 } batch_ctx;
 
@@ -441,7 +453,6 @@ static bool gather_batch(void *user, const char *name) {
             }
         } else {
             b->truncated = true;
-            /* Keep the cap_limit lexicographically smallest IDs > after so unsorted readdir never skips any ID. */
             size_t max_i = 0;
             for (size_t i = 1; i < b->ids.count; i++)
                 if (compare(b->ids.items[i], b->ids.items[max_i]) > 0) max_i = i;
@@ -456,51 +467,52 @@ static bool gather_batch(void *user, const char *name) {
     return true;
 }
 
-static s_result archive_one(const char *folder, const char *id, uint64_t now,
-                            bool *did_move, bool *peer_moved, text *report,
-                            void (*pause)(void *user, const char *stage), void *pause_user) {
-    *did_move = false;
-    *peer_moved = false;
+/* Prepares and copies one item (and removes its live .post). Leaves live tail sweep for the single batch pass! */
+static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_t now,
+                                     text *report, void (*pause)(void *user, const char *stage), void *pause_user) {
     const char *why = NULL;
-    if (!valid_id(id)) {
-        add_report(report, id, "that is not a message id");
+    if (!valid_id(it->id)) {
+        add_report(report, it->id, "that is not a message id");
         return S_DAMAGED;
     }
-    char month[8];
-    if (!archive_month(id, month)) {
-        add_report(report, id, "the message id has no valid date");
+    if (!archive_month(it->id, it->month)) {
+        add_report(report, it->id, "the message id has no valid date");
         return S_DAMAGED;
     }
     text post_p = {0};
-    live_path(folder, &post_p, id, "post");
+    live_path(folder, &post_p, it->id, "post");
     char *pdata = NULL;
     size_t plen = 0;
     p_result pr = post_p.failed ? P_FAILED : p_read(post_p.data, MOST_FILE, &pdata, &plen);
     if (pr == P_MISSING) {
         text_free(&post_p);
-        /* Live post is proven absent: sweep live tail ONLY if archive holds a validated terminal job. */
-        if (!archive_has_terminal_job(folder, id)) return S_NOTHING;
-        if (!ensure_archive_month(folder, month)) {
-            add_report(report, id, "archive folder cannot be created");
+        unsigned alinks = 0;
+        s_result tr = archive_has_terminal_job(folder, it->id, &alinks);
+        if (tr != S_OK) {
+            /* Live link/seen without live post and without a validated archived terminal job is genuine damage! */
+            if (it->links.count > 0 || it->seen.count > 0) {
+                add_report(report, it->id, tr == S_DAMAGED ? "archived terminal chain is damaged or incomplete" : "orphan event without post");
+                return S_DAMAGED;
+            }
+            return S_NOTHING;
+        }
+        if (!ensure_archive_month(folder, it->month)) {
+            add_report(report, it->id, "archive folder cannot be created");
             return S_DAMAGED;
         }
-        s_result sw = sweep_live_tail(folder, month, id, pause, pause_user, &why);
-        if (sw != S_OK) {
-            add_report(report, id, why);
-            return S_DAMAGED;
-        }
-        *did_move = true;
+        it->arch_links = alinks;
+        it->post_removed = true;
         return S_OK;
     }
     if (pr != P_OK) {
         text_free(&post_p);
-        add_report(report, id, "the message cannot be read");
+        add_report(report, it->id, "the message cannot be read");
         return S_DAMAGED;
     }
     message m = {0};
-    if (parse_post_bytes(pdata, plen, id, &m, &why) != S_OK) {
+    if (store_parse_post(pdata, plen, it->id, &m, &why) != S_OK) {
         text_free(&post_p);
-        add_report(report, id, why);
+        add_report(report, it->id, why);
         return S_DAMAGED;
     }
     if (!is_job(&m)) {
@@ -509,93 +521,48 @@ static s_result archive_one(const char *folder, const char *id, uint64_t now,
         return S_NOTHING;
     }
 
-    /* Fast path: replay links directly before scanning the directory so open/recent jobs never re-list messages/. */
-    store fast = {.folder = folder};
-    job j = {0};
-    s_result jr = store_job(&fast, &m, &j);
-    if (jr == S_REFUSED) {
-        message_free(&m);
-        text_free(&post_p);
-        *peer_moved = true;
-        return S_OK;
-    }
-    if (jr != S_OK) {
-        message_free(&m);
-        text_free(&post_p);
-        add_report(report, id, fast.why ? fast.why : "a step of this job is damaged");
-        return S_DAMAGED;
-    }
-    if ((j.state != DONE && j.state != REFUSED) || j.when > now || now - j.when < ARCHIVE_AGE_US) {
-        /* Still verify no link gap exists when a job looks open/taken/recent only if links were read? No: gap()
-           catches missing link.0000 when link.0001 exists; for archiving, an eligible job re-verifies with full
-           link list below, and ineligible jobs are checked by helio check. Wait: check if a damaged job with a
-           missing link.0000 must be named by helio archive -> check link.0001 if j.links == 0! */
-        text probe_ev = {0}, probe_p = {0};
-        link_suffix(&probe_ev, j.links + 1);
-        if (!probe_ev.failed) live_path(folder, &probe_p, id, probe_ev.data);
-        char *pd = NULL;
-        size_t pl = 0;
-        p_result pr2 = probe_ev.failed || probe_p.failed ? P_MISSING : p_read(probe_p.data, 64, &pd, &pl);
-        p_free(pd);
-        text_free(&probe_ev), text_free(&probe_p);
-        message_free(&m);
-        text_free(&post_p);
-        if (pr2 != P_MISSING) {
-            add_report(report, id, "a step of this job is missing");
-            return S_DAMAGED;
-        }
-        return S_NOTHING;
-    }
-
-    /* Eligible closed job: gather all live links and seen marks and re-verify chain with full gap() check. */
-    id_events ev;
-    if (!collect_id_events(folder, id, &ev)) {
-        free_id_events(&ev);
-        message_free(&m);
-        text_free(&post_p);
-        add_report(report, id, "the store cannot be read");
-        return S_DAMAGED;
-    }
-    store mini = {.folder = folder, .names = NULL, .count = 0};
+    /* Build mini.names from the single batch scan (zero extra p_list calls!). */
     str_list link_names = {0};
-    for (size_t i = 0; i < ev.links.count; i++) {
+    for (size_t i = 0; i < it->links.count; i++) {
         text full = {0};
-        add(&full, id), add(&full, "."), add(&full, ev.links.items[i]);
+        add(&full, it->id), add(&full, "."), add(&full, it->links.items[i]);
         if (full.failed || !list_push(&link_names, full.data, full.length)) link_names.failed = true;
         text_free(&full);
     }
     if (link_names.failed) {
         list_free(&link_names);
-        free_id_events(&ev);
         message_free(&m);
         text_free(&post_p);
-        add_report(report, id, "out of memory");
+        add_report(report, it->id, "out of memory");
         return S_DAMAGED;
     }
     sort_list(&link_names);
-    mini.names = link_names.items;
-    mini.count = link_names.count;
-    jr = store_job(&mini, &m, &j);
+    store mini = {.folder = folder, .names = link_names.items, .count = link_names.count};
+    job j = {0};
+    s_result jr = store_job(&mini, &m, &j);
     list_free(&link_names);
     if (jr == S_REFUSED) {
-        free_id_events(&ev);
         message_free(&m);
         text_free(&post_p);
-        *peer_moved = true;
+        it->peer_moved = true;
         return S_OK;
     }
     if (jr != S_OK) {
-        free_id_events(&ev);
         message_free(&m);
         text_free(&post_p);
-        add_report(report, id, mini.why ? mini.why : "a step of this job is damaged");
+        add_report(report, it->id, mini.why ? mini.why : "a step of this job is damaged");
         return S_DAMAGED;
+    }
+    if ((j.state != DONE && j.state != REFUSED) || j.when > now || now - j.when < ARCHIVE_AGE_US) {
+        message_free(&m);
+        text_free(&post_p);
+        return S_NOTHING;
     }
 
     /* Validate all live seen marks before copying anything. */
-    for (size_t i = 0; i < ev.seen.count; i++) {
+    for (size_t i = 0; i < it->seen.count; i++) {
         text sp = {0};
-        live_path(folder, &sp, id, ev.seen.items[i]);
+        live_path(folder, &sp, it->id, it->seen.items[i]);
         char *sd = NULL;
         size_t sl = 0;
         p_result sr = sp.failed ? P_FAILED : p_read(sp.data, MOST_FILE, &sd, &sl);
@@ -604,33 +571,30 @@ static s_result archive_one(const char *folder, const char *id, uint64_t now,
         bool ok_seen = sr == P_OK && sl == len(ARCHIVE_SEEN) && same(sd, ARCHIVE_SEEN);
         p_free(sd);
         if (!ok_seen) {
-            free_id_events(&ev);
             message_free(&m);
             text_free(&post_p);
-            add_report(report, id, "a seen mark is damaged");
+            add_report(report, it->id, "a seen mark is damaged");
             return S_DAMAGED;
         }
     }
 
-    if (!ensure_archive_month(folder, month)) {
-        free_id_events(&ev);
+    if (!ensure_archive_month(folder, it->month)) {
         message_free(&m);
         text_free(&post_p);
-        add_report(report, id, "archive folder cannot be created");
+        add_report(report, it->id, "archive folder cannot be created");
         return S_DAMAGED;
     }
 
-    /* Phase 1: Copy post, all steps, and all seen marks to archive/<YYYY-MM>/ before removing anything. */
+    /* Copy post, steps, and seen marks to archive/<YYYY-MM>/ before removing anything. */
     text dst_post = {0};
-    arch_path(folder, month, &dst_post, id, "post");
+    arch_path(folder, it->month, &dst_post, it->id, "post");
     if (pause) pause(pause_user, "before-copy-post");
     s_result cr = dst_post.failed ? (why = "out of memory", S_DAMAGED) : copy_durable(post_p.data, dst_post.data, &why);
     text_free(&dst_post);
     if (cr == S_DAMAGED) {
-        free_id_events(&ev);
         message_free(&m);
         text_free(&post_p);
-        add_report(report, id, why);
+        add_report(report, it->id, why);
         return S_DAMAGED;
     }
     if (pause) pause(pause_user, "after-copy-post");
@@ -639,57 +603,49 @@ static s_result archive_one(const char *folder, const char *id, uint64_t now,
         text lnm = {0}, lsrc = {0}, ldst = {0};
         link_suffix(&lnm, k);
         if (!lnm.failed) {
-            live_path(folder, &lsrc, id, lnm.data);
-            arch_path(folder, month, &ldst, id, lnm.data);
+            live_path(folder, &lsrc, it->id, lnm.data);
+            arch_path(folder, it->month, &ldst, it->id, lnm.data);
         }
         if (pause) pause(pause_user, "before-copy-link");
         s_result lr = lnm.failed || lsrc.failed || ldst.failed ? (why = "out of memory", S_DAMAGED) : copy_durable(lsrc.data, ldst.data, &why);
         text_free(&lnm), text_free(&lsrc), text_free(&ldst);
         if (lr == S_DAMAGED) {
-            free_id_events(&ev);
             message_free(&m);
             text_free(&post_p);
-            add_report(report, id, why);
+            add_report(report, it->id, why);
             return S_DAMAGED;
         }
     }
     if (pause) pause(pause_user, "after-copy-links");
 
-    for (size_t i = 0; i < ev.seen.count; i++) {
+    for (size_t i = 0; i < it->seen.count; i++) {
         text ssrc = {0}, sdst = {0};
-        live_path(folder, &ssrc, id, ev.seen.items[i]);
-        arch_path(folder, month, &sdst, id, ev.seen.items[i]);
+        live_path(folder, &ssrc, it->id, it->seen.items[i]);
+        arch_path(folder, it->month, &sdst, it->id, it->seen.items[i]);
         if (pause) pause(pause_user, "before-copy-seen");
         s_result sr = ssrc.failed || sdst.failed ? (why = "out of memory", S_DAMAGED) : copy_durable(ssrc.data, sdst.data, &why);
         text_free(&ssrc), text_free(&sdst);
         if (sr == S_DAMAGED) {
-            free_id_events(&ev);
             message_free(&m);
             text_free(&post_p);
-            add_report(report, id, why);
+            add_report(report, it->id, why);
             return S_DAMAGED;
         }
     }
-    free_id_events(&ev);
     message_free(&m);
 
-    /* Phase 2: Remove post first, then seen marks (preserving any late seen marks!), then steps last-to-first. */
     if (pause) pause(pause_user, "before-remove-post");
     p_result rm_post = p_remove(post_p.data);
     text_free(&post_p);
     if (rm_post != P_OK && rm_post != P_MISSING) {
-        add_report(report, id, "the post could not be removed");
+        add_report(report, it->id, "the post could not be removed");
         return S_DAMAGED;
     }
     if (pause) pause(pause_user, "after-remove-post");
 
-    s_result sw = sweep_live_tail(folder, month, id, pause, pause_user, &why);
-    if (sw != S_OK) {
-        add_report(report, id, why);
-        return S_DAMAGED;
-    }
-    if (rm_post == P_MISSING) *peer_moved = true;
-    else *did_move = true;
+    it->arch_links = j.links;
+    it->post_removed = true;
+    if (rm_post == P_MISSING) it->peer_moved = true;
     return S_OK;
 }
 
@@ -714,7 +670,7 @@ s_result archive_store(const char *folder, size_t limit, size_t *moved, text *re
             if (report) add(report, "there is no store here: run helio init\n");
             return S_DAMAGED;
         }
-        if ((lr != P_OK && !b.truncated) || b.ids.failed) {
+        if (lr != P_OK || b.ids.failed) {
             list_free(&b.ids);
             p_free(cursor);
             text_free(&msg_dir);
@@ -726,14 +682,55 @@ s_result archive_store(const char *folder, size_t limit, size_t *moved, text *re
             break;
         }
         sort_list(&b.ids);
-        for (size_t i = 0; i < b.ids.count; i++) {
-            bool did = false, peer = false;
-            s_result r = archive_one(folder, b.ids.items[i], now, &did, &peer, report, pause, pause_user);
-            if (r == S_DAMAGED) had_damage = true;
-            if (did) total_moved++;
-            if (peer) total_peer++;
-            if (limit && total_moved >= limit) break;
+        batch_events be = {.items = p_alloc(b.ids.count * sizeof *be.items), .count = b.ids.count};
+        if (!be.items) {
+            list_free(&b.ids);
+            had_damage = true;
+            break;
         }
+        for (size_t i = 0; i < b.ids.count; i++) be.items[i].id = b.ids.items[i];
+
+        /* One directory pass collects all .link.* and .seen.* for the entire batch! */
+        if (!populate_batch_events(folder, &be)) {
+            had_damage = true;
+            if (report) add(report, "the store cannot be read\n");
+        } else {
+            size_t batch_post_removed = 0;
+            for (size_t i = 0; i < be.count; i++) {
+                s_result r = copy_and_unlink_post(folder, &be.items[i], now, report, pause, pause_user);
+                if (r == S_DAMAGED) had_damage = true;
+                if (be.items[i].post_removed) batch_post_removed++;
+                else if (be.items[i].peer_moved) total_peer++;
+                if (limit && total_moved + batch_post_removed >= limit) break;
+            }
+            /* One single post-unlink scan collects any late .seen.* marks for all moved jobs in this batch! */
+            if (batch_post_removed > 0) {
+                if (!populate_batch_events(folder, &be)) {
+                    had_damage = true;
+                    if (report) add(report, "the store cannot be read\n");
+                } else {
+                    for (size_t i = 0; i < be.count; i++) {
+                        if (!be.items[i].post_removed) continue;
+                        const char *why = NULL;
+                        s_result sw = sweep_item_tail(folder, &be.items[i], pause, pause_user, &why);
+                        if (sw != S_OK) {
+                            add_report(report, be.items[i].id, why);
+                            had_damage = true;
+                        } else if (be.items[i].peer_moved) {
+                            total_peer++;
+                        } else {
+                            total_moved++;
+                        }
+                    }
+                }
+            }
+        }
+        for (size_t i = 0; i < be.count; i++) {
+            list_free(&be.items[i].seen);
+            list_free(&be.items[i].links);
+        }
+        p_free(be.items);
+
         if ((limit && total_moved >= limit) || !b.truncated) {
             list_free(&b.ids);
             break;
@@ -754,36 +751,108 @@ s_result archive_store(const char *folder, size_t limit, size_t *moved, text *re
     return (total_moved > 0 || total_peer > 0) ? S_OK : S_NOTHING;
 }
 
-s_result archive_daily(const char *folder, void (*pause)(void *user, const char *stage), void *pause_user) {
-    text day = {0}, sdir = {0}, mark = {0}, unique = {0};
-    add_time(&day, p_now());
+static bool parse_claim(const char *data, uint64_t *ts, size_t *done) {
+    uint64_t t = 0;
+    size_t d = 0;
+    const char *p = data;
+    if (*p < '0' || *p > '9') return false;
+    while (*p >= '0' && *p <= '9') t = t * 10 + (uint64_t)(*p++ - '0');
+    if (*p != ' ') return false;
+    p++;
+    if (*p < '0' || *p > '9') return false;
+    while (*p >= '0' && *p <= '9') d = d * 10 + (size_t)(*p++ - '0');
+    *ts = t, *done = d;
+    return true;
+}
+
+s_result archive_daily(const char *folder, text *report, void (*pause)(void *user, const char *stage), void *pause_user) {
+    uint64_t now = p_now();
+    text day = {0}, sdir = {0}, mark = {0}, claim = {0}, unique = {0};
+    add_time(&day, now);
     if (day.data) day.data[day.length = 10] = 0;
     add(&sdir, folder), add(&sdir, "/summary");
     add(&mark, sdir.data ? sdir.data : ""), add(&mark, "/"), add(&mark, day.data ? day.data : ""), add(&mark, ".archived");
+    add(&claim, sdir.data ? sdir.data : ""), add(&claim, "/"), add(&claim, day.data ? day.data : ""), add(&claim, ".claiming");
     add_number(&unique, p_tick(), 0);
-    bool full = day.failed || sdir.failed || mark.failed || unique.failed;
+    bool full = day.failed || sdir.failed || mark.failed || claim.failed || unique.failed;
     char *there = NULL;
     size_t tlen = 0;
     p_result got = full ? P_FAILED : p_read(mark.data, 64, &there, &tlen);
     p_free(there);
-    s_result res = S_OK;
-    if (got == P_MISSING) {
-        size_t moved = 0;
-        text report = {0};
-        s_result ar = archive_store(folder, 200, &moved, &report, pause, pause_user);
-        text_free(&report);
-        if (ar == S_DAMAGED) {
-            res = S_DAMAGED;
-        } else {
-            text body = {0};
-            add_number(&body, (uint64_t)moved, 0), add(&body, "\n");
-            p_result wr = body.failed || p_folder(sdir.data) != P_OK ? P_FAILED : p_write(mark.data, body.data, body.length, false, unique.data);
-            text_free(&body);
-            if (wr != P_OK && wr != P_EXISTS) res = S_DAMAGED;
-        }
-    } else if (got != P_OK) {
-        res = S_DAMAGED;
+    if (got == P_OK) {
+        text_free(&day), text_free(&sdir), text_free(&mark), text_free(&claim), text_free(&unique);
+        return S_OK;
     }
-    text_free(&day), text_free(&sdir), text_free(&mark), text_free(&unique);
+    if (got != P_MISSING) {
+        text_free(&day), text_free(&sdir), text_free(&mark), text_free(&claim), text_free(&unique);
+        return S_DAMAGED;
+    }
+    if (p_folder(sdir.data) != P_OK) {
+        text_free(&day), text_free(&sdir), text_free(&mark), text_free(&claim), text_free(&unique);
+        return S_DAMAGED;
+    }
+
+    /* Claim today's 200-job pass so concurrent inboxes do not exceed 200 and stale crashes resume cleanly. */
+    size_t prior_done = 0;
+    text cbody = {0};
+    add_number(&cbody, now, 0), add(&cbody, " 0\n");
+    p_result cw = cbody.failed ? P_FAILED : p_write(claim.data, cbody.data, cbody.length, false, unique.data);
+    text_free(&cbody);
+    if (cw == P_EXISTS) {
+        char *cdata = NULL;
+        size_t clen = 0;
+        p_result cr = p_read(claim.data, 128, &cdata, &clen);
+        uint64_t cts = 0;
+        size_t cdone = 0;
+        bool parsed = cr == P_OK && parse_claim(cdata, &cts, &cdone);
+        p_free(cdata);
+        if (cr == P_MISSING) {
+            /* Completed by peer just now. */
+            text_free(&day), text_free(&sdir), text_free(&mark), text_free(&claim), text_free(&unique);
+            return S_OK;
+        }
+        if (parsed && cts <= now && now - cts < CLAIM_STALE_US) {
+            /* Another live inbox holds today's claim. */
+            text_free(&day), text_free(&sdir), text_free(&mark), text_free(&claim), text_free(&unique);
+            return S_OK;
+        }
+        /* Stale claim from a crashed inbox: take over with remaining budget. */
+        prior_done = parsed ? cdone : 0;
+        text take_body = {0};
+        add_number(&take_body, now, 0), add(&take_body, " "), add_number(&take_body, (uint64_t)prior_done, 0), add(&take_body, "\n");
+        p_result rw = take_body.failed ? P_FAILED : p_write(claim.data, take_body.data, take_body.length, true, unique.data);
+        text_free(&take_body);
+        if (rw != P_OK) {
+            text_free(&day), text_free(&sdir), text_free(&mark), text_free(&claim), text_free(&unique);
+            return S_DAMAGED;
+        }
+    } else if (cw != P_OK) {
+        text_free(&day), text_free(&sdir), text_free(&mark), text_free(&claim), text_free(&unique);
+        return S_DAMAGED;
+    }
+
+    size_t remaining = prior_done < 200 ? 200 - prior_done : 0;
+    size_t moved = 0;
+    s_result res = S_OK;
+    if (remaining > 0) {
+        s_result ar = archive_store(folder, remaining, &moved, report, pause, pause_user);
+        if (ar == S_DAMAGED) {
+            /* Persist progress in .claiming so a retry respects the 200 cap, and surface S_DAMAGED. */
+            text prog = {0};
+            add_number(&prog, p_now(), 0), add(&prog, " "), add_number(&prog, (uint64_t)(prior_done + moved), 0), add(&prog, "\n");
+            if (!prog.failed) p_write(claim.data, prog.data, prog.length, true, unique.data);
+            text_free(&prog);
+            res = S_DAMAGED;
+        }
+    }
+    if (res == S_OK) {
+        text body = {0};
+        add_number(&body, (uint64_t)(prior_done + moved), 0), add(&body, "\n");
+        p_result wr = body.failed ? P_FAILED : p_write(mark.data, body.data, body.length, false, unique.data);
+        text_free(&body);
+        if (wr != P_OK && wr != P_EXISTS) res = S_DAMAGED;
+        else p_remove(claim.data);
+    }
+    text_free(&day), text_free(&sdir), text_free(&mark), text_free(&claim), text_free(&unique);
     return res;
 }

@@ -57,3 +57,5 @@ bool is_for(const message *m, const char *me);
 bool was_seen(store *s, const char *id, const char *me);
 s_result store_job(store *s, const message *m, job *out);
 void clean(text *out, const char *in, bool one_line);
+s_result store_parse_post(char *data, size_t length, const char *id, message *out, const char **why);
+bool store_apply_step(const message *m, job *now, char *data);

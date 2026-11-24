@@ -49,6 +49,7 @@ p_result p_input(size_t most, char **data, size_t *length) { return all(0, most,
 /* The name is on the disk too, not only the bytes. */
 #ifdef HELIO_TEST_HOOKS
 bool plat_fail_flush = false;
+bool plat_fail_sync = false;
 #endif
 static bool settle(const char *path) {
 #ifdef HELIO_TEST_HOOKS
@@ -101,12 +102,12 @@ p_result p_remove(const char *path) {
 
 p_result p_sync(const char *path) {
 #ifdef HELIO_TEST_HOOKS
-    if (plat_fail_flush) return P_FAILED;
+    if (plat_fail_flush || plat_fail_sync) return P_FAILED;
 #endif
     int file = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
     if (file < 0) return why();
     struct stat info;
-    bool good = !fstat(file, &info) && S_ISREG(info.st_mode) && (!fsync(file) || errno == EINVAL || errno == ENOTSUP);
+    bool good = !fstat(file, &info) && S_ISREG(info.st_mode) && !fsync(file);
     close(file);
     return good && settle(path) ? P_OK : P_FAILED;
 }
@@ -115,7 +116,7 @@ static bool sync_dir(const char *path) {
 #ifdef HELIO_TEST_HOOKS
     if (plat_fail_flush) return false;
 #endif
-    int file = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int file = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (file < 0) return false;
     bool good = !fsync(file) || errno == EINVAL || errno == ENOTSUP;
     close(file);
@@ -125,7 +126,7 @@ static bool sync_dir(const char *path) {
 p_result p_folder(const char *path) {
     struct stat info;
     if (!mkdir(path, 0700)) return settle(path) && sync_dir(path) ? P_OK : P_FAILED;
-    if (errno == EEXIST && !stat(path, &info) && S_ISDIR(info.st_mode)) return settle(path) && sync_dir(path) ? P_OK : P_FAILED;
+    if (errno == EEXIST && !lstat(path, &info) && S_ISDIR(info.st_mode)) return settle(path) && sync_dir(path) ? P_OK : P_FAILED;
     return errno == EEXIST ? P_FAILED : why();
 }
 
