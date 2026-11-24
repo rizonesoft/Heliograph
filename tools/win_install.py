@@ -422,8 +422,8 @@ def _find_winning_helio(reg_key: str, win_to: Path) -> Path | None:
 def _find_winning_helio_sh(reg_key: str, win_to: Path) -> Path | None:
     """Return the first extensionless `helio` (Git Bash / POSIX shim) resolved via Windows effective PATH.
 
-    Preserves the symlink location (without resolving the leaf) so a symlink in an earlier PATH directory
-    is detected as shadowing `<win_to>\\helio` (since `dirname "$0"` in the shim follows the invocation dir).
+    Resolves the parent directory (so a directory junction to `<win_to>` matches) while preserving the leaf
+    (so a file symlink in a different directory is detected as shadowing).
     """
     for d in _effective_win_path_dirs(reg_key):
         dp = Path(d)
@@ -431,7 +431,7 @@ def _find_winning_helio_sh(reg_key: str, win_to: Path) -> Path | None:
             continue
         cand = dp / WIN_SH_NAME
         if cand.is_file():
-            return Path(os.path.abspath(str(cand)))
+            return cand.parent.resolve() / cand.name
     return None
 
 
@@ -440,7 +440,7 @@ def _annotate_shadowing(manifest: dict[str, Any], reg_key: str, dest: Path) -> d
     winner_sh = _find_winning_helio_sh(reg_key, dest)
     out = dict(manifest)
     cmd_target = (dest / WIN_CMD_NAME).resolve()
-    sh_target = Path(os.path.abspath(str(dest / WIN_SH_NAME)))
+    sh_target = dest.resolve() / WIN_SH_NAME
     if winner is None:
         out["shadowed_by"] = "none (.CMD missing from PATHEXT)"
         out["shadowed_target"] = str(cmd_target)
@@ -1256,7 +1256,7 @@ def win_status(*, win_to: Path | None = None, reg_key: str = DEFAULT_REG_KEY) ->
                 problems.append(f"another helio earlier on PATH shadows {cmd_p}: {winner}")
             if cur.get("helio_sh_sha256"):
                 winner_sh = _find_winning_helio_sh(reg_key, dest)
-                if winner_sh is not None and os.path.normcase(str(winner_sh)) != os.path.normcase(os.path.abspath(str(sh_p))):
+                if winner_sh is not None and os.path.normcase(str(winner_sh)) != os.path.normcase(str(dest.resolve() / WIN_SH_NAME)):
                     problems.append(f"another extensionless helio earlier on PATH shadows Git Bash shim {sh_p}: {winner_sh}")
 
     store_p = Path(cur["store"])
