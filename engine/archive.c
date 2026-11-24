@@ -526,8 +526,26 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
         p_result ar = dst_post.failed ? P_FAILED : p_read(dst_post.data, MOST_FILE, &adata, &alen);
         bool equal = ar == P_OK && alen == plen;
         for (size_t k = 0; equal && k < plen; k++) equal = adata[k] == pdata[k];
-        p_free(adata);
-        p_free(pdata);
+        if (!equal && ar == P_OK) {
+            /* A killed keyed retry can republish the same message at a later second (different time: header only).
+               Accept and sweep the duplicate live post if every semantic field matches the archived post. */
+            message am = {0}, pm = {0};
+            const char *awhy = NULL, *pwhy = NULL;
+            s_result pa = store_parse_post(adata, alen, it->id, &am, &awhy);
+            s_result pp = store_parse_post(pdata, plen, it->id, &pm, &pwhy);
+            if (pa == S_OK && pp == S_OK) {
+                equal = same(am.from, pm.from) && same(am.to, pm.to) && same(am.kind, pm.kind) &&
+                        same(am.about, pm.about) && same(am.urgency, pm.urgency) && same(am.re, pm.re) &&
+                        am.due == pm.due && same(am.subject, pm.subject) && same(am.body, pm.body);
+            }
+            message_free(&am);
+            message_free(&pm);
+            adata = NULL;
+            pdata = NULL;
+        } else {
+            p_free(adata);
+            p_free(pdata);
+        }
         if (!equal) {
             text_free(&dst_post), text_free(&post_p);
             add_report(report, it->id, "archive copy differs from live file");

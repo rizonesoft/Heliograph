@@ -1410,9 +1410,12 @@ class Archive(Base):
             put(self.store / f"messages/{job_inf}.link.0000", l0_txt)
             put(self.store / f"messages/{job_inf}.link.0001", l1_txt)
             self.assertEqual(self.helio("archive", me=None).returncode, 0)
-            # Simulate a killed keyed retry leaving a duplicate live post while archived terminal job exists!
+            # Simulate a killed keyed retry leaving a duplicate live post (at a later second) while archived terminal job exists!
             arch_post = next((self.store / "archive").glob(f"*/{job_inf}.post"))
-            put(self.store / f"messages/{job_inf}.post", arch_post.read_text())
+            orig_arch_bytes = arch_post.read_bytes()
+            dup_lines = arch_post.read_text().splitlines(keepends=True)
+            dup_txt = "".join("time: 2026-12-31T23:59:59Z\n" if ln.startswith("time: ") else ln for ln in dup_lines)
+            put(self.store / f"messages/{job_inf}.post", dup_txt)
             put(self.store / "resume.write", "go")
             _, err_t = proc_t.communicate(timeout=30)
         finally:
@@ -1422,6 +1425,8 @@ class Archive(Base):
         self.assertIn(b"archived", err_t)
         self.assertFalse((self.store / f"messages/{job_inf}.link.0000").exists(), "rolled-back take must leave no link.0000")
         self.assertEqual(self.helio("archive", me=None).returncode, 0)
+        self.assertFalse((self.store / f"messages/{job_inf}.post").exists())
+        self.assertEqual(arch_post.read_bytes(), orig_arch_bytes, "original archived post must remain untouched")
         for name in ("paused.write", "resume.write"):
             (self.store / name).unlink(missing_ok=True)
 
