@@ -163,55 +163,16 @@ def _extract_wsl_distro(store_path: str) -> str | None:
 
 
 def render_win_cmd(default_store: str) -> str:
-    """Render helio.cmd (CRLF) forwarding %* directly (no call double-expansion) with WSL diagnostic."""
+    """Render helio.cmd (CRLF) forwarding %* directly to bin\\helio.exe with default HELIO_STORE."""
     if not default_store or any(ch in BATCH_FORBIDDEN for ch in default_store):
         raise WinInstallError(f"refusing unsafe store path for helio.cmd: {default_store!r}", code=2)
-    distro = _extract_wsl_distro(default_store)
-    if distro:
-        err_msg = f"helio: cannot reach WSL store '{default_store}' - check that WSL and distro '{distro}' are running"
-    else:
-        err_msg = f"helio: cannot reach store '{default_store}' - check that the store location is available"
     lines = [
         "@echo off",
         WIN_CMD_MARKER,
         "setlocal EnableExtensions",
-        'set "_H_HAS_STORE="',
-        'set "_H_SKIP="',
-        'set "_H_USED_DEFAULT="',
-        ":scan_args",
-        'if not "%~1"=="" goto :check_arg',
-        'if "%1"=="" goto :after_scan',
-        ":check_arg",
-        "if defined _H_SKIP (",
-        '  set "_H_SKIP="',
-        "  shift /1",
-        "  goto :scan_args",
-        ")",
-        'if "%~1"=="--store" (',
-        '  set "_H_HAS_STORE=1"',
-        '  set "_H_SKIP=1"',
-        ")",
-        'if "%~1"=="--as" set "_H_SKIP=1"',
-        'if "%~1"=="--session" set "_H_SKIP=1"',
-        'if "%~1"=="--key" set "_H_SKIP=1"',
-        'if "%~1"=="--due" set "_H_SKIP=1"',
-        'if "%~1"=="--about" set "_H_SKIP=1"',
-        "shift /1",
-        "goto :scan_args",
-        ":after_scan",
-        "if not defined _H_HAS_STORE if not defined HELIO_STORE (",
-        f'  set "HELIO_STORE={default_store}"',
-        '  set "_H_USED_DEFAULT=1"',
-        ")",
+        f'if not defined HELIO_STORE set "HELIO_STORE={default_store}"',
         '"%~dp0bin\\helio.exe" %*',
-        'set "_H_RC=%ERRORLEVEL%"',
-        'if not "%_H_RC%"=="0" if defined _H_USED_DEFAULT (',
-        f'  if not exist "{default_store}\\." (',
-        f"    >&2 echo {err_msg}",
-        "    exit /b 3",
-        "  )",
-        ")",
-        "exit /b %_H_RC%",
+        "exit /b %ERRORLEVEL%",
     ]
     return "\r\n".join(lines) + "\r\n"
 
@@ -434,11 +395,10 @@ def _verify_win_ownership(win_to: Path, manifest: dict[str, Any] | None, *, requ
         if _is_reparse_or_symlink(ret_p):
             raise WinInstallError(f"refusing symlink at tracked retired path {ret_p}", code=2)
         if ret_p.exists():
-            if ret_sha is not None:
-                if not ret_p.is_file() or sha256_file(ret_p) != ret_sha:
-                    raise WinInstallError(f"refusing externally modified retired file {ret_p}", code=2)
-            elif not _is_heliograph_pe(ret_p):
-                raise WinInstallError(f"refusing non-Heliograph file at legacy retired path {ret_p}", code=2)
+            if ret_sha is None:
+                raise WinInstallError(f"refusing unhashed legacy retired file {ret_p}; remove it manually", code=2)
+            if not ret_p.is_file() or sha256_file(ret_p) != ret_sha:
+                raise WinInstallError(f"refusing externally modified retired file {ret_p}", code=2)
 
 
 def _normalize_retired_map(raw: Any) -> dict[str, str | None]:
@@ -466,19 +426,15 @@ def _sweep_retired_exes(bin_dir: Path, retired_map: dict[str, str | None]) -> di
             raise WinInstallError(f"refusing symlink at tracked retired path {p}", code=2)
         if not p.exists():
             continue
-        if exp_sha is not None:
-            if not p.is_file() or sha256_file(p) != exp_sha:
-                raise WinInstallError(f"refusing externally modified retired file {p}", code=2)
-            verified_sha = exp_sha
-        else:
-            if not _is_heliograph_pe(p):
-                raise WinInstallError(f"refusing non-Heliograph file at legacy retired path {p}", code=2)
-            verified_sha = sha256_file(p)
+        if exp_sha is None:
+            raise WinInstallError(f"refusing unhashed legacy retired file {p}; remove it manually", code=2)
+        if not p.is_file() or sha256_file(p) != exp_sha:
+            raise WinInstallError(f"refusing externally modified retired file {p}", code=2)
         try:
             p.unlink()
         except OSError as exc:
             if getattr(exc, "winerror", None) in (5, 32) or isinstance(exc, PermissionError):
-                remaining[name] = verified_sha
+                remaining[name] = exp_sha
             else:
                 raise
     return remaining
@@ -598,6 +554,23 @@ def _desired_win_hashes(desired: dict[str, Any] | None) -> dict[str, str | None]
     }
 
 
+def _manifests_recovery_match(
+    current: dict[str, Any],
+    prev: dict[str, Any] | None,
+    journal_retired: dict[str, str | None],
+) -> bool:
+    if not isinstance(prev, dict):
+        return False
+    cur_core = {k: v for k, v in current.items() if k != "retired"}
+    prev_core = {k: v for k, v in prev.items() if k != "retired"}
+    if cur_core != prev_core:
+        return False
+    allowed_retired = _normalize_retired_map(prev.get("retired"))
+    allowed_retired.update(journal_retired)
+    cur_retired = _normalize_retired_map(current.get("retired"))
+    return all(k in allowed_retired and allowed_retired[k] == v for k, v in cur_retired.items())
+
+
 def recover_win_if_needed(win_to: Path, reg_key: str) -> bool:
     """Recover an interrupted Windows install, rollback, or removal journal."""
     jp = win_to / WIN_JOURNAL_NAME
@@ -659,7 +632,12 @@ def recover_win_if_needed(win_to: Path, reg_key: str) -> bool:
 
     if journal.get("had_manifest") and current_manifest is None:
         raise WinInstallError(f"recovery refusing journal claiming had_manifest=True when {WIN_MANIFEST_NAME} is absent", code=2)
-    if current_manifest is not None and current_manifest != prev_manifest and current_manifest != desired:
+    if (
+        current_manifest is not None
+        and current_manifest != prev_manifest
+        and current_manifest != desired
+        and not _manifests_recovery_match(current_manifest, prev_manifest, _normalize_retired_map(journal.get("retired")))
+    ):
         raise WinInstallError(f"recovery refusing externally modified {WIN_MANIFEST_NAME}", code=2)
 
     saved: dict[str, dict[str, Any]] = journal.get("saved_files", {})

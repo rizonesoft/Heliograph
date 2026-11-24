@@ -261,6 +261,33 @@ static int init(const char *folder) {
     return result == P_OK ? 0 : fail("the store cannot be made", 3);
 }
 
+static bool ascii_starts_ci(const char *s, const char *prefix) {
+    for (; *prefix; s++, prefix++) {
+        char a = *s, b = *prefix;
+        if (a == '/') a = '\\';
+        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+        if (a != b) return false;
+    }
+    return true;
+}
+
+static bool fail_wsl_store(const char *folder) {
+    const char *rest = ascii_starts_ci(folder, "\\\\wsl.localhost\\") ? folder + 16
+                     : ascii_starts_ci(folder, "\\\\wsl$\\") ? folder + 7 : NULL;
+    if (!rest || !*rest) return false;
+    const char *end = rest;
+    while (*end && *end != '\\' && *end != '/') end++;
+    if (end == rest) return false;
+    text msg = {0};
+    add(&msg, "cannot reach WSL store '"), clean(&msg, folder, true);
+    add(&msg, "' - check that WSL and distro '");
+    for (const char *p = rest; p < end; p++) add_bytes(&msg, p, 1);
+    add(&msg, "' are running");
+    fail(msg.failed ? "cannot reach WSL store" : msg.data, 3);
+    text_free(&msg);
+    return true;
+}
+
 static int run(options *o) {
     const char *command = o->count ? o->words[0] : "inbox";
     if (same(command, "help")) return p_print(help) ? 0 : 3;
@@ -280,6 +307,7 @@ static int run(options *o) {
     store s;
     if (store_open(&s, o->folder) != S_OK) {
         store_close(&s);
+        if (fail_wsl_store(o->folder)) return 3;
         return fail(s.why, 3);
     }
     if ((which == 0 || which == 8) && watch_summary(&s) != S_OK) fail(s.why, 3); /* the inbox is shown all the same */

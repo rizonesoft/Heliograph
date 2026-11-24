@@ -2116,24 +2116,25 @@ class TestWindowsInstaller(unittest.TestCase):
                 )
                 self.assertEqual(r_ov2.returncode, 0, r_ov2.stderr)
 
-                # Failing command with an explicit reachable --store (including an empty quoted arg before --store!)
-                # returns helio.exe's exact exit code and does NOT emit the offline default-WSL-distro diagnostic or exit 3!
-                r_fail_direct = subprocess.run(
-                    [str(self.helio_exe), "show", "nonexistent-id-123", "--as", "demo/win", "--about", "", "--store", str(flag_store)],
-                    capture_output=True,
-                    text=True,
-                )
-                r_fail_ov = subprocess.run(
-                    ["cmd.exe", "/c", "helio", "show", "nonexistent-id-123", "--as", "demo/win", "--about", "", "--store", str(flag_store)],
-                    cwd=str(outside_cwd),
-                    env=base_env,
-                    capture_output=True,
-                    text=True,
-                )
-                self.assertEqual(r_fail_ov.returncode, r_fail_direct.returncode)
-                self.assertNotEqual(r_fail_ov.returncode, 0)
-                self.assertNotIn("WSL", r_fail_ov.stderr)
-                self.assertNotIn(bogus_distro, r_fail_ov.stderr)
+                # Failing command with an explicit reachable --store (including empty quoted arg AND comma-containing
+                # --about value that cmd.exe's shift would split!) returns helio.exe's exact exit code with NO WSL diagnostic!
+                for extra_args in (["--about", ""], ["--about", "ref,--key"]):
+                    r_fail_direct = subprocess.run(
+                        [str(self.helio_exe), "show", "nonexistent-id-123", "--as", "demo/win", *extra_args, "--store", str(flag_store)],
+                        capture_output=True,
+                        text=True,
+                    )
+                    r_fail_ov = subprocess.run(
+                        ["cmd.exe", "/c", "helio", "show", "nonexistent-id-123", "--as", "demo/win", *extra_args, "--store", str(flag_store)],
+                        cwd=str(outside_cwd),
+                        env=base_env,
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(r_fail_ov.returncode, r_fail_direct.returncode, extra_args)
+                    self.assertNotEqual(r_fail_ov.returncode, 0)
+                    self.assertNotIn("WSL", r_fail_ov.stderr)
+                    self.assertNotIn(bogus_distro, r_fail_ov.stderr)
 
                 # Store-independent `helio help` STILL succeeds (exit 0) even when the default WSL distro is offline!
                 r_help = subprocess.run(
@@ -2210,7 +2211,8 @@ class TestWindowsInstaller(unittest.TestCase):
                 self.assertFalse(retired_file.exists())
                 self.assertEqual(m3["previous"]["helio_exe_sha256"], sha_a)
 
-                # Legacy list-format `retired: [name]` in manifest (from prior installer) is still owned and swept!
+                # Unhashed legacy list-format `retired: [name]` where the file exists on disk is REFUSED (never unlinked without digest!),
+                # while empty legacy `retired: []` upgrades cleanly!
                 leg_ret_name = ".helio.exe.abcdef012345.retired"
                 leg_ret_file = win_to / "bin" / leg_ret_name
                 shutil.copy2(exe_a, leg_ret_file)
@@ -2218,9 +2220,19 @@ class TestWindowsInstaller(unittest.TestCase):
                 m_leg_raw = json.loads(mp.read_text(encoding="utf-8"))
                 m_leg_raw["retired"] = [leg_ret_name]
                 mp.write_text(json.dumps(m_leg_raw), encoding="utf-8")
+                with self.assertRaises(self.win_mod.WinInstallError) as ctx:
+                    self.win_mod.win_install(source_exe=exe_b, source_sha256=sha_b, store_path=str(s2), commit="b" * 40, win_to=win_to, reg_key=reg_key)
+                self.assertEqual(ctx.exception.code, 2)
+                self.assertTrue(leg_ret_file.is_file())
+                with self.assertRaises(self.win_mod.WinInstallError) as ctx:
+                    self.win_mod.win_remove(win_to=win_to, reg_key=reg_key)
+                self.assertEqual(ctx.exception.code, 2)
+                self.assertTrue(leg_ret_file.is_file())
+                leg_ret_file.unlink()
+                m_leg_raw["retired"] = []
+                mp.write_text(json.dumps(m_leg_raw), encoding="utf-8")
                 m4 = self.win_mod.win_install(source_exe=exe_b, source_sha256=sha_b, store_path=str(s2), commit="b" * 40, win_to=win_to, reg_key=reg_key)
                 self.assertEqual(m4["retired"], {})
-                self.assertFalse(leg_ret_file.exists())
 
                 # Status healthy -> 0; tamper checks (wrapper, empty store, top-level helio.exe shadow, wrong reg_key) -> 3.
                 code, _ = self.win_mod.win_status(win_to=win_to, reg_key=reg_key)
@@ -2473,7 +2485,8 @@ class TestWindowsInstaller(unittest.TestCase):
                 self.assertEqual(ctx.exception.code, 2)
                 self.assertEqual((ext_to / "helio.cmd").read_bytes(), b"@echo user restored script\r\n")
 
-                # Legacy list-format `retired: []` in a schema-2 publishing journal (from prior installer) recovers cleanly!
+                # Legacy list-format `retired: []` in a schema-2 publishing journal (and interrupted recovery after
+                # writing the normalized restored manifest but before unlinking the journal) recovers cleanly on retry!
                 leg_j_to = root / "crash_legacy_list_journal"
                 self.win_mod.win_install(source_exe=exe_a, source_sha256=sha_a, store_path=str(store), commit="a" * 40, win_to=leg_j_to, reg_key=reg_key)
                 with self.assertRaises(SimulatedCrash):
@@ -2484,7 +2497,14 @@ class TestWindowsInstaller(unittest.TestCase):
                 jp_leg = leg_j_to / self.win_mod.WIN_JOURNAL_NAME
                 j_leg_data = json.loads(jp_leg.read_text(encoding="utf-8"))
                 j_leg_data["retired"] = []
-                jp_leg.write_text(json.dumps(j_leg_data), encoding="utf-8")
+                if isinstance(j_leg_data.get("previous_manifest"), dict):
+                    j_leg_data["previous_manifest"]["retired"] = []
+                saved_leg_journal = json.dumps(j_leg_data)
+                jp_leg.write_text(saved_leg_journal, encoding="utf-8")
+                self.assertTrue(self.win_mod.recover_win_if_needed(leg_j_to, reg_key))
+                self.assertEqual(self.win_mod.sha256_file(leg_j_to / "bin" / "helio.exe"), sha_a)
+                # Simulate crash after writing normalized restored manifest (retired: {}) before journal unlink: retry succeeds!
+                jp_leg.write_text(saved_leg_journal, encoding="utf-8")
                 self.assertTrue(self.win_mod.recover_win_if_needed(leg_j_to, reg_key))
                 self.assertEqual(self.win_mod.sha256_file(leg_j_to / "bin" / "helio.exe"), sha_a)
                 self.win_mod.win_remove(win_to=leg_j_to, reg_key=reg_key)
