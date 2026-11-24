@@ -4750,40 +4750,54 @@ class TestPhaseInstaller(unittest.TestCase):
                     self._cleanup_win_parent(sole_win_to)
 
                 # Verify first-write crash recovery via reserved `.phase.journal.init.json` (items 2 & 32):
-                # 1) Simulate a kill right before `os.replace` leaves `.phase.journal.init.json` on disk with
-                #    `phase.journal.json` absent;
-                # 2) Simulate a 0-byte `.phase.journal.init.json` (kill right after O_CREAT);
-                # In both cases recovery cleans `.phase.journal.init.json` and completes without leaving any
-                # orphan temp file or corrupt `phase.journal.json`!
+                # 1) Interrupted pre-replace `.phase.journal.init.json` (with `phase.journal.json` absent);
+                # 2) 0-byte empty `.phase.journal.init.json` (killed right after O_CREAT);
+                # Both run through full `run_phase_install` retry and assert it cleaned `.phase.journal.init.json`,
+                # published on Windows (`after_win_install`), reached `fail_verify` with the planted diagnostic,
+                # and left neither `.phase.journal.init.json` nor `phase.journal.json` behind!
                 init_jp = to_dir / self.phase_mod.PHASE_JOURNAL_INIT_NAME
-                with mock.patch.object(os, "replace", side_effect=lambda _s, _d: None):
-                    self.phase_mod._create_initial_phase_journal(
-                        to_dir / self.phase_mod.PHASE_JOURNAL_NAME,
-                        {"tx_id": "aabbccddeeff", "phase_state": "acquiring"},
-                        self.mod,
-                    )
-                self.assertTrue(init_jp.is_file(), "interrupted initial journal write must leave reserved init file")
-                self.assertFalse((to_dir / self.phase_mod.PHASE_JOURNAL_NAME).exists())
-                # Retry through full `run_phase_install` (here planted to fail at verification so we verify recovery + cleanup)
-                with self.assertRaises(self.mod.InstallError):
-                    self.phase_mod.run_phase_install(
-                        repo=checkout,
-                        phase=0,
-                        to_dir=to_dir,
-                        store_dir=store_dir,
-                        wrapper_path=wrapper,
-                        win_to_raw=win_to,
-                        reg_key=reg_key,
-                        sdk_url="unused",
-                        install_mod=self.mod,
-                        on_verify=fail_verify,
-                    )
-                self.assertFalse(init_jp.exists(), "retry must clean leftover .phase.journal.init.json")
-                self.assertFalse((to_dir / self.phase_mod.PHASE_JOURNAL_NAME).exists())
-                # Also verify 0-byte empty `.phase.journal.init.json` is cleaned cleanly on retry!
-                init_jp.write_bytes(b"")
-                self.phase_mod._cleanup_initial_phase_journal(to_dir, self.mod)
-                self.assertFalse(init_jp.exists())
+                for init_case in ("pre_replace", "empty"):
+                    if init_case == "pre_replace":
+                        with mock.patch.object(os, "replace", side_effect=lambda _s, _d: None):
+                            self.phase_mod._create_initial_phase_journal(
+                                to_dir / self.phase_mod.PHASE_JOURNAL_NAME,
+                                {"tx_id": "aabbccddeeff", "phase_state": "acquiring"},
+                                self.mod,
+                            )
+                    else:
+                        init_jp.write_bytes(b"")
+                    self.assertTrue(init_jp.is_file(), f"{init_case}: interrupted initial journal write must leave reserved init file")
+                    self.assertFalse((to_dir / self.phase_mod.PHASE_JOURNAL_NAME).exists())
+                    retry_bounds: list[str] = []
+                    retry_verify: list[str] = []
+
+                    def retry_rec_bound(name: str, _b: list[str] = retry_bounds) -> None:
+                        _b.append(name)
+
+                    def retry_fail_verify(stage: str, _v: list[str] = retry_verify) -> None:
+                        _v.append(stage)
+                        raise self.mod.InstallError("planted live verification fault", code=3)
+
+                    with self.assertRaises(self.mod.InstallError) as retry_ctx:
+                        self.phase_mod.run_phase_install(
+                            repo=checkout,
+                            phase=0,
+                            to_dir=to_dir,
+                            store_dir=store_dir,
+                            wrapper_path=wrapper,
+                            win_to_raw=win_to,
+                            reg_key=reg_key,
+                            sdk_url="unused",
+                            install_mod=self.mod,
+                            on_boundary=retry_rec_bound,
+                            on_verify=retry_fail_verify,
+                        )
+                    self.assertEqual(retry_ctx.exception.code, 3)
+                    self.assertIn("after_win_install", retry_bounds, f"{init_case}: retry must publish on Windows")
+                    self.assertTrue(retry_verify, f"{init_case}: retry must reach planted live verification fault")
+                    self.assertIn("planted live verification fault", str(retry_ctx.exception))
+                    self.assertFalse(init_jp.exists(), f"{init_case}: retry must clean leftover .phase.journal.init.json")
+                    self.assertFalse((to_dir / self.phase_mod.PHASE_JOURNAL_NAME).exists())
 
                 # Also verify `_store_needs_init` uses `os.stat` (preserving OS errors even on Python 3.14!)
                 # and propagates PermissionError for local Windows stores, reachable WSL shares, AND WSL
