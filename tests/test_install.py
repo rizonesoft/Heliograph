@@ -1335,10 +1335,11 @@ class TestQuickInstaller(unittest.TestCase):
 
             def _spy_replace(src, dst, *args, **kwargs):
                 nonlocal saw_atomic_replace
-                res = real_os_replace(src, dst, *args, **kwargs)
-                if Path(os.fspath(dst)).resolve() == exe_target:
+                is_exe_dst = Path(os.fspath(dst)).resolve() == exe_target
+                if is_exe_dst:
                     saw_atomic_replace = True
-                else:
+                res = real_os_replace(src, dst, *args, **kwargs)
+                if not is_exe_dst:
                     _probe_exe_during_gap("replace-away", src)
                 return res
 
@@ -1363,7 +1364,6 @@ class TestQuickInstaller(unittest.TestCase):
                         )
                 except self.mod.BusyExecutableError as exc:
                     self.assertEqual(exc.code, 3)
-                    saw_atomic_replace = True
                     if pinned_proc:
                         pinned_alive_after[0] = pinned_proc[0].poll() is None
                 finally:
