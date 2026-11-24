@@ -99,7 +99,7 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
         if fetch_res.returncode != 0:
             _fail(f"cannot fetch origin refs/heads/main in {repo}: {(fetch_res.stderr or fetch_res.stdout).strip()}")
 
-    def _scan_run_files(commit_ref: str, pnum: int) -> tuple[bool, bool, bool]:
+    def _scan_run_files(commit_ref: str, pnum: int) -> tuple[bool, bool, str | None]:
         ls_r = subprocess.run(
             ["git", "-C", str(repo), "ls-tree", "-r", "--name-only", commit_ref, "docs/phase-runs"],
             stdin=subprocess.DEVNULL,
@@ -113,7 +113,7 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
         phase_files = sorted(p.strip() for p in ls_r.stdout.splitlines() if p.strip().endswith(suffix))
         has_closeout = False
         has_open_park = False
-        has_installed = False
+        installed_sha: str | None = None
         for rp in phase_files:
             show_r = subprocess.run(
                 ["git", "-C", str(repo), "show", f"{commit_ref}:{rp}"],
@@ -128,12 +128,14 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
                 if line.startswith("## Closeout"):
                     has_closeout = True
                     has_open_park = False
-                    has_installed = False
+                    installed_sha = None
                 elif line.startswith("PARKED "):
                     has_open_park = True
-                elif has_closeout and not has_open_park and re.search(r"Installed commit:\s*`?[0-9a-f]{40}`?", line):
-                    has_installed = True
-        return has_closeout, has_open_park, has_installed
+                elif has_closeout and not has_open_park:
+                    m = re.search(r"Installed commit:\s*`?([0-9a-f]{40})`?", line)
+                    if m:
+                        installed_sha = m.group(1)
+        return has_closeout, has_open_park, installed_sha
 
     pending: list[int] = []
     declared_phases = data["phases"]
@@ -146,14 +148,17 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
         p_sections = [s for s in sections if isinstance(s, dict) and s.get("phase") == pnum]
         if not p_sections or not all(s.get("status") == "verified" for s in p_sections):
             continue
-        head_closed, head_parked, head_installed = _scan_run_files("HEAD", pnum)
+        head_closed, head_parked, head_installed_sha = _scan_run_files("HEAD", pnum)
         if not head_closed or head_parked:
             continue
-        if not head_installed:
-            pending.append(pnum)
-            continue
-        rem_closed, rem_parked, rem_installed = _scan_run_files(rem_sha, pnum)
-        if not (rem_closed and not rem_parked and rem_installed):
+        rem_closed, rem_parked, rem_installed_sha = _scan_run_files(rem_sha, pnum)
+        rem_published = rem_closed and not rem_parked and bool(rem_installed_sha)
+        if rem_published:
+            # Already published on origin/main: stale local checkout (head_installed_sha is None) is NOT pending,
+            # while a competing local receipt SHA that differs from origin/main IS pending until resolved/pushed!
+            if head_installed_sha is not None and head_installed_sha != rem_installed_sha:
+                pending.append(pnum)
+        else:
             pending.append(pnum)
     return sorted(pending)
 

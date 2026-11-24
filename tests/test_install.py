@@ -4636,23 +4636,28 @@ class TestPhaseInstaller(unittest.TestCase):
                     self._delete_reg_key(sole_reg_key)
                     self._cleanup_win_parent(sole_win_to)
 
-                # Verify cleanup_prev never deletes a pre-existing foreign file whose digest differs from expected_sha!
+                # Verify cleanup_prev ONLY deletes a snapshot durably recorded in `.phase-active.json['snapshot_file']`,
+                # never an unrecorded pre-existing file even if its bytes match `a_e_sha` identically!
                 self.phase_mod._win_phase_marker_call(
                     self.python_exe, win_install_py_win, "begin", win_to, reg_key, "aa11bb22cc33", phase=0, commit=a_commit, install_mod=self.mod
                 )
                 foreign_snap_code = (
                     "import pathlib, sys\n"
                     "p = pathlib.Path(sys.argv[1]) / 'bin' / '.phase-prev-aa11bb22cc33.helio.exe.old'\n"
-                    "p.write_bytes(b'FOREIGN_USER_FILE')\n"
+                    "p.write_bytes(pathlib.Path(sys.argv[2]).read_bytes())\n"
                 )
-                subprocess.run([self.python_exe, "-B", "-c", foreign_snap_code, win_to], check=True, stdin=subprocess.DEVNULL)
+                subprocess.run(
+                    [self.python_exe, "-B", "-c", foreign_snap_code, win_to, self.win_mod.wsl_to_windows_path(a_e)],
+                    check=True,
+                    stdin=subprocess.DEVNULL,
+                )
                 self.phase_mod._win_phase_marker_call(
                     self.python_exe, win_install_py_win, "cleanup_prev", win_to, reg_key, "aa11bb22cc33", payload_json=a_e_sha, install_mod=self.mod
                 )
                 check_snap_code = (
                     "import pathlib, sys\n"
                     "p = pathlib.Path(sys.argv[1]) / 'bin' / '.phase-prev-aa11bb22cc33.helio.exe.old'\n"
-                    "assert p.read_bytes() == b'FOREIGN_USER_FILE'\n"
+                    "assert p.is_file(), 'unrecorded pre-existing file with matching bytes must NOT be deleted'\n"
                     "p.unlink()\n"
                 )
                 subprocess.run([self.python_exe, "-B", "-c", check_snap_code, win_to], check=True, stdin=subprocess.DEVNULL)
@@ -4755,6 +4760,34 @@ class TestPhaseInstaller(unittest.TestCase):
                 r_unrel = subprocess.run([sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"], env=env, capture_output=True, text=True)
                 self.assertEqual(r_unrel.returncode, 0, r_unrel.stdout + r_unrel.stderr)
                 self.assertEqual(json.loads(r_unrel.stdout), [])
+                # Stale local checkout (HEAD lacks receipt, but origin/main ALREADY has the published receipt) -> [] (exit 0)!
+                stale_clone = root / "stale_clone"
+                subprocess.run(["git", "clone", str(checkout), str(stale_clone)], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(stale_clone), "reset", "--hard", head_sha], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(stale_clone), "remote", "set-url", "origin", str(checkout.parent / "origin.git")], check=True, capture_output=True)
+                r_stale = subprocess.run(
+                    [sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"],
+                    env={**os.environ, "HELIO_REPO": str(stale_clone)},
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(r_stale.returncode, 0, r_stale.stdout + r_stale.stderr)
+                self.assertEqual(json.loads(r_stale.stdout), [])
+                # Competing local receipt SHA (HEAD has different Installed commit than origin/main) -> [0] (exit 1)!
+                stale_rf = stale_clone / "docs" / "phase-runs" / "2026-11-24-phase-0.md"
+                stale_rf.write_text(stale_rf.read_text(encoding="utf-8") + f"\nInstalled commit: {'9' * 40}\n", encoding="utf-8")
+                subprocess.run(["git", "-C", str(stale_clone), "config", "user.name", "Test"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(stale_clone), "config", "user.email", "t@example.com"], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(stale_clone), "add", str(stale_rf)], check=True, capture_output=True)
+                subprocess.run(["git", "-C", str(stale_clone), "commit", "-m", "competing local receipt"], check=True, capture_output=True)
+                r_comp = subprocess.run(
+                    [sys.executable, "-B", str(REPO / "tools" / "install.py"), "--pending-phases"],
+                    env={**os.environ, "HELIO_REPO": str(stale_clone)},
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(r_comp.returncode, 1, r_comp.stdout + r_comp.stderr)
+                self.assertEqual(json.loads(r_comp.stdout), [0])
                 # A newer `## Closeout` after an older `Installed commit:` supersedes it -> returns [0] (exit 1)!
                 run_file.write_text(run_file.read_text(encoding="utf-8") + "\n## Closeout run=reopened\n\nRe-closed.\n", encoding="utf-8")
                 subprocess.run(["git", "-C", str(checkout), "add", str(run_file)], check=True, capture_output=True)
