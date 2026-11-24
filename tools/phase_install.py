@@ -173,22 +173,28 @@ def _check_clean_and_origin_main(repo: Path, install_mod: Any, *, expected_commi
             code=3,
         )
 
-    fetch = _git(repo, "fetch", "origin", "main")
-    if fetch.returncode != 0:
+    # Query origin directly with `git ls-remote` (single read-only call, never touches mutable FETCH_HEAD
+    # and ignores narrowed remote.origin.fetch mappings).
+    ls_rem = _git(repo, "ls-remote", "origin", "refs/heads/main")
+    if ls_rem.returncode != 0:
         raise install_mod.InstallError(
-            f"refusing phase install: cannot verify authoritative origin/main ({fetch.stderr.strip()})",
+            f"refusing phase install: cannot verify authoritative origin/main ({ls_rem.stderr.strip()})",
             code=2,
         )
-    fetched = _git(repo, "rev-parse", "FETCH_HEAD")
-    if fetched.returncode != 0:
+    remote_sha = ""
+    for line in ls_rem.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == "refs/heads/main":
+            remote_sha = parts[0].strip()
+            break
+    if not remote_sha:
         raise install_mod.InstallError(
-            f"refusing phase install: FETCH_HEAD unavailable after fetching origin main ({fetched.stderr.strip()})",
+            "refusing phase install: origin has no refs/heads/main",
             code=2,
         )
-    fetched_sha = fetched.stdout.strip()
-    if commit != fetched_sha:
+    if commit != remote_sha:
         raise install_mod.InstallError(
-            f"refusing phase install: HEAD ({commit[:12]}) is not at fetched origin/main ({fetched_sha[:12]})",
+            f"refusing phase install: HEAD ({commit[:12]}) is not at authoritative origin/main ({remote_sha[:12]})",
             code=2,
         )
     return commit
@@ -658,10 +664,11 @@ def _rollback_phase_journal(
                 else (cur_win.get("manifest") is None and not cur_win.get("exe_sha"))
             )
             if not win_already_restored:
-                # Verify the live Windows manifest belongs to THIS phase commit before running --back or --remove!
-                if cur_win_c.get("commit") != journal.get("commit"):
+                # Verify the live Windows manifest belongs to THIS phase commit and binary before --back or --remove!
+                expected_win_sha = str(journal.get("proved_win_sha") or "")
+                if cur_win_c.get("commit") != journal.get("commit") or (expected_win_sha and cur_win.get("exe_sha") != expected_win_sha):
                     errors.append(
-                        f"refusing Windows rollback: live commit {cur_win_c.get('commit')} != phase commit {journal.get('commit')}"
+                        f"refusing Windows rollback: live installation ({cur_win_c.get('commit')}) does not match phase publication ({journal.get('commit')})"
                     )
                 else:
                     win_args = ["--back" if journal.get("win_had_install") else "--remove", "--reg-key", reg_key, "--phase-tx", tx_id]
@@ -704,7 +711,12 @@ def _rollback_phase_journal(
             else:
                 wsl_already_restored = cur_wsl_m is None and not (to_dir / "helio").exists()
             if not wsl_already_restored:
-                if journal.get("wsl_had_install") or journal.get("wsl_had_legacy"):
+                expected_wsl_sha = str(journal.get("proved_wsl_sha") or "")
+                if cur_wsl_c.get("commit") != journal.get("commit") or (expected_wsl_sha and cur_wsl_sha != expected_wsl_sha):
+                    errors.append(
+                        f"refusing WSL rollback: live installation ({cur_wsl_c.get('commit')}) does not match phase publication ({journal.get('commit')})"
+                    )
+                elif journal.get("wsl_had_install") or journal.get("wsl_had_legacy"):
                     install_mod.go_back(to_dir=to_dir, wrapper_path=wrapper_path, allow_phase_journal=True)
                     live_sha = install_mod.sha256_file(to_dir / "helio")
                     if live_sha != journal.get("wsl_pre_helio_sha", ""):
@@ -767,7 +779,7 @@ def _read_and_validate_phase_journal(
         raise install_mod.InstallError(f"refusing non-regular phase journal at {jp}", code=2)
     try:
         journal = json.loads(jp.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise install_mod.InstallError(f"refusing unreadable or foreign phase journal at {jp}: {exc}", code=2) from exc
     if not isinstance(journal, dict):
         raise install_mod.InstallError(f"refusing foreign phase journal at {jp}", code=2)
@@ -775,13 +787,14 @@ def _read_and_validate_phase_journal(
     if sv == 2:
         if journal.get("managed_by") != "heliograph-phase-installer":
             raise install_mod.InstallError(f"refusing unowned phase journal at {jp}", code=2)
-    elif sv == 1:
-        # Accept schema-1 journals only when they carry the complete schema-1 field set (upgrade compatibility)
-        # and every external path matches this invocation's bound destinations.
-        if not all(k in journal for k in _REQUIRED_PHASE_JOURNAL_KEYS):
-            raise install_mod.InstallError(f"refusing incomplete or foreign phase journal at {jp}", code=2)
-    else:
+    elif sv != 1:
         raise install_mod.InstallError(f"refusing unsupported phase journal schema_version {sv!r} at {jp}", code=2)
+    # Enforce the complete required field set and bool types on BOTH schema 1 and schema 2!
+    if not all(k in journal for k in _REQUIRED_PHASE_JOURNAL_KEYS):
+        raise install_mod.InstallError(f"refusing incomplete or foreign phase journal at {jp}", code=2)
+    for bkey in ("wsl_changed", "win_changed", "wsl_had_install", "win_had_install"):
+        if not isinstance(journal.get(bkey), bool):
+            raise install_mod.InstallError(f"refusing phase journal with non-boolean {bkey} at {jp}", code=2)
 
     tx_id = journal.get("tx_id")
     if not isinstance(tx_id, str) or not re.fullmatch(r"[0-9a-f]{12}", tx_id):
@@ -1259,9 +1272,9 @@ def run_phase_install(
                     on_verify=on_verify,
                 )
 
-                # Release the Windows phase marker BEFORE transitioning to `notifying` (and notifying recovery also
-                # calls `end` idempotently) so a crash can never strand `.phase-active.json`.
-                _win_phase_marker_call(python_exe, win_install_py_win, "end", win_to_raw, reg_key, tx_id, install_mod=install_mod)
+                # Durable commit point: write `phase_state = "notifying"` FIRST while `.phase-active.json` is STILL held
+                # so rollback is permanently retired before releasing Windows ownership! Release the Windows marker
+                # immediately after (and `notifying` recovery also releases it idempotently on crash).
                 journal["phase_state"] = "notifying"
                 install_mod.write_json_atomic(to_dir / PHASE_JOURNAL_NAME, journal)
             except BaseException as exc:
@@ -1274,6 +1287,8 @@ def run_phase_install(
                     on_boundary=on_boundary,
                 )
                 raise install_mod.InstallError(f"phase install failed and rolled back: {exc}", code=3) from exc
+
+            _win_phase_marker_call(python_exe, win_install_py_win, "end", win_to_raw, reg_key, tx_id, install_mod=install_mod)
 
             # Post-verification notification: if this fails, keep `phase_state == "notifying"` so retry only re-sends.
             msg_id = _send_phase_tell(

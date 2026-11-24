@@ -3954,6 +3954,52 @@ class TestPhaseInstaller(unittest.TestCase):
                         install_mod=self.mod,
                     )
                 self.assertEqual(ctx_unbound.exception.code, 2)
+                # Non-UTF-8 phase.journal.json -> refused cleanly with exit 2 (never unhandled UnicodeDecodeError)!
+                foreign_jp.write_bytes(b"\xff\xfe\xfdnot-utf8")
+                with self.assertRaises(self.mod.InstallError) as ctx_bin:
+                    self.phase_mod._recover_pending_phase_journal(
+                        to_dir=foreign_to,
+                        wrapper_path=wrapper,
+                        store_dir=store_dir,
+                        win_to_raw=win_to,
+                        reg_key=reg_key,
+                        python_exe=self.python_exe,
+                        install_py_win=install_py_win,
+                        win_install_py_win=win_install_py_win,
+                        install_mod=self.mod,
+                    )
+                self.assertEqual(ctx_bin.exception.code, 2)
+                # Incomplete schema-2 journal (matching paths & managed_by but missing wsl_had_install) -> refused with exit 2!
+                foreign_jp.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 2,
+                            "managed_by": "heliograph-phase-installer",
+                            "tx_id": "112233445566",
+                            "phase_state": "wsl_done",
+                            "wsl_to": str(foreign_to.resolve()),
+                            "wrapper": str(wrapper.resolve()),
+                            "store": str(store_dir.resolve()),
+                            "win_to_arg": win_to,
+                            "reg_key": reg_key,
+                            "wsl_changed": True,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                with self.assertRaises(self.mod.InstallError) as ctx_inc2:
+                    self.phase_mod._recover_pending_phase_journal(
+                        to_dir=foreign_to,
+                        wrapper_path=wrapper,
+                        store_dir=store_dir,
+                        win_to_raw=win_to,
+                        reg_key=reg_key,
+                        python_exe=self.python_exe,
+                        install_py_win=install_py_win,
+                        win_install_py_win=win_install_py_win,
+                        install_mod=self.mod,
+                    )
+                self.assertEqual(ctx_inc2.exception.code, 2)
                 foreign_jp.unlink()
                 other_file = root / "other_target.json"
                 other_file.write_text("{}", encoding="utf-8")
@@ -4041,7 +4087,7 @@ class TestPhaseInstaller(unittest.TestCase):
                 with self.assertRaises(self.mod.InstallError) as ctx_nf:
                     self.phase_mod._check_clean_and_origin_main(checkout, self.mod)
                 self.assertEqual(ctx_nf.exception.code, 2)
-                self.assertIn("FETCH_HEAD" if "FETCH_HEAD" in str(ctx_nf.exception) else "fetched", str(ctx_nf.exception))
+                self.assertIn("origin/main", str(ctx_nf.exception))
 
                 # 11. Interrupted inner Windows publication of C over B (with predecessor A) on BOTH sides of live-file
                 # replacement: phase rollback calls `win_recover` first and restores exact B with ZERO pending
