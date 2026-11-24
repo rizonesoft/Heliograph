@@ -229,28 +229,33 @@ def find_closed_phases_missing_install(repo: Path, install_mod: Any | None = Non
 
 
 def _create_initial_phase_journal(jp: Path, payload: dict[str, Any], install_mod: Any) -> None:
-    """Atomically create the initial acquiring phase.journal.json via Linux O_TMPFILE + /proc/self/fd link.
+    """Atomically create the initial acquiring phase.journal.json via Linux O_TMPFILE + linkat(AT_SYMLINK_FOLLOW).
 
     No directory entry exists in `jp.parent` until the complete, fsynced JSON inode is atomically linked to `jp`
-    in a single kernel syscall. A kill before `os.link` leaves zero files on disk and requires no cleanup sweep.
+    in a single kernel syscall. Passing `dst_dir_fd` + relative `jp.name` + `follow_symlinks=True` guarantees
+    CPython 3.12+ calls `linkat(..., AT_SYMLINK_FOLLOW)` rather than 2-arg `link()`.
     """
     raw = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
-    fd = os.open(str(jp.parent), os.O_TMPFILE | os.O_WRONLY, 0o644)
+    dir_fd = os.open(str(jp.parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
     try:
-        view = memoryview(raw)
-        while view:
-            written = os.write(fd, view)
-            if written <= 0:
-                raise OSError("short write while creating initial phase journal")
-            view = view[written:]
-        os.fsync(fd)
+        fd = os.open(str(jp.parent), os.O_TMPFILE | os.O_WRONLY, 0o644)
         try:
-            os.link(f"/proc/self/fd/{fd}", str(jp))
-        except FileExistsError as exc:
-            raise install_mod.InstallError(f"refusing existing phase journal at {jp}", code=2) from exc
-        install_mod.fsync_dir(jp.parent)
+            view = memoryview(raw)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise OSError("short write while creating initial phase journal")
+                view = view[written:]
+            os.fsync(fd)
+            try:
+                os.link(f"/proc/self/fd/{fd}", jp.name, dst_dir_fd=dir_fd, follow_symlinks=True)
+            except FileExistsError as exc:
+                raise install_mod.InstallError(f"refusing existing phase journal at {jp}", code=2) from exc
+            os.fsync(dir_fd)
+        finally:
+            os.close(fd)
     finally:
-        os.close(fd)
+        os.close(dir_fd)
 
 
 def _sweep_phase_journal_temps(to_dir: Path, tx_id: str, install_mod: Any) -> None:

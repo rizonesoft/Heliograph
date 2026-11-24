@@ -4758,9 +4758,11 @@ class TestPhaseInstaller(unittest.TestCase):
                 init_dir = root / "init_otmpfile_check"
                 init_dir.mkdir(parents=True, exist_ok=True)
                 pre_link_entries: list[list[str]] = []
+                link_calls: list[tuple[str, str, dict[str, Any]]] = []
 
-                def abort_before_link(_src: str, _dst: str) -> None:
+                def abort_before_link(src: str, dst: str, **kw: Any) -> None:
                     pre_link_entries.append([p.name for p in init_dir.iterdir()])
+                    link_calls.append((src, dst, kw))
                     raise RuntimeError("killed before os.link")
 
                 with mock.patch.object(os, "link", side_effect=abort_before_link):
@@ -4771,6 +4773,10 @@ class TestPhaseInstaller(unittest.TestCase):
                             self.mod,
                         )
                 self.assertEqual(pre_link_entries, [[]], "O_TMPFILE must leave zero directory entries before os.link")
+                self.assertEqual(len(link_calls), 1)
+                self.assertEqual(link_calls[0][1], self.phase_mod.PHASE_JOURNAL_NAME)
+                self.assertIsInstance(link_calls[0][2].get("dst_dir_fd"), int)
+                self.assertIs(link_calls[0][2].get("follow_symlinks"), True)
                 self.assertEqual(list(init_dir.iterdir()), [], "aborted O_TMPFILE write must leave zero files on disk")
                 copied_acquiring = (
                     json.dumps(
