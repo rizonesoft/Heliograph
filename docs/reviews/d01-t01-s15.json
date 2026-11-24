@@ -1,0 +1,87 @@
+{
+  "ref": "D01 T01 \u00a715",
+  "title": "Quick installer",
+  "implementation_sha": "5b154710504fe1b194428f4d0a9cb65c466571a7",
+  "date": "2026-11-24",
+  "reviews": [
+    {
+      "round": 1,
+      "report": "docs/reviews/01-heliograph/D01-T01-s15.md",
+      "verdict": "fixed"
+    }
+  ],
+  "checks": [
+    "python3 ../ImpossibleSDK/tools/app_build.py . -> Ran 67 tests in 40.282s OK; 15 guard-reversion checks failed as expected; CI build.yml green at 5b15471"
+  ],
+  "completion": {
+    "report": "docs/reviews/01-heliograph/D01-T01-s15.md",
+    "verdict": "reconciled",
+    "candidate": "5b154710504fe1b194428f4d0a9cb65c466571a7",
+    "reviewer": "astra",
+    "model": "gpt-6.2-astra",
+    "filed": []
+  },
+  "rounds_spent": 1,
+  "round_cap": 33,
+  "plan": {
+    "report": "docs/reviews/01-heliograph/D01-T01-s15.md",
+    "candidate": "2e22a86d1c7171d0d763b1c5df88ea5fabef57b8",
+    "reviewer": "astra",
+    "model": "gpt-6.2-astra",
+    "effort": "medium",
+    "lenses": [
+      "plan"
+    ]
+  },
+  "schedule_sha": "2e22a86d1c7171d0d763b1c5df88ea5fabef57b8",
+  "schedule": {
+    "policy": "three-pass",
+    "pass_cap": 33,
+    "blocking": [
+      "P1",
+      "P2"
+    ],
+    "plan": {
+      "effort": "medium",
+      "lenses": [
+        "plan"
+      ]
+    },
+    "rounds": [
+      {
+        "effort": "medium",
+        "lenses": [
+          "adversarial",
+          "integration",
+          "source-defect",
+          "consistency",
+          "quality",
+          "optimization",
+          "design"
+        ]
+      }
+    ],
+    "completion": {
+      "effort": "low",
+      "lenses": [
+        "plan-delivery",
+        "record"
+      ]
+    },
+    "reconciliation": {
+      "effort": "low",
+      "lenses": [
+        "adversarial",
+        "integration",
+        "plan-delivery",
+        "record"
+      ]
+    },
+    "lenses": {
+      "thread-safety": "Which state is reached from two threads (UI, worker, callback, timer) without one lock or atomic owning it, and which lock order, wait, cancellation or teardown can deadlock or run after its owner is gone?",
+      "memory-safety": "Which pointer, reference, view, handle or iterator can outlive what it refers to, and which size, index or cast is trusted unchecked?"
+    }
+  },
+  "passes_spent": 12,
+  "pass_cap": 33
+}

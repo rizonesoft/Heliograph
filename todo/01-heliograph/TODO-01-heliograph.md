@@ -49,7 +49,7 @@ title: "TODO-01 -- Heliograph"
 | 12 | §12 | Expiry of seen heads-ups and findings | §3, §4 | [ ] |
 | 13 | §13 | Design and help that match the program | §11, §12, §14 | [ ] |
 | 14 | §14 | Unowned paths kept to their repository | §4, §6 | [ ] |
-| 15 | §15 | Quick installer | -- | [ ] |
+| 15 | §15 | Quick installer | -- | [x] |
 | 16 | §16 | Installer for Windows sessions | §15 | [ ] |
 | 17 | §17 | Installed program replaced after a tested phase | §15 | [ ] |
 
@@ -380,9 +380,12 @@ One command takes a checkout to a working `helio` in WSL. It records what it ins
 - [x] Add `--status`, `--back` and `--remove` to `tools/install.py`. Done when: `--status` hashes both live binaries and reports exit 0 (healthy), 1 (absent), or 3 (partial/mismatched, naming each file); `--back` verifies both `previous` backups against recorded hashes before swapping and updating `installed.json` (refusing first-install or corrupt backups with live files untouched); and `--remove` is idempotent, deletes only installer-owned files, removes the wrapper only if `# target=` matches `<to>`, and leaves the store and unrelated files untouched. Cheaper substitute: deleting by hand or trusting `installed.json` without hashing live files.
 - [x] Put the one install command plus `--status`, `--back`, `--remove` and `--to` usage in the Quick start of `README.md`. Done when: it is the command `tests/test_install.py` runs. Cheaper substitute: the steps as they are.
 - [x] Harden edge cases from chain-2 plan review in `tools/install.py` and `tests/test_install.py`: refuse cross-destination wrapper takeover; verify exact wrapper content/store and `previous` backup hashes in `--status`; refuse publication on build-time source drift; refuse partial legacy binary pairs naming the missing partner; retire outgoing third wrappers on successive `--wrapper` changes; report structured exit-3 diagnostics for `OSError` and failed recovery; and add clean-home login-shell `PATH`, nonrecursive real-checkout pinned-SDK install, and non-skipping WSL Windows-interop tests. Done when: every new regression passes and fails when its production guard is reverted. Cheaper substitute: skipping real-SDK or partial-pair checks.
-- [ ] Commit: `install: one command`
+- [x] Commit: `install: one command`
 
 **Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
+
+> **Verified:** 2026-11-24 | §15 | 5b154710504fe1b194428f4d0a9cb65c466571a7
+> **Review:** `docs/reviews/d01-t01-s15.json`
 
 ## 16. Installer for Windows sessions
 
