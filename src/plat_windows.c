@@ -352,10 +352,46 @@ p_result p_at_root(const char *dir, bool *at_root) {
     DWORD attrs = GetFileAttributesW(wide);
     im_free(wide);
     if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY)) return P_FAILED;
-    /* Keep relative "../" chains within Windows MAX_PATH (260): 80 steps is 240 chars (+ "helio.conf" = 250 < 260). */
-    size_t ups = 0;
-    for (const char *p = dir; p[0] == '.' && p[1] == '.' && (p[2] == '/' || p[2] == '\\' || !p[2]); p += p[2] ? 3 : 2) ups++;
-    if (ups >= 80) *at_root = true;
+    /* Check if parent does not exist (e.g. UNC share root). */
+    size_t n = im_length(dir);
+    char *up = im_alloc(n + 5);
+    if (!up) return P_FAILED;
+    for (size_t i = 0; i < n; i++) up[i] = dir[i];
+    size_t k = n;
+    if (k && up[k - 1] != '/' && up[k - 1] != '\\') up[k++] = '\\';
+    up[k++] = '.', up[k++] = '.', up[k] = 0;
+    wchar_t *wup = im_wide(up);
+    im_free(up);
+    if (!wup) return P_FAILED;
+    DWORD pattr = GetFileAttributesW(wup);
+    im_free(wup);
+    if (pattr == INVALID_FILE_ATTRIBUTES || !(pattr & FILE_ATTRIBUTE_DIRECTORY)) {
+        *at_root = true;
+        return P_OK;
+    }
+    /* On Windows, every subdirectory has a "." entry in FindFirstFileW("<dir>\\*"), whereas drive roots (C:\, D:\) do not. */
+    char *pat = im_alloc(n + 4);
+    if (!pat) return P_FAILED;
+    for (size_t i = 0; i < n; i++) pat[i] = dir[i];
+    k = n;
+    if (k && pat[k - 1] != '/' && pat[k - 1] != '\\') pat[k++] = '\\';
+    pat[k++] = '*', pat[k] = 0;
+    wchar_t *wpat = im_wide(pat);
+    im_free(pat);
+    if (!wpat) return P_FAILED;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(wpat, &fd);
+    im_free(wpat);
+    if (h == INVALID_HANDLE_VALUE) {
+        if (GetLastError() == ERROR_FILE_NOT_FOUND) {
+            *at_root = true;
+            return P_OK;
+        }
+        return P_FAILED;
+    }
+    bool has_dot = (fd.cFileName[0] == L'.' && fd.cFileName[1] == 0);
+    FindClose(h);
+    if (!has_dot) *at_root = true;
     return P_OK;
 }
 p_result p_input(size_t most, char **data, size_t *length) { return from(im_read_input(most, data, length)); }
