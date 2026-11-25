@@ -250,6 +250,8 @@ The design says a session sees only its own project's messages and those sent to
 
 ## 8. Mark for landed work
 
+> **Started:** 2026-11-25T16:23Z
+
 A linked commit marks a job landed and closes nothing. The engine starts no program, so the caller gives the commit. **Corrected 2026-11-25:** Plan and Round 1 reviews (`docs/reviews/01-heliograph/D01-T01-s8.md`) clarified: dispatch `landed` explicitly to `store_landed` (never falling through to `store_end`); validate commit syntax (7 to 64 hex digits, normalized to lowercase) and session syntax in CLI before `store_open` as well as in `store_landed`; enforce `wrong_dest_session` precedence before sender/owner overrides so session-targeted jobs cannot be marked by a wrong/empty sibling session; treat atomic `make_ex` publication after pre-check authorization as final and immutable (no post-hoc rollback that could erase another caller's acknowledged mark), call `p_sync` on `P_EXISTS` repeats so an unflushed prior publication is durably flushed before exit 0, and promote any concurrently archived published mark via `archive_promote_landed` (`copy_durable` + live removal, returning exit 0) so an acknowledged mark always survives and an exit-2 refusal (before `make_ex`) never introduces an archived mark; merge both archived and live landed marks in `store_landed_commits` and `archive_every` so duplicate-post and interrupted-archive states never hide an acknowledged commit; load landed marks after visibility/eligibility checks, propagate read/flush/OOM errors as exit 3, bound inbox/hook commit display so one heavily marked job never overflows the 2,000-byte budget, and include landed marks in all archive orphan, sweep, and check paths.
 
 **Phase:** 2
