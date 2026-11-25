@@ -417,7 +417,7 @@ class Damage(Base):
                 p.stdin.close()
             except OSError:
                 pass
-            time.sleep((n % 15) * 0.001)
+            time.sleep((n % 15) * (0.003 if ON_WINDOWS else 0.001))
             p.kill()
             p.wait(30)
         result = self.helio("check", me=None)
