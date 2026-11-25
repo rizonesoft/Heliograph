@@ -271,8 +271,22 @@ static void add_hex(text *out, const char *s) {
 
 static void session_base(text *out, const char *lane, const char *session, const char *repository) {
     for (; *lane; lane++) add_bytes(out, *lane == '/' ? "+" : lane, 1);
-    if (session && *session) add(out, "+"), add_hex(out, session);
-    if (repository && *repository) add(out, "++"), add(out, repository);
+    if (session && *session) {
+        if (repository && *repository) {
+            text digest = {0};
+            add_sha256_hex(&digest, session, len(session));
+            if (digest.failed || digest.length < 32) {
+                out->failed = true;
+            } else {
+                add(out, "+r"), add_bytes(out, digest.data, 32), add(out, "+"), add(out, repository);
+            }
+            text_free(&digest);
+        } else {
+            add(out, "+"), add_hex(out, session);
+        }
+    } else if (repository && *repository) {
+        add(out, "++"), add(out, repository);
+    }
 }
 
 static void session_seq_path(const store *s, text *out, const char *base, uint64_t seq) {
@@ -363,7 +377,7 @@ static p_result read_session_file(const char *path, session_info *out, bool *par
     return r;
 }
 
-/* Validates `<project>+<lane>[+<even-hex>][++<repo>][~<seq>]`. Sets base_len, lane, seq, and is_named_repo. */
+/* Validates `<project>+<lane>[+<even-hex>|++<repo>|+r<32-hex>+<repo>][~<seq>]`. Sets base_len, lane, seq, and is_named_repo. */
 static bool parse_session_filename(const char *name, size_t *base_len, char *lane, size_t lane_room, uint64_t *seq, bool *is_named_repo) {
     if (is_named_repo) *is_named_repo = false;
     size_t n = len(name);
@@ -393,23 +407,24 @@ static bool parse_session_filename(const char *name, size_t *base_len, char *lan
             if (!rlen || rlen >= sizeof repo) return false;
             copy_slice(repo, sizeof repo, name + plus2 + 2, rlen);
             if (!repo_ok(repo)) return false;
-        } else {
-            size_t plus3 = plus2 + 1;
-            while (plus3 < blen && name[plus3] != '+') plus3++;
-            size_t hlen = plus3 - (plus2 + 1);
-            if (hlen < 2 || hlen > 128 || (hlen & 1u)) return false;
-            for (size_t i = plus2 + 1; i < plus3; i++) {
+        } else if (plus2 + 1 < blen && name[plus2 + 1] == 'r') {
+            if (plus2 + 35 > blen || name[plus2 + 34] != '+') return false;
+            for (size_t i = plus2 + 2; i < plus2 + 34; i++) {
                 char c = name[i];
                 if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
             }
-            if (plus3 < blen) {
-                if (plus3 + 1 >= blen || name[plus3 + 1] != '+') return false;
-                size_t rlen = blen - plus3 - 2;
-                char repo[40];
-                if (!rlen || rlen >= sizeof repo) return false;
-                copy_slice(repo, sizeof repo, name + plus3 + 2, rlen);
-                if (!repo_ok(repo)) return false;
-                if (is_named_repo) *is_named_repo = true;
+            size_t rlen = blen - (plus2 + 35);
+            char repo[40];
+            if (!rlen || rlen >= sizeof repo) return false;
+            copy_slice(repo, sizeof repo, name + plus2 + 35, rlen);
+            if (!repo_ok(repo)) return false;
+            if (is_named_repo) *is_named_repo = true;
+        } else {
+            size_t hlen = blen - plus2 - 1;
+            if (hlen < 2 || hlen > 128 || (hlen & 1u)) return false;
+            for (size_t i = plus2 + 1; i < blen; i++) {
+                char c = name[i];
+                if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
             }
         }
     }

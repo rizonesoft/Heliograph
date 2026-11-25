@@ -4414,8 +4414,10 @@ class RepositoryRouting(Base):
             self.assertEqual(rc_at(t0 + 120 * M + idx * 1000, "hello", "claude", "--session", "s2", "--as", "os/dev", cwd=other_repo).returncode, 0)
         self.assertNotIn(scoped2, rc_at(t0 + 121 * M, "inbox", "--as", "os/main", cwd=repo_a).stdout.decode())
         # Even after s2 moved to repo-other-19, repo-a STILL has recent activity (2m ago) so unowned path goes to os/all (in repo-a)!
+        import hashlib
+        s2_hash = hashlib.sha256(b"s2").hexdigest()[:32]
         for sf in list((self.store / "sessions").iterdir()):
-            if "s2".encode().hex() not in sf.name:
+            if "s2".encode().hex() not in sf.name and f"+r{s2_hash}+" not in sf.name:
                 sf.unlink()
         routed_after_move = rc_at(t0 + 121 * M + 100, "ask", "path:docs/after-move.md", "Still busy", "--as", "os/main", cwd=repo_a, body=b"work").stdout.decode().strip()
         post_moved = (self.store / f"messages/{routed_after_move}.post").read_text()
