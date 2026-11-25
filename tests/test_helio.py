@@ -2621,6 +2621,27 @@ class Sessions(Base):
         self.assertGreater(int(info_healed["when"]), int(info2["when"]))
         info2 = info_healed
 
+        # Interrupted first Windows announcement (0-byte gen-0 with NO predecessor) self-heals on next hello/refresh!
+        put(self.store / "sessions/os+emptygen0", "")
+        r_g0 = self.helio("hello", "codex", me="os/emptygen0", cwd=repo)
+        self.assertEqual((r_g0.returncode, r_g0.stderr), (0, b""))
+        self.assertFalse((self.store / "sessions/os+emptygen0").exists())
+        rc_g0, info_g0 = self.read_session("os/emptygen0", "")
+        self.assertEqual((rc_g0, info_g0["agent"]), (0, "codex"))
+        for p in list((self.store / "sessions").iterdir()):
+            if p.name == "os+emptygen0" or p.name.startswith("os+emptygen0~"):
+                p.unlink()
+
+        # I/O read error on a newer generation (e.g. unreadable directory at ~99999 beside intact predecessor)
+        # MUST fail with S_DAMAGED rather than silently falling back to the older predecessor!
+        bad_newer = self.store / f"sessions/{base_r1}~99999"
+        bad_newer.mkdir()
+        self.assertNotEqual(self.read_session("os/apps", "race-1")[0], 0)
+        r_bad_newer = self.helio("inbox", "--session", "race-1", me=None, cwd=repo)
+        self.assertEqual(r_bad_newer.returncode, 1)
+        self.assertIn(b"cannot be read", r_bad_newer.stderr)
+        bad_newer.rmdir()
+
         # Backward compatibility with 4-field structured records without `end: yes` (written by 8509054):
         # both C readers parse them and an ordinary refresh advances them cleanly preserving agent.
         self.backdate_session("os/apps", "compat-4f", "time: 2000\nagent: codex\nrepository: race-repo\nsession: compat-4f\n")
