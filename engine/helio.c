@@ -75,7 +75,8 @@ static char *env_nonempty(const char *name) {
 
 static bool parse(options *o, int count, char **args) {
     *o = (options){.about = "", .urgency = "next", .for_session = "", .key = "", .due = "", .why = NULL};
-    o->me_env = p_env("HELIO_AS"), o->folder_env = p_env("HELIO_STORE"), o->default_env = p_env("HELIO_DEFAULT_STORE");
+    if (p_env_checked("HELIO_AS", &o->me_env) == P_FAILED) return o->why = "out of memory", false;
+    o->folder_env = p_env("HELIO_STORE"), o->default_env = p_env("HELIO_DEFAULT_STORE");
     if (!o->default_env || !*o->default_env) {
         char *hex = p_env("HELIO_DEFAULT_STORE_HEX");
         if (hex && *hex) {

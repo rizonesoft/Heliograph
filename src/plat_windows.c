@@ -387,16 +387,34 @@ p_result p_list(const char *path, bool (*each)(void *user, const char *name), vo
     return from(im_list(path, entry, &l));
 }
 
-char *p_env(const char *name) {
+p_result p_env_checked(const char *name, char **value_out) {
+    *value_out = NULL;
     wchar_t *wide = im_wide(name);
-    if (!wide) return NULL;
-    char *value = NULL;
+    if (!wide) return P_FAILED;
     DWORD need = GetEnvironmentVariableW(wide, NULL, 0);
-    wchar_t *text = need ? im_alloc((size_t)need * sizeof *text) : NULL;
-    if (text && GetEnvironmentVariableW(wide, text, need) < need) value = im_utf8(text);
+    if (!need) {
+        DWORD err = GetLastError();
+        im_free(wide);
+        return err == ERROR_ENVVAR_NOT_FOUND ? P_MISSING : P_FAILED;
+    }
+    wchar_t *text = im_alloc((size_t)need * sizeof *text);
+    if (!text) {
+        im_free(wide);
+        return P_FAILED;
+    }
+    p_result r = P_FAILED;
+    if (GetEnvironmentVariableW(wide, text, need) < need) {
+        *value_out = im_utf8(text);
+        if (*value_out) r = P_OK;
+    }
     im_free(text);
     im_free(wide);
-    return value;
+    return r;
+}
+
+char *p_env(const char *name) {
+    char *value = NULL;
+    return p_env_checked(name, &value) == P_OK ? value : NULL;
 }
 
 bool p_error(const char *text) {

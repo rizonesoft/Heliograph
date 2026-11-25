@@ -22,12 +22,14 @@ p_result p_sync(const char *path);
 p_result p_folder(const char *path);
 /* True iff path exists and is a real directory (never a symlink or reparse point). */
 bool p_is_real_dir(const char *path);
-/* Sets *at_root to true when dir is already at the filesystem root (dir == dir/..). */
+/* Sets *at_root to true once dir has reached the filesystem root (exact on POSIX; bounded by MAX_PATH depth on Windows). */
 p_result p_at_root(const char *dir, bool *at_root);
 p_result p_list(const char *path, bool (*each)(void *user, const char *name), void *user);
 p_result p_input(size_t most, char **data, size_t *length);
 uint64_t p_now(void); /* microseconds since 1970 */
 uint64_t p_tick(void); /* differs between programs started together */
 char *p_env(const char *name); /* new memory or NULL */
+/* Distinguishes present (P_OK, sets *value_out), absent (P_MISSING), and allocation failure (P_FAILED). */
+p_result p_env_checked(const char *name, char **value_out);
 bool p_print(const char *text);
 bool p_error(const char *text);

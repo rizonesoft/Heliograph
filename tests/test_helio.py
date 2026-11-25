@@ -3488,11 +3488,12 @@ class ProjectIsolation(Base):
             self.assertEqual(r_rl_empty.returncode, 2)
             self.assertEqual(r_rl_empty.stdout, b"")
 
-            # Project-only helio.conf scopes BOTH `log` and `log --all` to that project (including from 30 nested dirs deep)!
+            # Project-only helio.conf scopes BOTH `log` and `log --all` to that project (including from 260 nested dirs deep on Linux / 30 on Windows)!
             repo_proj = no_conf / "repo_proj"
             deep = repo_proj
-            for i in range(30):
-                deep = deep / f"d{i}"
+            depth = 30 if ON_WINDOWS else 260
+            for i in range(depth):
+                deep = deep / ("a" if not ON_WINDOWS else f"d{i}")
             deep.mkdir(parents=True)
             put(repo_proj / "helio.conf", "project: alpha\n")
             r_rp = run(self.store, "log", me=None, cwd=repo_proj)

@@ -60,7 +60,8 @@ Legend: ✅ works · 📋 planned
 | Daily summary | ✅ | Written by the first inbox or hook of the day |
 | Archive by month, expiry | 📋 | [§1 to §3 and §12](todo/01-heliograph/TODO-01-heliograph.md) |
 | Silent takers, messages for one session | ✅ | `helio hello`, `silent:` reporting, and `--for-session` targeting |
-| Projects kept apart, landed work, fixed marks | 📋 | [§7 to §9](todo/01-heliograph/TODO-01-heliograph.md) |
+| Projects kept apart in log and show | ✅ | `may_see` scopes `log`, `show`, `answer`, and job commands to your project |
+| Landed work, fixed marks | 📋 | [§8 and §9](todo/01-heliograph/TODO-01-heliograph.md) |
 | JSON, taking the next job as a queue | 📋 | [§10 and §11](todo/01-heliograph/TODO-01-heliograph.md) |
 
 ## Quick start

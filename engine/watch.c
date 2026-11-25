@@ -58,21 +58,52 @@ static bool collect_session_cb(void *user, const session_info *info) {
     return true;
 }
 
-void sessions_cache_load(store *s, session_cache *c) {
-    if (c->state != SESS_UNLOADED) return;
-    sess_collect sc = {c, false};
-    p_result r = place_each_session(s, collect_session_cb, &sc);
-    if (sc.oom || (r != P_OK && r != P_MISSING)) {
-        p_free(c->items);
-        c->items = NULL, c->count = 0, c->cap = 0;
-        c->state = SESS_FAILED;
-        return;
+static bool ensure_session_loaded(store *s, session_cache *c, const char *lane, const char *session) {
+    const char *sess = session ? session : "";
+    for (size_t i = 0; i < c->query_count; i++) {
+        if (same(c->queries[i].lane, lane) && same(c->queries[i].session, sess))
+            return !c->queries[i].failed;
     }
-    c->state = SESS_OK;
+    bool failed = false;
+    if (*sess) {
+        session_info info = {0};
+        s_result sr = place_session(s, lane, sess, &info);
+        if (sr == S_DAMAGED) failed = true;
+        else if (sr == S_OK) {
+            sess_collect col = {c, false};
+            collect_session_cb(&col, &info);
+            if (col.oom) failed = true;
+        }
+    } else {
+        sess_collect col = {c, false};
+        p_result pr = place_lane_sessions(s, lane, collect_session_cb, &col);
+        if (col.oom || (pr != P_OK && pr != P_MISSING)) failed = true;
+    }
+    if (c->query_count == c->query_cap) {
+        size_t next = c->query_cap ? c->query_cap * 2 : 8;
+        session_query_entry *grown = p_alloc(next * sizeof *grown);
+        if (grown) {
+            for (size_t i = 0; i < c->query_count; i++) grown[i] = c->queries[i];
+            p_free(c->queries);
+            c->queries = grown, c->query_cap = next;
+        }
+    }
+    if (c->query_count < c->query_cap) {
+        session_query_entry *q = &c->queries[c->query_count++];
+        size_t i = 0;
+        for (; i + 1 < sizeof q->lane && lane[i]; i++) q->lane[i] = lane[i];
+        q->lane[i] = 0;
+        i = 0;
+        for (; i + 1 < sizeof q->session && sess[i]; i++) q->session[i] = sess[i];
+        q->session[i] = 0;
+        q->failed = failed;
+    }
+    return !failed;
 }
 
 void sessions_cache_free(session_cache *c) {
     p_free(c->items);
+    p_free(c->queries);
     p_free(c->thresholds);
     *c = (session_cache){0};
 }
@@ -126,22 +157,8 @@ bool watch_classify_job(store *s, const place *here, const message *m, const job
     job_project(m->to, proj, sizeof proj);
     uint64_t silent_us = 0;
     if (cached_silent_us(s, here, sc, proj, &silent_us) != P_OK) return false;
-    if (*now->session) {
-        session_info info = {0};
-        s_result sr = place_session(s, now->by, now->session, &info);
-        if (sr == S_DAMAGED) return false;
-        *silent_out = is_silent(sr == S_OK ? &info : NULL, sr == S_OK ? 1 : 0, now, clock_now, silent_us);
-        return true;
-    }
-    session_cache lane_sc = {0};
-    sess_collect col = {&lane_sc, false};
-    p_result pr = place_lane_sessions(s, now->by, collect_session_cb, &col);
-    if (col.oom || (pr != P_OK && pr != P_MISSING)) {
-        sessions_cache_free(&lane_sc);
-        return false;
-    }
-    *silent_out = is_silent(lane_sc.items, lane_sc.count, now, clock_now, silent_us);
-    sessions_cache_free(&lane_sc);
+    if (!ensure_session_loaded(s, sc, now->by, now->session)) return false;
+    *silent_out = is_silent(sc->items, sc->count, now, clock_now, silent_us);
     return true;
 }
 
@@ -153,10 +170,8 @@ bool watch_classify_session_silent(store *s, const place *here, const message *m
     job_project(m->to, proj, sizeof proj);
     uint64_t silent_us = 0;
     if (cached_silent_us(s, here, sc, proj, &silent_us) != P_OK) return false;
-    session_info info = {0};
-    s_result sr = place_session(s, m->to, m->for_session, &info);
-    if (sr == S_DAMAGED) return false;
-    *silent_out = is_session_silent(sr == S_OK ? &info : NULL, sr == S_OK ? 1 : 0, m->to, m->for_session, since_us, clock_now, silent_us);
+    if (!ensure_session_loaded(s, sc, m->to, m->for_session)) return false;
+    *silent_out = is_session_silent(sc->items, sc->count, m->to, m->for_session, since_us, clock_now, silent_us);
     return true;
 }
 

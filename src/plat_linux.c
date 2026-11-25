@@ -293,5 +293,13 @@ char *p_env(const char *name) {
     return value ? strdup(value) : NULL;
 }
 
+p_result p_env_checked(const char *name, char **value_out) {
+    *value_out = NULL;
+    const char *value = getenv(name);
+    if (!value) return P_MISSING;
+    *value_out = strdup(value);
+    return *value_out ? P_OK : P_FAILED;
+}
+
 bool p_print(const char *text) { return fputs(text, stdout) >= 0 && !fflush(stdout); }
 bool p_error(const char *text) { return fputs(text, stderr) >= 0; }

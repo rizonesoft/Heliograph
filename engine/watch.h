@@ -2,23 +2,27 @@
 #pragma once
 #include "place.h"
 
-typedef enum { SESS_UNLOADED = 0, SESS_OK, SESS_FAILED } session_state;
-
 typedef struct silent_cache_entry {
     char project[36];
     uint64_t us;
     bool failed;
 } silent_cache_entry;
 
+typedef struct session_query_entry {
+    char lane[72];
+    char session[72]; /* "" = all sessions of lane */
+    bool failed;
+} session_query_entry;
+
 typedef struct session_cache {
-    session_state state;
     session_info *items;
     size_t count, cap;
+    session_query_entry *queries;
+    size_t query_count, query_cap;
     silent_cache_entry *thresholds;
     size_t thresh_count, thresh_cap;
 } session_cache;
 
-void sessions_cache_load(store *s, session_cache *c);
 void sessions_cache_free(session_cache *c);
 
 /* Records what this lane is touching; adds a line to said and tells the other
