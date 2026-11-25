@@ -35,4 +35,4 @@ s_result place_session(store *s, const char *lane, const char *session, session_
 p_result place_each_session(store *s, bool (*each)(void *user, const session_info *info), void *user);
 
 /* A lane of this project, other than me, said hello within the time. */
-bool place_busy(store *s, const char *project, const char *me, uint64_t within);
+s_result place_busy(store *s, const char *project, const char *me, uint64_t within, bool *busy);

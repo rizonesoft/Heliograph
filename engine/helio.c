@@ -101,12 +101,43 @@ static bool parse(options *o, int count, char **args) {
         else o->words[o->count++] = args[i];
     }
     if (!o->session_flag) {
-        /* One uniform precedence across every command so a process never splits its
-           session identity between hook/hello and inbox/take. */
+        /* Explicit HELIO_SESSION wins; otherwise if exactly one integration session env var
+           is set use it verbatim, and if nested integrations set 2+ vars combine them into a
+           single deterministic nested-<16-hex> ID so every command in one child agrees while
+           sibling children of the same parent remain distinct. */
         o->session_env = env_nonempty("HELIO_SESSION");
-        if (!o->session_env) o->session_env = env_nonempty("CODEX_THREAD_ID");
-        if (!o->session_env) o->session_env = env_nonempty("ANTIGRAVITY_CONVERSATION_ID");
-        if (!o->session_env) o->session_env = env_nonempty("CLAUDE_CODE_SESSION_ID");
+        if (!o->session_env) {
+            static const char *const vars[] = {"CODEX_THREAD_ID", "ANTIGRAVITY_CONVERSATION_ID", "CLAUDE_CODE_SESSION_ID"};
+            char *vals[3] = {NULL, NULL, NULL};
+            int nset = 0, only = -1;
+            for (int k = 0; k < 3; k++) {
+                vals[k] = env_nonempty(vars[k]);
+                if (vals[k]) nset++, only = k;
+            }
+            if (nset == 1) {
+                o->session_env = vals[only];
+                vals[only] = NULL;
+            } else if (nset >= 2) {
+                uint64_t h = 14695981039346656037ull;
+                for (int k = 0; k < 3; k++) {
+                    if (!vals[k]) continue;
+                    for (const char *p = vars[k]; *p; p++) h = (h ^ (unsigned char)*p) * 1099511628211ull;
+                    h = (h ^ (unsigned char)'=') * 1099511628211ull;
+                    for (const char *p = vals[k]; *p; p++) h = (h ^ (unsigned char)*p) * 1099511628211ull;
+                    h = (h ^ (unsigned char)'\n') * 1099511628211ull;
+                }
+                static const char hex[] = "0123456789abcdef";
+                char *buf = p_alloc(24);
+                if (buf) {
+                    const char *pfx = "nested-";
+                    for (int i = 0; i < 7; i++) buf[i] = pfx[i];
+                    for (int i = 0; i < 16; i++) buf[7 + i] = hex[(h >> ((15 - i) * 4)) & 15u];
+                    buf[23] = 0;
+                    o->session_env = buf;
+                }
+            }
+            for (int k = 0; k < 3; k++) p_free(vals[k]);
+        }
         o->session = o->session_env ? o->session_env : "";
     }
     if (place_open(&o->here, &o->why) != S_OK) return false;
@@ -408,15 +439,18 @@ static int hook(store *s, options *o) {
 }
 
 /* Where "path:<file>" goes: its owner, else whoever works there, else the owner of the project. */
-static const char *reader(store *s, options *o, const char *to) {
-    if (!starts(to, "path:")) return to;
-    if (!o->here.found) return "";
+static s_result reader(store *s, options *o, const char *to, const char **out) {
+    if (!starts(to, "path:")) return *out = to, S_OK;
+    if (!o->here.found) return *out = "", S_OK;
     place_owner(&o->here, to + 5, &o->to);
     if (!o->to.length) {
-        bool busy = place_busy(s, o->here.project, o->me, 30ull * 60 * 1000000);
+        bool busy = false;
+        s_result br = place_busy(s, o->here.project, o->me, 30ull * 60 * 1000000, &busy);
+        if (br != S_OK) return *out = "", br;
         add(&o->to, o->here.project), add(&o->to, busy ? "/all" : "/owner");
     }
-    return o->to.failed ? "" : o->to.data;
+    *out = o->to.failed ? "" : o->to.data;
+    return S_OK;
 }
 
 static bool ascii_starts_ci(const char *s, const char *prefix) {
@@ -582,10 +616,16 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
         code = result == S_OK ? 0 : fail(s.why, result);
         break;
     }
-    case 11: code = post(&s, o, "request", reader(&s, o, o->words[1]), ""); break;
-    case 12: code = post(&s, o, "handoff", reader(&s, o, o->words[1]), ""); break;
-    case 13: code = post(&s, o, "headsup", reader(&s, o, o->words[1]), ""); break;
-    case 14: code = post(&s, o, "finding", reader(&s, o, o->words[1]), ""); break;
+    case 11:
+    case 12:
+    case 13:
+    case 14: {
+        static const char *const post_kinds[] = {"request", "handoff", "headsup", "finding"};
+        const char *dest = "";
+        result = reader(&s, o, o->words[1], &dest);
+        code = result == S_OK ? post(&s, o, post_kinds[which - 11], dest, "") : fail(s.why, result);
+        break;
+    }
     case 15:
         result = announce_session(&s, o, o->words[1]);
         code = result == S_OK ? 0 : fail(s.why, result);

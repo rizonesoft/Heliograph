@@ -1,8 +1,6 @@
 #include "place.h"
 
 enum { MOST_SESSION_FILE = 512 };
-static const uint64_t SESSION_LOCK_STALE_US = 5000000ull; /* 5 seconds */
-static const uint64_t SESSION_LOCK_WAIT_US = 2000000ull;  /* 2 seconds */
 
 static bool take_word(char *to, size_t room, const char **at) {
     while (**at == ' ') ++*at;
@@ -187,21 +185,6 @@ static p_result read_session_file(const char *path, session_info *out, bool *par
     return r;
 }
 
-static p_result acquire_session_lock(const char *lock_path, const char *unique) {
-    uint64_t start = p_now();
-    for (;;) {
-        p_result r = p_create_excl(lock_path, "", 0);
-        if (r == P_OK) return P_OK;
-        if (r != P_EXISTS) return r;
-        uint64_t mtime = 0, now = p_now();
-        if (p_file_mtime(lock_path, &mtime) == P_OK && now > mtime && now - mtime >= SESSION_LOCK_STALE_US) {
-            p_claim_remove(lock_path, unique);
-            continue;
-        }
-        if (now >= start && now - start >= SESSION_LOCK_WAIT_US) return P_FAILED;
-    }
-}
-
 s_result place_hello(store *s, const char *lane, const char *agent, const char *repository, const char *session) {
     if (!lane || !address_ok(lane, false)) return s->why = "say who you are: --as project/lane or HELIO_AS", S_REFUSED;
     if (!session_ok(session)) return s->why = "the session name is invalid or too long", S_REFUSED;
@@ -228,7 +211,8 @@ s_result place_hello(store *s, const char *lane, const char *agent, const char *
 
     if (s->pause) s->pause(s->pause_user, "hello-write");
 
-    result = acquire_session_lock(lock_path.data, unique.data);
+    void *lock_handle = NULL;
+    result = p_lock(lock_path.data, &lock_handle);
     if (result != P_OK) {
         text_free(&folder), text_free(&path), text_free(&lock_path), text_free(&unique);
         return s->why = "the session cannot be announced", S_DAMAGED;
@@ -238,20 +222,23 @@ s_result place_hello(store *s, const char *lane, const char *agent, const char *
     bool have_existing = false;
     p_result er = read_session_file(path.data, &existing, &have_existing);
     if (er != P_OK && er != P_MISSING) {
-        p_remove(lock_path.data);
+        p_unlock(lock_handle);
         text_free(&folder), text_free(&path), text_free(&lock_path), text_free(&unique);
         return s->why = "the existing session cannot be read", S_DAMAGED;
     }
+
+    if (s->pause) s->pause(s->pause_user, "hello-in-lock");
 
     uint64_t now = p_now();
     if (have_existing && now <= existing.when) now = existing.when + 1;
     const char *use_agent = *ag ? ag : (have_existing && *existing.agent ? existing.agent : "");
     format_session(&data, now, use_agent, rp, ss);
     result = data.failed ? P_FAILED : p_write(path.data, data.data, data.length, true, unique.data);
-    p_remove(lock_path.data);
+    p_unlock(lock_handle);
 
     text_free(&folder), text_free(&path), text_free(&lock_path), text_free(&data), text_free(&unique);
-    if (result != P_OK) s->why = "the session cannot be announced";
+    if (result == P_UNFLUSHED) s->why = "the session was written, but its folder could not be flushed";
+    else if (result != P_OK) s->why = "the session cannot be announced";
     return result == P_OK ? S_OK : S_DAMAGED;
 }
 
@@ -280,7 +267,7 @@ typedef struct {
     bool had_error;
 } session_scan;
 
-static bool decode_lane_from_name(const char *name, char *lane, size_t room) {
+static bool decode_session_filename(const char *name, char *lane, size_t room) {
     size_t plus1 = 0;
     while (name[plus1] && name[plus1] != '+') plus1++;
     if (!name[plus1]) return false;
@@ -289,7 +276,17 @@ static bool decode_lane_from_name(const char *name, char *lane, size_t room) {
     if (plus2 == plus1 + 1 || plus2 >= room) return false;
     for (size_t i = 0; i < plus2; i++) lane[i] = i == plus1 ? '/' : name[i];
     lane[plus2] = 0;
-    return address_ok(lane, false);
+    if (!address_ok(lane, false)) return false;
+    if (name[plus2] == '+') {
+        const char *hex = name + plus2 + 1;
+        size_t hlen = len(hex);
+        if (hlen < 2 || hlen > 128 || (hlen & 1u)) return false;
+        for (size_t i = 0; i < hlen; i++) {
+            char c = hex[i];
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+        }
+    }
+    return true;
 }
 
 static bool scan_one_session(void *user, const char *name) {
@@ -298,7 +295,7 @@ static bool scan_one_session(void *user, const char *name) {
     if (n > 5 && same(name + n - 5, ".part")) return true;
     if (n > 5 && same(name + n - 5, ".lock")) return true;
     char lane[72];
-    if (!decode_lane_from_name(name, lane, sizeof lane)) return true;
+    if (!decode_session_filename(name, lane, sizeof lane)) return true;
     text path = {0};
     add(&path, sc->s->folder), add(&path, "/sessions/"), add(&path, name);
     bool keep = true;
@@ -344,9 +341,13 @@ static bool busy_each(void *user, const session_info *info) {
     return !l->busy;
 }
 
-bool place_busy(store *s, const char *project, const char *me, uint64_t within) {
+s_result place_busy(store *s, const char *project, const char *me, uint64_t within, bool *busy) {
+    *busy = false;
     uint64_t now = p_now();
     look l = {project, me, now > within ? now - within : 0, false};
-    place_each_session(s, busy_each, &l);
-    return l.busy;
+    p_result r = place_each_session(s, busy_each, &l);
+    if (r == P_MISSING) return S_OK;
+    if (r != P_OK) return s->why = "the sessions folder cannot be read", S_DAMAGED;
+    *busy = l.busy;
+    return S_OK;
 }

@@ -12,6 +12,7 @@
 
 #ifdef HELIO_TEST_HOOKS
 extern bool plat_fail_flush;
+extern bool plat_fail_write_flush;
 extern bool plat_fail_sync;
 extern uint64_t plat_now_override;
 extern size_t store_max_names;
@@ -186,6 +187,10 @@ int racer(int count, char **args) {
     }
     if (count >= 3 && same(args[1], "--fail-flush-cli")) {
         plat_fail_flush = true;
+        return helio(count - 1, args + 1);
+    }
+    if (count >= 3 && same(args[1], "--fail-write-flush-cli")) {
+        plat_fail_write_flush = true;
         return helio(count - 1, args + 1);
     }
     if (count >= 3 && same(args[1], "--fail-sync-cli")) {

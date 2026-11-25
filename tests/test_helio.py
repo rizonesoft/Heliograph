@@ -2270,6 +2270,9 @@ class Sessions(Base):
         put(self.store / "sessions/os+legacy-lane", f"{fresh_now}\n")
         named_part = self.store / f"sessions/os+apps+{'ghost'.encode().hex()}.123.part"
         put(named_part, "time: 9999999999999999\nagent: codex\nrepository: x\nsession: ghost\n")
+        # Legacy d4feaea-style .meta sidecar alongside a named session must NOT enumerate as a second session!
+        legacy_meta = self.store / f"sessions/os+apps+{'s-codex'.encode().hex()}.meta"
+        put(legacy_meta, "time: 9999999999999999\nagent: claude\nrepository: old\nsession: s-codex\n")
         listed = self.list_sessions()
         self.assertEqual(len(listed), 5, listed)
         by_key = {(row["lane"], row["session"]): row for row in listed}
@@ -2324,18 +2327,23 @@ class Sessions(Base):
             for osid, prev_when in others_before.items():
                 self.assertEqual(self.read_session("os/apps", osid)[1]["when"], prev_when)
 
-        # Single stable identity when both CODEX_THREAD_ID and CLAUDE_CODE_SESSION_ID are present:
-        # hook, inbox, and take all resolve to the same session ID!
-        j = self.send("ask", to="os/apps", me="os/main", subject="Unified session")
-        both_env = {"CODEX_THREAD_ID": "shared-codex-id", "CLAUDE_CODE_SESSION_ID": "other-claude-id"}
-        self.assertEqual(self.helio("hook", "claude", me=None, cwd=repo, extra_env=both_env).returncode, 0)
-        self.assertEqual(self.helio("inbox", me=None, cwd=repo, extra_env=both_env).returncode, 0)
-        self.assertEqual(self.helio("take", j, me=None, cwd=repo, extra_env=both_env).returncode, 0)
-        rc_shared, info_shared = self.read_session("os/apps", "shared-codex-id")
-        self.assertEqual((rc_shared, info_shared["agent"]), (0, "claude"))
-        self.assertEqual(self.read_session("os/apps", "other-claude-id")[0], 1)
+        # Nested integrations: two Claude children started from the same Codex parent each have a unified
+        # identity across hook/inbox/take, and child 2 is REFUSED (exit 2) when trying to finish child 1's job!
+        j = self.send("ask", to="os/apps", me="os/main", subject="Nested session ownership")
+        child1 = {"CODEX_THREAD_ID": "parent-codex", "CLAUDE_CODE_SESSION_ID": "child-claude-1"}
+        child2 = {"CODEX_THREAD_ID": "parent-codex", "CLAUDE_CODE_SESSION_ID": "child-claude-2"}
+        self.assertEqual(self.helio("hook", "claude", me=None, cwd=repo, extra_env=child1).returncode, 0)
+        self.assertEqual(self.helio("inbox", me=None, cwd=repo, extra_env=child1).returncode, 0)
+        self.assertEqual(self.helio("take", j, me=None, cwd=repo, extra_env=child1).returncode, 0)
         link0 = (self.store / f"messages/{j}.link.0000").read_text()
-        self.assertIn("session: shared-codex-id\n", link0)
+        sess1 = next(ln[9:] for ln in link0.splitlines() if ln.startswith("session: "))
+        self.assertTrue(sess1.startswith("nested-"), sess1)
+        rc_c1, info_c1 = self.read_session("os/apps", sess1)
+        self.assertEqual((rc_c1, info_c1["agent"]), (0, "claude"))
+        # Child 2 has a DIFFERENT nested ID and cannot finish child 1's taken job!
+        self.assertEqual(self.helio("done", j, "hijack", me=None, cwd=repo, extra_env=child2).returncode, 2)
+        # Child 1 itself CAN finish its own job!
+        self.assertEqual(self.helio("done", j, "legit", me=None, cwd=repo, extra_env=child1).returncode, 0)
 
     def test_two_repositories_and_unconfigured_dir_refresh(self):
         repo_a = self.store / "repo-a"
@@ -2404,6 +2412,7 @@ class Sessions(Base):
             (("working", "src/a.c"), ""),
             (("archive",), ""),
             (("help",), ""),
+            (("init",), ""),
         ):
             put(sfile, "time: 1000\nagent: antigravity\nrepository: cmd-repo\nsession: cmd-s\n")
             r = self.helio(*args, "--session", "cmd-s", me="os/apps", cwd=repo, body=body)
@@ -2411,6 +2420,14 @@ class Sessions(Base):
             _, cur = self.read_session("os/apps", "cmd-s")
             self.assertEqual(cur["agent"], "antigravity", args)
             self.assertGreater(int(cur["when"]), 1000, args)
+
+        # hook claude also strictly refreshes an established backdated session record.
+        put(sfile, "time: 1000\nagent: codex\nrepository: cmd-repo\nsession: cmd-s\n")
+        r_hk = self.helio("hook", "claude", "--session", "cmd-s", me="os/apps", cwd=repo)
+        self.assertEqual(r_hk.returncode, 0, r_hk.stderr)
+        _, cur_hk = self.read_session("os/apps", "cmd-s")
+        self.assertEqual(cur_hk["agent"], "claude")
+        self.assertGreater(int(cur_hk["when"]), 1000)
 
         # Store-free help still exits 0 quietly without error.
         clean_env = {k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_DEFAULT_STORE", "HELIO_DEFAULT_STORE_HEX", "HELIO_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "ANTIGRAVITY_CONVERSATION_ID")}
@@ -2479,44 +2496,66 @@ class Sessions(Base):
         self.assertEqual((rc, info["agent"], info["repository"]), (0, "codex", "race-repo"))
         self.assertGreater(int(info["when"]), int(mid["when"]))
 
-        # Case 2: established session, two overlapping ordinary refreshes never move time backward or lose agent/repository.
+        # Case 2: real lock contention on an established session! Process 1 acquires OS lock, reads existing,
+        # and pauses at hello-in-lock; Process 2 starts while Process 1 holds the lock and MUST wait until
+        # Process 1 releases, then both updates complete in serial order with monotonic time and preserved metadata!
         p2 = subprocess.Popen(
-            [str(RACER), "--pause-cli", "hello-write", str(self.store), "inbox", "--store", str(self.store), "--as", "os/apps", "--session", "race-1"],
+            [str(RACER), "--pause-cli", "hello-in-lock", str(self.store), "inbox", "--store", str(self.store), "--as", "os/apps", "--session", "race-1"],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=repo, env=clean,
         )
+        p3 = None
         try:
             deadline = time.time() + 15
-            while not (self.store / "paused.hello-write").exists():
+            while not (self.store / "paused.hello-in-lock").exists():
                 self.assertLess(time.time(), deadline)
                 time.sleep(0.01)
-            self.helio("inbox", "--session", "race-1", me=None, cwd=repo)
-            _, mid2 = self.read_session("os/apps", "race-1")
-            put(self.store / "resume.hello-write", "go")
+            # Launch contender while p2 holds the OS lock after reading existing!
+            p3 = subprocess.Popen(
+                [str(PROGRAM), "hello", "antigravity", "--store", str(self.store), "--as", "os/apps", "--session", "race-1"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=repo, env=clean,
+            )
+            time.sleep(0.1)
+            self.assertIsNone(p3.poll(), "contender must wait while p2 holds OS lock")
+            put(self.store / "resume.hello-in-lock", "go")
             p2.communicate(timeout=30)
+            _, p3_err = p3.communicate(timeout=30)
+            self.assertEqual(p3.returncode, 0, p3_err)
         finally:
-            if p2.poll() is None:
-                p2.kill()
-        for f in ("paused.hello-write", "resume.hello-write"):
+            for proc in (p2, p3):
+                if proc is not None and proc.poll() is None:
+                    proc.kill()
+        for f in ("paused.hello-in-lock", "resume.hello-in-lock"):
             if (self.store / f).exists():
                 (self.store / f).unlink()
         rc2, info2 = self.read_session("os/apps", "race-1")
-        self.assertEqual((rc2, info2["agent"], info2["repository"]), (0, "codex", "race-repo"))
-        self.assertGreater(int(info2["when"]), int(mid2["when"]))
+        self.assertEqual((rc2, info2["agent"], info2["repository"]), (0, "antigravity", "race-repo"))
+        self.assertGreater(int(info2["when"]), int(info["when"]))
         listed = [row for row in self.list_sessions() if row["session"] == "race-1"]
         self.assertEqual(len(listed), 1)
-        self.assertEqual((listed[0]["agent"], listed[0]["repository"], listed[0]["when"]), ("codex", "race-repo", info2["when"]))
+        self.assertEqual((listed[0]["agent"], listed[0]["repository"], listed[0]["when"]), ("antigravity", "race-repo", info2["when"]))
 
-        # Case 3: failed hello (flush failure) leaves existing announcement completely untouched (one publication point).
-        r_fail = subprocess.run(
-            [str(RACER), "--fail-flush-cli", "hello", "claude", "--store", str(self.store), "--as", "os/apps", "--session", "race-1"],
+        # Case 3a: pre-rename failure (--fail-sync-cli) leaves existing announcement 100% untouched.
+        r_sync_fail = subprocess.run(
+            [str(RACER), "--fail-sync-cli", "hello", "claude", "--store", str(self.store), "--as", "os/apps", "--session", "race-1"],
             capture_output=True, timeout=30, cwd=repo, env=clean,
         )
-        self.assertEqual(r_fail.returncode, 3)
+        self.assertEqual(r_sync_fail.returncode, 3)
         rc3, info3 = self.read_session("os/apps", "race-1")
-        self.assertEqual((rc3, info3["agent"], info3["repository"], info3["when"]), (0, "codex", "race-repo", info2["when"]))
+        self.assertEqual((rc3, info3["agent"], info3["repository"], info3["when"]), (0, "antigravity", "race-repo", info2["when"]))
+
+        # Case 3b: post-rename parent-dir flush failure (--fail-write-flush-cli -> P_UNFLUSHED) exits 3 with explicit
+        # un-flushed wording while the atomically renamed record is visibly published.
+        r_wf_fail = subprocess.run(
+            [str(RACER), "--fail-write-flush-cli", "hello", "claude", "--store", str(self.store), "--as", "os/apps", "--session", "race-1"],
+            capture_output=True, timeout=30, cwd=repo, env=clean,
+        )
+        self.assertEqual(r_wf_fail.returncode, 3)
+        self.assertIn(b"folder could not be flushed", r_wf_fail.stderr)
+        rc3b, info3b = self.read_session("os/apps", "race-1")
+        self.assertEqual((rc3b, info3b["agent"], info3b["repository"]), (0, "claude", "race-repo"))
 
         # Case 4: ordinary refresh when existing session path is unreadable (a directory) leaves it intact and warns,
-        # and place_each_session reports the I/O error rather than silently ignoring it.
+        # place_each_session reports the I/O error, AND unowned-path routing fails with exit 3 instead of routing to owner!
         (self.store / "sessions").mkdir(exist_ok=True)
         bad_entry = self.store / "sessions/os+unreadable"
         bad_entry.mkdir()
@@ -2526,6 +2565,8 @@ class Sessions(Base):
         self.assertIn(b"cannot be read", r_unr.stderr)
         r_list_err = subprocess.run([str(RACER), "--list-sessions", str(self.store)], capture_output=True, timeout=30)
         self.assertNotEqual(r_list_err.returncode, 0)
+        r_route = self.helio("ask", "path:docs/x.md", "Unowned", me=None, cwd=repo, body="body")
+        self.assertEqual(r_route.returncode, 3, r_route.stderr)
 
     def test_session_name_validation_blocks_collisions_and_length_overflow(self):
         # team<TAB>A is refused while team A is accepted; control-only is refused and never aliases anonymous "".

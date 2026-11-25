@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -63,6 +64,7 @@ p_result p_input(size_t most, char **data, size_t *length) { return all(0, most,
 /* The name is on the disk too, not only the bytes. */
 #ifdef HELIO_TEST_HOOKS
 bool plat_fail_flush = false;
+bool plat_fail_write_flush = false;
 bool plat_fail_sync = false;
 uint64_t plat_now_override = 0;
 #endif
@@ -100,14 +102,64 @@ p_result p_write(const char *path, const char *data, size_t length, bool replace
         good = wrote > 0;
         if (good) done += (size_t)wrote;
     }
+#ifdef HELIO_TEST_HOOKS
+    if (plat_fail_sync) good = false;
+#endif
     good = good && !fsync(file);
     good = !close(file) && good;
     p_result result = P_FAILED;
     if (good && replace) result = rename(temp, path) ? why() : P_OK;
     else if (good) result = link(temp, path) ? why() : P_OK; /* fails when the name is taken, on D: too */
     if (!(good && replace && result == P_OK)) unlink(temp);
+#ifdef HELIO_TEST_HOOKS
+    if (result == P_OK && plat_fail_write_flush) return P_UNFLUSHED;
+#endif
     if (result == P_OK && !settle(path)) result = P_UNFLUSHED;
     return result;
+}
+
+p_result p_lock(const char *path, void **handle) {
+    *handle = NULL;
+    int fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0) return why();
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (;;) {
+        if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
+            int *box = malloc(sizeof *box);
+            if (!box) {
+                flock(fd, LOCK_UN);
+                close(fd);
+                return P_FAILED;
+            }
+            *box = fd;
+            *handle = box;
+            return P_OK;
+        }
+        if (errno == EINTR) continue;
+        if (errno != EWOULDBLOCK) {
+            close(fd);
+            return P_FAILED;
+        }
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        uint64_t elapsed_ms = (uint64_t)(now.tv_sec - start.tv_sec) * 1000ull
+                            + (uint64_t)(now.tv_nsec - start.tv_nsec) / 1000000ull;
+        if (elapsed_ms >= 2000ull) {
+            close(fd);
+            return P_FAILED;
+        }
+        struct timespec ts = {0, 5000000};
+        nanosleep(&ts, NULL);
+    }
+}
+
+void p_unlock(void *handle) {
+    if (!handle) return;
+    int fd = *(int *)handle;
+    free(handle);
+    flock(fd, LOCK_UN);
+    close(fd);
 }
 
 p_result p_create_excl(const char *path, const char *data, size_t length) {

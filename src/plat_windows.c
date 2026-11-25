@@ -8,22 +8,58 @@ static p_result from(im_result result) {
 }
 _Static_assert((int)IM_FAILED == (int)P_FAILED && (int)IM_EXISTS == (int)P_EXISTS && (int)IM_TOO_LARGE == (int)P_TOO_LARGE, "the same order");
 
+#ifdef HELIO_TEST_HOOKS
+bool plat_fail_flush = false;
+bool plat_fail_write_flush = false;
+bool plat_fail_sync = false;
+uint64_t plat_now_override = 0;
+#endif
+
 void *p_alloc(size_t bytes) { return im_alloc(bytes); }
 void p_free(void *memory) { im_free(memory); }
 p_result p_read(const char *path, size_t most, char **data, size_t *length) { return from(im_read(path, most, data, length)); }
-p_result p_write(const char *path, const char *data, size_t length, bool replace, const char *unique) { return from(im_write(path, data, length, replace, unique)); }
+p_result p_write(const char *path, const char *data, size_t length, bool replace, const char *unique) {
+#ifdef HELIO_TEST_HOOKS
+    if (plat_fail_sync) return P_FAILED;
+#endif
+    p_result r = from(im_write(path, data, length, replace, unique));
+#ifdef HELIO_TEST_HOOKS
+    if (r == P_OK && plat_fail_write_flush) return P_UNFLUSHED;
+#endif
+    return r;
+}
+
+p_result p_lock(const char *path, void **handle) {
+    *handle = NULL;
+    wchar_t *wide = im_wide(path);
+    if (!wide) return P_FAILED;
+    for (int attempt = 0; attempt < 400; attempt++) {
+        HANDLE h = CreateFileW(wide, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h != INVALID_HANDLE_VALUE) {
+            im_free(wide);
+            *handle = (void *)h;
+            return P_OK;
+        }
+        DWORD err = GetLastError();
+        if (err != ERROR_SHARING_VIOLATION && err != ERROR_LOCK_VIOLATION) {
+            im_free(wide);
+            return err == ERROR_PATH_NOT_FOUND || err == ERROR_FILE_NOT_FOUND ? P_MISSING : P_FAILED;
+        }
+        Sleep(5);
+    }
+    im_free(wide);
+    return P_FAILED;
+}
+
+void p_unlock(void *handle) {
+    if (handle) CloseHandle((HANDLE)handle);
+}
 
 static bool passing_win(int attempt, DWORD error) {
     if (attempt >= 50 || (error != ERROR_SHARING_VIOLATION && error != ERROR_ACCESS_DENIED && error != ERROR_LOCK_VIOLATION)) return false;
     Sleep(4);
     return true;
 }
-
-#ifdef HELIO_TEST_HOOKS
-bool plat_fail_flush = false;
-bool plat_fail_sync = false;
-uint64_t plat_now_override = 0;
-#endif
 static bool is_wsl_unc(const char *path) {
     static const char p1[] = "\\\\wsl.localhost\\";
     static const char p2[] = "\\\\wsl$\\";
