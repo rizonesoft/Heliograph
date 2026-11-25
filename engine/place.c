@@ -145,7 +145,7 @@ bool place_parse_session(const char *data, size_t length, session_info *out) {
         out->legacy = true;
         return true;
     }
-    bool have_time = false;
+    bool have_time = false, have_end = false;
     size_t pos = 0;
     while (pos < length) {
         size_t end = pos;
@@ -162,10 +162,12 @@ bool place_parse_session(const char *data, size_t length, session_info *out) {
             copy_slice(out->repository, sizeof out->repository, line + 12, line_len - 12);
         } else if (line_len >= 9 && starts(line, "session: ")) {
             copy_slice(out->session, sizeof out->session, line + 9, line_len - 9);
+        } else if (line_len == 8 && starts(line, "end: yes")) {
+            have_end = true;
         }
         pos = end < length ? end + 1 : length;
     }
-    return have_time;
+    return have_time && have_end;
 }
 
 static void format_session(text *out, uint64_t when, const char *agent, const char *repository, const char *session) {
@@ -173,6 +175,7 @@ static void format_session(text *out, uint64_t when, const char *agent, const ch
     add(out, "agent: "), add(out, agent ? agent : ""), add(out, "\n");
     add(out, "repository: "), add(out, repository ? repository : ""), add(out, "\n");
     add(out, "session: "), add(out, session ? session : ""), add(out, "\n");
+    add(out, "end: yes\n");
 }
 
 static p_result read_session_file(const char *path, session_info *out, bool *parsed) {
@@ -309,7 +312,7 @@ s_result place_hello(store *s, const char *lane, const char *agent, const char *
                 text_free(&prev_path);
                 continue; /* Concurrent writer published prev_seq+1 and swept prev_seq. */
             }
-            if (er != P_OK) {
+            if (er != P_OK || !have_existing) {
                 text_free(&prev_path), text_free(&base);
                 return s->why = "the existing session cannot be read", S_DAMAGED;
             }
@@ -331,19 +334,30 @@ s_result place_hello(store *s, const char *lane, const char *agent, const char *
         if (s->pause) s->pause(s->pause_user, "hello-create");
 
         p_result cr = p_create_excl(next_path.data, data.data, data.length);
-        text_free(&next_path), text_free(&data);
+        text_free(&data);
         if (cr == P_EXISTS) {
-            text_free(&prev_path);
+            text_free(&next_path), text_free(&prev_path);
             if (s->pause) s->pause(s->pause_user, "hello-retry");
             continue;
         }
         if (cr == P_OK || cr == P_UNFLUSHED) {
+            /* Verify no newer generation (> next_seq) already superseded next_seq while we were delayed
+               (e.g. N+1 swept by N+2 before our delayed N+1 landed). If superseded, remove our stale
+               next_path and retry at max_seq + 1 so our update is never silently lost. */
+            bool chk_found = false;
+            uint64_t chk_max = 0;
+            if (find_latest_seq(s, base.data, &chk_found, &chk_max) == P_OK && chk_found && chk_max > next_seq) {
+                p_remove(next_path.data);
+                text_free(&next_path), text_free(&prev_path);
+                if (s->pause) s->pause(s->pause_user, "hello-retry");
+                continue;
+            }
             if (have_prev && prev_path.data) p_remove(prev_path.data);
-            text_free(&prev_path), text_free(&base);
+            text_free(&next_path), text_free(&prev_path), text_free(&base);
             if (cr == P_UNFLUSHED) return s->why = "the session was written, but its folder could not be flushed", S_DAMAGED;
             return S_OK;
         }
-        text_free(&prev_path), text_free(&base);
+        text_free(&next_path), text_free(&prev_path), text_free(&base);
         return s->why = "the session cannot be announced", S_DAMAGED;
     }
 
@@ -454,12 +468,20 @@ p_result place_each_session(store *s, bool (*each)(void *user, const session_inf
     bool had_error = false, keep = true;
     for (size_t i = 0; i < map.count && keep; i++) {
         session_info info = {0};
-        bool ok = false;
+        bool ok = false, gone = false;
         for (int attempt = 0; attempt < 8; attempt++) {
             uint64_t seq = map.items[i].seq;
             if (attempt > 0) {
                 bool found = false;
-                if (find_latest_seq(s, map.items[i].base, &found, &seq) != P_OK || !found) break;
+                p_result fr = find_latest_seq(s, map.items[i].base, &found, &seq);
+                if (fr != P_OK) {
+                    had_error = true;
+                    break;
+                }
+                if (!found) {
+                    gone = true;
+                    break;
+                }
             }
             text path = {0};
             session_seq_path(s, &path, map.items[i].base, seq);
@@ -480,6 +502,7 @@ p_result place_each_session(store *s, bool (*each)(void *user, const session_inf
             }
             break;
         }
+        if (!ok && !gone) had_error = true;
         if (ok) keep = each(user, &info);
     }
     for (size_t i = 0; i < map.count; i++) p_free(map.items[i].base);

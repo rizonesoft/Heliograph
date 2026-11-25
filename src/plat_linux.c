@@ -121,17 +121,14 @@ p_result p_create_excl(const char *path, const char *data, size_t length) {
 #ifdef HELIO_TEST_HOOKS
     if (plat_fail_sync) return P_FAILED;
 #endif
+    if (length > 0) {
+        char unique[32];
+        snprintf(unique, sizeof unique, "ex%llu", (unsigned long long)p_tick());
+        return p_write(path, data, length, false, unique);
+    }
     int file = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (file < 0) return why();
-    size_t done = 0;
-    bool good = true;
-    while (good && done < length) {
-        ssize_t wrote = write(file, data + done, length - done);
-        if (wrote < 0 && errno == EINTR) continue;
-        good = wrote > 0;
-        if (good) done += (size_t)wrote;
-    }
-    good = good && !fsync(file);
+    bool good = !fsync(file);
     good = !close(file) && good;
     if (!good) {
         unlink(path);
