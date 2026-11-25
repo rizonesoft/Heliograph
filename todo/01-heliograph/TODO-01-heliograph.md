@@ -384,6 +384,8 @@ The design lists `send` where the program has `hand` and `find`, and still lists
 
 ## 14. Unowned paths kept to their repository
 
+> **Started:** 2026-11-25T18:06Z
+
 A path that no lane owns goes to whoever works in that repository, and to the owner when nobody is there (design, "How does it find the reader?"). Today `reader` in `engine/helio.c` sends it to the whole project when any lane of the project was seen in the last half hour, and a test asks for that.
 
 **Phase:** 2
