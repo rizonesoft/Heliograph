@@ -53,6 +53,7 @@ bool place_parse_session(const char *data, size_t length, session_info *out);
 s_result place_hello(store *s, const char *lane, const char *agent, const char *repository, const char *session);
 s_result place_session(store *s, const char *lane, const char *session, session_info *out);
 s_result place_session_repo(store *s, const char *lane, const char *session, const char *repository, session_info *out);
+uint64_t place_session_repo_when(const session_info *info, const char *repository);
 p_result place_each_session(store *s, bool (*each)(void *user, const session_info *info), void *user);
 p_result place_lane_sessions(store *s, const char *lane, bool (*each)(void *user, const session_info *info), void *user);
 

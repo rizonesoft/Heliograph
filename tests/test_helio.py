@@ -4397,8 +4397,9 @@ class RepositoryRouting(Base):
         self.assertIn("SILENT", watch_out)
         # Heartbeating from repo-a clears SILENT!
         self.assertEqual(rc_at(t_late + 200, "hello", "claude", "--session", "s1", "--as", "os/dev", cwd=repo_a).returncode, 0)
-        watch_ok = rc_at(t_late + 300, "inbox", "--as", "os/main", cwd=repo_a).stdout.decode()
-        self.assertNotIn(scoped, watch_ok)
+        r_ok1 = rc_at(t_late + 300, "inbox", "--as", "os/main", cwd=repo_a)
+        self.assertEqual(r_ok1.returncode, 1, r_ok1.stderr)
+        self.assertNotIn(scoped, r_ok1.stdout.decode())
 
         # Reverse order + unbounded-repo class regression: active named taker refreshes in repo-a at +119m,
         # then visits 20 OTHER repositories before +121m -> STILL NOT silent, AND repo-a routing stays busy!
@@ -4412,7 +4413,9 @@ class RepositoryRouting(Base):
             other_repo.mkdir()
             put(other_repo / "helio.conf", f"project: os\nlane: dev\nrepository: repo-other-{idx}\n")
             self.assertEqual(rc_at(t0 + 120 * M + idx * 1000, "hello", "claude", "--session", "s2", "--as", "os/dev", cwd=other_repo).returncode, 0)
-        self.assertNotIn(scoped2, rc_at(t0 + 121 * M, "inbox", "--as", "os/main", cwd=repo_a).stdout.decode())
+        r_ok2 = rc_at(t0 + 121 * M, "inbox", "--as", "os/main", cwd=repo_a)
+        self.assertEqual(r_ok2.returncode, 1, r_ok2.stderr)
+        self.assertNotIn(scoped2, r_ok2.stdout.decode())
         # Even after s2 moved to repo-other-19, repo-a STILL has recent activity (2m ago) so unowned path goes to os/all (in repo-a)!
         import hashlib
         s2_hash = hashlib.sha256(b"s2").hexdigest()[:32]
@@ -4428,34 +4431,46 @@ class RepositoryRouting(Base):
         self.assertIn(scoped2, watch2_late)
         self.assertIn("SILENT", watch2_late)
 
-        # Interrupted refresh: canonical record has +119m in repo-a while per-repo record is still stale at t0 -> NOT silent at +121m!
+        # Interrupted refresh + subsequent repo-b refresh: canonical record had +119m in repo-a while per-repo was stale at t0;
+        # even AFTER a subsequent refresh in repo-b at +120m, write-before-supersede preserves repo-a (+119m) so NOT silent at +121m!
         s3_hex = "s3".encode().hex()
-        s3_hash = hashlib.sha256(b"s3").hexdigest()[:32]
         self.assertEqual(rc_at(t0, "hello", "claude", "--session", "s3", "--as", "os/dev", cwd=repo_a).returncode, 0)
         scoped3 = rc_at(t0 + 100, "ask", "path:docs/s3.md", "Interrupted refresh", "--as", "os/main", cwd=repo_a, body=b"work").stdout.decode().strip()
         self.assertEqual(rc_at(t0 + 200, "take", scoped3, "--session", "s3", "--as", "os/dev", cwd=repo_a).returncode, 0)
-        # Simulate crash between canonical write (+119m) and per-repo write (still at t0):
         for sf in list((self.store / "sessions").iterdir()):
             if f"os+dev+{s3_hex}" == sf.name or sf.name.startswith(f"os+dev+{s3_hex}~"):
                 sf.unlink()
         put(self.store / f"sessions/os+dev+{s3_hex}", f"time: {t0 + 119 * M}\nagent: claude\nrepository: repo-a\nsession: s3\nend: yes\n")
-        self.assertNotIn(scoped3, rc_at(t0 + 121 * M, "inbox", "--as", "os/main", cwd=repo_a).stdout.decode())
+        # Subsequent refresh in repo-b at +120m must durably preserve repo-a (+119m) BEFORE replacing canonical!
+        self.assertEqual(rc_at(t0 + 120 * M, "hello", "claude", "--session", "s3", "--as", "os/dev", cwd=repo_b).returncode, 0)
+        r_ok3 = rc_at(t0 + 121 * M, "inbox", "--as", "os/main", cwd=repo_a)
+        self.assertEqual(r_ok3.returncode, 1, r_ok3.stderr)
+        self.assertNotIn(scoped3, r_ok3.stdout.decode())
 
-        # Legacy 6a2b21a oversized (>512 bytes) canonical file with inline `repo-time:` lines: preserves activity and refreshes cleanly!
+        # Legacy 6a2b21a oversized (>512 bytes) canonical file with inline `repo-time:` lines:
+        # (a) sessionless take on repo-a sees qualifying pre-migration legacy activity BEFORE any refresh -> NOT silent at +121m!
         s4_hex = "s4".encode().hex()
-        legacy_lines = [f"time: {t0 + 121 * M}", "agent: claude", "repository: repo-b", "session: s4", f"repo-time: repo-a {t0 + 119 * M}"]
+        legacy_lines = [f"time: {t0 + 120 * M}", "agent: claude", "repository: repo-b", "session: s4", f"repo-time: repo-a {t0 + 119 * M}"]
         for idx in range(15):
             legacy_lines.append(f"repo-time: repo-legacy-{idx:02d}-padding {t0 + 100 * M + idx}")
         legacy_lines.append("end: yes\n")
         legacy_body = "\n".join(legacy_lines)
         self.assertGreater(len(legacy_body), 512)
-        put(self.store / f"sessions/os+dev+{s4_hex}", legacy_body)
-        # Refreshing s4 in repo-b migrates repo-a's legacy timestamp without failing on >512 bytes!
-        self.assertEqual(rc_at(t0 + 122 * M, "hello", "claude", "--session", "s4", "--as", "os/dev", cwd=repo_b).returncode, 0)
-        # Even after migration, repo-a still shows busy for s4 (3 minutes since +119m)!
         for sf in list((self.store / "sessions").iterdir()):
-            if s4_hex not in sf.name and f"+r{hashlib.sha256(b's4').hexdigest()[:32]}+" not in sf.name:
-                sf.unlink()
+            sf.unlink()
+        put(self.store / f"sessions/os+dev+{s4_hex}", legacy_body)
+        scoped4 = rc_at(t0 + 100, "ask", "path:docs/s4.md", "Sessionless legacy", "--as", "os/main4", cwd=repo_a, body=b"work").stdout.decode().strip()
+        self.assertEqual(rc_at(t0 + 200, "take", scoped4, "--session", "", "--as", "os/dev", cwd=repo_a).returncode, 0)
+        r_ok4 = rc_at(t0 + 121 * M, "inbox", "--as", "os/main4", cwd=repo_a)
+        self.assertIn(r_ok4.returncode, (0, 1), r_ok4.stderr)
+        self.assertNotIn(scoped4, r_ok4.stdout.decode())
+        r_log4 = rc_at(t0 + 121 * M, "log", "--as", "os/main4", cwd=repo_a)
+        self.assertEqual(r_log4.returncode, 0, r_log4.stderr)
+        s4_lines = [ln for ln in r_log4.stdout.decode().splitlines() if scoped4 in ln]
+        self.assertEqual(len(s4_lines), 1, r_log4.stdout.decode())
+        self.assertNotIn("SILENT", s4_lines[0])
+        # (b) refreshing s4 in repo-b migrates repo-a's legacy timestamp BEFORE superseding canonical, keeping repo-a busy!
+        self.assertEqual(rc_at(t0 + 122 * M, "hello", "claude", "--session", "s4", "--as", "os/dev", cwd=repo_b).returncode, 0)
         mig_job = rc_at(t0 + 122 * M + 100, "ask", "path:docs/mig.md", "Migrated", "--as", "os/main", cwd=repo_a, body=b"work").stdout.decode().strip()
         mig_post = (self.store / f"messages/{mig_job}.post").read_text()
         self.assertIn("to: os/all\n", mig_post)

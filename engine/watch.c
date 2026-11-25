@@ -11,15 +11,17 @@ bool is_silent(const session_info *sessions, size_t session_count, const job *no
     uint64_t last = now->when;
     if (*now->session) {
         for (size_t i = 0; i < session_count; i++) {
-            if (*now->repository && !same(sessions[i].repository, now->repository)) continue;
-            if (same(sessions[i].lane, now->by) && same(sessions[i].session, now->session) && sessions[i].when > last)
-                last = sessions[i].when;
+            if (same(sessions[i].lane, now->by) && same(sessions[i].session, now->session)) {
+                uint64_t t = place_session_repo_when(&sessions[i], now->repository);
+                if (t > last) last = t;
+            }
         }
     } else {
         for (size_t i = 0; i < session_count; i++) {
-            if (*now->repository && !same(sessions[i].repository, now->repository)) continue;
-            if (same(sessions[i].lane, now->by) && sessions[i].when > last)
-                last = sessions[i].when;
+            if (same(sessions[i].lane, now->by)) {
+                uint64_t t = place_session_repo_when(&sessions[i], now->repository);
+                if (t > last) last = t;
+            }
         }
     }
     return clock_now > last && (clock_now - last) >= silent_us;
