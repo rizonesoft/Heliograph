@@ -151,7 +151,8 @@ bool archive_is_clean_remnant(const char *folder, const char *id, const char *ev
     return equal;
 }
 
-static s_result copy_durable(const char *src, const char *dst, const char **why) {
+static s_result copy_durable_ex(const char *src, const char *dst, const char **why, bool *created) {
+    if (created) *created = false;
     char *data = NULL;
     size_t length = 0;
     p_result r = p_read(src, MOST_FILE, &data, &length);
@@ -178,6 +179,7 @@ static s_result copy_durable(const char *src, const char *dst, const char **why)
             *why = "an archive copy cannot be flushed";
             return S_DAMAGED;
         }
+        if (created) *created = true;
         return S_OK;
     }
     if (w == P_EXISTS) {
@@ -201,6 +203,10 @@ static s_result copy_durable(const char *src, const char *dst, const char **why)
     p_free(data);
     *why = w == P_UNFLUSHED ? "an archive copy cannot be flushed" : "an archive copy cannot be written";
     return S_DAMAGED;
+}
+
+static s_result copy_durable(const char *src, const char *dst, const char **why) {
+    return copy_durable_ex(src, dst, why, NULL);
 }
 
 typedef struct {
@@ -594,7 +600,7 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
             add_report(report, it->id, "the post could not be removed");
             return S_DAMAGED;
         }
-        if (rm_post == P_MISSING) it->peer_moved = true;
+        it->peer_moved = true; /* archived post already existed before this call */
         it->arch_links = existing_links;
         it->post_removed = true;
         return S_OK;
@@ -679,7 +685,8 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
     text dst_post = {0};
     arch_path(folder, it->month, &dst_post, it->id, "post");
     if (pause) pause(pause_user, "before-copy-post");
-    s_result cr = dst_post.failed ? (why = "out of memory", S_DAMAGED) : copy_durable(post_p.data, dst_post.data, &why);
+    bool post_created = false;
+    s_result cr = dst_post.failed ? (why = "out of memory", S_DAMAGED) : copy_durable_ex(post_p.data, dst_post.data, &why, &post_created);
     text_free(&dst_post);
     if (cr == S_DAMAGED) {
         message_free(&m);
@@ -687,6 +694,7 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
         add_report(report, it->id, why);
         return S_DAMAGED;
     }
+    if (!post_created) it->peer_moved = true;
     if (pause) pause(pause_user, "after-copy-post");
 
     for (unsigned k = 0; k < j.links; k++) {
@@ -731,12 +739,10 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
         add_report(report, it->id, "the post could not be removed");
         return S_DAMAGED;
     }
-    if (rm_post == P_MISSING) it->peer_moved = true;
     if (pause) pause(pause_user, "after-remove-post");
 
     it->arch_links = j.links;
     it->post_removed = true;
-    if (rm_post == P_MISSING) it->peer_moved = true;
     return S_OK;
 }
 

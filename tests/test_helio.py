@@ -1763,8 +1763,7 @@ class Archive(Base):
         lin_moved = int(arch_lin_out.decode().strip())
         self.assertGreater(win_moved, 0, f"Windows archiver moved 0 jobs (lin={lin_moved})")
         self.assertGreater(lin_moved, 0, f"Linux archiver moved 0 jobs (win={win_moved})")
-        # On \\wsl.localhost 9p, DeleteFileW (open+delete-on-close) and Linux unlink() can both return OK on one raced file.
-        self.assertGreaterEqual(win_moved + lin_moved, 1000, (win_moved, lin_moved))
+        self.assertEqual(win_moved + lin_moved, 1000, (win_moved, lin_moved))
         self.assertEqual(read_win_rc, 0, read_win_err)
         self.assertEqual(read_lin_rc, 0, read_lin_err)
         # Every live control job taken exactly once (per-job check, not aggregate!) and zero eligible old jobs taken!
@@ -1773,10 +1772,12 @@ class Archive(Base):
             self.assertTrue((st / f"messages/{lid}.post").exists(), lid)
             links = sorted(st.glob(f"messages/{lid}.link.*"))
             self.assertEqual([p.name for p in links], [f"{lid}.link.0000"], lid)
-        # Every one of the 1,000 eligible old jobs moved to archive/2025-02 with its complete terminal chain content and gone from messages/.
+        # Every one of the 1,000 eligible old jobs moved to archive/2025-02 with its complete terminal chain content
+        # and ZERO live files (.post, .link.*, .seen.*) remaining in messages/!
+        remaining_live = {p.name.split(".", 1)[0] for p in (st / "messages").iterdir()}
         arch_dir = st / "archive/2025-02"
         for oid in old_ids:
-            self.assertFalse((st / f"messages/{oid}.post").exists(), oid)
+            self.assertNotIn(oid, remaining_live, oid)
             self.assertIn(f"id: {oid}\n", (arch_dir / f"{oid}.post").read_text(), oid)
             self.assertIn("state: taken\n", (arch_dir / f"{oid}.link.0000").read_text(), oid)
             self.assertIn("state: done\n", (arch_dir / f"{oid}.link.0001").read_text(), oid)
