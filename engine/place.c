@@ -269,9 +269,10 @@ static void add_hex(text *out, const char *s) {
     }
 }
 
-static void session_base(text *out, const char *lane, const char *session) {
+static void session_base(text *out, const char *lane, const char *session, const char *repository) {
     for (; *lane; lane++) add_bytes(out, *lane == '/' ? "+" : lane, 1);
     if (session && *session) add(out, "+"), add_hex(out, session);
+    else if (repository && *repository) add(out, "++"), add(out, repository);
 }
 
 static void session_seq_path(const store *s, text *out, const char *base, uint64_t seq) {
@@ -362,7 +363,7 @@ static p_result read_session_file(const char *path, session_info *out, bool *par
     return r;
 }
 
-/* Validates `<project>+<lane>[+<even-hex>][~<seq>]`. Sets base_len, lane, and seq (0 if no ~<seq>). */
+/* Validates `<project>+<lane>[+<even-hex>|++<repo>][~<seq>]`. Sets base_len, lane, and seq (0 if no ~<seq>). */
 static bool parse_session_filename(const char *name, size_t *base_len, char *lane, size_t lane_room, uint64_t *seq) {
     size_t n = len(name);
     if (n > 5 && same(name + n - 5, ".part")) return false;
@@ -385,11 +386,19 @@ static bool parse_session_filename(const char *name, size_t *base_len, char *lan
     lane[plus2] = 0;
     if (!address_ok(lane, false)) return false;
     if (plus2 < blen) {
-        size_t hlen = blen - plus2 - 1;
-        if (hlen < 2 || hlen > 128 || (hlen & 1u)) return false;
-        for (size_t i = plus2 + 1; i < blen; i++) {
-            char c = name[i];
-            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+        if (plus2 + 1 < blen && name[plus2 + 1] == '+') {
+            size_t rlen = blen - plus2 - 2;
+            char repo[40];
+            if (!rlen || rlen >= sizeof repo) return false;
+            copy_slice(repo, sizeof repo, name + plus2 + 2, rlen);
+            if (!repo_ok(repo)) return false;
+        } else {
+            size_t hlen = blen - plus2 - 1;
+            if (hlen < 2 || hlen > 128 || (hlen & 1u)) return false;
+            for (size_t i = plus2 + 1; i < blen; i++) {
+                char c = name[i];
+                if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+            }
         }
     }
     *base_len = blen;
@@ -519,14 +528,14 @@ static p_result read_best_generation(const store *s, const char *base, bool *any
 s_result place_hello(store *s, const char *lane, const char *agent, const char *repository, const char *session) {
     if (!lane || !address_ok(lane, false)) return s->why = "say who you are: --as project/lane or HELIO_AS", S_REFUSED;
     if (!session_ok(session)) return s->why = "the session name is invalid or too long", S_REFUSED;
-    if (repository && *repository && len(repository) > 32) return s->why = "the repository name is too long", S_REFUSED;
+    if (repository && *repository && !repo_ok(repository)) return s->why = "the repository name is invalid or too long", S_REFUSED;
     const char *ag = agent ? agent : "";
     const char *rp = repository ? repository : "";
     const char *ss = session ? session : "";
 
     text folder = {0}, base = {0};
     add(&folder, s->folder), add(&folder, "/sessions");
-    session_base(&base, lane, ss);
+    session_base(&base, lane, ss, rp);
     if (folder.failed || base.failed) {
         text_free(&folder), text_free(&base);
         return s->why = "out of memory", S_DAMAGED;
@@ -621,7 +630,7 @@ s_result place_session(store *s, const char *lane, const char *session, session_
     *out = (session_info){0};
     if (!lane || !address_ok(lane, false) || !session_ok(session)) return s->why = "invalid lane or session", S_REFUSED;
     text base = {0};
-    session_base(&base, lane, session ? session : "");
+    session_base(&base, lane, session ? session : "", "");
     if (base.failed) {
         text_free(&base);
         return s->why = "out of memory", S_DAMAGED;
@@ -706,25 +715,45 @@ static p_result each_session_filtered(store *s, const char *only_lane, bool (*ea
     bool had_error = false, keep = true;
     for (size_t i = 0; i < map.count && keep; i++) {
         session_info info = {0};
-        bool ok = false, gone = false;
-        for (int attempt = 0; attempt < 8; attempt++) {
-            bool any_found = false, valid_found = false;
-            uint64_t max_seq = 0, valid_seq = 0;
-            p_result br = read_best_generation(s, map.items[i].base, &any_found, &max_seq, &valid_found, &valid_seq, NULL, false, &info);
-            if (br == P_MISSING) continue;
-            if (br == P_OK && !any_found) {
-                gone = true;
+        bool ok = false, gone = false, rescan = false;
+        text fast = {0};
+        session_seq_path(s, &fast, map.items[i].base, map.items[i].seq);
+        if (fast.failed) {
+            text_free(&fast);
+            had_error = true;
+            continue;
+        }
+        bool parsed = false, is_empty = false;
+        p_result rr = read_session_file(fast.data, &info, &parsed, &is_empty);
+        text_free(&fast);
+        if (rr == P_OK && parsed) {
+            copy_str(info.lane, sizeof info.lane, map.items[i].lane);
+            ok = true;
+        } else if (rr == P_MISSING || (rr == P_OK && is_empty)) {
+            rescan = true;
+        } else {
+            had_error = true;
+        }
+        if (rescan) {
+            for (int attempt = 0; attempt < 8; attempt++) {
+                bool any_found = false, valid_found = false;
+                uint64_t max_seq = 0, valid_seq = 0;
+                p_result br = read_best_generation(s, map.items[i].base, &any_found, &max_seq, &valid_found, &valid_seq, NULL, false, &info);
+                if (br == P_MISSING) continue;
+                if (br == P_OK && !any_found) {
+                    gone = true;
+                    break;
+                }
+                if (br == P_OK && valid_found) {
+                    copy_str(info.lane, sizeof info.lane, map.items[i].lane);
+                    ok = true;
+                } else {
+                    had_error = true;
+                }
                 break;
             }
-            if (br == P_OK && valid_found) {
-                copy_str(info.lane, sizeof info.lane, map.items[i].lane);
-                ok = true;
-            } else {
-                had_error = true;
-            }
-            break;
+            if (!ok && !gone) had_error = true;
         }
-        if (!ok && !gone) had_error = true;
         if (ok) keep = each(user, &info);
     }
     for (size_t i = 0; i < map.count; i++) p_free(map.items[i].base);

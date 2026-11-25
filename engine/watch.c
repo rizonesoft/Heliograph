@@ -11,9 +11,9 @@ bool is_silent(const session_info *sessions, size_t session_count, const job *no
     uint64_t last = now->when;
     if (*now->session) {
         for (size_t i = 0; i < session_count; i++) {
+            if (*now->repository && !same(sessions[i].repository, now->repository)) continue;
             if (same(sessions[i].lane, now->by) && same(sessions[i].session, now->session)) {
                 if (sessions[i].when > last) last = sessions[i].when;
-                break;
             }
         }
     } else {

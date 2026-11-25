@@ -432,22 +432,28 @@ static s_result remove_event(store *s, const char *id, const char *event) {
     return say(s, S_DAMAGED, "an archived step could not be removed");
 }
 
-/* The value of a field that must be there. */
-static bool keep(char *to, size_t room, char *data, const char *name) {
+typedef enum { FIELD_MISSING, FIELD_OK, FIELD_OVERFLOW } field_state;
+
+static field_state keep_opt(char *to, size_t room, char *data, const char *name) {
     for (char *line = data; *line;) {
         char *end = line;
         while (*end && *end != '\n') end++;
         size_t skip = len(name) + 2;
         if (*end && starts(line, name) && line[skip - 2] == ':' && line[skip - 1] == ' ') {
             size_t n = (size_t)(end - line) - skip;
-            if (n >= room) return false;
+            if (n >= room) return FIELD_OVERFLOW;
             memcpy(to, line + skip, n);
             to[n] = 0;
-            return true;
+            return FIELD_OK;
         }
         line = *end ? end + 1 : end;
     }
-    return false;
+    return FIELD_MISSING;
+}
+
+/* The value of a field that must be there. */
+static bool keep(char *to, size_t room, char *data, const char *name) {
+    return keep_opt(to, room, data, name) == FIELD_OK;
 }
 
 static void copy_to(char *to, const char *from) { memcpy(to, from, len(from) + 1); }
@@ -480,8 +486,8 @@ bool store_apply_step(const message *m, job *now, char *data) {
     static const char *const states[] = {"taken", "released", "done", "refused"};
     static const job_state after[] = {TAKEN, OPEN, DONE, REFUSED};
     char what[16], by[72], session[72], repo[40] = {0}, end[8], when[24];
-    bool has_repo = keep(repo, sizeof repo, data, "repository");
-    bool repo_valid = !has_repo || !*repo || repo_ok(repo);
+    field_state rs = keep_opt(repo, sizeof repo, data, "repository");
+    bool repo_valid = rs == FIELD_MISSING || (rs == FIELD_OK && (!*repo || repo_ok(repo)));
     bool good = keep(what, sizeof what, data, "state") && keep(by, sizeof by, data, "by") && address_ok(by, false)
                 && keep(session, sizeof session, data, "session") && repo_valid && keep(when, sizeof when, data, "time")
                 && read_time(when, &now->when) && keep(end, sizeof end, data, "end") && same(end, "yes");

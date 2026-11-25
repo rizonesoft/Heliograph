@@ -142,7 +142,7 @@ Every change to a job is the next file in its chain, decided from the steps befo
 
 ## Who gets a message?
 
-A message goes to `project/lane`, to `project/all`, or to `path:<file>`. A path goes to the lane that owns it in `helio.conf`, to whoever is active in that named `repository:` in the last half hour (or to the project when `helio.conf` omits `repository:`), and to the owner when nobody is there.
+A message goes to `project/lane`, to `project/all`, or to `path:<file>`. A path goes to the lane that owns it in `helio.conf`. When no lane owns it and another lane was active in the last half hour, it goes to `project/all` scoped to that named `repository:` (or to `project/all` across the project when `helio.conf` omits `repository:`), and any lane in that scope can receive it. When nobody else was active there, it goes to the owner.
 
 ```
 project: impossible

@@ -407,7 +407,10 @@ class Places(Base):
         self.assertIn("repository: repo-a\n", scoped_txt)
 
         # Stale session or sender-only session in repo-a falls back to os/owner.
-        put(self.store / "sessions/os+neon-a", "time: 1\nagent: claude\nrepository: repo-a\nsession: \n")
+        for p in list((self.store / "sessions").iterdir()):
+            if p.name.startswith("os+neon-a"):
+                p.unlink()
+        put(self.store / "sessions/os+neon-a++repo-a", "time: 1\nagent: claude\nrepository: repo-a\nsession: \nend: yes\n")
         self.assertEqual(self.helio("hook", "claude", me="os/apps", cwd=repo_a).returncode, 0)  # sender itself does not count
         self.assertEqual(self.to("docs/a.md", cwd=repo_a), "os/owner")
 
@@ -2692,7 +2695,7 @@ class Sessions(Base):
 
         empty_g0 = self.store / "sessions/os+emptygen0"
         put(empty_g0, "")
-        r_g0 = self.helio("hello", "codex", me="os/emptygen0", cwd=repo)
+        r_g0 = self.helio("hello", "codex", me="os/emptygen0", cwd=self.store)
         self.assertEqual((r_g0.returncode, r_g0.stderr), (0, b""))
         self.assertFalse(empty_g0.exists())
         rc_g0, info_g0 = self.read_session("os/emptygen0", "")
@@ -4337,11 +4340,65 @@ class RepositoryRouting(Base):
         self.assertEqual(rc_at(old_us + 100, "take", arch_j, "--as", "os/dev1").returncode, 0)
         self.assertEqual(rc_at(old_us + 200, "done", arch_j, "ok", "--as", "os/dev1").returncode, 0)
         self.assertEqual(self.helio("archive", me=None).returncode, 0)
+        self.assertEqual(list((self.store / "messages").glob(f"{arch_j}.*")), [])
+        for suf in ("post", "link.0000", "link.0001"):
+            self.assertTrue((self.store / f"archive/2025-02/{arch_j}.{suf}").exists(), suf)
         for sf in (self.store / "sessions").iterdir():
             sf.unlink()
         self.assertIn("(in repo-a)", self.helio("show", arch_j, me="os/main", cwd=repo_a).stdout.decode())
-        self.assertIn("(in repo-a)", self.helio("log", "--all", me="os/main", cwd=repo_a).stdout.decode())
+        log_lines = self.helio("log", "--all", me="os/main", cwd=repo_a).stdout.decode().splitlines()
+        self.assertTrue(any(arch_j in ln and "(in repo-a)" in ln for ln in log_lines), log_lines)
         self.assertEqual(self.helio("check", me=None).returncode, 0)
+
+        # (d) Overlong repository field (40+ bytes) in a step on an unscoped job is rejected by check.
+        unscoped = self.send("ask", "os/dev1", me="os/main", cwd=repo_a)
+        put(self.store / f"messages/{unscoped}.link.0000", f"by: os/dev1\ntime: 2026-11-25T12:00:00Z\nsession: \nrepository: {'r' * 45}\nstate: taken\nnote: \nend: yes\n")
+        self.assertEqual(self.helio("check", me=None).returncode, 3)
+        (self.store / f"messages/{unscoped}.link.0000").unlink()
+        self.assertEqual(self.helio("check", me=None).returncode, 0)
+
+    def test_sessionless_same_lane_across_repositories_and_foreign_named_heartbeat(self):
+        repo_a = self.store / "repo-a"
+        repo_b = self.store / "repo-b"
+        repo_a.mkdir(), repo_b.mkdir()
+        put(repo_a / "helio.conf", "project: os\nlane: main\nrepository: repo-a\n")
+        put(repo_b / "helio.conf", "project: os\nlane: main\nrepository: repo-b\n")
+
+        # Two sessionless workers sharing lane os/dev in repo-a and repo-b preserve independent activity in BOTH orders.
+        self.assertEqual(self.helio("hello", "claude", "--session", "", me="os/dev", cwd=repo_a).returncode, 0)
+        self.assertEqual(self.helio("hello", "claude", "--session", "", me="os/dev", cwd=repo_b).returncode, 0)
+        j_a = self.send("ask", "path:docs/a.md", me="os/main", cwd=repo_a)
+        post_a = (self.store / f"messages/{j_a}.post").read_text()
+        self.assertIn("to: os/all\n", post_a)
+        self.assertIn("repository: repo-a\n", post_a)
+
+        self.assertEqual(self.helio("hello", "claude", "--session", "", me="os/dev", cwd=repo_a).returncode, 0)
+        j_b = self.send("ask", "path:docs/b.md", me="os/main", cwd=repo_b)
+        post_b = (self.store / f"messages/{j_b}.post").read_text()
+        self.assertIn("to: os/all\n", post_b)
+        self.assertIn("repository: repo-b\n", post_b)
+
+        # Named taker's heartbeat from a DIFFERENT repository does NOT suppress SILENT on a repo-a scoped job.
+        t0 = 1_760_000_000_000_000
+        clean_env = {k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "ANTIGRAVITY_CONVERSATION_ID")}
+        def rc_at(us, *args, cwd=repo_a, body=b""):
+            return subprocess.run(
+                [str(RACER), "--now", str(us), *args, "--store", str(self.store)],
+                input=body, capture_output=True, timeout=30, cwd=cwd, env=clean_env,
+            )
+        self.assertEqual(rc_at(t0, "hello", "claude", "--session", "s1", "--as", "os/dev", cwd=repo_a).returncode, 0)
+        scoped = rc_at(t0 + 100, "ask", "path:docs/s.md", "Scoped silent", "--as", "os/main", cwd=repo_a, body=b"work").stdout.decode().strip()
+        self.assertEqual(rc_at(t0 + 200, "take", scoped, "--session", "s1", "--as", "os/dev", cwd=repo_a).returncode, 0)
+        # After 130 minutes (> 120m default silent threshold), os/dev --session s1 heartbeats from repo-b: SILENT still fires!
+        t_late = t0 + 130 * 60 * 1_000_000
+        self.assertEqual(rc_at(t_late, "hello", "claude", "--session", "s1", "--as", "os/dev", cwd=repo_b).returncode, 0)
+        watch_out = rc_at(t_late + 100, "inbox", "--as", "os/main", cwd=repo_a).stdout.decode()
+        self.assertIn(scoped, watch_out)
+        self.assertIn("SILENT", watch_out)
+        # Heartbeating from repo-a clears SILENT!
+        self.assertEqual(rc_at(t_late + 200, "hello", "claude", "--session", "s1", "--as", "os/dev", cwd=repo_a).returncode, 0)
+        watch_ok = rc_at(t_late + 300, "inbox", "--as", "os/main", cwd=repo_a).stdout.decode()
+        self.assertNotIn(scoped, watch_ok)
 
 
 if __name__ == "__main__":
