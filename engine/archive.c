@@ -542,7 +542,7 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
             bool has_rm_part = false;
             for (size_t i = 0; i < it->rm_parts.count; i++)
                 if (is_rm_part(it->rm_parts.items[i], len(it->rm_parts.items[i]))) has_rm_part = true;
-            if (it->links.count > 0 || it->seen.count > 0 || has_rm_part) {
+            if (tr == S_DAMAGED || it->links.count > 0 || it->seen.count > 0 || has_rm_part) {
                 add_report(report, it->id, tr == S_DAMAGED ? "archived terminal chain is damaged or incomplete" : "orphan event without post");
                 return S_DAMAGED;
             }

@@ -1763,6 +1763,18 @@ class Archive(Base):
             self.assertFalse(rem.exists(), "interrupted .rm.part remnant must be removed by subsequent archive")
             self.assertFalse(rem_legacy.exists(), "legacy .post.<unique>.part remnant must be removed by subsequent archive")
             self.assertEqual(list((st / "messages").iterdir()), [])
+            # Archive read error on a legacy-remnant-only ID MUST propagate exit 3 and preserve the remnant!
+            if not ON_WINDOWS and os.geteuid() != 0:
+                put(rem_legacy, archived_post)
+                arch_p = st / f"archive/2025-02/{j}.post"
+                arch_p.chmod(0)
+                try:
+                    self.assertEqual(run(st, "archive", me=None).returncode, 3)
+                    self.assertTrue(rem_legacy.exists(), "remnant must be preserved when archived post cannot be read")
+                finally:
+                    arch_p.chmod(0o600)
+                self.assertEqual(run(st, "archive", me=None).returncode, 0)
+                self.assertEqual(list((st / "messages").iterdir()), [])
 
     @unittest.skipUnless(WSL, "needs WSL")
     def test_windows_and_linux_archive_race_1000_rounds(self):
