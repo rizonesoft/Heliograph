@@ -11,68 +11,12 @@ _Static_assert((int)IM_FAILED == (int)P_FAILED && (int)IM_EXISTS == (int)P_EXIST
 void *p_alloc(size_t bytes) { return im_alloc(bytes); }
 void p_free(void *memory) { im_free(memory); }
 p_result p_read(const char *path, size_t most, char **data, size_t *length) { return from(im_read(path, most, data, length)); }
+p_result p_write(const char *path, const char *data, size_t length, bool replace, const char *unique) { return from(im_write(path, data, length, replace, unique)); }
+
 static bool passing_win(int attempt, DWORD error) {
     if (attempt >= 50 || (error != ERROR_SHARING_VIOLATION && error != ERROR_ACCESS_DENIED && error != ERROR_LOCK_VIOLATION)) return false;
     Sleep(4);
     return true;
-}
-
-static bool acquire_claim_win(const wchar_t *to, const wchar_t *claim, bool *exists, p_result *err_out) {
-    *exists = false;
-    *err_out = P_FAILED;
-    for (int attempt = 0; attempt < 1500; attempt++) {
-        HANDLE h = CreateFileW(claim, GENERIC_WRITE, 0, NULL, CREATE_NEW, 0, NULL);
-        if (h != INVALID_HANDLE_VALUE) {
-            CloseHandle(h);
-            return true;
-        }
-        DWORD err = GetLastError();
-        if (err == ERROR_FILE_EXISTS || err == ERROR_ALREADY_EXISTS) {
-            if (GetFileAttributesW(to) != INVALID_FILE_ATTRIBUTES) {
-                *exists = true;
-                return false;
-            }
-            if (attempt == 1250) DeleteFileW(claim); /* stale claim after ~5s */
-            else Sleep(4);
-            continue;
-        }
-        if (err == ERROR_PATH_NOT_FOUND || err == ERROR_FILE_NOT_FOUND) {
-            *err_out = P_MISSING;
-            return false;
-        }
-        if (!passing_win(attempt, err)) return false;
-    }
-    if (GetFileAttributesW(to) != INVALID_FILE_ATTRIBUTES) *exists = true;
-    return false;
-}
-
-p_result p_write(const char *path, const char *data, size_t length, bool replace, const char *unique) {
-    if (replace) return from(im_write(path, data, length, true, unique));
-    im_text claim_t = {0};
-    im_add(&claim_t, path), im_add(&claim_t, ".claim.part");
-    wchar_t *to = im_wide(path);
-    wchar_t *claim = claim_t.failed ? NULL : im_wide(claim_t.data);
-    im_text_free(&claim_t);
-    if (!to || !claim) {
-        im_free(to), im_free(claim);
-        return P_FAILED;
-    }
-    if (GetFileAttributesW(to) != INVALID_FILE_ATTRIBUTES) {
-        im_free(to), im_free(claim);
-        return P_EXISTS;
-    }
-    bool exists = false;
-    p_result err_res = P_FAILED;
-    if (!acquire_claim_win(to, claim, &exists, &err_res)) {
-        im_free(to), im_free(claim);
-        return exists ? P_EXISTS : err_res;
-    }
-    p_result result = GetFileAttributesW(to) != INVALID_FILE_ATTRIBUTES
-        ? P_EXISTS
-        : from(im_write(path, data, length, false, unique));
-    DeleteFileW(claim);
-    im_free(to), im_free(claim);
-    return result;
 }
 
 #ifdef HELIO_TEST_HOOKS
@@ -150,6 +94,46 @@ p_result p_remove(const char *path) {
         if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) return P_MISSING;
         return P_FAILED;
     }
+    return settle_win(path) ? P_OK : P_FAILED;
+}
+
+p_result p_claim_remove(const char *path, const char *unique) {
+    im_text temp_t = {0};
+    im_add(&temp_t, path), im_add(&temp_t, "."), im_add(&temp_t, unique), im_add(&temp_t, ".part");
+    wchar_t *from = im_wide(path);
+    wchar_t *to = temp_t.failed ? NULL : im_wide(temp_t.data);
+    im_text_free(&temp_t);
+    if (!from || !to) {
+        im_free(from), im_free(to);
+        return P_FAILED;
+    }
+    DWORD err = 0;
+    bool moved = false;
+    for (int attempt = 0;; attempt++) {
+        if (MoveFileExW(from, to, MOVEFILE_WRITE_THROUGH)) {
+            moved = true;
+            break;
+        }
+        err = GetLastError();
+        if (!passing_win(attempt, err)) break;
+    }
+    im_free(from);
+    if (!moved) {
+        im_free(to);
+        if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) return P_MISSING;
+        return P_FAILED;
+    }
+    bool deleted = false;
+    for (int attempt = 0;; attempt++) {
+        if (DeleteFileW(to)) {
+            deleted = true;
+            break;
+        }
+        err = GetLastError();
+        if (!passing_win(attempt, err)) break;
+    }
+    im_free(to);
+    if (!deleted && err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND) return P_FAILED;
     return settle_win(path) ? P_OK : P_FAILED;
 }
 

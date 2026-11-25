@@ -481,6 +481,14 @@ static bool gather_batch(void *user, const char *name) {
     return true;
 }
 
+static p_result remove_post_exclusive(const char *path) {
+    text uniq = {0};
+    add_number(&uniq, p_tick(), 0);
+    p_result r = uniq.failed ? P_FAILED : p_claim_remove(path, uniq.data);
+    text_free(&uniq);
+    return r;
+}
+
 /* Prepares and copies one item (and removes its live .post). Leaves live tail sweep for the single batch pass! */
 static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_t now,
                                      text *report, void (*pause)(void *user, const char *stage), void *pause_user) {
@@ -595,13 +603,13 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
                 return S_DAMAGED;
             }
         }
-        p_result rm_post = p_remove(post_p.data);
+        p_result rm_post = remove_post_exclusive(post_p.data);
         text_free(&post_p);
         if (rm_post != P_OK && rm_post != P_MISSING) {
             add_report(report, it->id, "the post could not be removed");
             return S_DAMAGED;
         }
-        it->peer_moved = true; /* archived post already existed before this call */
+        it->peer_moved = (rm_post == P_MISSING);
         it->arch_links = existing_links;
         it->post_removed = true;
         it->did_unlink = (rm_post == P_OK);
@@ -687,8 +695,7 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
     text dst_post = {0};
     arch_path(folder, it->month, &dst_post, it->id, "post");
     if (pause) pause(pause_user, "before-copy-post");
-    bool post_created = false;
-    s_result cr = dst_post.failed ? (why = "out of memory", S_DAMAGED) : copy_durable_ex(post_p.data, dst_post.data, &why, &post_created);
+    s_result cr = dst_post.failed ? (why = "out of memory", S_DAMAGED) : copy_durable(post_p.data, dst_post.data, &why);
     text_free(&dst_post);
     if (cr == S_DAMAGED) {
         message_free(&m);
@@ -696,7 +703,6 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
         add_report(report, it->id, why);
         return S_DAMAGED;
     }
-    if (!post_created) it->peer_moved = true;
     if (pause) pause(pause_user, "after-copy-post");
 
     for (unsigned k = 0; k < j.links; k++) {
@@ -735,7 +741,7 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
     message_free(&m);
 
     if (pause) pause(pause_user, "before-remove-post");
-    p_result rm_post = p_remove(post_p.data);
+    p_result rm_post = remove_post_exclusive(post_p.data);
     text_free(&post_p);
     if (rm_post != P_OK && rm_post != P_MISSING) {
         add_report(report, it->id, "the post could not be removed");
@@ -746,6 +752,7 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
     it->arch_links = j.links;
     it->post_removed = true;
     it->did_unlink = (rm_post == P_OK);
+    it->peer_moved = (rm_post == P_MISSING);
     return S_OK;
 }
 
