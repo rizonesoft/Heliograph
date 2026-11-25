@@ -39,7 +39,7 @@ title: "TODO-01 -- Heliograph"
 | 2 | §2 | Move a closed message to its month | §1 | [x] |
 | 3 | §3 | Read, answer and repeat archived messages | §2 | [x] |
 | 4 | §4 | Sessions announced by every call | -- | [x] |
-| 5 | §5 | Report of a silent taker | §4 | [ ] |
+| 5 | §5 | Report of a silent taker | §4 | [x] |
 | 6 | §6 | Messages for one session | §5 | [ ] |
 | 7 | §7 | Projects kept apart in log and show | -- | [ ] |
 | 8 | §8 | Mark for landed work | §2 | [ ] |
@@ -185,14 +185,17 @@ A job taken by a lane that has gone quiet is reported even when it has no due ti
 1. Decide silence in `engine/watch.c`. Done when: it is a pure function of the sessions, the job and the clock.
 2. Show it in `engine/helio.c`. Done when: the sender and the owner see it and others do not.
 
-- [ ] Write `is_silent` in `engine/watch.c` from the taker's session, else its lane (design, "How is nothing lost or done twice?"). Done when: a table of times and sessions passes. Cheaper substitute: the age of the take.
-- [ ] Read `silent: <minutes>` from `helio.conf` in `engine/place.c`, 120 when absent. Done when: a wrong value is refused with its line. Cheaper substitute: a fixed time.
-- [ ] Return a silent job to its sender and the owner in `into_inbox` of `engine/helio.c`, marked SILENT. Done when: both see it, a stranger does not and the taker keeps it. Cheaper substitute: the owner alone.
-- [ ] Add a Silent part to the summary in `engine/watch.c`. Done when: the count and the job are there. Cheaper substitute: counting it as Taken.
-- [ ] Release a silent job and take it again in `tests/test_helio.py`. Done when: only `helio release` frees it. Cheaper substitute: a release by itself.
-- [ ] Commit: `watch: a silent taker is reported`
+- [x] Write `is_silent` in `engine/watch.c` from the taker's session, else its lane (design, "How is nothing lost or done twice?"). Done when: a table of times and sessions passes. Cheaper substitute: the age of the take.
+- [x] Read `silent: <minutes>` from `helio.conf` in `engine/place.c`, 120 when absent. Done when: a wrong value is refused with its line. Cheaper substitute: a fixed time.
+- [x] Return a silent job to its sender and the owner in `into_inbox` of `engine/helio.c`, marked SILENT. Done when: both see it, a stranger does not and the taker keeps it. Cheaper substitute: the owner alone.
+- [x] Add a Silent part to the summary in `engine/watch.c`. Done when: the count and the job are there. Cheaper substitute: counting it as Taken.
+- [x] Release a silent job and take it again in `tests/test_helio.py`. Done when: only `helio release` frees it. Cheaper substitute: a release by itself.
+- [x] Commit: `watch: a silent taker is reported`
 
 **Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
+
+> **Verified:** 2026-11-25 | §5 | 34e4b9735c265e86c084d2f1cc0647732272c95b
+> **Review:** `docs/reviews/d01-t01-s5.json`
 
 ## 6. Messages for one session
 

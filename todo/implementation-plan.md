@@ -33,7 +33,7 @@ Sections: 7 | Checklist items: 37
 | Status | Reference   | Deliverable                            | Needs | Items |
 | ------ | ----------- | -------------------------------------- | ----- | ----- |
 | [x]    | D01 T01 §4  | Sessions announced by every call       | none  | 5     |
-| [ ]    | D01 T01 §5  | Report of a silent taker               | none  | 6     |
+| [x]    | D01 T01 §5  | Report of a silent taker               | none  | 6     |
 | [ ]    | D01 T01 §6  | Messages for one session               | none  | 5     |
 | [ ]    | D01 T01 §7  | Projects kept apart in log and show    | none  | 4     |
 | [ ]    | D01 T01 §8  | Mark for landed work                   | none  | 5     |
@@ -51,6 +51,6 @@ Sections: 4 | Checklist items: 19
 | [ ]    | D01 T01 §12 | Expiry of seen heads-ups and findings  | none  | 4     |
 | [ ]    | D01 T01 §13 | Design and help that match the program | none  | 4     |
 
-Progress: 7/17 verified sections, 4 ready to run now.
+Progress: 8/17 verified sections, 4 ready to run now.
 
-Checklist: 48/99 items completed (includes Commit items).
+Checklist: 54/99 items completed (includes Commit items).
