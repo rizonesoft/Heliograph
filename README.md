@@ -69,7 +69,7 @@ Legend: ✅ works · 📋 planned
 
 Windows or WSL on 64-bit x86, with Python 3.12 or newer, and Git. In WSL the command is `python3`, and a C compiler with C23 (GCC 14 or newer) builds the Linux program.
 
-In WSL, one command clones Impossible SDK beside the checkout if needed, builds and tests both programs, and installs `helio` into `~/ImpossibleOS/bin` (or `bin` beside the checkout) with a wrapper in `~/.local/bin/helio`:
+In WSL, one command clones Impossible SDK beside the checkout if needed, builds and tests both programs, and installs `helio` into `~/impossible/bin` (or `bin` beside the checkout) with a wrapper in `~/.local/bin/helio`:
 
 ```
 git clone https://github.com/rizonesoft/Heliograph.git
