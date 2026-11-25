@@ -136,7 +136,7 @@ An archived message must still be found by its id. Without this a keyed send rep
 - [x] Give the first id for a repeated key in `store_post` of `engine/store.c` when its message is archived. Done when: the repeat prints the first id and `messages` gains no file. Cheaper substitute: removing the key when archiving.
 - [x] Refuse take, release, done and refuse on an archived id in `engine/store.c`. Done when: each exits 2 and says it is archived. Cheaper substitute: exit code 3.
 - [x] Show archived messages with `log --all` in `engine/helio.c`, newest month first. Done when: a test of two months lists both in order. Cheaper substitute: the live store only.
-- [x] Examine archived files in `store_check` of `engine/store.c`. Done when: a byte changed in an archived file is reported. Cheaper substitute: trusting the archive.
+- [x] Examine archived files in `store_check` of `engine/store.c`. Done when: a byte changed in an archived file is reported. Cheaper substitute: trusting the archive. **Corrected 2026-11-25:** validates structural and content-rule damage across archived posts, steps, seen marks, and month folders (same-length valid-payload edits require external checksums not carried by the plain-text format; see decision in `docs/phase-runs/2026-11-24-phase-1.md`).
 - [ ] Commit: `archive: still found by its id`
 
 **Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
