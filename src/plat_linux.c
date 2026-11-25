@@ -123,14 +123,13 @@ p_result p_create_excl(const char *path, const char *data, size_t length) {
 #endif
     if (length > 0) {
         static unsigned long long excl_seq = 0;
-        char temp[4096], slot[4096];
+        char temp[4096];
         const char *slash = strrchr(path, '/');
         size_t dirlen = slash ? (size_t)(slash - path + 1) : 0;
         unsigned long long tick = (unsigned long long)p_tick();
         unsigned long pid = (unsigned long)getpid();
         unsigned long long seq = ++excl_seq;
         if ((size_t)snprintf(temp, sizeof temp, "%.*s.ex%lu-%llu-%llu.part", (int)dirlen, path, pid, tick, seq) >= sizeof temp) return P_FAILED;
-        if ((size_t)snprintf(slot, sizeof slot, "%s.slot", path) >= sizeof slot) return P_FAILED;
         int tf = open(temp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
         if (tf < 0) return errno == ENOENT ? P_MISSING : P_FAILED;
         size_t done = 0;
@@ -147,18 +146,9 @@ p_result p_create_excl(const char *path, const char *data, size_t length) {
             unlink(temp);
             return P_FAILED;
         }
-        /* Atomically claim the exclusive slot so cross-host Linux and Windows writers
-           never race on the same path, then publish the complete flushed file via link. */
-        int sf = open(slot, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
-        if (sf < 0) {
-            p_result sr = why();
-            unlink(temp);
-            return sr;
-        }
-        close(sf);
+        /* Atomically publish the complete flushed file without replacing an existing destination. */
         p_result lr = link(temp, path) ? why() : P_OK;
         unlink(temp);
-        unlink(slot);
         if (lr != P_OK) return lr;
 #ifdef HELIO_TEST_HOOKS
         if (plat_fail_write_flush) return P_UNFLUSHED;

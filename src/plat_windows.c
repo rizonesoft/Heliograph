@@ -116,18 +116,8 @@ p_result p_create_excl(const char *path, const char *data, size_t length) {
         size_t plen = im_length(path);
         size_t slash = plen;
         while (slash > 0 && path[slash - 1] != '/' && path[slash - 1] != '\\') slash--;
-        char *slot = im_alloc(plen + 6);
-        if (!slot) return P_FAILED;
-        for (size_t i = 0; i < plen; i++) slot[i] = path[i];
-        const char *ssfx = ".slot";
-        for (size_t i = 0; i <= 5; i++) slot[plen + i] = ssfx[i];
-        wchar_t *wslot = im_wide(slot);
         wchar_t *wpath = im_wide(path);
-        im_free(slot);
-        if (!wslot || !wpath) {
-            im_free(wslot), im_free(wpath);
-            return P_FAILED;
-        }
+        if (!wpath) return P_FAILED;
         /* 1. Write and flush complete payload to a short same-directory .part temp file
               (keeps temp well under MAX_PATH even for maximum-length session filenames). */
         wchar_t *wtemp = NULL;
@@ -139,7 +129,7 @@ p_result p_create_excl(const char *path, const char *data, size_t length) {
             h ^= h >> 33;
             char *temp = im_alloc(slash + 24);
             if (!temp) {
-                im_free(wslot), im_free(wpath);
+                im_free(wpath);
                 return P_FAILED;
             }
             size_t p = 0;
@@ -152,20 +142,20 @@ p_result p_create_excl(const char *path, const char *data, size_t length) {
             wtemp = im_wide(temp);
             im_free(temp);
             if (!wtemp) {
-                im_free(wslot), im_free(wpath);
+                im_free(wpath);
                 return P_FAILED;
             }
-            tf = CreateFileW(wtemp, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_NEW, 0, NULL);
+            tf = CreateFileW(wtemp, GENERIC_WRITE, 0, NULL, CREATE_NEW, 0, NULL);
             if (tf != INVALID_HANDLE_VALUE) break;
             DWORD err = GetLastError();
             im_free(wtemp);
             wtemp = NULL;
             if (err == ERROR_FILE_EXISTS || err == ERROR_ALREADY_EXISTS) continue;
-            im_free(wslot), im_free(wpath);
+            im_free(wpath);
             return (err == ERROR_PATH_NOT_FOUND || err == ERROR_FILE_NOT_FOUND) ? P_MISSING : P_FAILED;
         }
         if (tf == INVALID_HANDLE_VALUE) {
-            im_free(wslot), im_free(wpath);
+            im_free(wpath);
             return P_FAILED;
         }
         const char *at = data;
@@ -179,47 +169,38 @@ p_result p_create_excl(const char *path, const char *data, size_t length) {
         CloseHandle(tf);
         if (!good) {
             DeleteFileW(wtemp);
-            im_free(wtemp), im_free(wslot), im_free(wpath);
+            im_free(wtemp), im_free(wpath);
             return P_FAILED;
         }
-        /* 2. Atomically claim exclusive .slot (CREATE_NEW is atomic on NTFS and \\wsl.localhost 9p;
-              retry passing_win so a peer's DeleteFileW delete-pending window never masquerades as P_FAILED). */
-        HANDLE sf = INVALID_HANDLE_VALUE;
-        DWORD serr = 0;
+        /* 2. Atomically publish complete flushed temp without replacing an existing destination
+              (same non-replacing MoveFileExW semantics as ImpossibleSDK im_write(replace=false)). */
+        p_result res = P_FAILED;
         for (int attempt = 0;; attempt++) {
-            sf = CreateFileW(wslot, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_NEW, 0, NULL);
-            if (sf != INVALID_HANDLE_VALUE) break;
-            serr = GetLastError();
-            if (!passing_win(attempt, serr)) break;
-        }
-        if (sf == INVALID_HANDLE_VALUE) {
-            DeleteFileW(wtemp);
-            im_free(wtemp), im_free(wslot), im_free(wpath);
-            if (serr == ERROR_FILE_EXISTS || serr == ERROR_ALREADY_EXISTS) return P_EXISTS;
-            if (serr == ERROR_PATH_NOT_FOUND || serr == ERROR_FILE_NOT_FOUND) return P_MISSING;
-            return P_FAILED;
-        }
-        CloseHandle(sf);
-        /* 3. Atomically publish complete flushed temp without replacing an existing destination. */
-        bool moved = false;
-        DWORD merr = 0;
-        for (int attempt = 0;; attempt++) {
-            if (MoveFileExW(wtemp, wpath, 0)) {
-                moved = true;
+            if (MoveFileExW(wtemp, wpath, MOVEFILE_WRITE_THROUGH)) {
+                res = P_OK;
                 break;
             }
-            merr = GetLastError();
-            if (!passing_win(attempt, merr)) break;
+            DWORD merr = GetLastError();
+            if (merr == ERROR_ALREADY_EXISTS || merr == ERROR_FILE_EXISTS ||
+                GetFileAttributesW(wpath) != INVALID_FILE_ATTRIBUTES) {
+                res = P_EXISTS;
+                break;
+            }
+            if (merr == ERROR_PATH_NOT_FOUND || merr == ERROR_FILE_NOT_FOUND) {
+                res = P_MISSING;
+                break;
+            }
+            if (!passing_win(attempt, merr)) {
+                res = P_FAILED;
+                break;
+            }
         }
-        for (int attempt = 0; !DeleteFileW(wslot) && passing_win(attempt, GetLastError()); attempt++) {}
-        if (!moved) {
+        if (res != P_OK) {
             DeleteFileW(wtemp);
-            im_free(wtemp), im_free(wslot), im_free(wpath);
-            if (merr == ERROR_ALREADY_EXISTS || merr == ERROR_FILE_EXISTS) return P_EXISTS;
-            if (merr == ERROR_PATH_NOT_FOUND || merr == ERROR_FILE_NOT_FOUND) return P_MISSING;
-            return P_FAILED;
+            im_free(wtemp), im_free(wpath);
+            return res;
         }
-        im_free(wtemp), im_free(wslot), im_free(wpath);
+        im_free(wtemp), im_free(wpath);
 #ifdef HELIO_TEST_HOOKS
         if (plat_fail_write_flush) return P_UNFLUSHED;
 #endif

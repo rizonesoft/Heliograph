@@ -2605,47 +2605,22 @@ class Sessions(Base):
         self.assertIn(b"cannot be read", r_trunc.stderr)
         (self.store / "sessions/os+truncated").unlink()
 
-        # Interrupted publication leaving an abandoned (>5s old) .slot beside intact predecessor: readers ignore .slot
-        # and return intact predecessor, and the next announcement advances past it preserving agent and sweeping .slot!
+        # Interrupted publication leaving an abandoned .part temp file beside intact predecessor: readers ignore .part
+        # and return intact predecessor, and subsequent announcements advance cleanly preserving agent!
         base_r1 = f"os+apps+{'race-1'.encode().hex()}"
-        stale_t = time.time() - 60
-        empty_succ = self.store / f"sessions/{base_r1}~9999.slot"
-        put(empty_succ, "")
-        os.utime(empty_succ, (stale_t, stale_t))
+        abandoned_part = self.store / "sessions/.exdeadbeef.part"
+        put(abandoned_part, "time: 9999999999999999\nagent: ghost\n")
         rc_fb, info_fb = self.read_session("os/apps", "race-1")
         self.assertEqual((rc_fb, info_fb["agent"], info_fb["repository"], info_fb["when"]), (0, "antigravity", "race-repo", info2["when"]))
         listed_fb = [row for row in self.list_sessions() if row["session"] == "race-1"]
         self.assertEqual((len(listed_fb), listed_fb[0]["agent"]), (1, "antigravity"))
         r_heal = self.helio("inbox", "--session", "race-1", me=None, cwd=repo)
         self.assertEqual((r_heal.returncode, r_heal.stderr), (1, b""))
-        self.assertFalse(empty_succ.exists())
         rc_healed, info_healed = self.read_session("os/apps", "race-1")
         self.assertEqual((rc_healed, info_healed["agent"], info_healed["repository"]), (0, "antigravity", "race-repo"))
         self.assertGreater(int(info_healed["when"]), int(info2["when"]))
         info2 = info_healed
-
-        # Interrupted first announcement (abandoned >5s old gen-0 .slot with NO published file) self-heals on next hello!
-        empty_g0 = self.store / "sessions/os+emptygen0.slot"
-        put(empty_g0, "")
-        os.utime(empty_g0, (stale_t, stale_t))
-        r_g0 = self.helio("hello", "codex", me="os/emptygen0", cwd=repo)
-        self.assertEqual((r_g0.returncode, r_g0.stderr), (0, b""))
-        self.assertFalse(empty_g0.exists())
-        rc_g0, info_g0 = self.read_session("os/emptygen0", "")
-        self.assertEqual((rc_g0, info_g0["agent"]), (0, "codex"))
-        for p in list((self.store / "sessions").iterdir()):
-            if p.name == "os+emptygen0" or p.name.startswith("os+emptygen0~"):
-                p.unlink()
-
-        # Fresh (<5s old) .slot for a higher generation simulates an in-flight publish: an ordinary refresh
-        # must NOT jump past it to N+2 with stale predecessor metadata!
-        inflight = self.store / f"sessions/{base_r1}~99998.slot"
-        put(inflight, "")
-        r_inf = self.helio("inbox", "--session", "race-1", me=None, cwd=repo)
-        self.assertEqual(r_inf.returncode, 1)
-        self.assertIn(b"cannot be announced", r_inf.stderr)
-        self.assertFalse((self.store / f"sessions/{base_r1}~99999").exists())
-        inflight.unlink()
+        abandoned_part.unlink()
 
         # I/O read error on a newer generation (e.g. unreadable directory at ~99999 beside intact predecessor)
         # MUST fail with S_DAMAGED rather than silently falling back to the older predecessor!
