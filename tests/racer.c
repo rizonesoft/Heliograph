@@ -173,6 +173,12 @@ int racer(int count, char **args) {
         store_max_names = lim;
         return helio(count - 2, args + 2);
     }
+    if (count >= 4 && same(args[1], "--batch-size")) {
+        size_t lim = 0;
+        for (const char *p = args[2]; *p >= '0' && *p <= '9'; p++) lim = lim * 10 + (size_t)(*p - '0');
+        archive_batch_size = lim;
+        return helio(count - 2, args + 2);
+    }
 #endif
     if (count >= 4 && same(args[1], "--archive-loop")) {
         const char *folder = args[2];
@@ -188,10 +194,12 @@ int racer(int count, char **args) {
             if (p_now() > until) return 101;
         p_free(gdata);
         text_free(&ready), text_free(&go);
+        size_t total_moved = 0;
         for (int i = 0; i < rounds; i++) {
             size_t moved = 0;
             text rep = {0};
             s_result r = archive_store(folder, 1, &moved, &rep, NULL, NULL);
+            total_moved += moved;
             if (r == S_DAMAGED) {
                 if (rep.length) p_error(rep.data);
                 text_free(&rep);
@@ -199,6 +207,10 @@ int racer(int count, char **args) {
             }
             text_free(&rep);
         }
+        text out = {0};
+        add_number(&out, (uint64_t)total_moved, 0), add(&out, "\n");
+        if (!out.failed) p_print(out.data);
+        text_free(&out);
         return 0;
     }
     if (count >= 6 && same(args[1], "--read-loop")) {

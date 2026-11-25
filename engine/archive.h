@@ -21,5 +21,9 @@ bool archive_is_clean_remnant(const char *folder, const char *id, const char *ev
 s_result archive_store(const char *folder, size_t limit, size_t *moved, text *report,
                        void (*pause)(void *user, const char *stage), void *pause_user);
 
-/* Daily auto-archive of at most 200 eligible jobs, gated by summary/<YYYY-MM-DD>.archived and .claiming. */
+/* Daily auto-archive of at most 200 eligible jobs, gated by summary/<YYYY-MM-DD>.archived and slot files. */
 s_result archive_daily(const char *folder, text *report, void (*pause)(void *user, const char *stage), void *pause_user);
+
+#ifdef HELIO_TEST_HOOKS
+extern size_t archive_batch_size;
+#endif

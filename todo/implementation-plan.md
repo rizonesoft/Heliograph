@@ -20,11 +20,11 @@ Sections: 3 | Checklist items: 24
 
 Sections: 3 | Checklist items: 19
 
-| Status | Reference  | Deliverable                               | Needs | Items |
-| ------ | ---------- | ----------------------------------------- | ----- | ----- |
-| [x]    | D01 T01 §1 | Steps that notice an archived job         | none  | 5     |
-| [ ]    | D01 T01 §2 | Move a closed message to its month        | none  | 7     |
-| [ ]    | D01 T01 §3 | Read, answer and repeat archived messages | none  | 7     |
+| Status | Reference  | Deliverable                               | Needs               | Items |
+| ------ | ---------- | ----------------------------------------- | ------------------- | ----- |
+| [x]    | D01 T01 §1 | Steps that notice an archived job         | none                | 5     |
+| [ ]    | D01 T01 §2 | Move a closed message to its month        | wsl-windows-interop | 7     |
+| [ ]    | D01 T01 §3 | Read, answer and repeat archived messages | none                | 7     |
 
 ### Phase 2: The right reader
 

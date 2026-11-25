@@ -24,6 +24,22 @@ bool plat_fail_flush = false;
 bool plat_fail_sync = false;
 uint64_t plat_now_override = 0;
 #endif
+static bool is_wsl_unc(const char *path) {
+    static const char p1[] = "\\\\wsl.localhost\\";
+    static const char p2[] = "\\\\wsl$\\";
+    const char *prefixes[] = {p1, p2};
+    for (size_t k = 0; k < 2; k++) {
+        size_t i = 0;
+        for (; prefixes[k][i]; i++) {
+            char a = path[i], b = prefixes[k][i];
+            if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+            if (a != b) break;
+        }
+        if (!prefixes[k][i]) return true;
+    }
+    return false;
+}
+
 static bool settle_win_ex(const char *path, bool allow_unc_enosys) {
 #ifdef HELIO_TEST_HOOKS
     if (plat_fail_flush) return false;
@@ -42,7 +58,7 @@ static bool settle_win_ex(const char *path, bool allow_unc_enosys) {
         copy[dlen] = 0;
         dir_utf8 = copy;
     }
-    bool is_unc = dir_utf8[0] == '\\' && dir_utf8[1] == '\\';
+    bool is_wsl = is_wsl_unc(dir_utf8);
     wchar_t *wide = im_wide(dir_utf8);
     im_free(copy);
     if (!wide) return false;
@@ -52,10 +68,10 @@ static bool settle_win_ex(const char *path, bool allow_unc_enosys) {
     bool ok = FlushFileBuffers(dir) != 0;
     DWORD err = ok ? 0 : GetLastError();
     CloseHandle(dir);
-    /* WORKAROUND: Windows 9p/UNC redirectors (\\wsl.localhost) do not implement IRP_MJ_FLUSH_BUFFERS on directory
-       handles (returning ERROR_INVALID_FUNCTION/ERROR_NOT_SUPPORTED); local NTFS requires strict FlushFileBuffers,
-       and CreateFileW open + file-handle FlushFileBuffers remain strictly enforced on all paths including UNC. */
-    return ok || (allow_unc_enosys && is_unc && (err == ERROR_INVALID_FUNCTION || err == ERROR_NOT_SUPPORTED));
+    /* WORKAROUND: Windows 9p redirector (\\wsl.localhost\ and \\wsl$\) does not implement IRP_MJ_FLUSH_BUFFERS on
+       directory handles (returning ERROR_INVALID_FUNCTION/ERROR_NOT_SUPPORTED); local NTFS and non-WSL UNC shares
+       require strict FlushFileBuffers, and CreateFileW open + file-handle FlushFileBuffers remain strict everywhere. */
+    return ok || (allow_unc_enosys && is_wsl && (err == ERROR_INVALID_FUNCTION || err == ERROR_NOT_SUPPORTED));
 }
 
 static bool settle_win(const char *path) { return settle_win_ex(path, true); }
@@ -85,7 +101,7 @@ static bool sync_dir_win(const char *path, bool allow_unc_enosys) {
 #ifdef HELIO_TEST_HOOKS
     if (plat_fail_flush) return false;
 #endif
-    bool is_unc = path[0] == '\\' && path[1] == '\\';
+    bool is_wsl = is_wsl_unc(path);
     wchar_t *wide = im_wide(path);
     if (!wide) return false;
     HANDLE dir = CreateFileW(wide, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
@@ -94,7 +110,7 @@ static bool sync_dir_win(const char *path, bool allow_unc_enosys) {
     bool ok = FlushFileBuffers(dir) != 0;
     DWORD err = ok ? 0 : GetLastError();
     CloseHandle(dir);
-    return ok || (allow_unc_enosys && is_unc && (err == ERROR_INVALID_FUNCTION || err == ERROR_NOT_SUPPORTED));
+    return ok || (allow_unc_enosys && is_wsl && (err == ERROR_INVALID_FUNCTION || err == ERROR_NOT_SUPPORTED));
 }
 
 p_result p_sync(const char *path) {
@@ -124,8 +140,8 @@ p_result p_folder(const char *path) {
     im_free(wide);
     if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY) || (attrs & FILE_ATTRIBUTE_REPARSE_POINT))
         return P_FAILED;
-    /* Non-destructive directory creation (init/summary/watch) tolerates UNC/9p ENOSYS on directory handles;
-       p_sync and p_remove call settle_win strictly so no live file is ever removed without a proven directory flush. */
+    /* Flush parent and new directories strictly on local NTFS and non-WSL UNC shares; on WSL 9p shares
+       (\\wsl.localhost\ and \\wsl$\), settle_win_ex and sync_dir_win allow ENOSYS on directory handles only. */
     return settle_win_ex(path, true) && sync_dir_win(path, true) ? P_OK : P_FAILED;
 }
 p_result p_input(size_t most, char **data, size_t *length) { return from(im_read_input(most, data, length)); }

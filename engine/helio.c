@@ -394,9 +394,13 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
     }
     s.pause = pause;
     s.pause_user = pause_user;
-    if ((which == 0 || which == 8) && watch_summary(&s) != S_OK) fail(s.why, 3); /* the inbox is shown all the same */
+    bool summary_err = false;
+    if ((which == 0 || which == 8) && watch_summary(&s) != S_OK) {
+        fail(s.why, 3); /* the inbox is shown all the same */
+        summary_err = true;
+    }
     bool daily_err = false;
-    if (which == 0) {
+    if (which == 0 && !summary_err) {
         text drep = {0};
         if (archive_daily(o->folder, &drep, pause, pause_user) != S_OK) {
             if (drep.length && !drep.failed) p_error(drep.data);
@@ -410,7 +414,7 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
     int code;
     s_result result;
     switch (which) {
-    case 0: code = inbox(&s, o->me, o->all); if (daily_err) code = 3; break;
+    case 0: code = inbox(&s, o->me, o->all); if (summary_err || daily_err) code = 3; break;
     case 1: code = whole_log(&s); break;
     case 2: code = check(&s); break;
     case 3: code = show(&s, o->words[1], o->me); break;

@@ -1625,43 +1625,86 @@ class Archive(Base):
                 finally:
                     d0.chmod(0o600)
 
-        # Overfull-store recovery via --max-names: inbox refuses, archive drains, inbox recovers!
+        # Summary failure on first inbox MUST exit 3, still show inbox, leave daily archive pending, and retry cleanly!
+        if not ON_WINDOWS and os.geteuid() != 0:
+            with tempfile.TemporaryDirectory() as tmp:
+                st = Path(tmp)
+                put(st / "helio.conf", "project: os\n")
+                self.assertEqual(run(st, "init", me=None).returncode, 0)
+                j = f"{feb_us + 6000:016d}-c06000"
+                put(st / f"messages/{j}.post", f"id: {j}\ntime: 2025-02-15T00:00:00Z\nfrom: os/main\nto: os/userland\nkind: request\nabout: \nurgency: next\nre: \ndue: \nlength: 4\nsubject: sumfail\n\nbody")
+                put(st / f"messages/{j}.link.0000", "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: taken\nnote: \nend: yes\n")
+                put(st / f"messages/{j}.link.0001", "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: done\nnote: ok\nend: yes\n")
+                live_msg = run(st, "ask", "os/userland", "show-me-anyway", me="os/main", body="b").stdout.decode().strip()
+                (st / "summary").mkdir(exist_ok=True)
+                today_iso = time.strftime("%Y-%m-%d", time.gmtime())
+                (st / f"summary/{today_iso}.md").mkdir()  # directory at .md path forces watch_summary read error
+                r_fail = run(st, "inbox", me="os/userland")
+                self.assertEqual(r_fail.returncode, 3)
+                self.assertIn(live_msg.encode(), r_fail.stdout)
+                self.assertTrue((st / f"messages/{j}.post").exists(), "daily archive must remain pending when summary fails")
+                self.assertFalse((st / f"summary/{today_iso}.archived").exists())
+                (st / f"summary/{today_iso}.md").rmdir()
+                r_ok = run(st, "inbox", me="os/userland")
+                self.assertEqual(r_ok.returncode, 0, r_ok.stderr)
+                self.assertFalse((st / f"messages/{j}.post").exists())
+                self.assertTrue((st / f"archive/2025-02/{j}.post").exists())
+
+        # Overfull-store recovery across MULTIPLE archive batches (--batch-size 3 over 6 eligible jobs)!
         with tempfile.TemporaryDirectory() as tmp:
             st = Path(tmp)
             put(st / "helio.conf", "project: os\n")
             self.assertEqual(run(st, "init", me=None).returncode, 0)
-            for i in range(4):
+            for i in range(6):
                 j = f"{feb_us + 500 + i:016d}-f00{i:03x}"
-                put(st / f"messages/{j}.post", f"id: {j}\ntime: 2025-02-15T00:00:00Z\nfrom: os/main\nto: os/userland\nkind: request\nabout: \nurgency: next\nre: \ndue: \nlength: 4\nsubject: ovf\n\nbody")
+                put(st / f"messages/{j}.post", f"id: {j}\ntime: 2025-02-15T00:00:00Z\nfrom: os/main\nto: os/userland\nkind: request\nabout: \nurgency: next\nre: \ndue: \nlength: 4\nsubject: ovf-{i}\n\nbody")
                 put(st / f"messages/{j}.link.0000", "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: taken\nnote: \nend: yes\n")
                 put(st / f"messages/{j}.link.0001", "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: done\nnote: ok\nend: yes\n")
             live_open = run(st, "ask", "os/userland", "keep-open", "--key", "keep-k", me="os/main", body="b").stdout.decode().strip()
-            # 14 files > max-names 10 -> inbox fails with "too full", archive drains, inbox succeeds!
+            # 20 files > max-names 10 -> inbox fails with "too full", multi-batch archive drains all 6, inbox & keyed retry succeed!
             r_full = subprocess.run([str(RACER), "--max-names", "10", "inbox", "--store", str(st), "--as", "os/userland"], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
             self.assertEqual(r_full.returncode, 3, r_full.stderr)
             self.assertIn("too full", r_full.stderr)
-            r_drain = subprocess.run([str(RACER), "--max-names", "10", "archive", "--store", str(st)], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+            r_drain = subprocess.run([str(RACER), "--batch-size", "3", "archive", "--store", str(st)], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
             self.assertEqual(r_drain.returncode, 0, r_drain.stderr)
+            self.assertEqual(len(list((st / "archive/2025-02").glob("*.post"))), 6)
             r_ok = subprocess.run([str(RACER), "--max-names", "10", "inbox", "--store", str(st), "--as", "os/userland"], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
             self.assertEqual(r_ok.returncode, 0, r_ok.stderr)
             self.assertIn(live_open, r_ok.stdout)
-            self.assertTrue(any(f.name.startswith("key.") for f in (st / "messages").iterdir()))
+            r_key = run(st, "ask", "os/userland", "keep-open", "--key", "keep-k", me="os/main", body="b")
+            self.assertEqual(r_key.returncode, 0, r_key.stderr)
+            self.assertEqual(r_key.stdout.decode().strip(), live_open)
 
-        # Two concurrent `helio archive` runs both exit 0 and move each message once.
+        # Synchronized concurrent `helio archive` (A pauses after observing the eligible job while B archives it -> both exit 0),
+        # followed by an empty-store scan exiting 1!
         with tempfile.TemporaryDirectory() as tmp:
             st = Path(tmp)
             put(st / "helio.conf", "project: os\n")
             self.assertEqual(run(st, "init", me=None).returncode, 0)
-            for i in range(16):
-                j = f"{feb_us + 700 + i:016d}-cc{i:04x}"
-                put(st / f"messages/{j}.post", f"id: {j}\ntime: 2025-02-15T00:00:00Z\nfrom: os/main\nto: os/userland\nkind: request\nabout: \nurgency: next\nre: \ndue: \nlength: 4\nsubject: cc\n\nbody")
-                put(st / f"messages/{j}.link.0000", "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: taken\nnote: \nend: yes\n")
-                put(st / f"messages/{j}.link.0001", "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: done\nnote: ok\nend: yes\n")
-            with ThreadPoolExecutor(2) as pool:
-                codes = list(pool.map(lambda _: run(st, "archive", me=None).returncode, range(2)))
-            self.assertEqual(codes, [0, 0])
-            self.assertEqual(len(list((st / "archive/2025-02").glob("*.post"))), 16)
+            j = f"{feb_us + 700:016d}-cc0000"
+            put(st / f"messages/{j}.post", f"id: {j}\ntime: 2025-02-15T00:00:00Z\nfrom: os/main\nto: os/userland\nkind: request\nabout: \nurgency: next\nre: \ndue: \nlength: 4\nsubject: cc\n\nbody")
+            put(st / f"messages/{j}.link.0000", "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: taken\nnote: \nend: yes\n")
+            put(st / f"messages/{j}.link.0001", "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: done\nnote: ok\nend: yes\n")
+            p_a = subprocess.Popen(
+                [str(RACER), "--pause-cli", "before-copy-post", str(st), "archive", "--store", str(st)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=st,
+                env=clean,
+            )
+            try:
+                self.wait_for(st / "paused.before-copy-post")
+                self.assertEqual(run(st, "archive", me=None).returncode, 0)
+                put(st / "resume.before-copy-post", "go")
+                _, err_a = p_a.communicate(timeout=30)
+            finally:
+                if p_a.poll() is None:
+                    p_a.kill()
+            self.assertEqual(p_a.returncode, 0, err_a)
+            self.assertEqual(len(list((st / "archive/2025-02").glob("*.post"))), 1)
             self.assertEqual(list((st / "messages").iterdir()), [])
+            self.assertEqual(run(st, "archive", me=None).returncode, 1)
 
     @unittest.skipUnless(WSL, "needs WSL")
     def test_windows_and_linux_archive_race_1000_rounds(self):
@@ -1693,8 +1736,8 @@ class Archive(Base):
                     break
                 time.sleep(0.05)
             put(st / "go", "x")
-            _, arch_win_err = procs[0].communicate(timeout=240)
-            _, arch_lin_err = procs[1].communicate(timeout=240)
+            arch_win_out, arch_win_err = procs[0].communicate(timeout=240)
+            arch_lin_out, arch_lin_err = procs[1].communicate(timeout=240)
             arch_win_rc = procs[0].returncode
             arch_lin_rc = procs[1].returncode
             # Signal readers ONLY AFTER both archivers have finished all 1,000 moves!
@@ -1716,6 +1759,11 @@ class Archive(Base):
                     p.stderr.close()
         self.assertEqual(arch_win_rc, 0, arch_win_err)
         self.assertEqual(arch_lin_rc, 0, arch_lin_err)
+        win_moved = int(arch_win_out.decode().strip())
+        lin_moved = int(arch_lin_out.decode().strip())
+        self.assertGreater(win_moved, 0, f"Windows archiver moved 0 jobs (lin={lin_moved})")
+        self.assertGreater(lin_moved, 0, f"Linux archiver moved 0 jobs (win={win_moved})")
+        self.assertEqual(win_moved + lin_moved, 1000, (win_moved, lin_moved))
         self.assertEqual(read_win_rc, 0, read_win_err)
         self.assertEqual(read_lin_rc, 0, read_lin_err)
         # Every live control job taken exactly once (per-job check, not aggregate!) and zero eligible old jobs taken!
@@ -1724,13 +1772,13 @@ class Archive(Base):
             self.assertTrue((st / f"messages/{lid}.post").exists(), lid)
             links = sorted(st.glob(f"messages/{lid}.link.*"))
             self.assertEqual([p.name for p in links], [f"{lid}.link.0000"], lid)
-        # Every one of the 1,000 eligible old jobs moved to archive/2025-02 with its complete terminal chain and gone from messages/.
+        # Every one of the 1,000 eligible old jobs moved to archive/2025-02 with its complete terminal chain content and gone from messages/.
         arch_dir = st / "archive/2025-02"
         for oid in old_ids:
             self.assertFalse((st / f"messages/{oid}.post").exists(), oid)
-            self.assertTrue((arch_dir / f"{oid}.post").exists(), oid)
-            self.assertTrue((arch_dir / f"{oid}.link.0000").exists(), oid)
-            self.assertTrue((arch_dir / f"{oid}.link.0001").exists(), oid)
+            self.assertIn(f"id: {oid}\n", (arch_dir / f"{oid}.post").read_text(), oid)
+            self.assertIn("state: taken\n", (arch_dir / f"{oid}.link.0000").read_text(), oid)
+            self.assertIn("state: done\n", (arch_dir / f"{oid}.link.0001").read_text(), oid)
         self.assertEqual(run(st, "check", me=None).returncode, 0)
 
 

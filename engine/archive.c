@@ -2,6 +2,9 @@
 
 static const uint64_t ARCHIVE_AGE_US = 30ull * 86400ull * 1000000ull;
 static const char ARCHIVE_SEEN[] = "seen\n";
+#ifdef HELIO_TEST_HOOKS
+size_t archive_batch_size = 2048;
+#endif
 
 bool archive_month(const char *id, char out[8]) {
     if (!id || !*id) return false;
@@ -505,6 +508,7 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
             return S_DAMAGED;
         }
         it->arch_links = alinks;
+        it->peer_moved = true;
         it->post_removed = true;
         return S_OK;
     }
@@ -590,6 +594,7 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
             add_report(report, it->id, "the post could not be removed");
             return S_DAMAGED;
         }
+        if (rm_post == P_MISSING) it->peer_moved = true;
         it->arch_links = existing_links;
         it->post_removed = true;
         return S_OK;
@@ -726,6 +731,7 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
         add_report(report, it->id, "the post could not be removed");
         return S_DAMAGED;
     }
+    if (rm_post == P_MISSING) it->peer_moved = true;
     if (pause) pause(pause_user, "after-remove-post");
 
     it->arch_links = j.links;
@@ -746,7 +752,12 @@ s_result archive_store(const char *folder, size_t limit, size_t *moved, text *re
     uint64_t now = p_now();
     char *cursor = NULL;
     for (;;) {
-        batch_ctx b = {.ids = {.cap_limit = 2048}, .after = cursor, .truncated = false};
+#ifdef HELIO_TEST_HOOKS
+        size_t batch_cap = archive_batch_size ? archive_batch_size : 2048;
+#else
+        size_t batch_cap = 2048;
+#endif
+        batch_ctx b = {.ids = {.cap_limit = batch_cap}, .after = cursor, .truncated = false};
         p_result lr = p_list(msg_dir.data, gather_batch, &b);
         if (lr == P_MISSING) {
             list_free(&b.ids);
@@ -784,9 +795,14 @@ s_result archive_store(const char *folder, size_t limit, size_t *moved, text *re
             for (size_t i = 0; i < be.count; i++) {
                 s_result r = copy_and_unlink_post(folder, &be.items[i], now, report, pause, pause_user);
                 if (r == S_DAMAGED) had_damage = true;
-                if (be.items[i].post_removed) batch_post_removed++;
-                else if (be.items[i].peer_moved) total_peer++;
-                if (limit && total_moved + batch_post_removed >= limit) break;
+                if (be.items[i].post_removed) {
+                    batch_post_removed++;
+                    if (!be.items[i].peer_moved) total_moved++;
+                    else total_peer++;
+                } else if (be.items[i].peer_moved) {
+                    total_peer++;
+                }
+                if (limit && total_moved >= limit) break;
             }
             /* One single post-unlink scan collects any late .seen.* marks for all moved jobs in this batch! */
             if (batch_post_removed > 0) {
@@ -801,10 +817,6 @@ s_result archive_store(const char *folder, size_t limit, size_t *moved, text *re
                         if (sw != S_OK) {
                             add_report(report, be.items[i].id, why);
                             had_damage = true;
-                        } else if (be.items[i].peer_moved) {
-                            total_peer++;
-                        } else {
-                            total_moved++;
                         }
                     }
                 }
