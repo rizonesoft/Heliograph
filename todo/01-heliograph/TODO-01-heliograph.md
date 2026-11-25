@@ -386,7 +386,7 @@ The design lists `send` where the program has `hand` and `find`, and still lists
 
 > **Started:** 2026-11-25T18:06Z
 
-A path that no lane owns goes to whoever works in that repository, and to the owner when nobody is there (design, "How does it find the reader?"). Today `reader` in `engine/helio.c` sends it to the whole project when any lane of the project was seen in the last half hour, and a test asks for that.
+A path that no lane owns goes to whoever works in that repository, and to the owner when nobody is there (design, "How does it find the reader?"). Today `reader` in `engine/helio.c` sends it to the whole project when any lane of the project was seen in the last half hour, and a test asks for that. **Corrected 2026-11-25:** Plan review (`docs/reviews/01-heliograph/D01-T01-s14.md`) clarified: pass the selected `repository` from `reader` through `post` into `store_post` (keeping empty for direct addresses, explicit `/all`, and `answer`); pass the dispatch `actor` (carrying `here.repository`) into `hook` and use designated initializers for all `actor` literals; enforce repository identity for taker authority in `objection`, `landed_objection`, replay (`store_apply_step`), and `watch.c` `is_silent` liveness while preserving independent sender and owner powers from any checkout; use one shared `repo_ok` validator (`word` and not `"all"`) across `helio.conf` and persistence; display `(in <repo>)` in `format_line` and `watch_summary`; update `helio.conf`, `README.md`, and the §4 legacy-session fixture; rollout boundary: update both WSL and Windows installed binaries together via `tools/install.py --phase 2` before emitting `repository:`-scoped posts to a shared store.
 
 **Phase:** 2
 **Needs:** none
@@ -397,14 +397,14 @@ A path that no lane owns goes to whoever works in that repository, and to the ow
 1. Store the repository as the reader in `engine/store.c`. Done when: a message without it is read as before.
 2. Send and show it in `engine/helio.c`. Done when: the three cases of the design are tested.
 
-- [ ] Read `repository: <name>` from `helio.conf` in `place_open` of `engine/place.c`: the name is the identity, so Windows and WSL agree on one checkout. Done when: both spell it alike, two repositories of one project differ, a path is refused, and without the line an unowned path goes to the project as before. Cheaper substitute: the name of the folder.
-- [ ] Write and read `repository:` in `store_post` and `store_message` of `engine/store.c`, beside the reader of §6. Done when: old messages pass `helio check`. Cheaper substitute: one message for each lane.
-- [ ] Write the actor's repository into each step in `add_link` and read it in `store_job` of `engine/store.c`, as the session is. Done when: `helio check` accepts a take after its session has ended, a step without it still counts for a message without a repository, and one that names another repository is damage. Cheaper substitute: checking the live actor alone.
-- [ ] Give the repository from the sessions of §4 in `place_busy` of `engine/place.c`, in place of one yes or no for the project. Done when: a lane seen only in another repository of the project does not count. Cheaper substitute: the project.
-- [ ] Choose the reader in `reader` of `engine/helio.c`: the lane that owns the path, else this repository, else the owner. Done when: each of the three is chosen in a test. Cheaper substitute: the owner whenever no lane owns it.
-- [ ] Compare the actor's repository in `is_for` and `objection` of `engine/store.c`. Done when: two lanes of the repository both see the one job and one of them takes it, and a lane of another repository neither sees nor takes it. Cheaper substitute: hiding it in the inbox alone.
-- [ ] Replace `test_an_unowned_path_goes_to_whoever_works_there` in `tests/test_helio.py` with the three cases, its lane announced from inside the repository. Done when: it fails with the old `reader`. Cheaper substitute: keeping the project-wide expectation.
-- [ ] Commit: `routing: an unowned path stays in its repository`
+- [x] Read `repository: <name>` from `helio.conf` in `place_open` of `engine/place.c`: the name is the identity, so Windows and WSL agree on one checkout. Done when: both spell it alike, two repositories of one project differ, a path is refused, and without the line an unowned path goes to the project as before. Cheaper substitute: the name of the folder.
+- [x] Write and read `repository:` in `store_post` and `store_message` of `engine/store.c`, beside the reader of §6. Done when: old messages pass `helio check`. Cheaper substitute: one message for each lane.
+- [x] Write the actor's repository into each step in `add_link` and read it in `store_job` of `engine/store.c`, as the session is. Done when: `helio check` accepts a take after its session has ended, a step without it still counts for a message without a repository, and one that names another repository is damage. Cheaper substitute: checking the live actor alone.
+- [x] Give the repository from the sessions of §4 in `place_busy` of `engine/place.c`, in place of one yes or no for the project. Done when: a lane seen only in another repository of the project does not count. Cheaper substitute: the project.
+- [x] Choose the reader in `reader` of `engine/helio.c`: the lane that owns the path, else this repository, else the owner. Done when: each of the three is chosen in a test. Cheaper substitute: the owner whenever no lane owns it.
+- [x] Compare the actor's repository in `is_for` and `objection` of `engine/store.c`. Done when: two lanes of the repository both see the one job and one of them takes it, and a lane of another repository neither sees nor takes it. Cheaper substitute: hiding it in the inbox alone.
+- [x] Replace `test_an_unowned_path_goes_to_whoever_works_there` in `tests/test_helio.py` with the three cases, its lane announced from inside the repository. Done when: it fails with the old `reader`. Cheaper substitute: keeping the project-wide expectation.
+- [x] Commit: `routing: an unowned path stays in its repository`
 
 **Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
 

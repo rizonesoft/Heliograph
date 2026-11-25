@@ -30,6 +30,10 @@ bool address_ok(const char *a, bool may_be_all) {
     return may_be_all || !same(a + slash + 1, "all");
 }
 
+bool repo_ok(const char *repo) {
+    return repo && word(repo, len(repo)) && !same(repo, "all");
+}
+
 bool session_ok(const char *s) {
     if (!s || !*s) return true;
     size_t n = len(s);
@@ -174,6 +178,7 @@ s_result store_parse_post(char *data, size_t length, const char *id, message *ou
         .from = field(data, "from"),
         .to = field(data, "to"),
         .for_session = field(data, "for"),
+        .repository = field(data, "repository"),
         .kind = field(data, "kind"),
         .about = field(data, "about"),
         .urgency = field(data, "urgency"),
@@ -186,10 +191,11 @@ s_result store_parse_post(char *data, size_t length, const char *id, message *ou
     const char *due = field(data, "due");
     for (int digits = 0; *due >= '0' && *due <= '9' && digits < 17; digits++) out->due = out->due * 10 + (uint64_t)(*due++ - '0');
     bool due_ok = !*due || *due == '\n';
-    const char *all[] = {out->id, out->time, out->from, out->to, out->for_session, out->kind, out->about, out->urgency, out->re, out->subject};
+    const char *all[] = {out->id, out->time, out->from, out->to, out->for_session, out->repository, out->kind, out->about, out->urgency, out->re, out->subject};
     for (size_t i = 0; i < sizeof all / sizeof *all; i++) if (*all[i]) cut(all[i]);
     if (!same(out->id, id) || !address_ok(out->from, false) || !address_ok(out->to, true)
         || !session_ok(out->for_session) || (*out->for_session && !address_ok(out->to, false))
+        || (*out->repository && (!repo_ok(out->repository) || address_ok(out->to, false) || *out->for_session))
         || !*out->subject || !due_ok || !time_ok(out->time) || (*out->re && !id_ok(out->re))
         || !one_of(out->kind, kinds) || !one_of(out->urgency, urgencies) || !*out->body || len(out->body) != body) {
         message_free(out);
@@ -238,7 +244,9 @@ static bool lane_is_for(const message *m, const char *lane) {
 bool is_for(const message *m, actor me) {
     if (!lane_is_for(m, nz(me.lane))) return false;
     const char *for_s = nz(m->for_session);
-    return !*for_s || same(for_s, nz(me.session));
+    if (*for_s && !same(for_s, nz(me.session))) return false;
+    const char *repo = nz(m->repository);
+    return !*repo || same(repo, nz(me.repository));
 }
 
 static bool same_project(const char *a, const char *b) {
@@ -471,16 +479,19 @@ static bool gap(const store *s, const char *id, unsigned links) {
 bool store_apply_step(const message *m, job *now, char *data) {
     static const char *const states[] = {"taken", "released", "done", "refused"};
     static const job_state after[] = {TAKEN, OPEN, DONE, REFUSED};
-    char what[16], by[72], session[72], end[8], when[24];
+    char what[16], by[72], session[72], repo[40] = {0}, end[8], when[24];
+    bool has_repo = keep(repo, sizeof repo, data, "repository");
+    bool repo_valid = !has_repo || !*repo || repo_ok(repo);
     bool good = keep(what, sizeof what, data, "state") && keep(by, sizeof by, data, "by") && address_ok(by, false)
-                && keep(session, sizeof session, data, "session") && keep(when, sizeof when, data, "time")
+                && keep(session, sizeof session, data, "session") && repo_valid && keep(when, sizeof when, data, "time")
                 && read_time(when, &now->when) && keep(end, sizeof end, data, "end") && same(end, "yes");
     int step = 0;
     while (good && step < 4 && !same(what, states[step])) step++;
-    if (!good || step == 4 || objection(m, now, (actor){by, session}, (change)step)) return false;
+    if (!good || step == 4 || objection(m, now, (actor){.lane = by, .session = session, .repository = repo}, (change)step)) return false;
     now->state = after[step];
     bool open = now->state == OPEN;
     copy_to(now->by, open ? "" : by), copy_to(now->session, open ? "" : session);
+    copy_to(now->repository, open ? "" : nz(m->repository));
     return true;
 }
 
@@ -604,6 +615,7 @@ static s_result reserve(store *s, const message *m, const char *key, text *id) {
 static bool same_post_content(const message *there, const message *m, const char *about, const char *subject, const char *body) {
     return same(there->from, m->from) && same(there->to, m->to)
            && same(nz(there->for_session), nz(m->for_session))
+           && same(nz(there->repository), nz(m->repository))
            && same(there->kind, m->kind)
            && same(there->about, about ? about : "") && same(there->urgency, m->urgency)
            && same(there->re, m->re) && same(there->subject, subject) && same(there->body, body);
@@ -640,10 +652,12 @@ static s_result find_reserved(store *s, const message *m, const char *key, text 
 
 s_result store_post(store *s, const message *m, const char *key, text *id) {
     const char *for_s = nz(m->for_session);
+    const char *repo = nz(m->repository);
     if (!address_ok(m->from, false)) return say(s, S_REFUSED, "say who you are: --as project/lane");
     if (!address_ok(m->to, true)) return say(s, S_REFUSED, "the reader is project/lane, or project/all");
     if (!session_ok(for_s)) return say(s, S_REFUSED, "the target session name is invalid or too long");
     if (*for_s && !address_ok(m->to, false)) return say(s, S_REFUSED, "a message for one session must name a lane, not /all");
+    if (*repo && (!repo_ok(repo) || address_ok(m->to, false) || *for_s)) return say(s, S_REFUSED, "the repository name is invalid");
     if (!one_of(m->kind, kinds)) return say(s, S_REFUSED, "the kind is request, handoff, answer, finding or headsup");
     if (!one_of(m->urgency, urgencies)) return say(s, S_REFUSED, "the urgency is now, next or whenever");
     if (len(m->subject) > 120 || len(m->about) > 1000 || len(m->body) > MOST_BODY) return say(s, S_REFUSED, "the message is too long");
@@ -723,6 +737,7 @@ s_result store_post(store *s, const message *m, const char *key, text *id) {
             add(&out, "id: "), add(&out, id->data), add(&out, "\ntime: "), add_time(&out, stamp);
             add(&out, "\nfrom: "), add(&out, m->from), add(&out, "\nto: "), add(&out, m->to);
             if (*for_s) add(&out, "\nfor: "), add(&out, for_s);
+            if (*repo) add(&out, "\nrepository: "), add(&out, repo);
             add(&out, "\nkind: "), add(&out, m->kind);
             add(&out, "\nabout: "), add(&out, about.data ? about.data : ""), add(&out, "\nurgency: "), add(&out, m->urgency);
             add(&out, "\nre: "), add(&out, m->re), add(&out, "\ndue: ");
@@ -777,6 +792,8 @@ static s_result add_link(store *s, const char *id, const job *now, actor me, con
     if (published) *published = false;
     if (now->links >= MOST_LINKS - 2 && !same(state, "done") && !same(state, "refused")) return say(s, S_REFUSED, "this job changed hands too often: close it and ask again");
     if (!session_ok(me.session)) return say(s, S_REFUSED, "the session name is invalid or too long");
+    const char *repo = nz(me.repository);
+    if (*repo && !repo_ok(repo)) return say(s, S_REFUSED, "the repository name is invalid");
     text out = {0}, line = {0}, name = {0};
     clean(&line, note, true), link_name(&name, now->links);
     s_result result;
@@ -784,6 +801,7 @@ static s_result add_link(store *s, const char *id, const job *now, actor me, con
     else if (secret(line.data ? line.data : "")) result = say(s, S_REFUSED, "the note looks like it contains a secret");
     else {
         add(&out, "by: "), add(&out, me.lane), add(&out, "\ntime: "), add_time(&out, p_now()), add(&out, "\nsession: "), add(&out, me.session ? me.session : "");
+        if (*repo) add(&out, "\nrepository: "), add(&out, repo);
         add(&out, "\nstate: "), add(&out, state), add(&out, "\nnote: "), add(&out, line.data ? line.data : ""), add(&out, "\nend: yes\n");
         bool full = out.failed || line.failed || name.failed;
         result = full ? say(s, S_DAMAGED, "out of memory") : make_ex(s, id, name.data, out.data, published);
@@ -815,7 +833,9 @@ bool owns(const char *lane, const message *m) {
 static const char *objection(const message *m, const job *now, actor me, change what) {
     const char *for_s = nz(m->for_session);
     const char *my_s = nz(me.session);
-    bool taker = now->state == TAKEN && same(now->by, me.lane) && (!*now->session || same(now->session, my_s));
+    const char *m_repo = nz(m->repository);
+    bool wrong_repo = *m_repo && !same(m_repo, nz(me.repository));
+    bool taker = now->state == TAKEN && same(now->by, me.lane) && (!*now->session || same(now->session, my_s)) && !wrong_repo;
     bool wrong_dest_session = *for_s && same(m->to, me.lane) && !same(for_s, my_s);
     if (now->state == DONE || now->state == REFUSED) return "it is already closed";
     switch (what) {
@@ -952,9 +972,11 @@ bool store_valid_landed_payload(const char *data, size_t length, const char *com
 static const char *landed_objection(const message *m, const job *now, actor me) {
     const char *for_s = nz(m->for_session);
     const char *my_s = nz(me.session);
+    const char *m_repo = nz(m->repository);
+    bool wrong_repo = *m_repo && !same(m_repo, nz(me.repository));
     bool wrong_dest_session = *for_s && same(m->to, me.lane) && !same(for_s, my_s);
     bool taker = (now->state == TAKEN || now->state == DONE) && same(now->by, me.lane)
-                 && (!*now->session || same(now->session, my_s));
+                 && (!*now->session || same(now->session, my_s)) && !wrong_repo;
     if (now->state == REFUSED) return "a refused job cannot be marked landed";
     if (taker) return NULL;
     if (!wrong_dest_session && (same(m->from, me.lane) || owns(me.lane, m))) return NULL;
@@ -1326,7 +1348,7 @@ s_result store_seen_archived(store *s, const char *id, actor me) {
 }
 
 s_result store_seen_alert(store *s, const char *id, const char *owner_lane, unsigned alert_links) {
-    return write_seen_ex(s, id, (actor){owner_lane, ""}, true, alert_links);
+    return write_seen_ex(s, id, (actor){.lane = owner_lane, .session = ""}, true, alert_links);
 }
 
 s_result store_check(store *s, text *report) {

@@ -10,7 +10,7 @@ typedef enum { OPEN, TAKEN, DONE, REFUSED } job_state;
 
 typedef struct message {
     char *file; /* owns the strings below */
-    const char *id, *time, *from, *to, *for_session, *kind, *about, *urgency, *re, *subject, *body;
+    const char *id, *time, *from, *to, *for_session, *repository, *kind, *about, *urgency, *re, *subject, *body;
     uint64_t due; /* microseconds since 1970, or 0 */
     bool archived;
 } message;
@@ -28,18 +28,19 @@ typedef struct store {
 /* Who acts. A lane may have several sessions after each other; when both the
    taker and the caller name theirs, they must be the same. */
 typedef struct actor {
-    const char *lane, *session;
+    const char *lane, *session, *repository;
 } actor;
 
 typedef struct job {
     job_state state;
     unsigned links;
-    char by[72], session[72]; /* the taker, or who closed it */
-    uint64_t when;            /* of the last step */
-    bool from_archive;        /* true when replayed from archive/<YYYY-MM>/ */
+    char by[72], session[72], repository[40]; /* the taker (or who closed it), and scoped repo if any */
+    uint64_t when;                            /* of the last step */
+    bool from_archive;                        /* true when replayed from archive/<YYYY-MM>/ */
 } job;
 
 bool address_ok(const char *address, bool may_be_all); /* project/lane, or project/all */
+bool repo_ok(const char *repo);                        /* valid non-empty repository name (same grammar as lane, not "all") */
 bool session_ok(const char *session); /* empty, or 1..64 bytes unchanged by clean(..., true) */
 s_result store_open(store *s, const char *folder);
 void store_close(store *s);

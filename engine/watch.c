@@ -18,6 +18,7 @@ bool is_silent(const session_info *sessions, size_t session_count, const job *no
         }
     } else {
         for (size_t i = 0; i < session_count; i++) {
+            if (*now->repository && !same(sessions[i].repository, now->repository)) continue;
             if (same(sessions[i].lane, now->by) && sessions[i].when > last)
                 last = sessions[i].when;
         }
@@ -287,6 +288,7 @@ static void add_summary_item(text *part, unsigned *count, const message *m, cons
     (*count)++;
     if (*count <= 100) {
         add(part, "- "), add(part, m->id), add(part, " "), add(part, m->from), add(part, " to "), add(part, m->to);
+        if (m->repository && *m->repository) add(part, " (in "), add(part, m->repository), add(part, ")");
         if (*j->by) add(part, ", by "), add(part, j->by);
         add(part, ": "), clean(part, m->subject, true), add(part, "\n");
     }

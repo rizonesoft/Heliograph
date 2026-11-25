@@ -80,9 +80,9 @@ static int run_pause(int count, char **args) {
         if (r == S_OK) r = store_job(&s, &m, &now);
         message_free(&m);
     } else if (same(op, "take")) {
-        r = store_take(&s, id, (actor){lane, ""});
+        r = store_take(&s, id, (actor){.lane = lane, .session = ""});
     } else if (same(op, "seen")) {
-        r = store_seen(&s, id, (actor){lane, ""});
+        r = store_seen(&s, id, (actor){.lane = lane, .session = ""});
     } else {
         r = S_DAMAGED;
         s.why = "unknown op";
@@ -487,7 +487,7 @@ int racer(int count, char **args) {
     store s = {.folder = args[1]};
     int won = 0;
     for (int i = 3; i < count; i++) {
-        s_result result = store_take(&s, args[i], (actor){args[2], ""});
+        s_result result = store_take(&s, args[i], (actor){.lane = args[2], .session = ""});
         if (result == S_OK) won++;
         else if (result != S_REFUSED) return 102;
     }

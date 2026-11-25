@@ -381,14 +381,35 @@ class Places(Base):
         self.assertEqual(self.to("ui/draw.c", cwd=self.repo / "ui/deep"), "os/userland")
 
     def test_an_unowned_path_goes_to_whoever_works_there(self):
-        self.helio("hook", "claude", me="os/neon-b")
-        self.assertEqual(self.to("docs/a.md"), "os/all")
-        old = self.store / "sessions/os+neon-b"
-        put(old, "1\n")
-        self.assertEqual(self.to("docs/a.md"), "os/owner")
-        self.helio("hook", "claude", me="os/apps")  # the sender itself does not count
-        self.helio("hook", "claude", me="other/apps")
-        self.assertEqual(self.to("docs/a.md"), "os/owner")
+        # Configure two named repositories of project `os` so unowned paths stay in their repository.
+        repo_a = self.store / "repo-a"
+        repo_b = self.store / "repo-b"
+        repo_a.mkdir()
+        repo_b.mkdir()
+        put(repo_a / "helio.conf", "project: os\nlane: apps\nrepository: repo-a\npath: ui/ userland\n")
+        put(repo_b / "helio.conf", "project: os\nlane: apps\nrepository: repo-b\n")
+
+        # 1. Owned path goes to its owning lane with no repository header.
+        owned = self.send("ask", "path:ui/draw.c", me=None, cwd=repo_a)
+        owned_txt = (self.store / f"messages/{owned}.post").read_text()
+        self.assertIn("to: os/userland\n", owned_txt)
+        self.assertNotIn("repository: ", owned_txt)
+
+        # 2. Lane announced only in repo-b does NOT count for repo-a -> goes to os/owner!
+        self.assertEqual(self.helio("hook", "claude", me="os/neon-b", cwd=repo_b).returncode, 0)
+        self.assertEqual(self.to("docs/a.md", cwd=repo_a), "os/owner")
+
+        # 3. Lane announced inside repo-a counts -> goes to os/all with repository: repo-a!
+        self.assertEqual(self.helio("hook", "claude", me="os/neon-a", cwd=repo_a).returncode, 0)
+        scoped = self.send("ask", "path:docs/a.md", me=None, cwd=repo_a)
+        scoped_txt = (self.store / f"messages/{scoped}.post").read_text()
+        self.assertIn("to: os/all\n", scoped_txt)
+        self.assertIn("repository: repo-a\n", scoped_txt)
+
+        # Stale session or sender-only session in repo-a falls back to os/owner.
+        put(self.store / "sessions/os+neon-a", "time: 1\nagent: claude\nrepository: repo-a\nsession: \n")
+        self.assertEqual(self.helio("hook", "claude", me="os/apps", cwd=repo_a).returncode, 0)  # sender itself does not count
+        self.assertEqual(self.to("docs/a.md", cwd=repo_a), "os/owner")
 
     def test_the_repository_gives_the_lane(self):
         self.send("tell", to="os/apps")
@@ -2318,10 +2339,18 @@ class Sessions(Base):
         self.assertEqual(by_key[("os/legacy-lane", "")]["legacy"], "1")
         self.assertEqual(by_key[("os/legacy-lane", "")]["when"], fresh_now)
         self.assertNotIn(("os/apps", "ghost"), by_key)
-        # Legacy fresh file still counts as busy for unowned path routing!
+        # Legacy fresh file has no repository: in a named checkout it does not count (-> os/owner),
+        # while in a checkout without `repository:` it still counts as busy (-> os/all)!
         sent = self.send("ask", "path:docs/x.md", me=None, cwd=repo)
         post_txt = (self.store / f"messages/{sent}.post").read_text()
-        self.assertIn("to: os/all\n", post_txt)
+        self.assertIn("to: os/owner\n", post_txt)
+        unnamed = self.store / "unnamed-repo"
+        unnamed.mkdir()
+        put(unnamed / "helio.conf", "project: os\nlane: apps\n")
+        sent_u = self.send("ask", "path:docs/x.md", me=None, cwd=unnamed)
+        post_u = (self.store / f"messages/{sent_u}.post").read_text()
+        self.assertIn("to: os/all\n", post_u)
+        self.assertNotIn("repository: ", post_u)
 
     def test_two_sessions_of_one_lane_and_integration_env_vars_do_not_overwrite(self):
         repo = self.store / "repo-s"
@@ -4196,6 +4225,123 @@ class FixedMarks(Base):
             self.assertEqual(list((self.store / "messages").glob(f"{live_m}.seen.*")), [])
             self.assertEqual(run_closed_pipe("show", arch_m).returncode, 3)
             self.assertEqual(list((self.store / "archive/2025-02").glob(f"{arch_m}.seen.*")), [])
+
+
+class RepositoryRouting(Base):
+    def test_repository_name_validation_and_legacy_fallback(self):
+        cfg = self.store / "cfg"
+        cfg.mkdir()
+        # Invalid repository names (paths, leading dash, "all", uppercase, >32 chars, empty) exit 2.
+        for bad in ("a/b", "../x", "C:\\foo", "-repo", "all", "Repo", "a" * 33, ""):
+            put(cfg / "helio.conf", f"project: os\nlane: apps\nrepository: {bad}\n")
+            self.assertEqual(self.helio("log", me=None, cwd=cfg).returncode, 2, bad)
+        # 32-char valid repository name accepted.
+        put(cfg / "helio.conf", f"project: os\nlane: apps\nrepository: {'r' * 32}\n")
+        self.assertEqual(self.helio("hello", "codex", me=None, cwd=cfg).returncode, 0)
+        # Without `repository:`, unowned path routes project-wide (legacy behavior).
+        legacy = self.store / "legacy"
+        legacy.mkdir()
+        put(legacy / "helio.conf", "project: os\nlane: main\n")
+        self.assertEqual(self.helio("hello", "codex", me="os/worker", cwd=cfg).returncode, 0)
+        mid = self.send("ask", "path:docs/unowned.md", me=None, cwd=legacy)
+        txt = (self.store / f"messages/{mid}.post").read_text()
+        self.assertIn("to: os/all\n", txt)
+        self.assertNotIn("repository: ", txt)
+
+    def test_two_repositories_delivery_take_taker_identity_and_check(self):
+        repo_a = self.store / "repo-a"
+        repo_b = self.store / "repo-b"
+        repo_a.mkdir()
+        repo_b.mkdir()
+        put(repo_a / "helio.conf", "project: os\nrepository: repo-a\n")
+        put(repo_b / "helio.conf", "project: os\nrepository: repo-b\n")
+        self.assertEqual(self.helio("hello", "claude", me="os/dev1", cwd=repo_a).returncode, 0)
+        self.assertEqual(self.helio("hello", "codex", me="os/dev2", cwd=repo_a).returncode, 0)
+        self.assertEqual(self.helio("hello", "claude", me="os/other", cwd=repo_b).returncode, 0)
+
+        # Unowned path in repo-a produces a repo-a scoped job.
+        jid = self.send("ask", "path:docs/spec.md", "os/main", "s", "b", "--key", "k-repo", cwd=repo_a)
+        # Keyed retry from repo-b (different repository) is refused!
+        self.assertEqual(self.helio("hello", "codex", me="os/dev2", cwd=repo_b).returncode, 0)
+        self.assertEqual(self.helio("ask", "path:docs/spec.md", "s", "--key", "k-repo", me="os/main", cwd=repo_b, body="b").returncode, 2)
+
+        # Two lanes in repo-a BOTH see the job in inbox and hook; lane in repo-b sees NEITHER!
+        for who in ("os/dev1", "os/dev2"):
+            self.assertIn(jid, self.helio(me=who, cwd=repo_a).stdout.decode())
+            self.assertIn("(in repo-a)", self.helio("hook", "claude", me=who, cwd=repo_a).stdout.decode())
+        self.assertEqual(self.helio(me="os/other", cwd=repo_b).returncode, 1)
+        self.assertEqual(self.helio("hook", "claude", me="os/other", cwd=repo_b).stdout, b"")
+
+        # Outsider in repo-b trying to take WHILE OPEN is refused with "it is not for you" and writes NO step!
+        r_out = self.helio("take", jid, me="os/other", cwd=repo_b)
+        self.assertEqual(r_out.returncode, 2)
+        self.assertIn(b"not for you", r_out.stderr)
+        self.assertEqual(list((self.store / "messages").glob(f"{jid}.link.*")), [])
+
+        # First lane in repo-a takes it (sessionless); second lane in repo-a gets "already taken".
+        self.assertEqual(self.helio("take", jid, "--session", "", me="os/dev1", cwd=repo_a).returncode, 0)
+        self.assertEqual(self.helio("take", jid, me="os/dev2", cwd=repo_a).returncode, 2)
+        self.assertIn("repository: repo-a\n", (self.store / f"messages/{jid}.link.0000").read_text())
+
+        # Same lane name (`os/dev1`) in repo-b CANNOT release, done, refuse, or landed as taker!
+        self.assertEqual(self.helio("release", jid, "--session", "", me="os/dev1", cwd=repo_b).returncode, 2)
+        self.assertEqual(self.helio("done", jid, "no", "--session", "", me="os/dev1", cwd=repo_b).returncode, 2)
+        self.assertEqual(self.helio("refuse", jid, "no", "--session", "", me="os/dev1", cwd=repo_b).returncode, 2)
+        self.assertEqual(self.helio("landed", jid, "abcdef1", "--session", "", me="os/dev1", cwd=repo_b).returncode, 2)
+
+        # Owner can release from repo-b, then dev2 in repo-a can take and finish it; check passes even after sessions end!
+        self.assertEqual(self.helio("release", jid, me="os/owner", cwd=repo_b).returncode, 0)
+        self.assertEqual(self.helio("take", jid, me="os/dev2", cwd=repo_a).returncode, 0)
+        self.assertEqual(self.helio("done", jid, "shipped", me="os/dev2", cwd=repo_a).returncode, 0)
+        for sf in (self.store / "sessions").iterdir():
+            sf.unlink()
+        self.assertEqual(self.helio("check", me=None).returncode, 0)
+
+        # Scoped `tell`: outsider show displays `(in repo-a)` without marking seen; eligible repo-a show marks seen.
+        self.assertEqual(self.helio("hello", "claude", me="os/dev1", cwd=repo_a).returncode, 0)
+        tid = self.send("tell", "path:docs/info.md", me="os/main", cwd=repo_a)
+        self.assertIn("(in repo-a)", self.helio("show", tid, me="os/dev1", cwd=repo_b).stdout.decode())
+        self.assertEqual(list((self.store / "messages").glob(f"{tid}.seen.*")), [])
+        self.assertEqual(self.helio("show", tid, me="os/dev1", cwd=repo_a).returncode, 0)
+        self.assertEqual(self.helio(me="os/dev1", cwd=repo_a).returncode, 1)
+        self.assertIn(tid, self.helio(me="os/dev2", cwd=repo_a).stdout.decode())
+
+        # Corrupt posts and steps caught by check:
+        # (a) step on repo-scoped job naming wrong repository is damage.
+        bad_job = self.send("ask", "path:docs/bad.md", me="os/main", cwd=repo_a)
+        put(self.store / f"messages/{bad_job}.link.0000", "by: os/dev1\ntime: 2026-11-25T12:00:00Z\nsession: \nrepository: repo-b\nstate: taken\nnote: \nend: yes\n")
+        self.assertEqual(self.helio("check", me=None).returncode, 3)
+        (self.store / f"messages/{bad_job}.link.0000").unlink()
+        # (b) step omitting repository on repo-scoped job is damage.
+        put(self.store / f"messages/{bad_job}.link.0000", "by: os/dev1\ntime: 2026-11-25T12:00:00Z\nsession: \nstate: taken\nnote: \nend: yes\n")
+        self.assertEqual(self.helio("check", me=None).returncode, 3)
+        (self.store / f"messages/{bad_job}.link.0000").unlink()
+        # (c) post with repository: combined with direct destination or `for:` is damage.
+        orig_bad = (self.store / f"messages/{bad_job}.post").read_text()
+        put(self.store / f"messages/{bad_job}.post", orig_bad.replace("to: os/all\n", "to: os/dev1\n"))
+        self.assertEqual(self.helio("check", me=None).returncode, 3)
+        put(self.store / f"messages/{bad_job}.post", orig_bad.replace("to: os/all\n", "to: os/all\nfor: s1\n"))
+        self.assertEqual(self.helio("check", me=None).returncode, 3)
+        put(self.store / f"messages/{bad_job}.post", orig_bad)
+        self.assertEqual(self.helio("check", me=None).returncode, 0)
+
+        # Archived repo-scoped job preserves `(in repo-a)`, replay, and check after session removal.
+        old_us = 1739577600_000_000
+        clean_env = {k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "ANTIGRAVITY_CONVERSATION_ID")}
+        def rc_at(us, *args, cwd=repo_a, body=b""):
+            return subprocess.run(
+                [str(RACER), "--now", str(us), *args, "--store", str(self.store)],
+                input=body, capture_output=True, timeout=30, cwd=cwd, env=clean_env,
+            )
+        arch_j = rc_at(old_us, "ask", "path:docs/old.md", "Old repo job", "--as", "os/main", body=b"work").stdout.decode().strip()
+        self.assertEqual(rc_at(old_us + 100, "take", arch_j, "--as", "os/dev1").returncode, 0)
+        self.assertEqual(rc_at(old_us + 200, "done", arch_j, "ok", "--as", "os/dev1").returncode, 0)
+        self.assertEqual(self.helio("archive", me=None).returncode, 0)
+        for sf in (self.store / "sessions").iterdir():
+            sf.unlink()
+        self.assertIn("(in repo-a)", self.helio("show", arch_j, me="os/main", cwd=repo_a).stdout.decode())
+        self.assertIn("(in repo-a)", self.helio("log", "--all", me="os/main", cwd=repo_a).stdout.decode())
+        self.assertEqual(self.helio("check", me=None).returncode, 0)
 
 
 if __name__ == "__main__":

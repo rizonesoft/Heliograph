@@ -153,7 +153,7 @@ s_result place_open(place *p, const char **why) {
         char path[512], lane[36], word[32];
         if (starts(line, "project:")) value += 8, good = take_word(p->project, sizeof p->project, &value) && line_end(value);
         else if (starts(line, "lane:")) value += 5, good = take_word(p->lane, sizeof p->lane, &value) && line_end(value);
-        else if (starts(line, "repository:")) value += 11, good = take_word(p->repository, sizeof p->repository, &value) && pair_ok("x", p->repository) && line_end(value);
+        else if (starts(line, "repository:")) value += 11, good = take_word(p->repository, sizeof p->repository, &value) && repo_ok(p->repository) && line_end(value);
         else if (starts(line, "silent:")) {
             value += 7;
             uint64_t mins = 0;
@@ -740,21 +740,22 @@ p_result place_lane_sessions(store *s, const char *lane, bool (*each)(void *user
     return each_session_filtered(s, lane, each, user);
 }
 
-typedef struct { const char *project, *me; uint64_t since; bool busy; } look;
+typedef struct { const char *project, *repository, *me; uint64_t since; bool busy; } look;
 
 static bool busy_each(void *user, const session_info *info) {
     look *l = user;
     size_t n = len(l->project);
     if (!starts(info->lane, l->project) || info->lane[n] != '/') return true;
     if (same(info->lane, l->me)) return true;
+    if (l->repository && *l->repository && !same(info->repository, l->repository)) return true;
     if (info->when >= l->since) l->busy = true;
     return !l->busy;
 }
 
-s_result place_busy(store *s, const char *project, const char *me, uint64_t within, bool *busy) {
+s_result place_busy(store *s, const char *project, const char *repository, const char *me, uint64_t within, bool *busy) {
     *busy = false;
     uint64_t now = p_now();
-    look l = {project, me, now > within ? now - within : 0, false};
+    look l = {project, repository, me, now > within ? now - within : 0, false};
     p_result r = place_each_session(s, busy_each, &l);
     if (r == P_MISSING) return S_OK;
     if (r != P_OK) return s->why = "the sessions folder cannot be read", S_DAMAGED;

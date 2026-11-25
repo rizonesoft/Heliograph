@@ -48,8 +48,8 @@ s_result place_session(store *s, const char *lane, const char *session, session_
 p_result place_each_session(store *s, bool (*each)(void *user, const session_info *info), void *user);
 p_result place_lane_sessions(store *s, const char *lane, bool (*each)(void *user, const session_info *info), void *user);
 
-/* A lane of this project, other than me, said hello within the time. */
-s_result place_busy(store *s, const char *project, const char *me, uint64_t within, bool *busy);
+/* A lane of this project (and repository, when non-empty), other than me, said hello within the time. */
+s_result place_busy(store *s, const char *project, const char *repository, const char *me, uint64_t within, bool *busy);
 
 /* Root prefix length of an absolute path; sets *win_out when Windows separators apply. */
 size_t place_path_root_len(const char *path, bool *win_out);
