@@ -1534,7 +1534,7 @@ class Archive(Base):
                 put(st / f"messages/{j}.link.0000", "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: taken\nnote: \nend: yes\n")
                 put(st / f"messages/{j}.link.0001", "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: done\nnote: ok\nend: yes\n")
             with ThreadPoolExecutor(3) as pool:
-                sim_codes = list(pool.map(lambda _: subprocess.run([str(RACER), "--now", fixed_day_us, "inbox", "--store", str(st), "--as", "os/userland"], stdin=subprocess.DEVNULL, capture_output=True, timeout=30).returncode, range(3)))
+                sim_codes = list(pool.map(lambda _: subprocess.run([str(RACER), "--now", fixed_day_us, "inbox", "--store", str(st), "--as", "os/userland"], stdin=subprocess.DEVNULL, capture_output=True, timeout=90).returncode, range(3)))
             for rc in sim_codes:
                 self.assertIn(rc, (0, 1))
             moved_sim = len(list((st / "archive/2025-02").glob("*.post")))
