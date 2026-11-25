@@ -200,7 +200,8 @@ bool archive_is_clean_remnant(const char *folder, const char *id, const char *ev
     return equal;
 }
 
-static s_result copy_durable_ex(const char *src, const char *dst, const char **why, bool *created) {
+static s_result copy_durable_ex(const char *src, const char *dst, const char **why, bool *created,
+                                void (*pause)(void *user, const char *stage), void *pause_user, const char *after_read_stage) {
     if (created) *created = false;
     char *data = NULL;
     size_t length = 0;
@@ -218,6 +219,7 @@ static s_result copy_durable_ex(const char *src, const char *dst, const char **w
         *why = "a live file cannot be read";
         return S_DAMAGED;
     }
+    if (pause && after_read_stage) pause(pause_user, after_read_stage);
     text unique = {0};
     add_number(&unique, p_tick(), 0);
     p_result w = unique.failed ? P_FAILED : p_write(dst, data, length, false, unique.data);
@@ -255,7 +257,12 @@ static s_result copy_durable_ex(const char *src, const char *dst, const char **w
 }
 
 static s_result copy_durable(const char *src, const char *dst, const char **why) {
-    return copy_durable_ex(src, dst, why, NULL);
+    return copy_durable_ex(src, dst, why, NULL, NULL, NULL, NULL);
+}
+
+static s_result copy_durable_paused(const char *src, const char *dst, const char **why,
+                                    void (*pause)(void *user, const char *stage), void *pause_user, const char *after_read_stage) {
+    return copy_durable_ex(src, dst, why, NULL, pause, pause_user, after_read_stage);
 }
 
 typedef struct {
@@ -461,7 +468,7 @@ static s_result sweep_item_tail(const char *folder, const batch_item *it,
                 *why = "a landed mark is damaged";
                 res = S_DAMAGED;
             } else {
-                s_result cr = copy_durable(src.data, dst.data, why);
+                s_result cr = copy_durable_paused(src.data, dst.data, why, pause, pause_user, "after-read-landed");
                 if (cr == S_DAMAGED) res = S_DAMAGED;
                 else {
                     if (pause) pause(pause_user, "before-remove-landed");
@@ -902,7 +909,8 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
         live_path(folder, &lsrc, it->id, it->landed.items[i]);
         arch_path(folder, it->month, &ldst, it->id, it->landed.items[i]);
         if (pause) pause(pause_user, "before-copy-landed");
-        s_result lr = lsrc.failed || ldst.failed ? (why = "out of memory", S_DAMAGED) : copy_durable(lsrc.data, ldst.data, &why);
+        s_result lr = lsrc.failed || ldst.failed ? (why = "out of memory", S_DAMAGED)
+                    : copy_durable_paused(lsrc.data, ldst.data, &why, pause, pause_user, "after-read-landed");
         text_free(&lsrc), text_free(&ldst);
         if (lr == S_DAMAGED) {
             message_free(&m);
@@ -1530,7 +1538,21 @@ static s_result format_arch_landed_events(const store *s, const char *month, con
         size_t ll = 0;
         p_result lr = lp.failed ? P_FAILED : p_read(lp.data, MOST_FILE, &ld, &ll);
         text_free(&lp);
-        if (lr == P_MISSING) continue;
+        if (lr == P_MISSING) {
+            s_result al = archive_read_landed_one(s->folder, id, ev + 7);
+            if (al == S_OK) {
+                if (!list_push(&live_extra, ev, len(ev))) {
+                    list_free(&live_extra), text_free(&prefix), text_free(&bare);
+                    if (why) *why = "out of memory";
+                    return S_DAMAGED;
+                }
+            } else if (al == S_DAMAGED) {
+                list_free(&live_extra), text_free(&prefix), text_free(&bare);
+                if (why) *why = "an archived landed mark is damaged";
+                return S_DAMAGED;
+            }
+            continue;
+        }
         bool ok = lr == P_OK && store_valid_landed_payload(ld, ll, ev + 7);
         p_free(ld);
         if (!ok || !list_push(&live_extra, ev, len(ev))) {

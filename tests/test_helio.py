@@ -3841,25 +3841,28 @@ class Landed(Base):
                 if (self.store / f).exists():
                     (self.store / f).unlink()
 
-        #    (b) Archiver pauses at before-copy-landed (after reading live mark, before writing archive dest); concurrent landed succeeds and both agree!
+        #    (b) Archiver pauses at after-read-landed (AFTER reading live mark into memory, BEFORE writing archive dest);
+        #        concurrent landed promotes it and archiver resumes with buffered bytes -> both exit 0 and exact bytes survive!
         race_b = rc_at(old_us + 500, "ask", "os/apps", "Race arch copy", "--as", "os/main", body=b"w").stdout.decode().strip()
         self.assertEqual(rc_at(old_us + 600, "take", race_b, "--as", "os/apps").returncode, 0)
         self.assertEqual(rc_at(old_us + 700, "done", race_b, "ok", "--as", "os/apps").returncode, 0)
         self.assertEqual(rc_at(old_us + 750, "landed", race_b, "bbbb222", "--as", "os/main").returncode, 0)
         orig_b = (self.store / f"messages/{race_b}.landed.bbbb222").read_bytes()
         p_arch = subprocess.Popen(
-            [str(RACER), "--pause-cli", "before-copy-landed", str(self.store), "archive", "--store", str(self.store)],
+            [str(RACER), "--pause-cli", "after-read-landed", str(self.store), "archive", "--store", str(self.store)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=clean_env,
         )
         try:
             for _ in range(200):
-                if (self.store / "paused.before-copy-landed").exists():
+                if (self.store / "paused.after-read-landed").exists():
                     break
                 time.sleep(0.02)
-            self.assertTrue((self.store / "paused.before-copy-landed").exists())
+            self.assertTrue((self.store / "paused.after-read-landed").exists())
             r_mid = self.helio("landed", race_b, "bbbb222", me="os/main")
             self.assertEqual(r_mid.returncode, 0, r_mid.stderr)
-            put(self.store / "resume.before-copy-landed", "x")
+            self.assertTrue((self.store / f"archive/2025-02/{race_b}.landed.bbbb222").exists())
+            self.assertFalse((self.store / f"messages/{race_b}.landed.bbbb222").exists())
+            put(self.store / "resume.after-read-landed", "x")
             _, err_arch = p_arch.communicate(timeout=30)
             self.assertEqual(p_arch.returncode, 0, err_arch)
             self.assertEqual((self.store / f"archive/2025-02/{race_b}.landed.bbbb222").read_bytes(), orig_b)
@@ -3872,7 +3875,7 @@ class Landed(Base):
                 p_arch.stdout.close()
             if p_arch.stderr:
                 p_arch.stderr.close()
-            for f in ("paused.before-copy-landed", "resume.before-copy-landed"):
+            for f in ("paused.after-read-landed", "resume.after-read-landed"):
                 if (self.store / f).exists():
                     (self.store / f).unlink()
 

@@ -1229,7 +1229,15 @@ s_result store_landed_commits(store *s, const message *m, const job *now, bool c
                 if (!commit_vec_add(&v, c)) break;
             } else if (er == S_NOTHING) {
                 p_free(data);
-                if (!read_arch) {
+                if (read_arch) {
+                    s_result al = archive_read_landed_one(s->folder, m->id, c);
+                    if (al == S_OK) {
+                        if (!commit_vec_add(&v, c)) break;
+                    } else if (al == S_DAMAGED) {
+                        res = say(s, S_DAMAGED, "an archived landed mark is damaged");
+                        break;
+                    }
+                } else {
                     s_result lp = live_post(s, m->id);
                     if (lp == S_REFUSED) {
                         res = S_REFUSED;
