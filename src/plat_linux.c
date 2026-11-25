@@ -87,9 +87,47 @@ static bool settle(const char *path) {
     return good;
 }
 
+static bool acquire_claim(const char *path, const char *claim, bool *exists, p_result *err_out) {
+    *exists = false;
+    *err_out = P_FAILED;
+    for (int attempt = 0; attempt < 1500; attempt++) {
+        int fd = open(claim, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (fd >= 0) {
+            close(fd);
+            return true;
+        }
+        if (errno == EEXIST) {
+            struct stat st;
+            if (!lstat(path, &st)) {
+                *exists = true;
+                return false;
+            }
+            if (attempt == 1250) unlink(claim); /* stale claim after ~5s */
+            else {
+                struct timespec ts = {0, 4000000L};
+                nanosleep(&ts, NULL);
+            }
+            continue;
+        }
+        if (errno == ENOENT) {
+            *err_out = P_MISSING;
+            return false;
+        }
+        if (!passing_linux(attempt, errno)) return false;
+    }
+    struct stat st;
+    if (!lstat(path, &st)) *exists = true;
+    return false;
+}
+
 p_result p_write(const char *path, const char *data, size_t length, bool replace, const char *unique) {
-    char temp[4096];
+    char temp[4096], claim[4096];
     if ((size_t)snprintf(temp, sizeof temp, "%s.%s.part", path, unique) >= sizeof temp) return P_FAILED;
+    if (!replace) {
+        if ((size_t)snprintf(claim, sizeof claim, "%s.claim.part", path) >= sizeof claim) return P_FAILED;
+        struct stat st;
+        if (!lstat(path, &st)) return P_EXISTS;
+    }
     int file = open(temp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (file < 0) return errno == ENOENT ? P_MISSING : P_FAILED; /* a taken temporary name says nothing about path */
     size_t done = 0;
@@ -103,8 +141,18 @@ p_result p_write(const char *path, const char *data, size_t length, bool replace
     good = good && !fsync(file);
     good = !close(file) && good;
     p_result result = P_FAILED;
-    if (good && replace) result = rename(temp, path) ? why() : P_OK;
-    else if (good) result = link(temp, path) ? why() : P_OK; /* fails when the name is taken, on D: too */
+    if (good && replace) {
+        result = rename(temp, path) ? why() : P_OK;
+    } else if (good) {
+        bool exists = false;
+        p_result err_res = P_FAILED;
+        if (acquire_claim(path, claim, &exists, &err_res)) {
+            result = link(temp, path) ? why() : P_OK;
+            unlink(claim);
+        } else {
+            result = exists ? P_EXISTS : err_res;
+        }
+    }
     if (!(good && replace && result == P_OK)) unlink(temp);
     if (result == P_OK && !settle(path)) result = P_UNFLUSHED;
     return result;

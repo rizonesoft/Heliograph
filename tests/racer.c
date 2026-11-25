@@ -206,6 +206,7 @@ int racer(int count, char **args) {
                 return 3;
             }
             text_free(&rep);
+            if (r == S_NOTHING) break;
         }
         text out = {0};
         add_number(&out, (uint64_t)total_moved, 0), add(&out, "\n");

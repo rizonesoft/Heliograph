@@ -262,6 +262,7 @@ typedef struct {
     str_list links;
     unsigned arch_links;
     bool post_removed;
+    bool did_unlink;
     bool peer_moved;
 } batch_item;
 
@@ -603,6 +604,7 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
         it->peer_moved = true; /* archived post already existed before this call */
         it->arch_links = existing_links;
         it->post_removed = true;
+        it->did_unlink = (rm_post == P_OK);
         return S_OK;
     }
     message m = {0};
@@ -743,13 +745,14 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
 
     it->arch_links = j.links;
     it->post_removed = true;
+    it->did_unlink = (rm_post == P_OK);
     return S_OK;
 }
 
 s_result archive_store(const char *folder, size_t limit, size_t *moved, text *report,
                        void (*pause)(void *user, const char *stage), void *pause_user) {
     if (moved) *moved = 0;
-    size_t total_moved = 0, total_peer = 0;
+    size_t total_moved = 0, total_peer = 0, total_removed = 0;
     bool had_damage = false;
     text msg_dir = {0};
     add(&msg_dir, folder), add(&msg_dir, "/messages");
@@ -803,12 +806,17 @@ s_result archive_store(const char *folder, size_t limit, size_t *moved, text *re
                 if (r == S_DAMAGED) had_damage = true;
                 if (be.items[i].post_removed) {
                     batch_post_removed++;
-                    if (!be.items[i].peer_moved) total_moved++;
-                    else total_peer++;
+                    if (!be.items[i].peer_moved) {
+                        total_moved++;
+                        total_removed++;
+                    } else {
+                        total_peer++;
+                        if (be.items[i].did_unlink) total_removed++;
+                    }
                 } else if (be.items[i].peer_moved) {
                     total_peer++;
                 }
-                if (limit && total_moved >= limit) break;
+                if (limit && (total_moved >= limit || total_removed >= limit)) break;
             }
             /* One single post-unlink scan collects any late .seen.* marks for all moved jobs in this batch! */
             if (batch_post_removed > 0) {
@@ -834,7 +842,7 @@ s_result archive_store(const char *folder, size_t limit, size_t *moved, text *re
         }
         p_free(be.items);
 
-        if ((limit && total_moved >= limit) || !b.truncated) {
+        if ((limit && (total_moved >= limit || total_removed >= limit)) || !b.truncated) {
             list_free(&b.ids);
             break;
         }

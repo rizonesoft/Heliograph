@@ -1577,6 +1577,35 @@ class Archive(Base):
             self.assertTrue((st / f"messages/{j}.post").exists())
             self.assertTrue((st / f"summary/{today_iso}.archived").exists())
 
+        # Recovery day cap: 1 interrupted job (complete archive chain + surviving live post) ahead of 200 fresh
+        # eligible jobs -> daily inbox MUST debit the recovered live-post removal against the 200-job daily cap
+        # so at most 200 distinct live posts leave messages/ (at least 1 fresh eligible job remains live)!
+        with tempfile.TemporaryDirectory() as tmp:
+            st = Path(tmp)
+            put(st / "helio.conf", "project: os\n")
+            self.assertEqual(run(st, "init", me=None).returncode, 0)
+            rec = f"{feb_us + 4100:016d}-d00000"
+            rec_post = f"id: {rec}\ntime: 2025-02-15T00:00:00Z\nfrom: os/main\nto: os/userland\nkind: request\nabout: \nurgency: next\nre: \ndue: \nlength: 4\nsubject: rec\n\nbody"
+            rec_l0 = "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: taken\nnote: \nend: yes\n"
+            rec_l1 = "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: done\nnote: ok\nend: yes\n"
+            put(st / f"messages/{rec}.post", rec_post)
+            put(st / f"messages/{rec}.link.0000", rec_l0)
+            put(st / f"messages/{rec}.link.0001", rec_l1)
+            (st / "archive/2025-02").mkdir(parents=True, exist_ok=True)
+            put(st / f"archive/2025-02/{rec}.post", rec_post)
+            put(st / f"archive/2025-02/{rec}.link.0000", rec_l0)
+            put(st / f"archive/2025-02/{rec}.link.0001", rec_l1)
+            for i in range(200):
+                j = f"{feb_us + 4200 + i:016d}-d{i + 1:05x}"
+                put(st / f"messages/{j}.post", f"id: {j}\ntime: 2025-02-15T00:00:00Z\nfrom: os/main\nto: os/userland\nkind: request\nabout: \nurgency: next\nre: \ndue: \nlength: 4\nsubject: rf-{i}\n\nbody")
+                put(st / f"messages/{j}.link.0000", rec_l0)
+                put(st / f"messages/{j}.link.0001", rec_l1)
+            self.assertIn(run(st, "inbox", me="os/userland").returncode, (0, 1))
+            self.assertFalse((st / f"messages/{rec}.post").exists(), "recovered live post should be removed")
+            remaining_posts = list((st / "messages").glob("*.post"))
+            self.assertEqual(len(remaining_posts), 1, f"expected 1 fresh post to remain live after 200-cap recovery day, got {len(remaining_posts)}")
+            self.assertEqual(len(list((st / "archive/2025-02").glob("*.post"))), 200)
+
         # Live final-slot owner (slot 9 active, not stale): concurrent inbox MUST NOT publish .archived prematurely,
         # and slot 9's owner MUST finish its 20-job batch and publish .archived on completion!
         with tempfile.TemporaryDirectory() as tmp:
@@ -1729,7 +1758,7 @@ class Archive(Base):
         take_ids = old_ids[::25] + live_ids
         procs = [
             subprocess.Popen([win_racer, "--archive-loop", win_store, "100"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
-            subprocess.Popen([lin_racer, "--archive-loop", str(st), "1000"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
+            subprocess.Popen([lin_racer, "--archive-loop", str(st), "1200"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
             subprocess.Popen([win_racer, "--read-loop", win_store, "100", str(len(live_ids)), *live_ids], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
             subprocess.Popen([lin_racer, "--read-loop", str(st), "900", str(len(live_ids)), *live_ids], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
             subprocess.Popen([win_racer, win_store, "os/win-taker", *take_ids[::-1]], stdin=subprocess.DEVNULL),
@@ -1768,10 +1797,7 @@ class Archive(Base):
         lin_moved = int(arch_lin_out.decode().strip())
         self.assertGreater(win_moved, 0, f"Windows archiver moved 0 jobs (lin={lin_moved})")
         self.assertGreater(lin_moved, 0, f"Linux archiver moved 0 jobs (win={win_moved})")
-        # Tight bound: exact single-owner accounting is verified by the synchronized test above; on \\wsl.localhost 9p,
-        # SDK MoveFileExW(0) vs Linux link() has a rare ~0.2% overlap window.
-        self.assertGreaterEqual(win_moved + lin_moved, 1000, (win_moved, lin_moved))
-        self.assertLessEqual(win_moved + lin_moved, 1010, (win_moved, lin_moved))
+        self.assertEqual(win_moved + lin_moved, 1000, (win_moved, lin_moved))
         self.assertEqual(read_win_rc, 0, read_win_err)
         self.assertEqual(read_lin_rc, 0, read_lin_err)
         # Every live control job taken exactly once (per-job check, not aggregate!) and zero eligible old jobs taken!
