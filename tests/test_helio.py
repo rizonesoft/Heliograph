@@ -2560,7 +2560,7 @@ class Sessions(Base):
         # (in repo) creates seq=N+1. Windows resumes, hits real cross-host P_EXISTS on seq=N+1 (observed via
         # paused.hello-retry!), re-reads Linux's seq=N+1, and publishes seq=N+2 with BOTH agent=codex (Linux)
         # AND repository=other-repo (Windows)!
-        if not ON_WINDOWS and (BUILD / "racer.exe").exists():
+        if WSL and not ON_WINDOWS and (BUILD / "racer.exe").exists():
             win_store = subprocess.run(["wslpath", "-w", str(self.store)], capture_output=True, text=True, check=True, timeout=30).stdout.strip()
             p_win = subprocess.Popen(
                 [str(BUILD / "racer.exe"), "--pause-cli", "hello-create,hello-retry", win_store, "inbox", "--store", win_store, "--as", "os/apps", "--session", "race-1"],

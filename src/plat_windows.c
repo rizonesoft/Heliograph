@@ -182,14 +182,21 @@ p_result p_create_excl(const char *path, const char *data, size_t length) {
             im_free(wtemp), im_free(wslot), im_free(wpath);
             return P_FAILED;
         }
-        /* 2. Atomically claim exclusive .slot (CREATE_NEW is atomic on NTFS and \\wsl.localhost 9p). */
-        HANDLE sf = CreateFileW(wslot, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_NEW, 0, NULL);
+        /* 2. Atomically claim exclusive .slot (CREATE_NEW is atomic on NTFS and \\wsl.localhost 9p;
+              retry passing_win so a peer's DeleteFileW delete-pending window never masquerades as P_FAILED). */
+        HANDLE sf = INVALID_HANDLE_VALUE;
+        DWORD serr = 0;
+        for (int attempt = 0;; attempt++) {
+            sf = CreateFileW(wslot, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_NEW, 0, NULL);
+            if (sf != INVALID_HANDLE_VALUE) break;
+            serr = GetLastError();
+            if (!passing_win(attempt, serr)) break;
+        }
         if (sf == INVALID_HANDLE_VALUE) {
-            DWORD err = GetLastError();
             DeleteFileW(wtemp);
             im_free(wtemp), im_free(wslot), im_free(wpath);
-            if (err == ERROR_FILE_EXISTS || err == ERROR_ALREADY_EXISTS) return P_EXISTS;
-            if (err == ERROR_PATH_NOT_FOUND || err == ERROR_FILE_NOT_FOUND) return P_MISSING;
+            if (serr == ERROR_FILE_EXISTS || serr == ERROR_ALREADY_EXISTS) return P_EXISTS;
+            if (serr == ERROR_PATH_NOT_FOUND || serr == ERROR_FILE_NOT_FOUND) return P_MISSING;
             return P_FAILED;
         }
         CloseHandle(sf);
@@ -204,7 +211,7 @@ p_result p_create_excl(const char *path, const char *data, size_t length) {
             merr = GetLastError();
             if (!passing_win(attempt, merr)) break;
         }
-        DeleteFileW(wslot);
+        for (int attempt = 0; !DeleteFileW(wslot) && passing_win(attempt, GetLastError()); attempt++) {}
         if (!moved) {
             DeleteFileW(wtemp);
             im_free(wtemp), im_free(wslot), im_free(wpath);
