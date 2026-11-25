@@ -260,6 +260,7 @@ typedef struct {
     char month[8];
     str_list seen;
     str_list links;
+    str_list rm_parts;
     unsigned arch_links;
     bool post_removed;
     bool did_unlink;
@@ -287,10 +288,14 @@ static int find_batch_id(const batch_events *be, const char *id, size_t id_len) 
     return -1;
 }
 
+static bool is_rm_part(const char *name, size_t n) {
+    return n > 8 && same(name + n - 8, ".rm.part");
+}
+
 static bool attach_events(void *user, const char *name) {
     batch_events *be = user;
     size_t n = len(name);
-    if (n > 5 && same(name + n - 5, ".part")) return true;
+    if (n > 5 && same(name + n - 5, ".part") && !is_rm_part(name, n)) return true;
     const char *dot = name;
     while (*dot && *dot != '.') dot++;
     if (!*dot) return true;
@@ -301,7 +306,8 @@ static bool attach_events(void *user, const char *name) {
     if (same(ev, "post")) return true;
     if (starts(ev, "seen.")) list_push(&be->items[idx].seen, ev, len(ev));
     else if (starts(ev, "link.")) list_push(&be->items[idx].links, ev, len(ev));
-    if (be->items[idx].seen.failed || be->items[idx].links.failed) return be->failed = true, false;
+    else if (is_rm_part(ev, len(ev))) list_push(&be->items[idx].rm_parts, ev, len(ev));
+    if (be->items[idx].seen.failed || be->items[idx].links.failed || be->items[idx].rm_parts.failed) return be->failed = true, false;
     return true;
 }
 
@@ -309,6 +315,7 @@ static bool populate_batch_events(const char *folder, batch_events *be) {
     for (size_t i = 0; i < be->count; i++) {
         list_free(&be->items[i].seen);
         list_free(&be->items[i].links);
+        list_free(&be->items[i].rm_parts);
     }
     be->failed = false;
     text dir = {0};
@@ -429,6 +436,13 @@ static s_result sweep_item_tail(const char *folder, const batch_item *it,
         text_free(&src), text_free(&dst);
         if (rm != P_OK && rm != P_MISSING) *why = "a step could not be removed", res = S_DAMAGED;
     }
+    for (size_t i = 0; res == S_OK && i < it->rm_parts.count; i++) {
+        text src = {0};
+        live_path(folder, &src, it->id, it->rm_parts.items[i]);
+        p_result rm = src.failed ? P_FAILED : p_remove(src.data);
+        text_free(&src);
+        if (rm != P_OK && rm != P_MISSING) *why = "an interrupted removal could not be cleaned up", res = S_DAMAGED;
+    }
     return res;
 }
 
@@ -447,7 +461,7 @@ static bool list_contains(const str_list *l, const char *s, size_t n) {
 static bool gather_batch(void *user, const char *name) {
     batch_ctx *b = user;
     size_t n = len(name);
-    if (n > 5 && same(name + n - 5, ".part")) return true;
+    if (n > 5 && same(name + n - 5, ".part") && !is_rm_part(name, n)) return true;
     const char *dot = name;
     while (*dot && *dot != '.') dot++;
     if (!*dot) return true;
@@ -511,8 +525,8 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
         unsigned alinks = 0;
         s_result tr = archive_has_terminal_job(folder, it->id, &alinks);
         if (tr != S_OK) {
-            /* Live link/seen without live post and without a validated archived terminal job is genuine damage! */
-            if (it->links.count > 0 || it->seen.count > 0) {
+            /* Live link/seen/rm.part without live post and without a validated archived terminal job is genuine damage! */
+            if (it->links.count > 0 || it->seen.count > 0 || it->rm_parts.count > 0) {
                 add_report(report, it->id, tr == S_DAMAGED ? "archived terminal chain is damaged or incomplete" : "orphan event without post");
                 return S_DAMAGED;
             }
@@ -846,6 +860,7 @@ s_result archive_store(const char *folder, size_t limit, size_t *moved, text *re
         for (size_t i = 0; i < be.count; i++) {
             list_free(&be.items[i].seen);
             list_free(&be.items[i].links);
+            list_free(&be.items[i].rm_parts);
         }
         p_free(be.items);
 
@@ -930,7 +945,7 @@ s_result archive_daily(const char *folder, text *report, void (*pause)(void *use
         text sp = {0}, sbody = {0};
         add(&sp, sdir.data), add(&sp, "/"), add(&sp, day.data), add(&sp, ".slot."), add_number(&sp, slot, 0);
         add_number(&sbody, p_now(), 0), add(&sbody, "\n");
-        p_result sw = (sp.failed || sbody.failed) ? P_FAILED : p_write(sp.data, sbody.data, sbody.length, false, unique.data);
+        p_result sw = (sp.failed || sbody.failed) ? P_FAILED : p_create_excl(sp.data, sbody.data, sbody.length);
         text_free(&sp), text_free(&sbody);
         if (sw == P_EXISTS) continue;
         if (sw != P_OK) {
@@ -1000,9 +1015,10 @@ s_result archive_daily(const char *folder, text *report, void (*pause)(void *use
                 }
                 uint64_t sts = 0;
                 const char *p = sd;
+                bool has_nl = (sl > 0 && sd[sl - 1] == '\n');
                 while (*p >= '0' && *p <= '9') sts = sts * 10 + (uint64_t)(*p++ - '0');
                 p_free(sd);
-                if (!(check_now > sts && check_now - sts >= 60ull * 1000000ull)) all_finished = false;
+                if (!(has_nl && sts > 0 && check_now > sts && check_now - sts >= 60ull * 1000000ull)) all_finished = false;
             }
         }
         if (all_finished) {

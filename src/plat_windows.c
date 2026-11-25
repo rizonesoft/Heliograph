@@ -97,9 +97,33 @@ p_result p_remove(const char *path) {
     return settle_win(path) ? P_OK : P_FAILED;
 }
 
+p_result p_create_excl(const char *path, const char *data, size_t length) {
+    wchar_t *wide = im_wide(path);
+    if (!wide) return P_FAILED;
+    HANDLE file = CreateFileW(wide, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_NEW, 0, NULL);
+    DWORD err = file == INVALID_HANDLE_VALUE ? GetLastError() : 0;
+    im_free(wide);
+    if (file == INVALID_HANDLE_VALUE) {
+        if (err == ERROR_FILE_EXISTS || err == ERROR_ALREADY_EXISTS) return P_EXISTS;
+        if (err == ERROR_PATH_NOT_FOUND || err == ERROR_FILE_NOT_FOUND) return P_MISSING;
+        return P_FAILED;
+    }
+    const char *at = data;
+    bool good = true;
+    for (size_t left = length; good && left;) {
+        DWORD part = left > 0x100000 ? 0x100000 : (DWORD)left, wrote = 0;
+        good = WriteFile(file, at, part, &wrote, NULL) && wrote;
+        at += wrote, left -= wrote;
+    }
+    good = good && FlushFileBuffers(file);
+    CloseHandle(file);
+    if (!good) return P_FAILED;
+    return settle_win(path) ? P_OK : P_UNFLUSHED;
+}
+
 p_result p_claim_remove(const char *path, const char *unique) {
     im_text temp_t = {0};
-    im_add(&temp_t, path), im_add(&temp_t, "."), im_add(&temp_t, unique), im_add(&temp_t, ".part");
+    im_add(&temp_t, path), im_add(&temp_t, "."), im_add(&temp_t, unique), im_add(&temp_t, ".rm.part");
     wchar_t *from = im_wide(path);
     wchar_t *to = temp_t.failed ? NULL : im_wide(temp_t.data);
     im_text_free(&temp_t);

@@ -11,6 +11,8 @@ void p_free(void *memory);
 p_result p_read(const char *path, size_t most, char **data, size_t *length);
 /* Complete or not at all. Without replace the second writer gets P_EXISTS. */
 p_result p_write(const char *path, const char *data, size_t length, bool replace, const char *unique);
+/* Atomic exclusive create (O_CREAT|O_EXCL / CREATE_NEW); returns P_EXISTS if path already exists. */
+p_result p_create_excl(const char *path, const char *data, size_t length);
 p_result p_remove(const char *path);
 /* Atomically claim and remove path via a unique per-caller rename before unlink. */
 p_result p_claim_remove(const char *path, const char *unique);

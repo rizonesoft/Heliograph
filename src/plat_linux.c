@@ -110,9 +110,26 @@ p_result p_write(const char *path, const char *data, size_t length, bool replace
     return result;
 }
 
+p_result p_create_excl(const char *path, const char *data, size_t length) {
+    int file = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (file < 0) return why();
+    size_t done = 0;
+    bool good = true;
+    while (good && done < length) {
+        ssize_t wrote = write(file, data + done, length - done);
+        if (wrote < 0 && errno == EINTR) continue;
+        good = wrote > 0;
+        if (good) done += (size_t)wrote;
+    }
+    good = good && !fsync(file);
+    good = !close(file) && good;
+    if (!good) return P_FAILED;
+    return settle(path) ? P_OK : P_UNFLUSHED;
+}
+
 p_result p_claim_remove(const char *path, const char *unique) {
     char temp[4096];
-    if ((size_t)snprintf(temp, sizeof temp, "%s.%s.part", path, unique) >= sizeof temp) return P_FAILED;
+    if ((size_t)snprintf(temp, sizeof temp, "%s.%s.rm.part", path, unique) >= sizeof temp) return P_FAILED;
     for (int attempt = 0;; attempt++) {
         if (!rename(path, temp)) break;
         if (!passing_linux(attempt, errno)) return why();

@@ -1739,6 +1739,12 @@ class Archive(Base):
             self.assertEqual(len(list((st / "archive/2025-02").glob("*.post"))), 1)
             self.assertEqual(list((st / "messages").iterdir()), [])
             self.assertEqual(run(st, "archive", me=None).returncode, 1)
+            # Interrupted rename-before-unlink remnant (<id>.post.<unique>.rm.part) MUST be cleaned up by a subsequent archive!
+            rem = st / f"messages/{j}.post.99999.rm.part"
+            put(rem, (st / f"archive/2025-02/{j}.post").read_text())
+            self.assertEqual(run(st, "archive", me=None).returncode, 0)
+            self.assertFalse(rem.exists(), "interrupted .rm.part remnant must be removed by subsequent archive")
+            self.assertEqual(list((st / "messages").iterdir()), [])
 
     @unittest.skipUnless(WSL, "needs WSL")
     def test_windows_and_linux_archive_race_1000_rounds(self):
