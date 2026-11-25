@@ -438,22 +438,28 @@ static int show(store *s, const char *id, actor me, const place *here) {
     if (body.failed) out.failed = true;
     text_free(&body);
     bool mine = is_for(&m, me);
-    bool alert_outstanding = false;
+    bool alert_outstanding = false, alert_err = false;
     unsigned alert_links = 0;
     if (!m.archived && lr == S_OK && m.for_session && *m.for_session && dest_owns(me.lane, &m)) {
         session_cache sc = {0};
         uint64_t now_us = p_now();
         if (!is_job(&m)) {
             bool target_seen = false;
-            if (store_was_seen(s, id, (actor){m.to, m.for_session}, false, 0, &target_seen) == S_OK && !target_seen) {
+            if (store_was_seen(s, id, (actor){m.to, m.for_session}, false, 0, &target_seen) != S_OK) {
+                alert_err = true;
+            } else if (!target_seen) {
                 bool sess_silent = false;
-                if (watch_classify_session_silent(s, here, &m, message_time_us(&m), now_us, &sc, &sess_silent) && sess_silent)
+                if (!watch_classify_session_silent(s, here, &m, message_time_us(&m), now_us, &sc, &sess_silent))
+                    alert_err = true;
+                else if (sess_silent)
                     alert_outstanding = true;
             }
         } else if (shown_job.state == OPEN) {
             bool sess_silent = false;
             uint64_t since = shown_job.links > 0 ? shown_job.when : message_time_us(&m);
-            if (watch_classify_session_silent(s, here, &m, since, now_us, &sc, &sess_silent) && sess_silent) {
+            if (!watch_classify_session_silent(s, here, &m, since, now_us, &sc, &sess_silent))
+                alert_err = true;
+            else if (sess_silent) {
                 alert_outstanding = true;
                 alert_links = shown_job.links;
             }
@@ -482,6 +488,7 @@ static int show(store *s, const char *id, actor me, const place *here) {
         }
     }
 maybe_ack_alert:
+    if (alert_err) return fail("the alert state cannot be read", 3);
     if (alert_outstanding) {
         result = store_seen_alert(s, id, me.lane, alert_links);
         if (result != S_OK && result != S_REFUSED) return fail(s->why, result);

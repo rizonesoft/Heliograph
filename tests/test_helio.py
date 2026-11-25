@@ -3318,6 +3318,15 @@ class SessionTargeting(Base):
         self.assertIn("damaged", r_dmg_hook.stdout.decode().lower())
         self.assertEqual(rc_at(t5 + 65 * M, "show", dmg_note, "--as", "os/owner").returncode, 3)
         (self.store / f"messages/{dmg_note}.seen.os+owner~alert").unlink()
+        # Corrupt target seen mark during owner show also propagates exit 3 so owner knows alert was not acknowledged.
+        import hashlib
+        h_s5 = hashlib.sha256(b"s5").hexdigest()[:32]
+        bad_target_seen = self.store / f"messages/{dmg_note}.seen.os+apps+{h_s5}"
+        put(bad_target_seen, "corrupt\n")
+        r_show_err = rc_at(t5 + 65 * M, "show", dmg_note, "--as", "os/owner")
+        self.assertEqual(r_show_err.returncode, 3)
+        self.assertIn(b"Damaged seen", r_show_err.stdout)
+        bad_target_seen.unlink()
         self.assertEqual(self.helio("check", me=None).returncode, 0)
 
 
