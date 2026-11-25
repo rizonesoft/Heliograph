@@ -530,10 +530,10 @@ def _verify_race_test_ran(output: str, install_mod: Any) -> None:
 
 
 def _find_sdk_dir(repo: Path, sdk_url: str, install_mod: Any) -> Path:
-    sdk_dir = repo.parent / "ImpossibleSDK"
+    sdk_dir = repo.parent / "SDK"
     if not (sdk_dir / "tools" / "app_build.py").is_file() or not (sdk_dir / "tools" / "prove.py").is_file():
         raise install_mod.InstallError(
-            f"ImpossibleSDK with app_build.py and prove.py not found beside checkout at {sdk_dir}",
+            f"Impossible SDK with app_build.py and prove.py not found beside checkout at {sdk_dir}",
             code=3,
         )
     return sdk_dir

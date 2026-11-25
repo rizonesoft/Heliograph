@@ -962,7 +962,7 @@ def git_provenance(repo: Path) -> tuple[str, bool]:
 def ensure_sdk_and_build(repo: Path, sdk_url: str, stage_dir: Path) -> tuple[Path, Path, str, bool]:
     """Ensure Impossible SDK exists beside repo, build+test under checkout build lock, and snapshot outputs."""
     _validate_sdk_url(sdk_url)
-    sdk_dir = repo.parent / "ImpossibleSDK"
+    sdk_dir = repo.parent / "SDK"
     build_lock = repo / "build" / BUILD_LOCK_NAME
     with acquire_lock(build_lock, blocking=True):
         prov_before = git_provenance_snapshot(repo)

@@ -77,7 +77,7 @@ Archiving removes files that `store_job` reads one by one. A reader that holds t
 - [x] Pause a racer between reading and writing a step in `tests/racer.c`, remove the post and steps meanwhile, and let it go on. Done when: `tests/test_helio.py` sees a refusal and an empty folder, and fails with either second look removed. Cheaper substitute: a test without the pause.
 - [x] Commit: `store: steps notice an archived job`
 
-**Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
+**Test checkpoint:** `python3 ../SDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
 
 > **Verified:** 2026-11-24 | §1 | b671912bc78b1d68e4a800a14d0fc1615cc5c4b1
 > **Review:** `docs/reviews/d01-t01-s1.json`
@@ -109,7 +109,7 @@ A job done or refused for 30 days moves to `archive/<year-month>`. The month com
 - [x] Race archivers with takers and readers from Windows and WSL in `tests/test_helio.py`. Done when: no job has two takers and no message is missing in 1000 rounds. Cheaper substitute: one system.
 - [x] Commit: `archive: closed jobs move to their month`
 
-**Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
+**Test checkpoint:** `python3 ../SDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
 
 > **Verified:** 2026-11-25 | §2 | 8f9752acd0ec10475197ed6b416d1698e43a4a40
 > **Review:** `docs/reviews/d01-t01-s2.json`
@@ -139,7 +139,7 @@ An archived message must still be found by its id. Without this a keyed send rep
 - [x] Examine archived files in `store_check` of `engine/store.c`. Done when: a byte changed in an archived file is reported. Cheaper substitute: trusting the archive. **Corrected 2026-11-25:** validates structural and content-rule damage across archived posts, steps, seen marks, and month folders (same-length valid-payload edits require external checksums not carried by the plain-text format; see decision in `docs/phase-runs/2026-11-24-phase-1.md`).
 - [x] Commit: `archive: still found by its id`
 
-**Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
+**Test checkpoint:** `python3 ../SDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
 
 > **Verified:** 2026-11-25 | §3 | 9093c2f9aa6e806af45ebde1b1708ca5be282602
 > **Review:** `docs/reviews/d01-t01-s3.json`
@@ -165,7 +165,7 @@ Only the Claude hook announces a session, and it records a time alone. Codex and
 - [x] Announce the lane on every other call in `engine/helio.c` without failing it. Done when: an unwritable `sessions` leaves the command's exit code unchanged and says why. Cheaper substitute: ignoring it.
 - [x] Commit: `sessions: every call is a sign of life`
 
-**Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
+**Test checkpoint:** `python3 ../SDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
 
 > **Verified:** 2026-11-25 | §4 | 5da8c72349bd58f046552c217fe829bc925152e4
 > **Review:** `docs/reviews/d01-t01-s4.json`
@@ -192,7 +192,7 @@ A job taken by a lane that has gone quiet is reported even when it has no due ti
 - [x] Release a silent job and take it again in `tests/test_helio.py`. Done when: only `helio release` frees it. Cheaper substitute: a release by itself.
 - [x] Commit: `watch: a silent taker is reported`
 
-**Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
+**Test checkpoint:** `python3 ../SDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
 
 > **Verified:** 2026-11-25 | §5 | 34e4b9735c265e86c084d2f1cc0647732272c95b
 > **Review:** `docs/reviews/d01-t01-s5.json`
@@ -218,7 +218,7 @@ The design lets a message be for a session, not only a lane. `--for-session <nam
 - [x] Show it to the owner when the session is silent in `engine/helio.c`. Done when: it appears once for the owner after the time of §5. Cheaper substitute: it waits unseen.
 - [x] Commit: `messages: for one session`
 
-**Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
+**Test checkpoint:** `python3 ../SDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
 
 > **Verified:** 2026-11-25 | §6 | 761a76efa0ac63be8ed968b3f1db6b6a707e5424
 > **Review:** `docs/reviews/d01-t01-s6.json`
@@ -243,7 +243,7 @@ The design says a session sees only its own project's messages and those sent to
 - [x] Show every project with `log --all` when no lane is named outside a configured repository in `engine/helio.c`, for the owner's terminal. Done when: a call with a lane or inside a configured checkout stays inside its project. Cheaper substitute: no way to see all.
 - [x] Commit: `messages: projects stay apart`
 
-**Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
+**Test checkpoint:** `python3 ../SDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
 
 > **Verified:** 2026-11-25 | §7 | 36dc2566ca3068ea62fc0d9b3cc07c8c442fa3cd
 > **Review:** `docs/reviews/d01-t01-s7.json`
@@ -269,7 +269,7 @@ A linked commit marks a job landed and closes nothing. The engine starts no prog
 - [x] Move the mark with its message in `engine/archive.c`. Done when: an archived job still names its commit. Cheaper substitute: dropping it.
 - [x] Commit: `jobs: a commit marks them landed`
 
-**Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
+**Test checkpoint:** `python3 ../SDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
 
 > **Verified:** 2026-11-25 | §8 | 3eb564fd010360898f86137fe69d3fc7aeee91d1
 > **Review:** `docs/reviews/d01-t01-s8.json`
@@ -294,7 +294,7 @@ A linked commit marks a job landed and closes nothing. The engine starts no prog
 - [x] Count the marks in the 2,000 characters in `fill_inbox` of `engine/helio.c`. Done when: the largest hook output is 2,000 characters or fewer. Cheaper substitute: counting messages alone.
 - [x] Commit: `output: fixed marks around messages`
 
-**Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
+**Test checkpoint:** `python3 ../SDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
 
 > **Verified:** 2026-11-25 | §9 | 124fad2bfbaebd3f02eab670f55a37c5e0ab5334
 > **Review:** `docs/reviews/d01-t01-s9.json`
@@ -319,7 +319,7 @@ A script must not parse lines meant for people. `--json` prints one JSON value, 
 - [ ] Print an error as `{"error": ..., "code": ...}` in `fail` of `engine/helio.c`. Done when: exit codes are unchanged for 0, 1, 2 and 3. Cheaper substitute: text on an error.
 - [ ] Commit: `output: JSON on every command`
 
-**Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
+**Test checkpoint:** `python3 ../SDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
 
 ## 11. Take the next job as a queue
 
@@ -340,7 +340,7 @@ The Gemini driver's queue is `helio take --kind request --lane neon-a --json`. I
 - [ ] Declare the need `heliograph-queue` in `app.json`: the OS Neon driver uses `helio take` in place of its own queue folder (design, "Limits"). Done when: it is on main in the form `AGENTS.md` gives. Cheaper substitute: editing the OS repository.
 - [ ] Commit: `jobs: take the next one`
 
-**Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
+**Test checkpoint:** `python3 ../SDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
 
 ## 12. Expiry of seen heads-ups and findings
 
@@ -360,7 +360,7 @@ Seen heads-ups, findings and answers stay in the working store for ever. They le
 - [ ] Keep an unseen message in `engine/archive.c` and count it in the summary of `engine/watch.c` after 30 days. Done when: it is in the summary and still in the inbox. Cheaper substitute: deleting it.
 - [ ] Commit: `archive: seen messages expire`
 
-**Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
+**Test checkpoint:** `python3 ../SDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
 
 ## 13. Design and help that match the program
 
@@ -380,7 +380,7 @@ The design lists `send` where the program has `hand` and `find`, and still lists
 - [ ] Compare the commands in the help of `engine/helio.c`, `README.md` and the design in `tests/test_helio.py`. Done when: a planted extra command fails it. Cheaper substitute: reading them.
 - [ ] Commit: `docs: the design matches the program`
 
-**Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
+**Test checkpoint:** `python3 ../SDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
 
 ## 14. Unowned paths kept to their repository
 
@@ -406,7 +406,7 @@ A path that no lane owns goes to whoever works in that repository, and to the ow
 - [x] Replace `test_an_unowned_path_goes_to_whoever_works_there` in `tests/test_helio.py` with the three cases, its lane announced from inside the repository. Done when: it fails with the old `reader`. Cheaper substitute: keeping the project-wide expectation.
 - [x] Commit: `routing: an unowned path stays in its repository`
 
-**Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
+**Test checkpoint:** `python3 ../SDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
 
 ## 15. Quick installer
 
@@ -438,7 +438,7 @@ One command takes a checkout to a working `helio` in WSL. It records what it ins
 - [x] Harden edge cases from chain-2 plan review in `tools/install.py` and `tests/test_install.py`: refuse cross-destination wrapper takeover; verify exact wrapper content/store and `previous` backup hashes in `--status`; refuse publication on build-time source drift; refuse partial legacy binary pairs naming the missing partner; retire outgoing third wrappers on successive `--wrapper` changes; report structured exit-3 diagnostics for `OSError` and failed recovery; and add clean-home login-shell `PATH`, nonrecursive real-checkout pinned-SDK install, and non-skipping WSL Windows-interop tests. Done when: every new regression passes and fails when its production guard is reverted. Cheaper substitute: skipping real-SDK or partial-pair checks.
 - [x] Commit: `install: one command`
 
-**Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
+**Test checkpoint:** `python3 ../SDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
 
 > **Verified:** 2026-11-24 | §15 | 5b154710504fe1b194428f4d0a9cb65c466571a7
 > **Review:** `docs/reviews/d01-t01-s15.json`
@@ -469,7 +469,7 @@ A Windows session has no `helio` on its `PATH`, so its hook finds nothing. The i
 - [x] Document the Windows install, `--status`, `--back`, and `--remove` commands in `README.md` Quick start and cover them in `TestWindowsInstaller` (executed by `prove.py`) plus WSL handoff tests in `tests/test_install.py`. Done when: `prove.py` executes all Windows tests natively with zero skips on the new class and `app_build.py` passes in WSL. Cheaper substitute: skipping Windows tests or omitting docs.
 - [x] Commit: `install: Windows sessions`
 
-**Test checkpoint:** `python3 ../ImpossibleSDK/tools/prove.py .` exits 0 after the commit and the new tests fail when their production change is reverted.
+**Test checkpoint:** `python3 ../SDK/tools/prove.py .` exits 0 after the commit and the new tests fail when their production change is reverted.
 
 > **Verified:** 2026-11-24 | §16 | 7a376e422268ee520a6afa025688585d6350bd5d
 > **Review:** `docs/reviews/d01-t01-s16.json`
@@ -502,7 +502,7 @@ When a phase is closed and everything is tested, the program that the sessions u
 - [x] Tell the other lanes with `helio tell impossible/all` from `tools/install.py --phase`, keyed by the commit. Done when: a repeat sends nothing new. Cheaper substitute: silence.
 - [x] Commit: `install: after a tested phase`
 
-**Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
+**Test checkpoint:** `python3 ../SDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
 
 > **Verified:** 2026-11-24 | §17 | bad7ff6ca4483ebfa1f78a397b98fef5a9729cd8
 > **Review:** `docs/reviews/d01-t01-s17.json`
@@ -510,5 +510,5 @@ When a phase is closed and everything is tested, the program that the sessions u
 ## Verification
 
 - A job is sent on Windows, taken in WSL with `helio take --kind request --lane neon-a --json`, marked landed, done, archived and shown again by its id.
-- `python3 ../ImpossibleSDK/tools/prove.py .` exits 0 after the last commit.
+- `python3 ../SDK/tools/prove.py .` exits 0 after the last commit.
 - `python3 scripts/todo-graph.py validate` and `python3 scripts/todo-graph.py plan --check` pass.

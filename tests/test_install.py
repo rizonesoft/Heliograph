@@ -34,7 +34,7 @@ def find_built_binaries() -> tuple[Path, Path]:
 
 
 def find_mingw_gcc() -> Path | None:
-    sdk_dir = Path(os.environ.get("IMPOSSIBLE_SDK_DIR") or (REPO.parent / "ImpossibleSDK"))
+    sdk_dir = Path(os.environ.get("IMPOSSIBLE_SDK_DIR") or (REPO.parent / "SDK"))
     bootstrap_py = sdk_dir / "tools" / "bootstrap.py"
     if not bootstrap_py.is_file():
         return None
@@ -1471,7 +1471,7 @@ class TestQuickInstaller(unittest.TestCase):
             drift_ws = root / "drift_ws"
             drift_repo = drift_ws / "Heliograph"
             init_git_repo(drift_repo)
-            drift_sdk = drift_ws / "ImpossibleSDK" / "tools"
+            drift_sdk = drift_ws / "SDK" / "tools"
             drift_sdk.mkdir(parents=True)
             (drift_sdk / "app_build.py").write_text(
                 "import pathlib, shutil, sys\n"
@@ -1642,7 +1642,7 @@ class TestQuickInstaller(unittest.TestCase):
             dirty_repo = dirty_ws / "Heliograph"
             init_git_repo(dirty_repo)
             (dirty_repo / "README.md").write_text("already dirty before build\n", encoding="utf-8")
-            dirty_sdk = dirty_ws / "ImpossibleSDK" / "tools"
+            dirty_sdk = dirty_ws / "SDK" / "tools"
             dirty_sdk.mkdir(parents=True)
             (dirty_sdk / "app_build.py").write_text(
                 "import pathlib, shutil, sys\n"
@@ -1665,7 +1665,7 @@ class TestQuickInstaller(unittest.TestCase):
             ext_hdr = root / "external_header.h"
             ext_hdr.write_text("#define V 1\n", encoding="utf-8")
             (sym_repo / "linked.h").symlink_to(ext_hdr)
-            sym_sdk = sym_ws / "ImpossibleSDK" / "tools"
+            sym_sdk = sym_ws / "SDK" / "tools"
             sym_sdk.mkdir(parents=True)
             (sym_sdk / "app_build.py").write_text(
                 "import pathlib, shutil, sys\n"
@@ -1699,7 +1699,7 @@ class TestQuickInstaller(unittest.TestCase):
     def test_real_checkout_pinned_sdk_install_and_roundtrip(self) -> None:
         if os.environ.get("HELIO_INSTALL_BUILD_ACTIVE") == "1":
             self.skipTest("already inside tools/install.py build; skipping nested self-install")
-        sdk_build = REPO.parent / "ImpossibleSDK" / "tools" / "app_build.py"
+        sdk_build = REPO.parent / "SDK" / "tools" / "app_build.py"
         if not sdk_build.is_file():
             self.skipTest("pinned ImpossibleSDK checkout not present beside repo")
         with tempfile.TemporaryDirectory() as tmp:
@@ -1785,7 +1785,7 @@ class TestQuickInstaller(unittest.TestCase):
                 ok_ws = root / "ok_ws"
                 ok_repo = ok_ws / "Heliograph"
                 init_git_repo(ok_repo)
-                ok_sdk = ok_ws / "ImpossibleSDK" / "tools"
+                ok_sdk = ok_ws / "SDK" / "tools"
                 ok_sdk.mkdir(parents=True)
                 (ok_sdk / "app_build.py").write_text(
                     "import pathlib, shutil, sys\n"
@@ -1999,7 +1999,7 @@ class TestQuickInstaller(unittest.TestCase):
                 fail_ws = root / "fail_ws"
                 fail_repo = fail_ws / "Heliograph"
                 init_git_repo(fail_repo)
-                fail_sdk = fail_ws / "ImpossibleSDK" / "tools"
+                fail_sdk = fail_ws / "SDK" / "tools"
                 fail_sdk.mkdir(parents=True)
                 (fail_sdk / "app_build.py").write_text("import sys; sys.exit(4)\n", encoding="utf-8")
                 with self.assertRaises(self.mod.InstallError) as ctx:
@@ -3097,7 +3097,7 @@ class TestPhaseInstaller(unittest.TestCase):
         h_src, e_src = self._make_distinct_pair(src_bins, bin_tag)
 
         # Stub ImpossibleSDK beside checkout
-        sdk_tools = ws / "ImpossibleSDK" / "tools"
+        sdk_tools = ws / "SDK" / "tools"
         sdk_tools.mkdir(parents=True)
         (sdk_tools / "app_build.py").write_text(
             "#!/usr/bin/env python3\n"
@@ -3282,8 +3282,8 @@ class TestPhaseInstaller(unittest.TestCase):
                 (checkout / "dirty.txt").unlink()
 
                 # app_build.py fails -> refused
-                mode_ab = checkout.parent / "ImpossibleSDK" / "tools" / "app_build.mode"
-                mode_pr = checkout.parent / "ImpossibleSDK" / "tools" / "prove.mode"
+                mode_ab = checkout.parent / "SDK" / "tools" / "app_build.mode"
+                mode_pr = checkout.parent / "SDK" / "tools" / "prove.mode"
                 mode_ab.write_text("fail", encoding="utf-8")
                 with self.assertRaises(self.mod.InstallError) as ctx:
                     call_phase(0)
@@ -3580,9 +3580,9 @@ class TestPhaseInstaller(unittest.TestCase):
             # (pre-Phase-0 baseline) using the pinned ImpossibleSDK build so BOTH hosts exercise a truly older reader!
             prev_ws = root / "prev_ws"
             prev_ws.mkdir()
-            real_sdk = REPO.parent / "ImpossibleSDK"
+            real_sdk = REPO.parent / "SDK"
             self.assertTrue((real_sdk / "tools" / "app_build.py").is_file(), "ImpossibleSDK required to build c4de2fe")
-            os.symlink(real_sdk, prev_ws / "ImpossibleSDK")
+            os.symlink(real_sdk, prev_ws / "SDK")
             prev_src = prev_ws / "Heliograph"
             prev_src.mkdir()
             arch = subprocess.run(
@@ -3596,7 +3596,7 @@ class TestPhaseInstaller(unittest.TestCase):
                 encoding="utf-8",
             )
             subprocess.run(
-                [sys.executable, str(prev_ws / "ImpossibleSDK" / "tools" / "app_build.py"), str(prev_src)],
+                [sys.executable, str(prev_ws / "SDK" / "tools" / "app_build.py"), str(prev_src)],
                 check=True,
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
@@ -5307,7 +5307,7 @@ class TestPhaseInstaller(unittest.TestCase):
         """Exercise one nonrecursive fixture checkout through the REAL pinned ImpossibleSDK app_build.py and prove.py."""
         if os.environ.get("HELIO_IN_SDK_PHASE_TEST") == "1":
             self.skipTest("prevent recursion inside nested SDK phase test")
-        real_sdk = REPO.parent / "ImpossibleSDK"
+        real_sdk = REPO.parent / "SDK"
         if not (real_sdk / "tools" / "app_build.py").is_file() or not (real_sdk / "tools" / "prove.py").is_file():
             self.skipTest("ImpossibleSDK checkout beside Heliograph is required")
         reg_key = self._new_reg_key()
@@ -5315,7 +5315,7 @@ class TestPhaseInstaller(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory(prefix="helio-real-sdk-phase-") as tmp:
                 root = Path(tmp)
-                os.symlink(real_sdk, root / "ImpossibleSDK")
+                os.symlink(real_sdk, root / "SDK")
                 checkout = root / "Heliograph"
                 checkout.mkdir()
                 for name in ("CMakeLists.txt", "app.json", "sdk.json", ".gitignore"):

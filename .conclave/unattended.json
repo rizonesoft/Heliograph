@@ -51,7 +51,7 @@
       "name": "build",
       "command": [
         "python3",
-        "../ImpossibleSDK/tools/app_build.py",
+        "../SDK/tools/app_build.py",
         "."
       ],
       "timeout_seconds": 900

@@ -97,7 +97,7 @@ python3 Heliograph/tools/install.py --windows --remove
 
 After `--windows`, open a new Windows terminal and run `helio check` to confirm it reaches the shared WSL store.
 
-To build and test without installing, run `python ImpossibleSDK/tools/app_build.py Heliograph` (or `python3` in WSL). It installs the pinned toolchain once per machine, builds with the SDK commit in [`sdk.json`](sdk.json), also when the SDK has moved on, and runs the tests. From WSL it makes `helio.exe` for Windows and `linux/helio` for WSL in `build/linux`; on Windows it makes `helio.exe` in `build/windows`.
+To build and test without installing, run `python SDK/tools/app_build.py Heliograph` (or `python3` in WSL). It installs the pinned toolchain once per machine, builds with the SDK commit in [`sdk.json`](sdk.json), also when the SDK has moved on, and runs the tests. From WSL it makes `helio.exe` for Windows and `linux/helio` for WSL in `build/linux`; on Windows it makes `helio.exe` in `build/windows`.
 
 ## How do I use it?
 

@@ -47,14 +47,14 @@ jobs:
         with:
           repository: rizonesoft/ImpossibleSDK
           ref: ${{ steps.sdk.outputs.commit }}
-          path: ImpossibleSDK
+          path: SDK
       - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
       - uses: actions/cache@v6
         with:
           path: ${{ matrix.tools }}
-          key: tools-${{ matrix.os }}-${{ hashFiles('ImpossibleSDK/toolchain.json') }}
+          key: tools-${{ matrix.os }}-${{ hashFiles('SDK/toolchain.json') }}
       - name: A C23 compiler for the Linux program
         if: runner.os == 'Linux'
         run: |
@@ -65,7 +65,7 @@ jobs:
             sudo update-alternatives --set cc /usr/bin/gcc-14
           fi
       - name: Build and test
-        run: python ImpossibleSDK/tools/app_build.py Heliograph
+        run: python SDK/tools/app_build.py Heliograph
       - name: Work list
         working-directory: Heliograph
         run: |

@@ -7,10 +7,10 @@ Thank you for looking at Heliograph. It is early, so a good bug report or a smal
 Put [Impossible SDK](https://github.com/rizonesoft/ImpossibleSDK) beside this folder, then:
 
 ```
-python ../ImpossibleSDK/tools/app_build.py .
+python ../SDK/tools/app_build.py .
 ```
 
-Use Windows or WSL (there the command is `python3`). In WSL, `python3 ../ImpossibleSDK/tools/prove.py .` lets Windows run the tests against the committed programs; a change counts when that passes.
+Use Windows or WSL (there the command is `python3`). In WSL, `python3 ../SDK/tools/prove.py .` lets Windows run the tests against the committed programs; a change counts when that passes.
 
 ## What a change needs
 
