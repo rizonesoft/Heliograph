@@ -116,6 +116,8 @@ A job done or refused for 30 days moves to `archive/<year-month>`. The month com
 
 ## 3. Read, answer and repeat archived messages
 
+> **Started:** 2026-11-25T04:36Z
+
 An archived message must still be found by its id. Without this a keyed send repeated after archiving would make the message again, because `store_post` sees no post.
 
 **Phase:** 1
