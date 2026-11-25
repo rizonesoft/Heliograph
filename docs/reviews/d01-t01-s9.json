@@ -1,0 +1,92 @@
+{
+  "ref": "D01 T01 \u00a79",
+  "title": "Fixed marks around every shown message",
+  "implementation_sha": "124fad2bfbaebd3f02eab670f55a37c5e0ab5334",
+  "date": "2026-11-25",
+  "reviews": [
+    {
+      "round": 1,
+      "report": "docs/reviews/01-heliograph/D01-T01-s9.md",
+      "verdict": "fixed"
+    }
+  ],
+  "checks": [
+    "python3 ../ImpossibleSDK/tools/prove.py . -> 118 OK (skipped=22) on eebea74",
+    "python3 ../ImpossibleSDK/tools/app_build.py . -> 118 OK (skipped=4) on eebea74",
+    "FixedMarks revert -> REVERT_RC=1 vs 340b46e",
+    "build.yml -> green 45668141218 on eebea74"
+  ],
+  "completion": {
+    "report": "docs/reviews/01-heliograph/D01-T01-s9.md",
+    "verdict": "filed",
+    "candidate": "124fad2bfbaebd3f02eab670f55a37c5e0ab5334",
+    "reviewer": "astra",
+    "model": "gpt-6.2-astra",
+    "filed": [
+      "D01 T01 \u00a713"
+    ]
+  },
+  "rounds_spent": 1,
+  "round_cap": 33,
+  "plan": {
+    "report": "docs/reviews/01-heliograph/D01-T01-s9.md",
+    "candidate": "340b46e3e6dfbfc5a507e334e31c35525f4e0760",
+    "reviewer": "astra",
+    "model": "gpt-6.2-astra",
+    "effort": "medium",
+    "lenses": [
+      "plan"
+    ]
+  },
+  "schedule_sha": "340b46e3e6dfbfc5a507e334e31c35525f4e0760",
+  "schedule": {
+    "policy": "three-pass",
+    "pass_cap": 33,
+    "blocking": [
+      "P1",
+      "P2"
+    ],
+    "plan": {
+      "effort": "medium",
+      "lenses": [
+        "plan"
+      ]
+    },
+    "rounds": [
+      {
+        "effort": "medium",
+        "lenses": [
+          "adversarial",
+          "integration",
+          "source-defect",
+          "consistency",
+          "quality",
+          "optimization",
+          "design"
+        ]
+      }
+    ],
+    "completion": {
+      "effort": "low",
+      "lenses": [
+        "plan-delivery",
+        "record"
+      ]
+    },
+    "reconciliation": {
+      "effort": "low",
+      "lenses": [
+        "adversarial",
+        "integration",
+        "plan-delivery",
+        "record"
+      ]
+    },
+    "lenses": {
+      "thread-safety": "Which state is reached from two threads (UI, worker, callback, timer) without one lock or atomic owning it, and which lock order, wait, cancellation or teardown can deadlock or run after its owner is gone?",
+      "memory-safety": "Which pointer, reference, view, handle or iterator can outlive what it refers to, and which size, index or cast is trusted unchecked?"
+    }
+  },
+  "passes_spent": 3,
+  "pass_cap": 33
+}
