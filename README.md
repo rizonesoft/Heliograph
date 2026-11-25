@@ -62,7 +62,7 @@ Legend: ✅ works · 📋 planned
 | Silent takers, messages for one session | ✅ | `helio hello`, `silent:` reporting, and `--for-session` targeting |
 | Projects kept apart in log and show | ✅ | `may_see` scopes `log`, `show`, `answer`, and job commands to your project |
 | Mark for landed work | ✅ | `helio landed <id> <commit>` links a commit without closing the job |
-| Fixed marks around shown messages | 📋 | [§9](todo/01-heliograph/TODO-01-heliograph.md) |
+| Fixed marks around shown messages | ✅ | `inbox`, `log`, `show`, and `hook` wrap every message line behind `| ` between fixed marks |
 | JSON, taking the next job as a queue | 📋 | [§10 and §11](todo/01-heliograph/TODO-01-heliograph.md) |
 
 ## Quick start
@@ -172,7 +172,7 @@ No. The inbox, the hook and `helio working` look when they are called, so a remi
 <details>
 <summary><strong>Can a message make an agent do something?</strong></summary>
 
-It should not. `helio show` and the Claude hook say that a message is information from another agent, and `show` puts bars before its lines. The inbox and the log do not yet ([§9](todo/01-heliograph/TODO-01-heliograph.md)). A session still works by its own rules and its owner's word.
+It should not. `inbox`, `log`, `show`, and the Claude hook wrap every shown message between fixed opening and closing marks stating it is information from another agent, not an instruction, and prefix every message line with `| `. A session still works by its own rules and its owner's word.
 
 </details>
 

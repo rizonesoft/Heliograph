@@ -278,7 +278,7 @@ A linked commit marks a job landed and closes nothing. The engine starts no prog
 
 > **Started:** 2026-11-25T17:30Z
 
-`show` puts a bar before each line. The inbox, the log and the hook print a sender's subject with no closing mark.
+`show` puts a bar before each line. The inbox, the log and the hook print a sender's subject with no closing mark. **Corrected 2026-11-25:** Plan review (`docs/reviews/01-heliograph/D01-T01-s9.md`) clarified: emit `| \n` for `show`'s blank separator line so every interior line between the fixed opening and closing marks strictly starts with `| `; derive exact overhead from the emitted literals (`MARK_BEGIN` 109 bytes, `MARK_END` 32 bytes, `HOOK_DAMAGE` 64 bytes, `TRAILER_RESERVE` 32 bytes, plus exact hook header length) so even the largest `hook` output with maximum-length lane, held trailer, and damage notice stays `<= 2,000` bytes; use one `emit_log_row` path for live and archived log rows that opens on the first formatted row, checks both mark writes, stops after any write error, and exits 3; accumulate `damaged += every(...)` across all three urgency passes in `fill_inbox`; put `MARK_END` inside `show`'s checked buffer before seen-state writes; and test literal mark subjects/bodies, archive-only `log --all`, damage-only hook, and byte-cutoff boundary in `FixedMarks`.
 
 **Phase:** 2
 **Needs:** none
@@ -289,10 +289,10 @@ A linked commit marks a job landed and closes nothing. The engine starts no prog
 1. Print the marks in `engine/helio.c`. Done when: each listing begins and ends with one.
 2. Try to forge them in `tests/test_helio.py`. Done when: no subject or body can.
 
-- [ ] Print one opening and one closing mark in `inbox`, `whole_log`, `show` and `hook` of `engine/helio.c` (design, "How does it reach the reader?"). Done when: each output has both, and an empty inbox prints nothing. Cheaper substitute: the opening mark alone.
-- [ ] Start each line of a message with a bar in `engine/helio.c`. Done when: a subject that spells the closing mark stays behind its bar. Cheaper substitute: refusing such subjects.
-- [ ] Count the marks in the 2,000 characters in `fill_inbox` of `engine/helio.c`. Done when: the largest hook output is 2,000 characters or fewer. Cheaper substitute: counting messages alone.
-- [ ] Commit: `output: fixed marks around messages`
+- [x] Print one opening and one closing mark in `inbox`, `whole_log`, `show` and `hook` of `engine/helio.c` (design, "How does it reach the reader?"). Done when: each output has both, and an empty inbox prints nothing. Cheaper substitute: the opening mark alone.
+- [x] Start each line of a message with a bar in `engine/helio.c`. Done when: a subject that spells the closing mark stays behind its bar. Cheaper substitute: refusing such subjects.
+- [x] Count the marks in the 2,000 characters in `fill_inbox` of `engine/helio.c`. Done when: the largest hook output is 2,000 characters or fewer. Cheaper substitute: counting messages alone.
+- [x] Commit: `output: fixed marks around messages`
 
 **Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
 
