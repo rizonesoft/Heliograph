@@ -1,4 +1,5 @@
 """Messages are not lost, a job has one taker, and Windows and Linux share one store."""
+import hashlib
 import os
 import platform
 import subprocess
@@ -2561,16 +2562,14 @@ class Sessions(Base):
         self.assertEqual((rc, info["agent"], info["repository"]), (0, "codex", "race-repo"))
         self.assertGreater(int(info["when"]), int(mid["when"]))
 
-        # Case 2: deterministic lock-free CAS contention advancing TWO generations (N+1 and N+2, sweeping N+1!)
-        # while p3 (inbox in repo_other) is paused at hello-create about to create N+1. When p3 resumes, p3
-        # detects N+2 > N+1, removes its stale N+1, emits hello-retry, re-reads N+2, and publishes N+3 with
-        # BOTH agent=antigravity (from writer 2) AND repository=other-repo (from p3), leaving zero stale N+1!
-        repo_other = self.store / "repo-other"
-        repo_other.mkdir()
-        put(repo_other / "helio.conf", "project: os\nlane: apps\nrepository: other-repo\n")
+        # Case 2: deterministic lock-free CAS contention on one key (race-1 in race-repo) advancing TWO
+        # generations (N+1 and N+2, sweeping N+1!) while p3 (inbox in the same repository) is paused at
+        # hello-create about to create N+1. When p3 resumes, p3 detects N+2 > N+1, removes its stale N+1,
+        # emits hello-retry, re-reads N+2, and publishes N+3 keeping agent=antigravity (from writer 2),
+        # leaving zero stale N+1! A refresh in another repository writes another key and never contends here.
         p3 = subprocess.Popen(
             [str(RACER), "--pause-cli", "hello-create,hello-retry", str(self.store), "inbox", "--store", str(self.store), "--as", "os/apps", "--session", "race-1"],
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=repo_other, env=clean,
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=repo, env=clean,
         )
         try:
             deadline = time.time() + 15
@@ -2594,35 +2593,34 @@ class Sessions(Base):
         for f in ("paused.hello-create", "resume.hello-create", "paused.hello-retry", "resume.hello-retry"):
             if (self.store / f).exists():
                 (self.store / f).unlink()
-        base_r1 = f"os+apps+{'race-1'.encode().hex()}"
+        base_r1 = f"os+apps+r{hashlib.sha256(b'race-1').hexdigest()[:32]}+race-repo"
         r1_files = [p.name for p in (self.store / "sessions").iterdir() if p.name == base_r1 or p.name.startswith(base_r1 + "~")]
         self.assertEqual(len(r1_files), 1, r1_files)
         rc2, info2 = self.read_session("os/apps", "race-1")
-        self.assertEqual((rc2, info2["agent"], info2["repository"]), (0, "antigravity", "other-repo"))
+        self.assertEqual((rc2, info2["agent"], info2["repository"]), (0, "antigravity", "race-repo"))
         self.assertGreater(int(info2["when"]), int(info["when"]))
         listed = [row for row in self.list_sessions() if row["session"] == "race-1"]
         self.assertEqual(len(listed), 1)
-        self.assertEqual((listed[0]["agent"], listed[0]["repository"], listed[0]["when"]), ("antigravity", "other-repo", info2["when"]))
+        self.assertEqual((listed[0]["agent"], listed[0]["repository"], listed[0]["when"]), ("antigravity", "race-repo", info2["when"]))
 
         # Unconditional duplicate-generation deduplication verified directly through BOTH C readers (place_session + place_each_session).
         put(self.store / f"sessions/{base_r1}", "time: 5\nagent: stale\nrepository: stale\nsession: race-1\nend: yes\n")
         rc_dup, info_dup = self.read_session("os/apps", "race-1")
-        self.assertEqual((rc_dup, info_dup["agent"], info_dup["repository"], info_dup["when"]), (0, "antigravity", "other-repo", info2["when"]))
+        self.assertEqual((rc_dup, info_dup["agent"], info_dup["repository"], info_dup["when"]), (0, "antigravity", "race-repo", info2["when"]))
         listed_dup = [row for row in self.list_sessions() if row["session"] == "race-1"]
         self.assertEqual(len(listed_dup), 1)
-        self.assertEqual((listed_dup[0]["agent"], listed_dup[0]["repository"], listed_dup[0]["when"]), ("antigravity", "other-repo", info2["when"]))
+        self.assertEqual((listed_dup[0]["agent"], listed_dup[0]["repository"], listed_dup[0]["when"]), ("antigravity", "race-repo", info2["when"]))
         (self.store / f"sessions/{base_r1}").unlink()
 
-        # Case 2b: cross-host WSL/Windows lock-free CAS contention over \\wsl.localhost!
-        # Windows p_win (racer.exe inbox in repo_other) reads seq=N and pauses at hello-create. Linux hello codex
+        # Case 2b: cross-host WSL/Windows lock-free CAS contention over \\wsl.localhost on one key!
+        # Windows p_win (racer.exe inbox in repo) reads seq=N and pauses at hello-create. Linux hello codex
         # (in repo) creates seq=N+1. Windows resumes, hits real cross-host P_EXISTS on seq=N+1 (observed via
-        # paused.hello-retry!), re-reads Linux's seq=N+1, and publishes seq=N+2 with BOTH agent=codex (Linux)
-        # AND repository=other-repo (Windows)!
+        # paused.hello-retry!), re-reads Linux's seq=N+1, and publishes seq=N+2 keeping agent=codex (Linux)!
         if WSL and not ON_WINDOWS and (BUILD / "racer.exe").exists():
             win_store = subprocess.run(["wslpath", "-w", str(self.store)], capture_output=True, text=True, check=True, timeout=30).stdout.strip()
             p_win = subprocess.Popen(
                 [str(BUILD / "racer.exe"), "--pause-cli", "hello-create,hello-retry", win_store, "inbox", "--store", win_store, "--as", "os/apps", "--session", "race-1"],
-                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=repo_other, env=clean,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=repo, env=clean,
             )
             try:
                 deadline = time.time() + 15
@@ -2645,7 +2643,7 @@ class Sessions(Base):
                 if (self.store / f).exists():
                     (self.store / f).unlink()
             rc_xh, info_xh = self.read_session("os/apps", "race-1")
-            self.assertEqual((rc_xh, info_xh["agent"], info_xh["repository"]), (0, "codex", "other-repo"))
+            self.assertEqual((rc_xh, info_xh["agent"], info_xh["repository"]), (0, "codex", "race-repo"))
             self.assertGreater(int(info_xh["when"]), int(info2["when"]))
             # Restore antigravity + race-repo state so Case 3a/3b below stay deterministic.
             self.assertEqual(self.helio("hello", "antigravity", "--session", "race-1", me=None, cwd=repo).returncode, 0)
@@ -2665,7 +2663,7 @@ class Sessions(Base):
 
         # Interrupted publication leaving an abandoned .part temp file beside intact predecessor: readers ignore .part
         # and return intact predecessor, and subsequent announcements advance cleanly preserving agent!
-        base_r1 = f"os+apps+{'race-1'.encode().hex()}"
+        base_r1 = f"os+apps+r{hashlib.sha256(b'race-1').hexdigest()[:32]}+race-repo"
         abandoned_part = self.store / "sessions/.exdeadbeef.part"
         put(abandoned_part, "time: 9999999999999999\nagent: ghost\n")
         rc_fb, info_fb = self.read_session("os/apps", "race-1")
@@ -4231,6 +4229,9 @@ class FixedMarks(Base):
 
 
 class RepositoryRouting(Base):
+    parse_racer_sessions = Sessions.parse_racer_sessions
+    read_session = Sessions.read_session
+
     def test_repository_name_validation_and_legacy_fallback(self):
         cfg = self.store / "cfg"
         cfg.mkdir()
@@ -4514,6 +4515,63 @@ class RepositoryRouting(Base):
         self.assertIn("to: os/all\n", handoff_post)
         self.assertIn("repository: repo-a\n", handoff_post)
 
+
+    def test_a_refresh_never_touches_another_key_so_no_lookup_loses_a_heartbeat(self):
+        """The class behind every handoff race: a heartbeat on disk when a lookup starts must stay
+        under its own name while the session works elsewhere. A refresh writes only its own key."""
+        repos = {}
+        for name in ("repo-a", "repo-b", "repo-c", "repo-d"):
+            repos[name] = self.store / name
+            repos[name].mkdir()
+            put(repos[name] / "helio.conf", f"project: os\nrepository: {name}\n")
+        self.assertEqual(self.helio("hello", "claude", "--session", "w", me="os/dev", cwd=repos["repo-a"]).returncode, 0)
+        # A record an older build wrote under the session's key outside a repository, with inline times.
+        now_us = int(time.time() * 1_000_000)
+        put(self.store / f"sessions/os+dev+{'w'.encode().hex()}",
+            f"time: {now_us}\nagent: claude\nrepository: repo-c\nsession: w\nrepo-time: repo-d {now_us - 5}\nend: yes\n")
+        self.assertEqual(self.helio("hello", "codex", me="os/other", cwd=repos["repo-a"]).returncode, 0)
+
+        def snapshot():
+            return {p.name: p.read_bytes() for p in (self.store / "sessions").iterdir()}
+
+        own = f"os+dev+r{hashlib.sha256(b'w').hexdigest()[:32]}+"
+        for target in ("repo-b", "repo-c", "repo-d", "repo-b", "repo-a"):
+            before = snapshot()
+            r = self.helio("inbox", "--session", "w", me="os/dev", cwd=repos[target])
+            self.assertIn(r.returncode, (0, 1), r.stderr)
+            after = snapshot()
+            mine = own + target
+            for name, data in before.items():
+                if name == mine or name.startswith(mine + "~"):
+                    continue
+                self.assertEqual(after.get(name), data, f"a refresh in {target} changed {name}")
+            self.assertTrue(any(n == mine or n.startswith(mine + "~") for n in after), mine)
+            # The agent is kept from the session's newest record although inbox names none.
+            rc, info = self.read_session("os/dev", "w")
+            self.assertEqual((rc, info["agent"]), (0, "claude"))
+
+        # End to end: while the session refreshes in b, c and d over and over, every unowned path sent
+        # in repo-a still finds the worker there and stays in repo-a.
+        stop = time.time() + 6
+        def churn():
+            i = 0
+            while time.time() < stop:
+                self.helio("inbox", "--session", "w", me="os/dev", cwd=repos[("repo-b", "repo-c", "repo-d")[i % 3]])
+                i += 1
+        import threading
+        worker = threading.Thread(target=churn)
+        worker.start()
+        sent = []
+        try:
+            while time.time() < stop - 0.5:
+                sent.append(self.send("ask", "path:docs/churn.md", me="os/main", cwd=repos["repo-a"]))
+        finally:
+            worker.join()
+        self.assertGreater(len(sent), 5)
+        for mid in sent:
+            post = (self.store / f"messages/{mid}.post").read_text()
+            self.assertIn("to: os/all\n", post, mid)
+            self.assertIn("repository: repo-a\n", post, mid)
 
 if __name__ == "__main__":
     unittest.main()

@@ -564,20 +564,20 @@ static p_result read_best_generation(const store *s, const char *base, bool *any
     return P_OK;
 }
 
-/* Lock-free monotonic CAS: each update atomically creates `<base>` (seq 0) or
-   `<base>~<seq+1>` via p_create_excl. On P_EXISTS another writer won that slot,
-   so we re-read the latest generation, merge monotonically, and retry. After
-   publishing, the superseded generation is removed best-effort. */
-static s_result preserve_named_repo(store *s, const char *lane, const char *ag, const char *repo, const char *ss, uint64_t at);
+/* One key holds one heartbeat: a lane, its session name and the one repository it ran in
+   (`<lane>+r<32-hex>+<repo>`), a named session outside a repository (`<lane>+<hex>`), or a
+   sessionless lane with or without a repository (`<lane>++<repo>`, `<lane>`). A refresh writes
+   only its own key and never copies, moves or supersedes another key, so a heartbeat that is on
+   disk when a reader starts looking stays under its own name: there is no hand-over between keys
+   for a reader to fall into. Records written by older builds under the named key (`<lane>+<hex>`,
+   with `repository:` and legacy `repo-time:` lines) are read where they lie and never rewritten.
 
-/* Publishes a monotonic session generation for `base`. When `preserve_at` is non-zero,
-   ensures the key records at least `preserve_at` (a no-op if an existing generation already
-   has `when >= preserve_at`). When `preserve_lane` is non-NULL (canonical named-session write),
-   durably preserves the exact `existing` predecessor's prior repository and legacy `repo-time:`
-   entries on every CAS attempt (including retries) BEFORE superseding `existing`. */
-static s_result publish_session_key(store *s, const char *base, const char *ag, const char *rp, const char *ss,
-                                    uint64_t preserve_at, const char *preserve_lane, bool use_pauses) {
-    if (use_pauses && s->pause) s->pause(s->pause_user, "hello-write");
+   Within one key, each update atomically creates `<base>` (seq 0) or `<base>~<seq+1>` via
+   p_create_excl. On P_EXISTS another writer won that slot, so we re-read the latest generation,
+   merge monotonically, and retry. After publishing, the superseded generation is removed
+   best-effort. */
+static s_result publish_session_key(store *s, const char *base, const char *ag, const char *fallback_agent, const char *rp, const char *ss) {
+    if (s->pause) s->pause(s->pause_user, "hello-write");
 
     for (int attempt = 0; attempt < MOST_CAS_ATTEMPTS; attempt++) {
         bool any_found = false, have_existing = false, only_empty = false;
@@ -588,23 +588,9 @@ static s_result publish_session_key(store *s, const char *base, const char *ag, 
         if (br != P_OK || (any_found && !have_existing && !only_empty))
             return s->why = "the existing session cannot be read", S_DAMAGED;
 
-        if (preserve_at && have_existing && existing.when >= preserve_at) return S_OK;
-
-        const char *use_agent = *ag ? ag : (have_existing && *existing.agent ? existing.agent : "");
-        if (preserve_lane && *ss && have_existing) {
-            if (*existing.repository && (!*rp || !same(existing.repository, rp))) {
-                s_result pr = preserve_named_repo(s, preserve_lane, use_agent, existing.repository, ss, existing.when);
-                if (pr != S_OK) return pr;
-            }
-            for (size_t i = 0; i < existing.legacy_repo_count; i++) {
-                if (*rp && same(existing.legacy_repos[i].name, rp)) continue;
-                s_result pr = preserve_named_repo(s, preserve_lane, use_agent, existing.legacy_repos[i].name, ss, existing.legacy_repos[i].when);
-                if (pr != S_OK) return pr;
-            }
-        }
-
+        const char *use_agent = *ag ? ag : (have_existing && *existing.agent ? existing.agent : fallback_agent);
         uint64_t next_seq = any_found ? max_seq + 1 : 0;
-        uint64_t now = preserve_at ? preserve_at : p_now();
+        uint64_t now = p_now();
         if (have_existing && now <= existing.when) now = existing.when + 1;
 
         text next_path = {0}, data = {0};
@@ -615,13 +601,13 @@ static s_result publish_session_key(store *s, const char *base, const char *ag, 
             return s->why = "out of memory", S_DAMAGED;
         }
 
-        if (use_pauses && s->pause) s->pause(s->pause_user, "hello-create");
+        if (s->pause) s->pause(s->pause_user, "hello-create");
 
         p_result cr = p_create_excl(next_path.data, data.data, data.length);
         text_free(&data);
         if (cr == P_EXISTS) {
             text_free(&next_path);
-            if (use_pauses && s->pause) s->pause(s->pause_user, "hello-retry");
+            if (s->pause) s->pause(s->pause_user, "hello-retry");
             continue;
         }
         if (cr == P_OK || cr == P_UNFLUSHED) {
@@ -630,7 +616,7 @@ static s_result publish_session_key(store *s, const char *base, const char *ag, 
             session_info chk_info = {0};
             p_result chkr = P_MISSING;
             for (int v = 0; v < 8; v++) {
-                chkr = read_best_generation(s, base, &chk_any, &chk_max, &chk_valid, &chk_vseq, NULL, use_pauses && v == 0, &chk_info);
+                chkr = read_best_generation(s, base, &chk_any, &chk_max, &chk_valid, &chk_vseq, NULL, v == 0, &chk_info);
                 if (chkr != P_MISSING) break;
             }
             if (chkr != P_OK || !chk_any || !chk_valid || chk_vseq < next_seq) {
@@ -640,7 +626,7 @@ static s_result publish_session_key(store *s, const char *base, const char *ag, 
             if (chk_vseq > next_seq) {
                 p_remove(next_path.data);
                 text_free(&next_path);
-                if (use_pauses && s->pause) s->pause(s->pause_user, "hello-retry");
+                if (s->pause) s->pause(s->pause_user, "hello-retry");
                 continue;
             }
             if (have_existing) {
@@ -666,19 +652,6 @@ static s_result publish_session_key(store *s, const char *base, const char *ag, 
     return s->why = "the session cannot be announced", S_DAMAGED;
 }
 
-static s_result preserve_named_repo(store *s, const char *lane, const char *ag, const char *repo, const char *ss, uint64_t at) {
-    if (!repo || !*repo || !repo_ok(repo)) return S_OK;
-    text rbase = {0};
-    session_base(&rbase, lane, ss, repo);
-    if (rbase.failed) {
-        text_free(&rbase);
-        return s->why = "out of memory", S_DAMAGED;
-    }
-    s_result r = publish_session_key(s, rbase.data, ag, repo, ss, at, NULL, false);
-    text_free(&rbase);
-    return r;
-}
-
 s_result place_hello(store *s, const char *lane, const char *agent, const char *repository, const char *session) {
     if (!lane || !address_ok(lane, false)) return s->why = "say who you are: --as project/lane or HELIO_AS", S_REFUSED;
     if (!session_ok(session)) return s->why = "the session name is invalid or too long", S_REFUSED;
@@ -689,8 +662,7 @@ s_result place_hello(store *s, const char *lane, const char *agent, const char *
 
     text folder = {0}, base = {0};
     add(&folder, s->folder), add(&folder, "/sessions");
-    /* Canonical key: `<lane>+<hex(ss)>` for named sessions, `<lane>++<rp>` for sessionless+repo, `<lane>` for sessionless. */
-    session_base(&base, lane, ss, *ss ? "" : rp);
+    session_base(&base, lane, ss, rp);
     if (folder.failed || base.failed) {
         text_free(&folder), text_free(&base);
         return s->why = "out of memory", S_DAMAGED;
@@ -700,13 +672,13 @@ s_result place_hello(store *s, const char *lane, const char *agent, const char *
         return s->why = "the session cannot be announced", S_DAMAGED;
     }
     text_free(&folder);
-
-    /* Write-before-supersede happens inside publish_session_key's CAS loop on every attempt
-       (preserving the exact predecessor generation being superseded before creating next_seq). */
-    s_result r = publish_session_key(s, base.data, ag, rp, ss, 0, *ss ? lane : NULL, true);
+    /* A call that names no agent keeps the one the session last gave, read from its newest record in
+       any repository: only the name is read, no heartbeat moves between keys. */
+    session_info newest = {0};
+    if (!*ag && *ss && place_session(s, lane, ss, &newest) != S_OK) newest = (session_info){0};
+    s_result r = publish_session_key(s, base.data, ag, newest.agent, rp, ss);
     text_free(&base);
-    if (r != S_OK || !*ss || !*rp) return r;
-    return preserve_named_repo(s, lane, ag, rp, ss, 0);
+    return r;
 }
 
 static s_result read_session_by_base(store *s, const char *lane, const char *base, session_info *out) {
@@ -723,18 +695,84 @@ static s_result read_session_by_base(store *s, const char *lane, const char *bas
     return s->why = "the session cannot be read", S_DAMAGED;
 }
 
+typedef struct {
+    const char *prefix;
+    size_t prefix_len;
+    char **bases;
+    size_t count, cap;
+    bool failed;
+} base_list;
+
+/* Collects the distinct keys of one named session in every repository (`<lane>+r<32-hex>+`). */
+static bool collect_repo_keys_cb(void *user, const char *name) {
+    base_list *bl = user;
+    size_t blen = 0;
+    char lane[72];
+    uint64_t seq = 0;
+    bool is_named_repo = false;
+    if (!parse_session_filename(name, &blen, lane, sizeof lane, &seq, &is_named_repo) || !is_named_repo) return true;
+    if (blen <= bl->prefix_len) return true;
+    for (size_t i = 0; i < bl->prefix_len; i++)
+        if (name[i] != bl->prefix[i]) return true;
+    for (size_t i = 0; i < bl->count; i++)
+        if (len(bl->bases[i]) == blen) {
+            bool eq = true;
+            for (size_t j = 0; j < blen && eq; j++) eq = bl->bases[i][j] == name[j];
+            if (eq) return true;
+        }
+    if (bl->count == bl->cap) {
+        size_t next = bl->cap ? bl->cap * 2 : 8;
+        char **grown = p_alloc(next * sizeof *grown);
+        if (!grown) { bl->failed = true; return false; }
+        for (size_t i = 0; i < bl->count; i++) grown[i] = bl->bases[i];
+        p_free(bl->bases);
+        bl->bases = grown, bl->cap = next;
+    }
+    char *bcopy = copy(name, blen);
+    if (!bcopy) { bl->failed = true; return false; }
+    bl->bases[bl->count++] = bcopy;
+    return true;
+}
+
+/* The session's newest heartbeat in any repository: its key outside a repository (or the record an
+   older build wrote there) and each of its repository keys. */
 s_result place_session(store *s, const char *lane, const char *session, session_info *out) {
     *out = (session_info){0};
     if (!lane || !address_ok(lane, false) || !session_ok(session)) return s->why = "invalid lane or session", S_REFUSED;
+    const char *ss = session ? session : "";
     text base = {0};
-    session_base(&base, lane, session ? session : "", "");
+    session_base(&base, lane, ss, "");
     if (base.failed) {
         text_free(&base);
         return s->why = "out of memory", S_DAMAGED;
     }
     s_result r = read_session_by_base(s, lane, base.data, out);
     text_free(&base);
-    return r;
+    if (r == S_DAMAGED || !*ss) return r;
+    bool have = r == S_OK;
+
+    text prefix = {0}, folder = {0};
+    session_base(&prefix, lane, ss, "x");
+    add(&folder, s->folder), add(&folder, "/sessions");
+    if (prefix.failed || folder.failed || !prefix.length) {
+        text_free(&prefix), text_free(&folder);
+        return s->why = "out of memory", S_DAMAGED;
+    }
+    base_list bl = {prefix.data, prefix.length - 1, NULL, 0, 0, false};
+    p_result lr = p_list(folder.data, collect_repo_keys_cb, &bl);
+    text_free(&folder);
+    s_result result = have ? S_OK : S_NOTHING;
+    if ((lr != P_OK && lr != P_MISSING) || bl.failed) result = (s->why = "the sessions folder cannot be read", S_DAMAGED);
+    for (size_t i = 0; i < bl.count && result != S_DAMAGED; i++) {
+        session_info ri = {0};
+        s_result rr = read_session_by_base(s, lane, bl.bases[i], &ri);
+        if (rr == S_DAMAGED) result = S_DAMAGED;
+        else if (rr == S_OK && (!have || ri.when > out->when)) *out = ri, have = true, result = S_OK;
+    }
+    for (size_t i = 0; i < bl.count; i++) p_free(bl.bases[i]);
+    p_free(bl.bases);
+    text_free(&prefix);
+    return result;
 }
 
 uint64_t place_session_repo_when(const session_info *info, const char *repository) {
@@ -748,29 +786,26 @@ uint64_t place_session_repo_when(const session_info *info, const char *repositor
     return best;
 }
 
+/* The session's newest heartbeat in one repository: its key there, or what an older build recorded
+   for that repository under the session's key outside a repository. */
 s_result place_session_repo(store *s, const char *lane, const char *session, const char *repository, session_info *out) {
     *out = (session_info){0};
     if (!lane || !address_ok(lane, false) || !session_ok(session)) return s->why = "invalid lane or session", S_REFUSED;
     if (!repository || !*repository) return place_session(s, lane, session, out);
     if (!repo_ok(repository)) return s->why = "invalid repository", S_REFUSED;
-    text base = {0};
-    session_base(&base, lane, session ? session : "", repository);
-    if (base.failed) {
-        text_free(&base);
+    const char *ss = session ? session : "";
+    text cbase = {0}, rbase = {0};
+    session_base(&cbase, lane, ss, "");
+    session_base(&rbase, lane, ss, repository);
+    if (cbase.failed || rbase.failed) {
+        text_free(&cbase), text_free(&rbase);
         return s->why = "out of memory", S_DAMAGED;
     }
-    /* Read canonical FIRST and per-repo copy SECOND to match the writer's write-before-supersede
-       handoff order (writer preserves per-repo copy BEFORE superseding canonical): if canonical has
-       already moved on to another repository, the per-repo copy is guaranteed to be on disk. */
     session_info canon_info = {0}, repo_info = {0};
-    s_result cr = place_session(s, lane, session, &canon_info);
-    if (cr == S_DAMAGED) {
-        text_free(&base);
-        return S_DAMAGED;
-    }
-    s_result rr = read_session_by_base(s, lane, base.data, &repo_info);
-    text_free(&base);
-    if (rr == S_DAMAGED) return S_DAMAGED;
+    s_result cr = read_session_by_base(s, lane, cbase.data, &canon_info);
+    s_result rr = cr == S_DAMAGED ? S_DAMAGED : read_session_by_base(s, lane, rbase.data, &repo_info);
+    text_free(&cbase), text_free(&rbase);
+    if (cr == S_DAMAGED || rr == S_DAMAGED) return S_DAMAGED;
 
     uint64_t best_when = 0;
     bool have = false;
@@ -795,13 +830,13 @@ typedef struct {
     char *base;
     char lane[72];
     uint64_t seq;
+    bool is_named_repo;
 } latest_entry;
 
 typedef struct {
     latest_entry *items;
     size_t count, cap;
     const char *only_lane;
-    bool include_named_repos;
     bool failed;
 } latest_map;
 
@@ -812,7 +847,6 @@ static bool collect_latest_cb(void *user, const char *name) {
     uint64_t seq = 0;
     bool is_named_repo = false;
     if (!parse_session_filename(name, &blen, lane, sizeof lane, &seq, &is_named_repo)) return true;
-    if (is_named_repo && !m->include_named_repos) return true;
     if (m->only_lane && !same(lane, m->only_lane)) return true;
     for (size_t i = 0; i < m->count; i++) {
         if (len(m->items[i].base) == blen) {
@@ -837,18 +871,21 @@ static bool collect_latest_cb(void *user, const char *name) {
     m->items[m->count].base = bcopy;
     copy_str(m->items[m->count].lane, sizeof m->items[m->count].lane, lane);
     m->items[m->count].seq = seq;
+    m->items[m->count].is_named_repo = is_named_repo;
     m->count++;
     return true;
 }
 
-static p_result each_session_filtered(store *s, const char *only_lane, const char *target_repo, bool include_named_repos, bool (*each)(void *user, const session_info *info), void *user) {
+/* Gives every key once, each as the heartbeat it holds. Keys never hand a heartbeat to each other,
+   so consumers take the newest across the keys they care about. */
+static p_result each_session_filtered(store *s, const char *only_lane, const char *target_repo, bool (*each)(void *user, const session_info *info), void *user) {
     text folder = {0};
     add(&folder, s->folder), add(&folder, "/sessions");
     if (folder.failed) {
         text_free(&folder);
         return P_FAILED;
     }
-    latest_map map = {.only_lane = only_lane, .include_named_repos = include_named_repos};
+    latest_map map = {.only_lane = only_lane};
     p_result r = p_list(folder.data, collect_latest_cb, &map);
     text_free(&folder);
     if (r != P_OK || map.failed) {
@@ -899,26 +936,22 @@ static p_result each_session_filtered(store *s, const char *only_lane, const cha
             }
             if (!ok && !gone) had_error = true;
         }
-        if (ok) {
-            /* Canonical-first handoff for bulk lookups: for any discovered named session, directly resolve
-               the requested `target_repo` per-repo copy AFTER reading the canonical record, independent of
-               whether `readdir` observed the newly created per-repo filename during a live migration. */
-            if (target_repo && *target_repo && *info.session && repo_ok(target_repo)) {
-                text rbase = {0};
-                session_base(&rbase, info.lane, info.session, target_repo);
-                if (rbase.failed) {
-                    had_error = true;
-                } else {
-                    session_info rinfo = {0};
-                    s_result rsr = read_session_by_base(s, info.lane, rbase.data, &rinfo);
-                    if (rsr == S_DAMAGED) had_error = true;
-                    else if (rsr == S_OK && same(rinfo.repository, target_repo) && rinfo.when > place_session_repo_when(&info, target_repo))
-                        info = rinfo;
-                }
-                text_free(&rbase);
+        if (ok && target_repo && *target_repo && *info.session && repo_ok(target_repo) && !map.items[i].is_named_repo) {
+            /* A session found by its key outside a repository also gives its key in target_repo, read
+               directly, so a generation of that key rolling over during the listing is still seen. */
+            text rbase = {0};
+            session_base(&rbase, info.lane, info.session, target_repo);
+            if (rbase.failed) {
+                had_error = true;
+            } else {
+                session_info rinfo = {0};
+                s_result rsr = read_session_by_base(s, info.lane, rbase.data, &rinfo);
+                if (rsr == S_DAMAGED) had_error = true;
+                else if (rsr == S_OK && same(rinfo.repository, target_repo)) keep = each(user, &rinfo);
             }
-            keep = each(user, &info);
+            text_free(&rbase);
         }
+        if (ok && keep) keep = each(user, &info);
     }
     for (size_t i = 0; i < map.count; i++) p_free(map.items[i].base);
     p_free(map.items);
@@ -926,15 +959,15 @@ static p_result each_session_filtered(store *s, const char *only_lane, const cha
 }
 
 p_result place_each_session(store *s, bool (*each)(void *user, const session_info *info), void *user) {
-    return each_session_filtered(s, NULL, NULL, false, each, user);
+    return each_session_filtered(s, NULL, NULL, each, user);
 }
 
 p_result place_lane_sessions(store *s, const char *lane, bool (*each)(void *user, const session_info *info), void *user) {
-    return each_session_filtered(s, lane, NULL, true, each, user);
+    return each_session_filtered(s, lane, NULL, each, user);
 }
 
 p_result place_lane_sessions_repo(store *s, const char *lane, const char *repository, bool (*each)(void *user, const session_info *info), void *user) {
-    return each_session_filtered(s, lane, repository, true, each, user);
+    return each_session_filtered(s, lane, repository, each, user);
 }
 
 typedef struct { const char *project, *repository, *me; uint64_t since; bool busy; } look;
@@ -947,12 +980,11 @@ static bool busy_each(void *user, const session_info *info) {
     if (place_session_repo_when(info, l->repository) >= l->since) l->busy = true;
     return !l->busy;
 }
-
 s_result place_busy(store *s, const char *project, const char *repository, const char *me, uint64_t within, bool *busy) {
     *busy = false;
     uint64_t now = p_now();
     look l = {project, repository, me, now > within ? now - within : 0, false};
-    p_result r = each_session_filtered(s, NULL, repository, true, busy_each, &l);
+    p_result r = each_session_filtered(s, NULL, repository, busy_each, &l);
     if (r == P_MISSING) return S_OK;
     if (r != P_OK) return s->why = "the sessions folder cannot be read", S_DAMAGED;
     *busy = l.busy;
