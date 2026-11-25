@@ -6,32 +6,20 @@ bool is_overdue(const message *m, const job *now) {
     return m->due && (now->state == OPEN || now->state == TAKEN) && m->due < p_now();
 }
 
-static uint64_t session_repo_when(const session_info *s, const char *repository) {
-    if (!repository || !*repository) return s->when;
-    uint64_t best = same(s->repository, repository) ? s->when : 0;
-    for (size_t k = 0; k < s->repo_count; k++) {
-        if (same(s->repos[k].name, repository) && s->repos[k].when > best)
-            best = s->repos[k].when;
-    }
-    return best;
-}
-
 bool is_silent(const session_info *sessions, size_t session_count, const job *now, uint64_t clock_now, uint64_t silent_us) {
     if (!now || now->state != TAKEN || !*now->by || !silent_us) return false;
     uint64_t last = now->when;
     if (*now->session) {
         for (size_t i = 0; i < session_count; i++) {
-            if (same(sessions[i].lane, now->by) && same(sessions[i].session, now->session)) {
-                uint64_t t = session_repo_when(&sessions[i], now->repository);
-                if (t > last) last = t;
-            }
+            if (*now->repository && !same(sessions[i].repository, now->repository)) continue;
+            if (same(sessions[i].lane, now->by) && same(sessions[i].session, now->session) && sessions[i].when > last)
+                last = sessions[i].when;
         }
     } else {
         for (size_t i = 0; i < session_count; i++) {
-            if (same(sessions[i].lane, now->by)) {
-                uint64_t t = session_repo_when(&sessions[i], now->repository);
-                if (t > last) last = t;
-            }
+            if (*now->repository && !same(sessions[i].repository, now->repository)) continue;
+            if (same(sessions[i].lane, now->by) && sessions[i].when > last)
+                last = sessions[i].when;
         }
     }
     return clock_now > last && (clock_now - last) >= silent_us;
@@ -42,10 +30,8 @@ bool is_session_silent(const session_info *sessions, size_t session_count, const
     if (!lane || !*lane || !session || !*session || !silent_us) return false;
     uint64_t last = since_us;
     for (size_t i = 0; i < session_count; i++) {
-        if (same(sessions[i].lane, lane) && same(sessions[i].session, session)) {
-            if (sessions[i].when > last) last = sessions[i].when;
-            break;
-        }
+        if (same(sessions[i].lane, lane) && same(sessions[i].session, session) && sessions[i].when > last)
+            last = sessions[i].when;
     }
     return clock_now > last && (clock_now - last) >= silent_us;
 }
@@ -70,16 +56,17 @@ static bool collect_session_cb(void *user, const session_info *info) {
     return true;
 }
 
-static bool ensure_session_loaded(store *s, session_cache *c, const char *lane, const char *session) {
+static bool ensure_session_loaded(store *s, session_cache *c, const char *lane, const char *session, const char *repository) {
     const char *sess = session ? session : "";
+    const char *repo = (*sess && repository) ? repository : "";
     for (size_t i = 0; i < c->query_count; i++) {
-        if (same(c->queries[i].lane, lane) && same(c->queries[i].session, sess))
+        if (same(c->queries[i].lane, lane) && same(c->queries[i].session, sess) && same(c->queries[i].repository, repo))
             return !c->queries[i].failed;
     }
     bool failed = false;
     if (*sess) {
         session_info info = {0};
-        s_result sr = place_session(s, lane, sess, &info);
+        s_result sr = *repo ? place_session_repo(s, lane, sess, repo, &info) : place_session(s, lane, sess, &info);
         if (sr == S_DAMAGED) failed = true;
         else if (sr == S_OK) {
             sess_collect col = {c, false};
@@ -108,6 +95,9 @@ static bool ensure_session_loaded(store *s, session_cache *c, const char *lane, 
         i = 0;
         for (; i + 1 < sizeof q->session && sess[i]; i++) q->session[i] = sess[i];
         q->session[i] = 0;
+        i = 0;
+        for (; i + 1 < sizeof q->repository && repo[i]; i++) q->repository[i] = repo[i];
+        q->repository[i] = 0;
         q->failed = failed;
     }
     return !failed;
@@ -169,7 +159,7 @@ bool watch_classify_job(store *s, const place *here, const message *m, const job
     job_project(m->to, proj, sizeof proj);
     uint64_t silent_us = 0;
     if (cached_silent_us(s, here, sc, proj, &silent_us) != P_OK) return false;
-    if (!ensure_session_loaded(s, sc, now->by, now->session)) return false;
+    if (!ensure_session_loaded(s, sc, now->by, now->session, now->repository)) return false;
     *silent_out = is_silent(sc->items, sc->count, now, clock_now, silent_us);
     return true;
 }
@@ -182,7 +172,7 @@ bool watch_classify_session_silent(store *s, const place *here, const message *m
     job_project(m->to, proj, sizeof proj);
     uint64_t silent_us = 0;
     if (cached_silent_us(s, here, sc, proj, &silent_us) != P_OK) return false;
-    if (!ensure_session_loaded(s, sc, m->to, m->for_session)) return false;
+    if (!ensure_session_loaded(s, sc, m->to, m->for_session, "")) return false;
     *silent_out = is_session_silent(sc->items, sc->count, m->to, m->for_session, since_us, clock_now, silent_us);
     return true;
 }

@@ -9,7 +9,7 @@
 #pragma once
 #include "store.h"
 
-enum { PLACE_SILENT_DEFAULT = 120, PLACE_MAX_REPOS = 16 };
+enum { PLACE_SILENT_DEFAULT = 120 };
 
 typedef struct place {
     char *file;
@@ -19,19 +19,12 @@ typedef struct place {
     char why[128];
 } place;
 
-typedef struct repo_time {
-    char name[36];
-    uint64_t when;
-} repo_time;
-
 typedef struct session_info {
     uint64_t when;
     char lane[72];
     char agent[16];
     char repository[36];
     char session[72];
-    repo_time repos[PLACE_MAX_REPOS];
-    size_t repo_count;
     bool legacy;
 } session_info;
 
@@ -52,6 +45,7 @@ void place_owner(const place *p, const char *path, text *to);
 bool place_parse_session(const char *data, size_t length, session_info *out);
 s_result place_hello(store *s, const char *lane, const char *agent, const char *repository, const char *session);
 s_result place_session(store *s, const char *lane, const char *session, session_info *out);
+s_result place_session_repo(store *s, const char *lane, const char *session, const char *repository, session_info *out);
 p_result place_each_session(store *s, bool (*each)(void *user, const session_info *info), void *user);
 p_result place_lane_sessions(store *s, const char *lane, bool (*each)(void *user, const session_info *info), void *user);
 

@@ -1182,9 +1182,10 @@ def win_install(
                                     code=2,
                                 )
                             create_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                            win_root = os.environ.get("SystemDrive", "C:") + "\\"
                             init_r = subprocess.run(
                                 [str(stage_exe), "init", "--store", store_path],
-                                cwd=tempfile.gettempdir(),
+                                cwd=win_root,
                                 stdin=subprocess.DEVNULL,
                                 capture_output=True,
                                 text=True,

@@ -3618,21 +3618,31 @@ class TestPhaseInstaller(unittest.TestCase):
                 if k not in ("HELIO_STORE", "HELIO_DEFAULT_STORE", "HELIO_DEFAULT_STORE_HEX", "HELIO_AS")
             }
 
-            # Also prove older binary init succeeds when --store is INSIDE a configured checkout with `repository:`!
+            # Also prove older binary init succeeds even when BOTH --store AND TMPDIR are INSIDE a configured checkout with `repository:`!
             in_repo_store = prev_dir / "configured-repo" / "signals"
+            in_repo_tmp = prev_dir / "configured-repo" / "tmp"
             in_repo_store.parent.mkdir(parents=True, exist_ok=True)
+            in_repo_tmp.mkdir(parents=True, exist_ok=True)
             (in_repo_store.parent / "helio.conf").write_text("project: os\nlane: apps\nrepository: heliograph\n", encoding="utf-8")
             in_repo_to = prev_dir / "in-repo-to"
             in_repo_wrap = prev_dir / "in-repo-bin" / "helio"
-            self.mod.install(
-                repo=REPO,
-                to_dir=in_repo_to,
-                store_dir=in_repo_store,
-                wrapper_path=in_repo_wrap,
-                prebuilt=(prev_h, prev_e),
-                commit_override="c4de2fe" + "0" * 33,
-                dirty_override=False,
-            )
+            old_tmpdir = os.environ.get("TMPDIR")
+            os.environ["TMPDIR"] = str(in_repo_tmp)
+            try:
+                self.mod.install(
+                    repo=REPO,
+                    to_dir=in_repo_to,
+                    store_dir=in_repo_store,
+                    wrapper_path=in_repo_wrap,
+                    prebuilt=(prev_h, prev_e),
+                    commit_override="c4de2fe" + "0" * 33,
+                    dirty_override=False,
+                )
+            finally:
+                if old_tmpdir is None:
+                    os.environ.pop("TMPDIR", None)
+                else:
+                    os.environ["TMPDIR"] = old_tmpdir
             self.assertTrue((in_repo_store / "messages").is_dir())
 
             # Install genuine previous engine (c4de2fe) on BOTH WSL and Windows, then replace both with candidate.

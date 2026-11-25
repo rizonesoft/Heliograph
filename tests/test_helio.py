@@ -4400,14 +4400,27 @@ class RepositoryRouting(Base):
         watch_ok = rc_at(t_late + 300, "inbox", "--as", "os/main", cwd=repo_a).stdout.decode()
         self.assertNotIn(scoped, watch_ok)
 
-        # Reverse order: active named taker refreshes in repo-a at +119m, then runs in repo-b at +121m -> NOT silent!
+        # Reverse order + unbounded-repo class regression: active named taker refreshes in repo-a at +119m,
+        # then visits 20 OTHER repositories before +121m -> STILL NOT silent, AND repo-a routing stays busy!
         M = 60 * 1_000_000
         self.assertEqual(rc_at(t0, "hello", "claude", "--session", "s2", "--as", "os/dev", cwd=repo_a).returncode, 0)
-        scoped2 = rc_at(t0 + 100, "ask", "path:docs/s2.md", "Active then foreign", "--as", "os/main", cwd=repo_a, body=b"work").stdout.decode().strip()
+        scoped2 = rc_at(t0 + 100, "ask", "path:docs/s2.md", "Active then 20 repos", "--as", "os/main", cwd=repo_a, body=b"work").stdout.decode().strip()
         self.assertEqual(rc_at(t0 + 200, "take", scoped2, "--session", "s2", "--as", "os/dev", cwd=repo_a).returncode, 0)
         self.assertEqual(rc_at(t0 + 119 * M, "hello", "claude", "--session", "s2", "--as", "os/dev", cwd=repo_a).returncode, 0)
-        self.assertEqual(rc_at(t0 + 121 * M, "hello", "claude", "--session", "s2", "--as", "os/dev", cwd=repo_b).returncode, 0)
-        self.assertNotIn(scoped2, rc_at(t0 + 121 * M + 100, "inbox", "--as", "os/main", cwd=repo_a).stdout.decode())
+        for idx in range(20):
+            other_repo = self.store / f"repo-other-{idx}"
+            other_repo.mkdir()
+            put(other_repo / "helio.conf", f"project: os\nlane: dev\nrepository: repo-other-{idx}\n")
+            self.assertEqual(rc_at(t0 + 120 * M + idx * 1000, "hello", "claude", "--session", "s2", "--as", "os/dev", cwd=other_repo).returncode, 0)
+        self.assertNotIn(scoped2, rc_at(t0 + 121 * M, "inbox", "--as", "os/main", cwd=repo_a).stdout.decode())
+        # Even after s2 moved to repo-other-19, repo-a STILL has recent activity (2m ago) so unowned path goes to os/all (in repo-a)!
+        for sf in list((self.store / "sessions").iterdir()):
+            if "s2".encode().hex() not in sf.name:
+                sf.unlink()
+        routed_after_move = rc_at(t0 + 121 * M + 100, "ask", "path:docs/after-move.md", "Still busy", "--as", "os/main", cwd=repo_a, body=b"work").stdout.decode().strip()
+        post_moved = (self.store / f"messages/{routed_after_move}.post").read_text()
+        self.assertIn("to: os/all\n", post_moved)
+        self.assertIn("repository: repo-a\n", post_moved)
         # Once 120m elapses after the +119m repo-a heartbeat (at +240m), SILENT fires!
         watch2_late = rc_at(t0 + 240 * M, "inbox", "--as", "os/main", cwd=repo_a).stdout.decode()
         self.assertIn(scoped2, watch2_late)

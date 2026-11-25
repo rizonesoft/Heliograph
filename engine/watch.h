@@ -10,7 +10,8 @@ typedef struct silent_cache_entry {
 
 typedef struct session_query_entry {
     char lane[72];
-    char session[72]; /* "" = all sessions of lane */
+    char session[72];    /* "" = all sessions of lane */
+    char repository[36]; /* "" = canonical session, non-empty = per-repo heartbeat */
     bool failed;
 } session_query_entry;
 

@@ -1,6 +1,6 @@
 #include "place.h"
 
-enum { MOST_SESSION_FILE = 2048, MOST_CAS_ATTEMPTS = 64 };
+enum { MOST_SESSION_FILE = 512, MOST_CAS_ATTEMPTS = 64 };
 
 static bool take_word(char *to, size_t room, const char **at) {
     while (**at == ' ') ++*at;
@@ -272,7 +272,7 @@ static void add_hex(text *out, const char *s) {
 static void session_base(text *out, const char *lane, const char *session, const char *repository) {
     for (; *lane; lane++) add_bytes(out, *lane == '/' ? "+" : lane, 1);
     if (session && *session) add(out, "+"), add_hex(out, session);
-    else if (repository && *repository) add(out, "++"), add(out, repository);
+    if (repository && *repository) add(out, "++"), add(out, repository);
 }
 
 static void session_seq_path(const store *s, text *out, const char *base, uint64_t seq) {
@@ -298,29 +298,6 @@ static void copy_slice(char *to, size_t room, const char *from, size_t n) {
     size_t take = n < room - 1 ? n : room - 1;
     for (size_t i = 0; i < take; i++) to[i] = from[i];
     to[take] = 0;
-}
-
-static void repo_time_upsert(session_info *info, const char *repo, uint64_t when) {
-    if (!repo || !*repo || !repo_ok(repo)) return;
-    for (size_t i = 0; i < info->repo_count; i++) {
-        if (same(info->repos[i].name, repo)) {
-            if (when > info->repos[i].when) info->repos[i].when = when;
-            return;
-        }
-    }
-    if (info->repo_count < PLACE_MAX_REPOS) {
-        size_t i = info->repo_count++;
-        copy_str(info->repos[i].name, sizeof info->repos[i].name, repo);
-        info->repos[i].when = when;
-        return;
-    }
-    size_t oldest = 0;
-    for (size_t i = 1; i < PLACE_MAX_REPOS; i++)
-        if (info->repos[i].when < info->repos[oldest].when) oldest = i;
-    if (when > info->repos[oldest].when) {
-        copy_str(info->repos[oldest].name, sizeof info->repos[oldest].name, repo);
-        info->repos[oldest].when = when;
-    }
 }
 
 bool place_parse_session(const char *data, size_t length, session_info *out) {
@@ -354,17 +331,6 @@ bool place_parse_session(const char *data, size_t length, session_info *out) {
         } else if (line_len >= 9 && starts(line, "session: ")) {
             copy_slice(out->session, sizeof out->session, line + 9, line_len - 9);
             have_session = true;
-        } else if (line_len >= 11 && starts(line, "repo-time: ")) {
-            size_t sep = 11;
-            while (sep < line_len && line[sep] != ' ') sep++;
-            if (sep == 11 || sep + 1 >= line_len) return false;
-            char rname[36];
-            size_t rlen = sep - 11;
-            if (rlen >= sizeof rname) return false;
-            copy_slice(rname, sizeof rname, line + 11, rlen);
-            uint64_t rt = 0;
-            if (!repo_ok(rname) || !parse_u64(line + sep + 1, line_len - sep - 1, &rt)) return false;
-            repo_time_upsert(out, rname, rt);
         } else if (line_len == 8 && starts(line, "end: yes")) {
             have_end = true;
         }
@@ -373,18 +339,11 @@ bool place_parse_session(const char *data, size_t length, session_info *out) {
     return have_time && (have_end || (have_agent && have_repo && have_session && data[length - 1] == '\n'));
 }
 
-static void format_session(text *out, uint64_t when, const char *agent, const char *repository, const char *session,
-                           const session_info *repos_src) {
+static void format_session(text *out, uint64_t when, const char *agent, const char *repository, const char *session) {
     add(out, "time: "), add_number(out, when, 0), add(out, "\n");
     add(out, "agent: "), add(out, agent ? agent : ""), add(out, "\n");
     add(out, "repository: "), add(out, repository ? repository : ""), add(out, "\n");
     add(out, "session: "), add(out, session ? session : ""), add(out, "\n");
-    if (repos_src) {
-        for (size_t i = 0; i < repos_src->repo_count; i++) {
-            add(out, "repo-time: "), add(out, repos_src->repos[i].name), add(out, " ");
-            add_number(out, repos_src->repos[i].when, 0), add(out, "\n");
-        }
-    }
     add(out, "end: yes\n");
 }
 
@@ -404,8 +363,9 @@ static p_result read_session_file(const char *path, session_info *out, bool *par
     return r;
 }
 
-/* Validates `<project>+<lane>[+<even-hex>|++<repo>][~<seq>]`. Sets base_len, lane, and seq (0 if no ~<seq>). */
-static bool parse_session_filename(const char *name, size_t *base_len, char *lane, size_t lane_room, uint64_t *seq) {
+/* Validates `<project>+<lane>[+<even-hex>][++<repo>][~<seq>]`. Sets base_len, lane, seq, and is_named_repo. */
+static bool parse_session_filename(const char *name, size_t *base_len, char *lane, size_t lane_room, uint64_t *seq, bool *is_named_repo) {
+    if (is_named_repo) *is_named_repo = false;
     size_t n = len(name);
     if (n > 5 && same(name + n - 5, ".part")) return false;
     size_t tilde = 0;
@@ -434,11 +394,22 @@ static bool parse_session_filename(const char *name, size_t *base_len, char *lan
             copy_slice(repo, sizeof repo, name + plus2 + 2, rlen);
             if (!repo_ok(repo)) return false;
         } else {
-            size_t hlen = blen - plus2 - 1;
+            size_t plus3 = plus2 + 1;
+            while (plus3 < blen && name[plus3] != '+') plus3++;
+            size_t hlen = plus3 - (plus2 + 1);
             if (hlen < 2 || hlen > 128 || (hlen & 1u)) return false;
-            for (size_t i = plus2 + 1; i < blen; i++) {
+            for (size_t i = plus2 + 1; i < plus3; i++) {
                 char c = name[i];
                 if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+            }
+            if (plus3 < blen) {
+                if (plus3 + 1 >= blen || name[plus3 + 1] != '+') return false;
+                size_t rlen = blen - plus3 - 2;
+                char repo[40];
+                if (!rlen || rlen >= sizeof repo) return false;
+                copy_slice(repo, sizeof repo, name + plus3 + 2, rlen);
+                if (!repo_ok(repo)) return false;
+                if (is_named_repo) *is_named_repo = true;
             }
         }
     }
@@ -460,7 +431,7 @@ static bool collect_base_seqs_cb(void *user, const char *name) {
     size_t blen = 0;
     char lane[72];
     uint64_t seq = 0;
-    if (!parse_session_filename(name, &blen, lane, sizeof lane, &seq)) return true;
+    if (!parse_session_filename(name, &blen, lane, sizeof lane, &seq, NULL)) return true;
     if (blen != sl->base_len) return true;
     for (size_t i = 0; i < blen; i++)
         if (name[i] != sl->base[i]) return true;
@@ -566,6 +537,82 @@ static p_result read_best_generation(const store *s, const char *base, bool *any
    `<base>~<seq+1>` via p_create_excl. On P_EXISTS another writer won that slot,
    so we re-read the latest generation, merge monotonically, and retry. After
    publishing, the superseded generation is removed best-effort. */
+static s_result publish_session_key(store *s, const char *base, const char *ag, const char *rp, const char *ss, bool use_pauses) {
+    if (use_pauses && s->pause) s->pause(s->pause_user, "hello-write");
+
+    for (int attempt = 0; attempt < MOST_CAS_ATTEMPTS; attempt++) {
+        bool any_found = false, have_existing = false, only_empty = false;
+        uint64_t max_seq = 0, valid_seq = 0;
+        session_info existing = {0};
+        p_result br = read_best_generation(s, base, &any_found, &max_seq, &have_existing, &valid_seq, &only_empty, false, &existing);
+        if (br == P_MISSING) continue; /* Concurrent writer swept all seen generations; retry. */
+        if (br != P_OK || (any_found && !have_existing && !only_empty))
+            return s->why = "the existing session cannot be read", S_DAMAGED;
+
+        uint64_t next_seq = any_found ? max_seq + 1 : 0;
+        uint64_t now = p_now();
+        if (have_existing && now <= existing.when) now = existing.when + 1;
+        const char *use_agent = *ag ? ag : (have_existing && *existing.agent ? existing.agent : "");
+
+        text next_path = {0}, data = {0};
+        session_seq_path(s, &next_path, base, next_seq);
+        format_session(&data, now, use_agent, rp, ss);
+        if (next_path.failed || data.failed) {
+            text_free(&next_path), text_free(&data);
+            return s->why = "out of memory", S_DAMAGED;
+        }
+
+        if (use_pauses && s->pause) s->pause(s->pause_user, "hello-create");
+
+        p_result cr = p_create_excl(next_path.data, data.data, data.length);
+        text_free(&data);
+        if (cr == P_EXISTS) {
+            text_free(&next_path);
+            if (use_pauses && s->pause) s->pause(s->pause_user, "hello-retry");
+            continue;
+        }
+        if (cr == P_OK || cr == P_UNFLUSHED) {
+            bool chk_any = false, chk_valid = false;
+            uint64_t chk_max = 0, chk_vseq = 0;
+            session_info chk_info = {0};
+            p_result chkr = P_MISSING;
+            for (int v = 0; v < 8; v++) {
+                chkr = read_best_generation(s, base, &chk_any, &chk_max, &chk_valid, &chk_vseq, NULL, use_pauses && v == 0, &chk_info);
+                if (chkr != P_MISSING) break;
+            }
+            if (chkr != P_OK || !chk_any || !chk_valid || chk_vseq < next_seq) {
+                text_free(&next_path);
+                return s->why = "the session was written, but could not be verified", S_DAMAGED;
+            }
+            if (chk_vseq > next_seq) {
+                p_remove(next_path.data);
+                text_free(&next_path);
+                if (use_pauses && s->pause) s->pause(s->pause_user, "hello-retry");
+                continue;
+            }
+            if (have_existing) {
+                text sweep = {0};
+                session_seq_path(s, &sweep, base, valid_seq);
+                if (!sweep.failed) p_remove(sweep.data);
+                text_free(&sweep);
+            }
+            if (any_found && (!have_existing || max_seq != valid_seq)) {
+                text empty_sweep = {0};
+                session_seq_path(s, &empty_sweep, base, max_seq);
+                if (!empty_sweep.failed) p_remove(empty_sweep.data);
+                text_free(&empty_sweep);
+            }
+            text_free(&next_path);
+            if (cr == P_UNFLUSHED) return s->why = "the session was written, but its folder could not be flushed", S_DAMAGED;
+            return S_OK;
+        }
+        text_free(&next_path);
+        return s->why = "the session cannot be announced", S_DAMAGED;
+    }
+
+    return s->why = "the session cannot be announced", S_DAMAGED;
+}
+
 s_result place_hello(store *s, const char *lane, const char *agent, const char *repository, const char *session) {
     if (!lane || !address_ok(lane, false)) return s->why = "say who you are: --as project/lane or HELIO_AS", S_REFUSED;
     if (!session_ok(session)) return s->why = "the session name is invalid or too long", S_REFUSED;
@@ -576,7 +623,8 @@ s_result place_hello(store *s, const char *lane, const char *agent, const char *
 
     text folder = {0}, base = {0};
     add(&folder, s->folder), add(&folder, "/sessions");
-    session_base(&base, lane, ss, rp);
+    /* Canonical key: `<lane>+<hex(ss)>` for named sessions, `<lane>++<rp>` for sessionless+repo, `<lane>` for sessionless. */
+    session_base(&base, lane, ss, *ss ? "" : rp);
     if (folder.failed || base.failed) {
         text_free(&folder), text_free(&base);
         return s->why = "out of memory", S_DAMAGED;
@@ -587,93 +635,35 @@ s_result place_hello(store *s, const char *lane, const char *agent, const char *
     }
     text_free(&folder);
 
-    if (s->pause) s->pause(s->pause_user, "hello-write");
-
-    for (int attempt = 0; attempt < MOST_CAS_ATTEMPTS; attempt++) {
-        bool any_found = false, have_existing = false, only_empty = false;
-        uint64_t max_seq = 0, valid_seq = 0;
-        session_info existing = {0};
-        p_result br = read_best_generation(s, base.data, &any_found, &max_seq, &have_existing, &valid_seq, &only_empty, false, &existing);
-        if (br == P_MISSING) continue; /* Concurrent writer swept all seen generations; retry. */
-        if (br != P_OK || (any_found && !have_existing && !only_empty)) {
-            text_free(&base);
-            return s->why = "the existing session cannot be read", S_DAMAGED;
-        }
-
-        uint64_t next_seq = any_found ? max_seq + 1 : 0;
-        uint64_t now = p_now();
-        if (have_existing && now <= existing.when) now = existing.when + 1;
-        const char *use_agent = *ag ? ag : (have_existing && *existing.agent ? existing.agent : "");
-
-        text next_path = {0}, data = {0};
-        session_seq_path(s, &next_path, base.data, next_seq);
-        session_info merged = {0};
-        if (*ss) {
-            if (have_existing) {
-                for (size_t i = 0; i < existing.repo_count; i++)
-                    repo_time_upsert(&merged, existing.repos[i].name, existing.repos[i].when);
-                if (*existing.repository) repo_time_upsert(&merged, existing.repository, existing.when);
-            }
-            if (*rp) repo_time_upsert(&merged, rp, now);
-        }
-        format_session(&data, now, use_agent, rp, ss, *ss ? &merged : NULL);
-        if (next_path.failed || data.failed) {
-            text_free(&next_path), text_free(&data), text_free(&base);
-            return s->why = "out of memory", S_DAMAGED;
-        }
-
-        if (s->pause) s->pause(s->pause_user, "hello-create");
-
-        p_result cr = p_create_excl(next_path.data, data.data, data.length);
-        text_free(&data);
-        if (cr == P_EXISTS) {
-            text_free(&next_path);
-            if (s->pause) s->pause(s->pause_user, "hello-retry");
-            continue;
-        }
-        if (cr == P_OK || cr == P_UNFLUSHED) {
-            /* Verify our newly written generation next_seq itself is readable and not superseded.
-               Retry P_MISSING if a concurrent peer swept next_seq between enumeration and open. */
-            bool chk_any = false, chk_valid = false;
-            uint64_t chk_max = 0, chk_vseq = 0;
-            session_info chk_info = {0};
-            p_result chkr = P_MISSING;
-            for (int v = 0; v < 8; v++) {
-                chkr = read_best_generation(s, base.data, &chk_any, &chk_max, &chk_valid, &chk_vseq, NULL, v == 0, &chk_info);
-                if (chkr != P_MISSING) break;
-            }
-            if (chkr != P_OK || !chk_any || !chk_valid || chk_vseq < next_seq) {
-                text_free(&next_path), text_free(&base);
-                return s->why = "the session was written, but could not be verified", S_DAMAGED;
-            }
-            if (chk_vseq > next_seq) {
-                p_remove(next_path.data);
-                text_free(&next_path);
-                if (s->pause) s->pause(s->pause_user, "hello-retry");
-                continue;
-            }
-            if (have_existing) {
-                text sweep = {0};
-                session_seq_path(s, &sweep, base.data, valid_seq);
-                if (!sweep.failed) p_remove(sweep.data);
-                text_free(&sweep);
-            }
-            if (any_found && (!have_existing || max_seq != valid_seq)) {
-                text empty_sweep = {0};
-                session_seq_path(s, &empty_sweep, base.data, max_seq);
-                if (!empty_sweep.failed) p_remove(empty_sweep.data);
-                text_free(&empty_sweep);
-            }
-            text_free(&next_path), text_free(&base);
-            if (cr == P_UNFLUSHED) return s->why = "the session was written, but its folder could not be flushed", S_DAMAGED;
-            return S_OK;
-        }
-        text_free(&next_path), text_free(&base);
-        return s->why = "the session cannot be announced", S_DAMAGED;
-    }
-
+    s_result r = publish_session_key(s, base.data, ag, rp, ss, true);
     text_free(&base);
-    return s->why = "the session cannot be announced", S_DAMAGED;
+    if (r != S_OK || !*ss || !*rp) return r;
+
+    /* For named sessions in a named repository, also publish an unbounded per-repository heartbeat record
+       `<lane>+<hex(ss)>++<rp>` so visiting other repositories never evicts or overwrites this repo's liveness. */
+    text repo_base = {0};
+    session_base(&repo_base, lane, ss, rp);
+    if (repo_base.failed) {
+        text_free(&repo_base);
+        return s->why = "out of memory", S_DAMAGED;
+    }
+    r = publish_session_key(s, repo_base.data, ag, rp, ss, false);
+    text_free(&repo_base);
+    return r;
+}
+
+static s_result read_session_by_base(store *s, const char *lane, const char *base, session_info *out) {
+    for (int attempt = 0; attempt < 8; attempt++) {
+        bool any_found = false, valid_found = false;
+        uint64_t max_seq = 0, valid_seq = 0;
+        p_result br = read_best_generation(s, base, &any_found, &max_seq, &valid_found, &valid_seq, NULL, false, out);
+        if (br == P_MISSING) continue;
+        if (br == P_OK && !any_found) return S_NOTHING;
+        if (br != P_OK || !valid_found) return s->why = "the session cannot be read", S_DAMAGED;
+        copy_str(out->lane, sizeof out->lane, lane);
+        return S_OK;
+    }
+    return s->why = "the session cannot be read", S_DAMAGED;
 }
 
 s_result place_session(store *s, const char *lane, const char *session, session_info *out) {
@@ -685,19 +675,26 @@ s_result place_session(store *s, const char *lane, const char *session, session_
         text_free(&base);
         return s->why = "out of memory", S_DAMAGED;
     }
-    for (int attempt = 0; attempt < 8; attempt++) {
-        bool any_found = false, valid_found = false;
-        uint64_t max_seq = 0, valid_seq = 0;
-        p_result br = read_best_generation(s, base.data, &any_found, &max_seq, &valid_found, &valid_seq, NULL, false, out);
-        if (br == P_MISSING) continue;
-        text_free(&base);
-        if (br == P_OK && !any_found) return S_NOTHING;
-        if (br != P_OK || !valid_found) return s->why = "the session cannot be read", S_DAMAGED;
-        copy_str(out->lane, sizeof out->lane, lane);
-        return S_OK;
-    }
+    s_result r = read_session_by_base(s, lane, base.data, out);
     text_free(&base);
-    return s->why = "the session cannot be read", S_DAMAGED;
+    return r;
+}
+
+s_result place_session_repo(store *s, const char *lane, const char *session, const char *repository, session_info *out) {
+    *out = (session_info){0};
+    if (!lane || !address_ok(lane, false) || !session_ok(session)) return s->why = "invalid lane or session", S_REFUSED;
+    if (!repository || !*repository) return place_session(s, lane, session, out);
+    if (!repo_ok(repository)) return s->why = "invalid repository", S_REFUSED;
+    text base = {0};
+    session_base(&base, lane, session ? session : "", repository);
+    if (base.failed) {
+        text_free(&base);
+        return s->why = "out of memory", S_DAMAGED;
+    }
+    s_result r = read_session_by_base(s, lane, base.data, out);
+    text_free(&base);
+    if (r == S_NOTHING) return place_session(s, lane, session, out);
+    return r;
 }
 
 typedef struct {
@@ -710,6 +707,7 @@ typedef struct {
     latest_entry *items;
     size_t count, cap;
     const char *only_lane;
+    bool include_named_repos;
     bool failed;
 } latest_map;
 
@@ -718,7 +716,9 @@ static bool collect_latest_cb(void *user, const char *name) {
     size_t blen = 0;
     char lane[72];
     uint64_t seq = 0;
-    if (!parse_session_filename(name, &blen, lane, sizeof lane, &seq)) return true;
+    bool is_named_repo = false;
+    if (!parse_session_filename(name, &blen, lane, sizeof lane, &seq, &is_named_repo)) return true;
+    if (is_named_repo && !m->include_named_repos) return true;
     if (m->only_lane && !same(lane, m->only_lane)) return true;
     for (size_t i = 0; i < m->count; i++) {
         if (len(m->items[i].base) == blen) {
@@ -747,14 +747,14 @@ static bool collect_latest_cb(void *user, const char *name) {
     return true;
 }
 
-static p_result each_session_filtered(store *s, const char *only_lane, bool (*each)(void *user, const session_info *info), void *user) {
+static p_result each_session_filtered(store *s, const char *only_lane, bool include_named_repos, bool (*each)(void *user, const session_info *info), void *user) {
     text folder = {0};
     add(&folder, s->folder), add(&folder, "/sessions");
     if (folder.failed) {
         text_free(&folder);
         return P_FAILED;
     }
-    latest_map map = {.only_lane = only_lane};
+    latest_map map = {.only_lane = only_lane, .include_named_repos = include_named_repos};
     p_result r = p_list(folder.data, collect_latest_cb, &map);
     text_free(&folder);
     if (r != P_OK || map.failed) {
@@ -812,11 +812,11 @@ static p_result each_session_filtered(store *s, const char *only_lane, bool (*ea
 }
 
 p_result place_each_session(store *s, bool (*each)(void *user, const session_info *info), void *user) {
-    return each_session_filtered(s, NULL, each, user);
+    return each_session_filtered(s, NULL, false, each, user);
 }
 
 p_result place_lane_sessions(store *s, const char *lane, bool (*each)(void *user, const session_info *info), void *user) {
-    return each_session_filtered(s, lane, each, user);
+    return each_session_filtered(s, lane, true, each, user);
 }
 
 typedef struct { const char *project, *repository, *me; uint64_t since; bool busy; } look;
@@ -835,7 +835,7 @@ s_result place_busy(store *s, const char *project, const char *repository, const
     *busy = false;
     uint64_t now = p_now();
     look l = {project, repository, me, now > within ? now - within : 0, false};
-    p_result r = place_each_session(s, busy_each, &l);
+    p_result r = each_session_filtered(s, NULL, true, busy_each, &l);
     if (r == P_MISSING) return S_OK;
     if (r != P_OK) return s->why = "the sessions folder cannot be read", S_DAMAGED;
     *busy = l.busy;
