@@ -2002,10 +2002,12 @@ class Archive(Base):
                                   input=b"different-body", capture_output=True, timeout=30)
             self.assertEqual(conf.returncode, 2, conf.stderr)
             self.assertEqual(sorted(p.name for p in (st / "messages").iterdir()), live_before)
-            conf_about = run(st, "ask", "os/userland", "cap-key-subj", "--key", "cap-k", "--about", "engine/other.c", me="os/main", body="cap-body")
+            conf_about = subprocess.run([str(RACER), "--max-names", "10", "ask", "os/userland", "cap-key-subj", "--key", "cap-k", "--about", "engine/other.c", "--store", str(st), "--as", "os/main"],
+                                        input=b"cap-body", capture_output=True, timeout=30)
             self.assertEqual(conf_about.returncode, 2, conf_about.stderr)
             self.assertIn(b"another message", conf_about.stderr.lower())
-            conf_urg = run(st, "ask", "os/userland", "cap-key-subj", "--key", "cap-k", "--now", me="os/main", body="cap-body")
+            conf_urg = subprocess.run([str(RACER), "--max-names", "10", "ask", "os/userland", "cap-key-subj", "--key", "cap-k", "--now", "--store", str(st), "--as", "os/main"],
+                                      input=b"cap-body", capture_output=True, timeout=30)
             self.assertEqual(conf_urg.returncode, 2, conf_urg.stderr)
             self.assertIn(b"another message", conf_urg.stderr.lower())
             self.assertEqual(sorted(p.name for p in (st / "messages").iterdir()), live_before)
