@@ -1,6 +1,6 @@
 #include "place.h"
 
-enum { MOST_SESSION_FILE = 512 };
+enum { MOST_SESSION_FILE = 512, MOST_CAS_ATTEMPTS = 64 };
 
 static bool take_word(char *to, size_t room, const char **at) {
     while (**at == ' ') ++*at;
@@ -104,10 +104,14 @@ static void add_hex(text *out, const char *s) {
     }
 }
 
-static void hello_path(const store *s, text *out, const char *lane, const char *session) {
-    add(out, s->folder), add(out, "/sessions/");
+static void session_base(text *out, const char *lane, const char *session) {
     for (; *lane; lane++) add_bytes(out, *lane == '/' ? "+" : lane, 1);
     if (session && *session) add(out, "+"), add_hex(out, session);
+}
+
+static void session_seq_path(const store *s, text *out, const char *base, uint64_t seq) {
+    add(out, s->folder), add(out, "/sessions/"), add(out, base);
+    if (seq > 0) add(out, "~"), add_number(out, seq, 0);
 }
 
 static bool parse_u64(const char *s, size_t n, uint64_t *out) {
@@ -185,6 +189,80 @@ static p_result read_session_file(const char *path, session_info *out, bool *par
     return r;
 }
 
+/* Validates `<project>+<lane>[+<even-hex>][~<seq>]`. Sets base_len, lane, and seq (0 if no ~<seq>). */
+static bool parse_session_filename(const char *name, size_t *base_len, char *lane, size_t lane_room, uint64_t *seq) {
+    size_t n = len(name);
+    if (n > 5 && same(name + n - 5, ".part")) return false;
+    size_t tilde = 0;
+    while (name[tilde] && name[tilde] != '~') tilde++;
+    uint64_t s = 0;
+    if (name[tilde] == '~') {
+        const char *digits = name + tilde + 1;
+        size_t dlen = n - tilde - 1;
+        if (!dlen || digits[0] == '0' || !parse_u64(digits, dlen, &s) || s == 0) return false;
+    }
+    size_t blen = tilde;
+    size_t plus1 = 0;
+    while (plus1 < blen && name[plus1] != '+') plus1++;
+    if (plus1 >= blen) return false;
+    size_t plus2 = plus1 + 1;
+    while (plus2 < blen && name[plus2] != '+') plus2++;
+    if (plus2 == plus1 + 1 || plus2 >= lane_room) return false;
+    for (size_t i = 0; i < plus2; i++) lane[i] = i == plus1 ? '/' : name[i];
+    lane[plus2] = 0;
+    if (!address_ok(lane, false)) return false;
+    if (plus2 < blen) {
+        size_t hlen = blen - plus2 - 1;
+        if (hlen < 2 || hlen > 128 || (hlen & 1u)) return false;
+        for (size_t i = plus2 + 1; i < blen; i++) {
+            char c = name[i];
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+        }
+    }
+    *base_len = blen;
+    *seq = s;
+    return true;
+}
+
+typedef struct {
+    const char *base;
+    size_t base_len;
+    bool found;
+    uint64_t max_seq;
+} latest_scan;
+
+static bool find_latest_cb(void *user, const char *name) {
+    latest_scan *ls = user;
+    size_t blen = 0;
+    char lane[72];
+    uint64_t seq = 0;
+    if (!parse_session_filename(name, &blen, lane, sizeof lane, &seq)) return true;
+    if (blen != ls->base_len) return true;
+    for (size_t i = 0; i < blen; i++)
+        if (name[i] != ls->base[i]) return true;
+    if (!ls->found || seq > ls->max_seq) ls->found = true, ls->max_seq = seq;
+    return true;
+}
+
+static p_result find_latest_seq(const store *s, const char *base, bool *found, uint64_t *max_seq) {
+    *found = false, *max_seq = 0;
+    text folder = {0};
+    add(&folder, s->folder), add(&folder, "/sessions");
+    if (folder.failed) {
+        text_free(&folder);
+        return P_FAILED;
+    }
+    latest_scan ls = {base, len(base), false, 0};
+    p_result r = p_list(folder.data, find_latest_cb, &ls);
+    text_free(&folder);
+    if (r == P_OK) *found = ls.found, *max_seq = ls.max_seq;
+    return r;
+}
+
+/* Lock-free monotonic CAS: each update atomically creates `<base>` (seq 0) or
+   `<base>~<seq+1>` via p_create_excl. On P_EXISTS another writer won that slot,
+   so we re-read the latest generation, merge monotonically, and retry. After
+   publishing, the superseded generation is removed best-effort. */
 s_result place_hello(store *s, const char *lane, const char *agent, const char *repository, const char *session) {
     if (!lane || !address_ok(lane, false)) return s->why = "say who you are: --as project/lane or HELIO_AS", S_REFUSED;
     if (!session_ok(session)) return s->why = "the session name is invalid or too long", S_REFUSED;
@@ -193,134 +271,169 @@ s_result place_hello(store *s, const char *lane, const char *agent, const char *
     const char *rp = repository ? repository : "";
     const char *ss = session ? session : "";
 
-    text folder = {0}, path = {0}, lock_path = {0}, data = {0}, unique = {0};
+    text folder = {0}, base = {0};
     add(&folder, s->folder), add(&folder, "/sessions");
-    hello_path(s, &path, lane, ss);
-    add(&lock_path, path.data ? path.data : ""), add(&lock_path, ".lock");
-    add_number(&unique, p_tick(), 0);
-    if (folder.failed || path.failed || lock_path.failed || unique.failed) {
-        text_free(&folder), text_free(&path), text_free(&lock_path), text_free(&unique);
+    session_base(&base, lane, ss);
+    if (folder.failed || base.failed) {
+        text_free(&folder), text_free(&base);
         return s->why = "out of memory", S_DAMAGED;
     }
-
-    p_result result = p_folder(folder.data);
-    if (result != P_OK) {
-        text_free(&folder), text_free(&path), text_free(&lock_path), text_free(&unique);
+    if (p_folder(folder.data) != P_OK) {
+        text_free(&folder), text_free(&base);
         return s->why = "the session cannot be announced", S_DAMAGED;
     }
+    text_free(&folder);
 
     if (s->pause) s->pause(s->pause_user, "hello-write");
 
-    void *lock_handle = NULL;
-    if (s->pause) s->pause(s->pause_user, "hello-before-lock");
-    result = p_lock(lock_path.data, &lock_handle);
-    if (result != P_OK) {
-        text_free(&folder), text_free(&path), text_free(&lock_path), text_free(&unique);
+    for (int attempt = 0; attempt < MOST_CAS_ATTEMPTS; attempt++) {
+        bool have_prev = false;
+        uint64_t prev_seq = 0;
+        p_result lr = find_latest_seq(s, base.data, &have_prev, &prev_seq);
+        if (lr != P_OK) {
+            text_free(&base);
+            return s->why = "the session cannot be announced", S_DAMAGED;
+        }
+
+        session_info existing = {0};
+        bool have_existing = false;
+        text prev_path = {0};
+        if (have_prev) {
+            session_seq_path(s, &prev_path, base.data, prev_seq);
+            if (prev_path.failed) {
+                text_free(&prev_path), text_free(&base);
+                return s->why = "out of memory", S_DAMAGED;
+            }
+            p_result er = read_session_file(prev_path.data, &existing, &have_existing);
+            if (er == P_MISSING) {
+                text_free(&prev_path);
+                continue; /* Concurrent writer published prev_seq+1 and swept prev_seq. */
+            }
+            if (er != P_OK) {
+                text_free(&prev_path), text_free(&base);
+                return s->why = "the existing session cannot be read", S_DAMAGED;
+            }
+        }
+
+        uint64_t next_seq = have_prev ? prev_seq + 1 : 0;
+        uint64_t now = p_now();
+        if (have_existing && now <= existing.when) now = existing.when + 1;
+        const char *use_agent = *ag ? ag : (have_existing && *existing.agent ? existing.agent : "");
+
+        text next_path = {0}, data = {0};
+        session_seq_path(s, &next_path, base.data, next_seq);
+        format_session(&data, now, use_agent, rp, ss);
+        if (next_path.failed || data.failed) {
+            text_free(&next_path), text_free(&data), text_free(&prev_path), text_free(&base);
+            return s->why = "out of memory", S_DAMAGED;
+        }
+
+        if (s->pause) s->pause(s->pause_user, "hello-create");
+
+        p_result cr = p_create_excl(next_path.data, data.data, data.length);
+        text_free(&next_path), text_free(&data);
+        if (cr == P_EXISTS) {
+            text_free(&prev_path);
+            if (s->pause) s->pause(s->pause_user, "hello-retry");
+            continue;
+        }
+        if (cr == P_OK || cr == P_UNFLUSHED) {
+            if (have_prev && prev_path.data) p_remove(prev_path.data);
+            text_free(&prev_path), text_free(&base);
+            if (cr == P_UNFLUSHED) return s->why = "the session was written, but its folder could not be flushed", S_DAMAGED;
+            return S_OK;
+        }
+        text_free(&prev_path), text_free(&base);
         return s->why = "the session cannot be announced", S_DAMAGED;
     }
 
-    session_info existing = {0};
-    bool have_existing = false;
-    p_result er = read_session_file(path.data, &existing, &have_existing);
-    if (er != P_OK && er != P_MISSING) {
-        p_unlock(lock_handle);
-        text_free(&folder), text_free(&path), text_free(&lock_path), text_free(&unique);
-        return s->why = "the existing session cannot be read", S_DAMAGED;
-    }
-
-    if (s->pause) s->pause(s->pause_user, "hello-in-lock");
-
-    if (!p_lock_valid(lock_path.data, lock_handle)) {
-        p_unlock(lock_handle);
-        text_free(&folder), text_free(&path), text_free(&lock_path), text_free(&unique);
-        return s->why = "the session lock was lost", S_DAMAGED;
-    }
-
-    uint64_t now = p_now();
-    if (have_existing && now <= existing.when) now = existing.when + 1;
-    const char *use_agent = *ag ? ag : (have_existing && *existing.agent ? existing.agent : "");
-    format_session(&data, now, use_agent, rp, ss);
-    result = data.failed ? P_FAILED : p_write(path.data, data.data, data.length, true, unique.data);
-    p_unlock(lock_handle);
-
-    text_free(&folder), text_free(&path), text_free(&lock_path), text_free(&data), text_free(&unique);
-    if (result == P_UNFLUSHED) s->why = "the session was written, but its folder could not be flushed";
-    else if (result != P_OK) s->why = "the session cannot be announced";
-    return result == P_OK ? S_OK : S_DAMAGED;
+    text_free(&base);
+    return s->why = "the session cannot be announced", S_DAMAGED;
 }
 
 s_result place_session(store *s, const char *lane, const char *session, session_info *out) {
     *out = (session_info){0};
     if (!lane || !address_ok(lane, false) || !session_ok(session)) return s->why = "invalid lane or session", S_REFUSED;
-    text path = {0};
-    hello_path(s, &path, lane, session ? session : "");
-    if (path.failed) {
-        text_free(&path);
+    text base = {0};
+    session_base(&base, lane, session ? session : "");
+    if (base.failed) {
+        text_free(&base);
         return s->why = "out of memory", S_DAMAGED;
     }
-    bool parsed = false;
-    p_result r = read_session_file(path.data, out, &parsed);
-    text_free(&path);
-    if (r == P_MISSING) return S_NOTHING;
-    if (r != P_OK || !parsed) return s->why = "the session cannot be read", S_DAMAGED;
-    copy_str(out->lane, sizeof out->lane, lane);
-    return S_OK;
+    for (int attempt = 0; attempt < 8; attempt++) {
+        bool found = false;
+        uint64_t max_seq = 0;
+        p_result lr = find_latest_seq(s, base.data, &found, &max_seq);
+        if (lr == P_MISSING || (lr == P_OK && !found)) {
+            text_free(&base);
+            return S_NOTHING;
+        }
+        if (lr != P_OK) {
+            text_free(&base);
+            return s->why = "the session cannot be read", S_DAMAGED;
+        }
+        text path = {0};
+        session_seq_path(s, &path, base.data, max_seq);
+        if (path.failed) {
+            text_free(&path), text_free(&base);
+            return s->why = "out of memory", S_DAMAGED;
+        }
+        bool parsed = false;
+        p_result r = read_session_file(path.data, out, &parsed);
+        text_free(&path);
+        if (r == P_MISSING) continue; /* Concurrent writer swept max_seq after publishing max_seq+1. */
+        text_free(&base);
+        if (r != P_OK || !parsed) return s->why = "the session cannot be read", S_DAMAGED;
+        copy_str(out->lane, sizeof out->lane, lane);
+        return S_OK;
+    }
+    text_free(&base);
+    return s->why = "the session cannot be read", S_DAMAGED;
 }
 
 typedef struct {
-    store *s;
-    bool (*each)(void *user, const session_info *info);
-    void *user;
-    bool had_error;
-} session_scan;
-
-static bool decode_session_filename(const char *name, char *lane, size_t room) {
-    size_t plus1 = 0;
-    while (name[plus1] && name[plus1] != '+') plus1++;
-    if (!name[plus1]) return false;
-    size_t plus2 = plus1 + 1;
-    while (name[plus2] && name[plus2] != '+') plus2++;
-    if (plus2 == plus1 + 1 || plus2 >= room) return false;
-    for (size_t i = 0; i < plus2; i++) lane[i] = i == plus1 ? '/' : name[i];
-    lane[plus2] = 0;
-    if (!address_ok(lane, false)) return false;
-    if (name[plus2] == '+') {
-        const char *hex = name + plus2 + 1;
-        size_t hlen = len(hex);
-        if (hlen < 2 || hlen > 128 || (hlen & 1u)) return false;
-        for (size_t i = 0; i < hlen; i++) {
-            char c = hex[i];
-            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
-        }
-    }
-    return true;
-}
-
-static bool scan_one_session(void *user, const char *name) {
-    session_scan *sc = user;
-    size_t n = len(name);
-    if (n > 5 && same(name + n - 5, ".part")) return true;
-    if (n > 5 && same(name + n - 5, ".lock")) return true;
+    char *base;
     char lane[72];
-    if (!decode_session_filename(name, lane, sizeof lane)) return true;
-    text path = {0};
-    add(&path, sc->s->folder), add(&path, "/sessions/"), add(&path, name);
-    bool keep = true;
-    if (path.failed) {
-        sc->had_error = true;
-    } else {
-        session_info info = {0};
-        bool parsed = false;
-        p_result r = read_session_file(path.data, &info, &parsed);
-        if (r == P_OK && parsed) {
-            copy_str(info.lane, sizeof info.lane, lane);
-            keep = sc->each(sc->user, &info);
-        } else if (r != P_MISSING) {
-            sc->had_error = true;
+    uint64_t seq;
+} latest_entry;
+
+typedef struct {
+    latest_entry *items;
+    size_t count, cap;
+    bool failed;
+} latest_map;
+
+static bool collect_latest_cb(void *user, const char *name) {
+    latest_map *m = user;
+    size_t blen = 0;
+    char lane[72];
+    uint64_t seq = 0;
+    if (!parse_session_filename(name, &blen, lane, sizeof lane, &seq)) return true;
+    for (size_t i = 0; i < m->count; i++) {
+        if (len(m->items[i].base) == blen) {
+            bool eq = true;
+            for (size_t j = 0; j < blen && eq; j++) eq = m->items[i].base[j] == name[j];
+            if (eq) {
+                if (seq > m->items[i].seq) m->items[i].seq = seq;
+                return true;
+            }
         }
     }
-    text_free(&path);
-    return keep;
+    if (m->count == m->cap) {
+        size_t next = m->cap ? m->cap * 2 : 32;
+        latest_entry *grown = p_alloc(next * sizeof *grown);
+        if (!grown) { m->failed = true; return false; }
+        for (size_t i = 0; i < m->count; i++) grown[i] = m->items[i];
+        p_free(m->items);
+        m->items = grown, m->cap = next;
+    }
+    char *bcopy = copy(name, blen);
+    if (!bcopy) { m->failed = true; return false; }
+    m->items[m->count].base = bcopy;
+    copy_str(m->items[m->count].lane, sizeof m->items[m->count].lane, lane);
+    m->items[m->count].seq = seq;
+    m->count++;
+    return true;
 }
 
 p_result place_each_session(store *s, bool (*each)(void *user, const session_info *info), void *user) {
@@ -330,11 +443,48 @@ p_result place_each_session(store *s, bool (*each)(void *user, const session_inf
         text_free(&folder);
         return P_FAILED;
     }
-    session_scan sc = {s, each, user, false};
-    p_result r = p_list(folder.data, scan_one_session, &sc);
+    latest_map map = {0};
+    p_result r = p_list(folder.data, collect_latest_cb, &map);
     text_free(&folder);
-    if (r != P_OK) return r;
-    return sc.had_error ? P_FAILED : P_OK;
+    if (r != P_OK || map.failed) {
+        for (size_t i = 0; i < map.count; i++) p_free(map.items[i].base);
+        p_free(map.items);
+        return r != P_OK ? r : P_FAILED;
+    }
+    bool had_error = false, keep = true;
+    for (size_t i = 0; i < map.count && keep; i++) {
+        session_info info = {0};
+        bool ok = false;
+        for (int attempt = 0; attempt < 8; attempt++) {
+            uint64_t seq = map.items[i].seq;
+            if (attempt > 0) {
+                bool found = false;
+                if (find_latest_seq(s, map.items[i].base, &found, &seq) != P_OK || !found) break;
+            }
+            text path = {0};
+            session_seq_path(s, &path, map.items[i].base, seq);
+            if (path.failed) {
+                text_free(&path);
+                had_error = true;
+                break;
+            }
+            bool parsed = false;
+            p_result rr = read_session_file(path.data, &info, &parsed);
+            text_free(&path);
+            if (rr == P_MISSING) continue;
+            if (rr == P_OK && parsed) {
+                copy_str(info.lane, sizeof info.lane, map.items[i].lane);
+                ok = true;
+            } else {
+                had_error = true;
+            }
+            break;
+        }
+        if (ok) keep = each(user, &info);
+    }
+    for (size_t i = 0; i < map.count; i++) p_free(map.items[i].base);
+    p_free(map.items);
+    return had_error ? P_FAILED : P_OK;
 }
 
 typedef struct { const char *project, *me; uint64_t since; bool busy; } look;

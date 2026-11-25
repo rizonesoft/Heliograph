@@ -2222,6 +2222,16 @@ class Sessions(Base):
         self.assertEqual(r.returncode, 0, r.stderr)
         return self.parse_racer_sessions(r.stdout.decode())
 
+    def backdate_session(self, lane, session, content, store=None):
+        st = store or self.store
+        sdir = st / "sessions"
+        sdir.mkdir(exist_ok=True)
+        base = lane.replace("/", "+") + (f"+{session.encode().hex()}" if session else "")
+        for p in list(sdir.iterdir()):
+            if p.name == base or p.name.startswith(base + "~"):
+                p.unlink()
+        put(sdir / base, content)
+
     def test_hello_records_three_known_agents_and_reads_back_all_fields_via_c_harness(self):
         repo = self.store / "repo-a"
         repo.mkdir()
@@ -2315,8 +2325,7 @@ class Sessions(Base):
 
         # Each integration's repeat call strictly advances its own timestamp from a backdated record without touching siblings.
         for var, sid in integrations:
-            sfile = self.store / f"sessions/os+apps+{sid.encode().hex()}"
-            put(sfile, f"time: 1000\nagent: \nrepository: repo-s\nsession: {sid}\n")
+            self.backdate_session("os/apps", sid, f"time: 1000\nagent: \nrepository: repo-s\nsession: {sid}\n")
             others_before = {
                 osid: self.read_session("os/apps", osid)[1]["when"]
                 for _, osid in integrations if osid != sid
@@ -2373,8 +2382,7 @@ class Sessions(Base):
 
         # Refresh from a separate unconfigured temp directory (no ancestor helio.conf) clears repository while preserving agent.
         with tempfile.TemporaryDirectory() as unconf:
-            sfile = self.store / f"sessions/os+apps+{'s1'.encode().hex()}"
-            put(sfile, "time: 1000\nagent: codex\nrepository: alpha\nsession: s1\n")
+            self.backdate_session("os/apps", "s1", "time: 1000\nagent: codex\nrepository: alpha\nsession: s1\n")
             r = self.helio("inbox", "--session", "s1", me="os/apps", cwd=unconf)
             self.assertEqual(r.returncode, 1)
             _, ia_after = self.read_session("os/apps", "s1")
@@ -2391,7 +2399,6 @@ class Sessions(Base):
 
         # Every command strictly advances time from a known older record (1000) and preserves hello agent.
         self.assertEqual(self.helio("hello", "antigravity", "--session", "cmd-s", me=None, cwd=repo).returncode, 0)
-        sfile = self.store / f"sessions/os+apps+{'cmd-s'.encode().hex()}"
         for args, body in (
             ((), ""),  # default no-command inbox
             (("inbox",), ""),
@@ -2414,7 +2421,7 @@ class Sessions(Base):
             (("help",), ""),
             (("init",), ""),
         ):
-            put(sfile, "time: 1000\nagent: antigravity\nrepository: cmd-repo\nsession: cmd-s\n")
+            self.backdate_session("os/apps", "cmd-s", "time: 1000\nagent: antigravity\nrepository: cmd-repo\nsession: cmd-s\n")
             r = self.helio(*args, "--session", "cmd-s", me="os/apps", cwd=repo, body=body)
             self.assertIn(r.returncode, (0, 1), (args, r.stderr))
             _, cur = self.read_session("os/apps", "cmd-s")
@@ -2422,7 +2429,7 @@ class Sessions(Base):
             self.assertGreater(int(cur["when"]), 1000, args)
 
         # hook claude also strictly refreshes an established backdated session record.
-        put(sfile, "time: 1000\nagent: codex\nrepository: cmd-repo\nsession: cmd-s\n")
+        self.backdate_session("os/apps", "cmd-s", "time: 1000\nagent: codex\nrepository: cmd-repo\nsession: cmd-s\n")
         r_hk = self.helio("hook", "claude", "--session", "cmd-s", me="os/apps", cwd=repo)
         self.assertEqual(r_hk.returncode, 0, r_hk.stderr)
         _, cur_hk = self.read_session("os/apps", "cmd-s")
@@ -2496,44 +2503,36 @@ class Sessions(Base):
         self.assertEqual((rc, info["agent"], info["repository"]), (0, "codex", "race-repo"))
         self.assertGreater(int(info["when"]), int(mid["when"]))
 
-        # Case 2: real lock contention on an established session with BOTH publications independently observable!
-        # p2 (hello antigravity in repo) holds the lock at hello-in-lock; p3 (inbox in repo_other, which preserves
-        # p2's agent while setting repository=other-repo) pauses right before p_lock, resumes into contention,
-        # blocks while p2 holds the lock, then publishes after p2 releases -> final state MUST have BOTH
-        # agent=antigravity (only p2) AND repository=other-repo (only p3)!
+        # Case 2: deterministic lock-free CAS contention on an established session with observed P_EXISTS + both publications!
+        # p3 (inbox in repo_other) reads seq=N and pauses at hello-create (about to create seq=N+1). While paused,
+        # hello antigravity (in repo) atomically creates seq=N+1. When p3 resumes, p3 hits P_EXISTS on seq=N+1
+        # (proven by paused.hello-retry!), re-reads seq=N+1, merges agent=antigravity + repository=other-repo, and
+        # publishes seq=N+2!
         repo_other = self.store / "repo-other"
         repo_other.mkdir()
         put(repo_other / "helio.conf", "project: os\nlane: apps\nrepository: other-repo\n")
-        p2 = subprocess.Popen(
-            [str(RACER), "--pause-cli", "hello-in-lock", str(self.store), "hello", "antigravity", "--store", str(self.store), "--as", "os/apps", "--session", "race-1"],
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=repo, env=clean,
+        p3 = subprocess.Popen(
+            [str(RACER), "--pause-cli", "hello-create,hello-retry", str(self.store), "inbox", "--store", str(self.store), "--as", "os/apps", "--session", "race-1"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=repo_other, env=clean,
         )
-        p3 = None
         try:
             deadline = time.time() + 15
-            while not (self.store / "paused.hello-in-lock").exists():
+            while not (self.store / "paused.hello-create").exists():
                 self.assertLess(time.time(), deadline)
                 time.sleep(0.01)
-            p3 = subprocess.Popen(
-                [str(RACER), "--pause-cli", "hello-before-lock", str(self.store), "inbox", "--store", str(self.store), "--as", "os/apps", "--session", "race-1"],
-                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=repo_other, env=clean,
-            )
-            while not (self.store / "paused.hello-before-lock").exists():
+            r_win1 = self.helio("hello", "antigravity", "--session", "race-1", me=None, cwd=repo)
+            self.assertEqual((r_win1.returncode, r_win1.stderr), (0, b""))
+            put(self.store / "resume.hello-create", "go")
+            while not (self.store / "paused.hello-retry").exists():
                 self.assertLess(time.time(), deadline)
                 time.sleep(0.01)
-            put(self.store / "resume.hello-before-lock", "go")
-            time.sleep(0.1)
-            self.assertIsNone(p3.poll(), "contender must block inside p_lock while p2 holds lock")
-            put(self.store / "resume.hello-in-lock", "go")
-            _, p2_err = p2.communicate(timeout=30)
+            put(self.store / "resume.hello-retry", "go")
             _, p3_err = p3.communicate(timeout=30)
-            self.assertEqual((p2.returncode, p2_err), (0, b""))
             self.assertEqual((p3.returncode, p3_err), (1, b""))
         finally:
-            for proc in (p2, p3):
-                if proc is not None and proc.poll() is None:
-                    proc.kill()
-        for f in ("paused.hello-in-lock", "resume.hello-in-lock", "paused.hello-before-lock", "resume.hello-before-lock"):
+            if p3.poll() is None:
+                p3.kill()
+        for f in ("paused.hello-create", "resume.hello-create", "paused.hello-retry", "resume.hello-retry"):
             if (self.store / f).exists():
                 (self.store / f).unlink()
         rc2, info2 = self.read_session("os/apps", "race-1")
@@ -2543,48 +2542,46 @@ class Sessions(Base):
         self.assertEqual(len(listed), 1)
         self.assertEqual((listed[0]["agent"], listed[0]["repository"], listed[0]["when"]), ("antigravity", "other-repo", info2["when"]))
 
-        # Case 2b: cross-host WSL/Windows lock serialization on the same session over \\wsl.localhost!
-        # Linux p_lin (hello codex in repo) holds the lock at hello-in-lock; Windows p_win (racer.exe inbox in repo_other)
-        # synchronizes at hello-before-lock (proving Windows process is booted and entering p_lock), blocks while Linux
-        # holds the lock, then publishes after Linux releases -> final state MUST have BOTH agent=codex (only Linux)
-        # AND repository=other-repo (only Windows)!
+        # Case 2b: cross-host WSL/Windows lock-free CAS contention over \\wsl.localhost!
+        # Windows p_win (racer.exe inbox in repo_other) reads seq=N and pauses at hello-create. Linux hello codex
+        # (in repo) creates seq=N+1. Windows resumes, hits real cross-host P_EXISTS on seq=N+1 (observed via
+        # paused.hello-retry!), re-reads Linux's seq=N+1, and publishes seq=N+2 with BOTH agent=codex (Linux)
+        # AND repository=other-repo (Windows)!
         if not ON_WINDOWS and (BUILD / "racer.exe").exists():
             win_store = subprocess.run(["wslpath", "-w", str(self.store)], capture_output=True, text=True, check=True, timeout=30).stdout.strip()
-            p_lin = subprocess.Popen(
-                [str(RACER), "--pause-cli", "hello-in-lock", str(self.store), "hello", "codex", "--store", str(self.store), "--as", "os/apps", "--session", "race-1"],
-                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=repo, env=clean,
+            p_win = subprocess.Popen(
+                [str(BUILD / "racer.exe"), "--pause-cli", "hello-create,hello-retry", win_store, "inbox", "--store", win_store, "--as", "os/apps", "--session", "race-1"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=repo_other, env=clean,
             )
-            p_win = None
             try:
                 deadline = time.time() + 15
-                while not (self.store / "paused.hello-in-lock").exists():
+                while not (self.store / "paused.hello-create").exists():
                     self.assertLess(time.time(), deadline)
                     time.sleep(0.01)
-                p_win = subprocess.Popen(
-                    [str(BUILD / "racer.exe"), "--pause-cli", "hello-before-lock", win_store, "inbox", "--store", win_store, "--as", "os/apps", "--session", "race-1"],
-                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=repo_other, env=clean,
-                )
-                while not (self.store / "paused.hello-before-lock").exists():
+                r_lin = self.helio("hello", "codex", "--session", "race-1", me=None, cwd=repo)
+                self.assertEqual((r_lin.returncode, r_lin.stderr), (0, b""))
+                put(self.store / "resume.hello-create", "go")
+                while not (self.store / "paused.hello-retry").exists():
                     self.assertLess(time.time(), deadline)
                     time.sleep(0.01)
-                put(self.store / "resume.hello-before-lock", "go")
-                time.sleep(0.15)
-                self.assertIsNone(p_win.poll(), "Windows racer.exe must block inside p_lock while Linux holds the cross-host lock")
-                put(self.store / "resume.hello-in-lock", "go")
-                _, lin_err = p_lin.communicate(timeout=30)
+                put(self.store / "resume.hello-retry", "go")
                 _, win_err = p_win.communicate(timeout=30)
-                self.assertEqual((p_lin.returncode, lin_err), (0, b""))
                 self.assertEqual((p_win.returncode, win_err), (1, b""))
             finally:
-                for proc in (p_lin, p_win):
-                    if proc is not None and proc.poll() is None:
-                        proc.kill()
-            for f in ("paused.hello-in-lock", "resume.hello-in-lock", "paused.hello-before-lock", "resume.hello-before-lock"):
+                if p_win.poll() is None:
+                    p_win.kill()
+            for f in ("paused.hello-create", "resume.hello-create", "paused.hello-retry", "resume.hello-retry"):
                 if (self.store / f).exists():
                     (self.store / f).unlink()
             rc_xh, info_xh = self.read_session("os/apps", "race-1")
             self.assertEqual((rc_xh, info_xh["agent"], info_xh["repository"]), (0, "codex", "other-repo"))
             self.assertGreater(int(info_xh["when"]), int(info2["when"]))
+            # Also verify crash-left duplicate generation files deduplicate to the highest generation in both C readers.
+            base_r1 = f"os+apps+{'race-1'.encode().hex()}"
+            put(self.store / f"sessions/{base_r1}", "time: 5\nagent: stale\nrepository: stale\nsession: race-1\n")
+            listed_dup = [row for row in self.list_sessions() if row["session"] == "race-1"]
+            self.assertEqual(len(listed_dup), 1)
+            self.assertEqual((listed_dup[0]["agent"], listed_dup[0]["repository"]), ("codex", "other-repo"))
             # Restore antigravity + race-repo state so Case 3a/3b below stay deterministic.
             self.assertEqual(self.helio("hello", "antigravity", "--session", "race-1", me=None, cwd=repo).returncode, 0)
             _, info2 = self.read_session("os/apps", "race-1")

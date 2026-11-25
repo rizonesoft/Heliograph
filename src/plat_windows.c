@@ -29,129 +29,6 @@ p_result p_write(const char *path, const char *data, size_t length, bool replace
     return r;
 }
 
-typedef struct {
-    char *path;
-    char token[32];
-} win_lock;
-
-static size_t format_u64_win(char *buf, uint64_t v) {
-    char rev[32];
-    size_t n = 0;
-    do rev[n++] = (char)('0' + (v % 10)), v /= 10; while (v);
-    for (size_t i = 0; i < n; i++) buf[i] = rev[n - 1 - i];
-    buf[n] = 0;
-    return n;
-}
-
-static bool win_lock_matches(const char *path, const char *token) {
-    char *data = NULL;
-    size_t length = 0;
-    if (p_read(path, 64, &data, &length) != P_OK) return false;
-    size_t tlen = im_length(token);
-    bool ok = length == tlen;
-    for (size_t i = 0; ok && i < tlen; i++) ok = data[i] == token[i];
-    p_free(data);
-    return ok;
-}
-
-static bool win_deadline_passed(LARGE_INTEGER start, uint64_t limit) {
-    if (!limit) return false;
-    LARGE_INTEGER now = {0};
-    QueryPerformanceCounter(&now);
-    return (uint64_t)(now.QuadPart - start.QuadPart) >= limit;
-}
-
-p_result p_lock(const char *path, void **handle) {
-    *handle = NULL;
-    size_t plen = im_length(path);
-    win_lock *lk = im_alloc(sizeof *lk);
-    if (!lk) return P_FAILED;
-    lk->path = im_alloc(plen + 1);
-    if (!lk->path) {
-        im_free(lk);
-        return P_FAILED;
-    }
-    for (size_t i = 0; i <= plen; i++) lk->path[i] = path[i];
-    size_t tlen = format_u64_win(lk->token, p_tick());
-
-    char *reclaim = im_alloc(plen + 9);
-    if (reclaim) {
-        const char *sfx = ".reclaim";
-        for (size_t i = 0; i < plen; i++) reclaim[i] = path[i];
-        for (size_t i = 0; i <= 8; i++) reclaim[plen + i] = sfx[i];
-    }
-
-    LARGE_INTEGER freq = {0}, start = {0};
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&start);
-    uint64_t limit = freq.QuadPart > 0 ? (uint64_t)freq.QuadPart * 2ull : 0;
-
-    for (bool first = true;; first = false) {
-        if (!first && win_deadline_passed(start, limit)) {
-            im_free(reclaim);
-            im_free(lk->path);
-            im_free(lk);
-            return P_FAILED;
-        }
-        p_result r = p_create_excl(path, lk->token, tlen);
-        if (r == P_OK) {
-            im_free(reclaim);
-            *handle = lk;
-            return P_OK;
-        }
-        if (r != P_EXISTS) {
-            im_free(reclaim);
-            im_free(lk->path);
-            im_free(lk);
-            return r;
-        }
-        uint64_t mtime = 0, wall = p_now();
-        if (reclaim && p_file_mtime(path, &mtime) == P_OK && wall > mtime && wall - mtime >= 60000000ull) {
-            p_result gr = p_create_excl(reclaim, lk->token, tlen);
-            if (gr == P_OK) {
-                uint64_t mtime2 = 0, wall2 = p_now();
-                p_result ar = P_EXISTS;
-                if (p_file_mtime(path, &mtime2) == P_OK && wall2 > mtime2 && wall2 - mtime2 >= 60000000ull) {
-                    p_result cr = p_claim_remove(path, lk->token);
-                    if ((cr == P_OK || cr == P_MISSING) && !win_deadline_passed(start, limit))
-                        ar = p_create_excl(path, lk->token, tlen);
-                }
-                if (win_lock_matches(reclaim, lk->token)) p_remove(reclaim);
-                if (ar == P_OK) {
-                    im_free(reclaim);
-                    *handle = lk;
-                    return P_OK;
-                }
-            } else if (gr == P_EXISTS) {
-                uint64_t rmtime = 0, rwall = p_now();
-                if (p_file_mtime(reclaim, &rmtime) == P_OK && rwall > rmtime && rwall - rmtime >= 120000000ull)
-                    p_claim_remove(reclaim, lk->token);
-            }
-        }
-        if (win_deadline_passed(start, limit)) {
-            im_free(reclaim);
-            im_free(lk->path);
-            im_free(lk);
-            return P_FAILED;
-        }
-        Sleep(5);
-    }
-}
-
-bool p_lock_valid(const char *path, void *handle) {
-    if (!handle) return false;
-    win_lock *lk = handle;
-    return win_lock_matches(path ? path : lk->path, lk->token);
-}
-
-void p_unlock(void *handle) {
-    if (!handle) return;
-    win_lock *lk = handle;
-    if (win_lock_matches(lk->path, lk->token)) p_remove(lk->path);
-    im_free(lk->path);
-    im_free(lk);
-}
-
 static bool passing_win(int attempt, DWORD error) {
     if (attempt >= 50 || (error != ERROR_SHARING_VIOLATION && error != ERROR_ACCESS_DENIED && error != ERROR_LOCK_VIOLATION)) return false;
     Sleep(4);
@@ -231,6 +108,9 @@ p_result p_remove(const char *path) {
 }
 
 p_result p_create_excl(const char *path, const char *data, size_t length) {
+#ifdef HELIO_TEST_HOOKS
+    if (plat_fail_sync) return P_FAILED;
+#endif
     wchar_t *wide = im_wide(path);
     if (!wide) return P_FAILED;
     HANDLE file = CreateFileW(wide, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_NEW, 0, NULL);
@@ -251,6 +131,9 @@ p_result p_create_excl(const char *path, const char *data, size_t length) {
     good = good && FlushFileBuffers(file);
     CloseHandle(file);
     if (!good) return P_FAILED;
+#ifdef HELIO_TEST_HOOKS
+    if (plat_fail_write_flush) return P_UNFLUSHED;
+#endif
     return settle_win(path) ? P_OK : P_UNFLUSHED;
 }
 

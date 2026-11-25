@@ -5,7 +5,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/file.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -118,112 +117,10 @@ p_result p_write(const char *path, const char *data, size_t length, bool replace
     return result;
 }
 
-typedef struct {
-    char *path;
-    char token[32];
-} linux_lock;
-
-static bool linux_lock_matches(const char *path, const char *token) {
-    char *data = NULL;
-    size_t length = 0;
-    if (p_read(path, 64, &data, &length) != P_OK) return false;
-    bool ok = length == strlen(token) && memcmp(data, token, length) == 0;
-    p_free(data);
-    return ok;
-}
-
-static bool linux_deadline_passed(struct timespec deadline) {
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    return now.tv_sec > deadline.tv_sec || (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec);
-}
-
-p_result p_lock(const char *path, void **handle) {
-    *handle = NULL;
-    size_t plen = strlen(path);
-    linux_lock *lk = malloc(sizeof *lk);
-    if (!lk) return P_FAILED;
-    lk->path = malloc(plen + 1);
-    if (!lk->path) {
-        free(lk);
-        return P_FAILED;
-    }
-    memcpy(lk->path, path, plen + 1);
-    snprintf(lk->token, sizeof lk->token, "%llu", (unsigned long long)p_tick());
-    size_t tlen = strlen(lk->token);
-
-    char reclaim[4096];
-    bool have_reclaim_path = (size_t)snprintf(reclaim, sizeof reclaim, "%s.reclaim", path) < sizeof reclaim;
-
-    struct timespec deadline;
-    clock_gettime(CLOCK_MONOTONIC, &deadline);
-    deadline.tv_sec += 2;
-
-    for (bool first = true;; first = false) {
-        if (!first && linux_deadline_passed(deadline)) {
-            free(lk->path);
-            free(lk);
-            return P_FAILED;
-        }
-        p_result r = p_create_excl(path, lk->token, tlen);
-        if (r == P_OK) {
-            *handle = lk;
-            return P_OK;
-        }
-        if (r != P_EXISTS) {
-            free(lk->path);
-            free(lk);
-            return r;
-        }
-        uint64_t mtime = 0, wall = p_now();
-        if (have_reclaim_path && p_file_mtime(path, &mtime) == P_OK && wall > mtime && wall - mtime >= 60000000ull) {
-            p_result gr = p_create_excl(reclaim, lk->token, tlen);
-            if (gr == P_OK) {
-                /* Re-check staleness inside the exclusive reclaim guard so two reclaimers
-                   can never race and remove a freshly acquired lock. */
-                uint64_t mtime2 = 0, wall2 = p_now();
-                p_result ar = P_EXISTS;
-                if (p_file_mtime(path, &mtime2) == P_OK && wall2 > mtime2 && wall2 - mtime2 >= 60000000ull) {
-                    p_result cr = p_claim_remove(path, lk->token);
-                    if ((cr == P_OK || cr == P_MISSING) && !linux_deadline_passed(deadline))
-                        ar = p_create_excl(path, lk->token, tlen);
-                }
-                if (linux_lock_matches(reclaim, lk->token)) p_remove(reclaim);
-                if (ar == P_OK) {
-                    *handle = lk;
-                    return P_OK;
-                }
-            } else if (gr == P_EXISTS) {
-                uint64_t rmtime = 0, rwall = p_now();
-                if (p_file_mtime(reclaim, &rmtime) == P_OK && rwall > rmtime && rwall - rmtime >= 120000000ull)
-                    p_claim_remove(reclaim, lk->token);
-            }
-        }
-        if (linux_deadline_passed(deadline)) {
-            free(lk->path);
-            free(lk);
-            return P_FAILED;
-        }
-        struct timespec ts = {0, 5000000};
-        nanosleep(&ts, NULL);
-    }
-}
-
-bool p_lock_valid(const char *path, void *handle) {
-    if (!handle) return false;
-    linux_lock *lk = handle;
-    return linux_lock_matches(path ? path : lk->path, lk->token);
-}
-
-void p_unlock(void *handle) {
-    if (!handle) return;
-    linux_lock *lk = handle;
-    if (linux_lock_matches(lk->path, lk->token)) p_remove(lk->path);
-    free(lk->path);
-    free(lk);
-}
-
 p_result p_create_excl(const char *path, const char *data, size_t length) {
+#ifdef HELIO_TEST_HOOKS
+    if (plat_fail_sync) return P_FAILED;
+#endif
     int file = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (file < 0) return why();
     size_t done = 0;
@@ -236,7 +133,13 @@ p_result p_create_excl(const char *path, const char *data, size_t length) {
     }
     good = good && !fsync(file);
     good = !close(file) && good;
-    if (!good) return P_FAILED;
+    if (!good) {
+        unlink(path);
+        return P_FAILED;
+    }
+#ifdef HELIO_TEST_HOOKS
+    if (plat_fail_write_flush) return P_UNFLUSHED;
+#endif
     return settle(path) ? P_OK : P_UNFLUSHED;
 }
 
