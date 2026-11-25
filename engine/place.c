@@ -1,6 +1,6 @@
 #include "place.h"
 
-enum { MOST_SESSION_FILE = 512, MOST_CAS_ATTEMPTS = 64 };
+enum { MOST_SESSION_FILE = 2048, MOST_CAS_ATTEMPTS = 64 };
 
 static bool take_word(char *to, size_t room, const char **at) {
     while (**at == ' ') ++*at;
@@ -345,6 +345,22 @@ bool place_parse_session(const char *data, size_t length, session_info *out) {
         } else if (line_len >= 9 && starts(line, "session: ")) {
             copy_slice(out->session, sizeof out->session, line + 9, line_len - 9);
             have_session = true;
+        } else if (line_len >= 11 && starts(line, "repo-time: ")) {
+            /* Legacy 6a2b21a inline per-repo heartbeat line: preserved for upgrade compatibility. */
+            size_t sep = 11;
+            while (sep < line_len && line[sep] != ' ') sep++;
+            if (sep == 11 || sep + 1 >= line_len) return false;
+            char rname[36];
+            size_t rlen = sep - 11;
+            if (rlen >= sizeof rname) return false;
+            copy_slice(rname, sizeof rname, line + 11, rlen);
+            uint64_t rt = 0;
+            if (!repo_ok(rname) || !parse_u64(line + sep + 1, line_len - sep - 1, &rt)) return false;
+            if (out->legacy_repo_count < PLACE_LEGACY_REPOS) {
+                copy_str(out->legacy_repos[out->legacy_repo_count].name, sizeof out->legacy_repos[0].name, rname);
+                out->legacy_repos[out->legacy_repo_count].when = rt;
+                out->legacy_repo_count++;
+            }
         } else if (line_len == 8 && starts(line, "end: yes")) {
             have_end = true;
         }
@@ -552,7 +568,8 @@ static p_result read_best_generation(const store *s, const char *base, bool *any
    `<base>~<seq+1>` via p_create_excl. On P_EXISTS another writer won that slot,
    so we re-read the latest generation, merge monotonically, and retry. After
    publishing, the superseded generation is removed best-effort. */
-static s_result publish_session_key(store *s, const char *base, const char *ag, const char *rp, const char *ss, bool use_pauses) {
+static s_result publish_session_key(store *s, const char *base, const char *ag, const char *rp, const char *ss, uint64_t min_now, bool use_pauses, session_info *prev_out) {
+    if (prev_out) *prev_out = (session_info){0};
     if (use_pauses && s->pause) s->pause(s->pause_user, "hello-write");
 
     for (int attempt = 0; attempt < MOST_CAS_ATTEMPTS; attempt++) {
@@ -565,7 +582,7 @@ static s_result publish_session_key(store *s, const char *base, const char *ag, 
             return s->why = "the existing session cannot be read", S_DAMAGED;
 
         uint64_t next_seq = any_found ? max_seq + 1 : 0;
-        uint64_t now = p_now();
+        uint64_t now = min_now ? min_now : p_now();
         if (have_existing && now <= existing.when) now = existing.when + 1;
         const char *use_agent = *ag ? ag : (have_existing && *existing.agent ? existing.agent : "");
 
@@ -618,6 +635,7 @@ static s_result publish_session_key(store *s, const char *base, const char *ag, 
                 text_free(&empty_sweep);
             }
             text_free(&next_path);
+            if (prev_out && have_existing) *prev_out = existing;
             if (cr == P_UNFLUSHED) return s->why = "the session was written, but its folder could not be flushed", S_DAMAGED;
             return S_OK;
         }
@@ -627,6 +645,8 @@ static s_result publish_session_key(store *s, const char *base, const char *ag, 
 
     return s->why = "the session cannot be announced", S_DAMAGED;
 }
+
+static s_result read_session_by_base(store *s, const char *lane, const char *base, session_info *out);
 
 s_result place_hello(store *s, const char *lane, const char *agent, const char *repository, const char *session) {
     if (!lane || !address_ok(lane, false)) return s->why = "say who you are: --as project/lane or HELIO_AS", S_REFUSED;
@@ -650,19 +670,34 @@ s_result place_hello(store *s, const char *lane, const char *agent, const char *
     }
     text_free(&folder);
 
-    s_result r = publish_session_key(s, base.data, ag, rp, ss, true);
+    session_info prev = {0};
+    s_result r = publish_session_key(s, base.data, ag, rp, ss, 0, true, &prev);
     text_free(&base);
-    if (r != S_OK || !*ss || !*rp) return r;
+    if (r != S_OK || !*ss) return r;
+
+    /* Migrate any legacy 6a2b21a inline `repo-time:` entries to per-repo files before they are forgotten. */
+    for (size_t i = 0; i < prev.legacy_repo_count; i++) {
+        if (*rp && same(prev.legacy_repos[i].name, rp)) continue;
+        text mig_base = {0};
+        session_base(&mig_base, lane, ss, prev.legacy_repos[i].name);
+        if (!mig_base.failed) {
+            session_info cur = {0};
+            if (read_session_by_base(s, lane, mig_base.data, &cur) == S_NOTHING)
+                (void)publish_session_key(s, mig_base.data, *ag ? ag : prev.agent, prev.legacy_repos[i].name, ss, prev.legacy_repos[i].when, false, NULL);
+        }
+        text_free(&mig_base);
+    }
+    if (!*rp) return S_OK;
 
     /* For named sessions in a named repository, also publish an unbounded per-repository heartbeat record
-       `<lane>+<hex(ss)>++<rp>` so visiting other repositories never evicts or overwrites this repo's liveness. */
+       `<lane>+r<32-hex-sha256>+<rp>` so visiting other repositories never evicts or overwrites this repo's liveness. */
     text repo_base = {0};
     session_base(&repo_base, lane, ss, rp);
     if (repo_base.failed) {
         text_free(&repo_base);
         return s->why = "out of memory", S_DAMAGED;
     }
-    r = publish_session_key(s, repo_base.data, ag, rp, ss, false);
+    r = publish_session_key(s, repo_base.data, ag, rp, ss, 0, false, NULL);
     text_free(&repo_base);
     return r;
 }
@@ -706,10 +741,36 @@ s_result place_session_repo(store *s, const char *lane, const char *session, con
         text_free(&base);
         return s->why = "out of memory", S_DAMAGED;
     }
-    s_result r = read_session_by_base(s, lane, base.data, out);
+    session_info repo_info = {0}, canon_info = {0};
+    s_result rr = read_session_by_base(s, lane, base.data, &repo_info);
     text_free(&base);
-    if (r == S_NOTHING) return place_session(s, lane, session, out);
-    return r;
+    if (rr == S_DAMAGED) return S_DAMAGED;
+    s_result cr = place_session(s, lane, session, &canon_info);
+    if (cr == S_DAMAGED) return S_DAMAGED;
+
+    /* Combine both records so an interrupted refresh between canonical and per-repo writes,
+       or a legacy 6a2b21a canonical record with inline `repo-time:` lines, never loses the newest heartbeat. */
+    uint64_t best_when = 0;
+    bool have = false;
+    if (rr == S_OK && same(repo_info.repository, repository)) {
+        *out = repo_info;
+        best_when = repo_info.when;
+        have = true;
+    }
+    if (cr == S_OK) {
+        uint64_t ct = same(canon_info.repository, repository) ? canon_info.when : 0;
+        for (size_t i = 0; i < canon_info.legacy_repo_count; i++) {
+            if (same(canon_info.legacy_repos[i].name, repository) && canon_info.legacy_repos[i].when > ct)
+                ct = canon_info.legacy_repos[i].when;
+        }
+        if (ct && (!have || ct > best_when)) {
+            *out = canon_info;
+            copy_str(out->repository, sizeof out->repository, repository);
+            out->when = ct;
+            have = true;
+        }
+    }
+    return have ? S_OK : S_NOTHING;
 }
 
 typedef struct {
@@ -841,8 +902,16 @@ static bool busy_each(void *user, const session_info *info) {
     size_t n = len(l->project);
     if (!starts(info->lane, l->project) || info->lane[n] != '/') return true;
     if (same(info->lane, l->me)) return true;
-    if (l->repository && *l->repository && !same(info->repository, l->repository)) return true;
-    if (info->when >= l->since) l->busy = true;
+    if (l->repository && *l->repository) {
+        uint64_t t = same(info->repository, l->repository) ? info->when : 0;
+        for (size_t i = 0; i < info->legacy_repo_count; i++) {
+            if (same(info->legacy_repos[i].name, l->repository) && info->legacy_repos[i].when > t)
+                t = info->legacy_repos[i].when;
+        }
+        if (t >= l->since) l->busy = true;
+    } else if (info->when >= l->since) {
+        l->busy = true;
+    }
     return !l->busy;
 }
 

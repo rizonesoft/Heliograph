@@ -4428,6 +4428,39 @@ class RepositoryRouting(Base):
         self.assertIn(scoped2, watch2_late)
         self.assertIn("SILENT", watch2_late)
 
+        # Interrupted refresh: canonical record has +119m in repo-a while per-repo record is still stale at t0 -> NOT silent at +121m!
+        s3_hex = "s3".encode().hex()
+        s3_hash = hashlib.sha256(b"s3").hexdigest()[:32]
+        self.assertEqual(rc_at(t0, "hello", "claude", "--session", "s3", "--as", "os/dev", cwd=repo_a).returncode, 0)
+        scoped3 = rc_at(t0 + 100, "ask", "path:docs/s3.md", "Interrupted refresh", "--as", "os/main", cwd=repo_a, body=b"work").stdout.decode().strip()
+        self.assertEqual(rc_at(t0 + 200, "take", scoped3, "--session", "s3", "--as", "os/dev", cwd=repo_a).returncode, 0)
+        # Simulate crash between canonical write (+119m) and per-repo write (still at t0):
+        for sf in list((self.store / "sessions").iterdir()):
+            if f"os+dev+{s3_hex}" == sf.name or sf.name.startswith(f"os+dev+{s3_hex}~"):
+                sf.unlink()
+        put(self.store / f"sessions/os+dev+{s3_hex}", f"time: {t0 + 119 * M}\nagent: claude\nrepository: repo-a\nsession: s3\nend: yes\n")
+        self.assertNotIn(scoped3, rc_at(t0 + 121 * M, "inbox", "--as", "os/main", cwd=repo_a).stdout.decode())
+
+        # Legacy 6a2b21a oversized (>512 bytes) canonical file with inline `repo-time:` lines: preserves activity and refreshes cleanly!
+        s4_hex = "s4".encode().hex()
+        legacy_lines = [f"time: {t0 + 121 * M}", "agent: claude", "repository: repo-b", "session: s4", f"repo-time: repo-a {t0 + 119 * M}"]
+        for idx in range(15):
+            legacy_lines.append(f"repo-time: repo-legacy-{idx:02d}-padding {t0 + 100 * M + idx}")
+        legacy_lines.append("end: yes\n")
+        legacy_body = "\n".join(legacy_lines)
+        self.assertGreater(len(legacy_body), 512)
+        put(self.store / f"sessions/os+dev+{s4_hex}", legacy_body)
+        # Refreshing s4 in repo-b migrates repo-a's legacy timestamp without failing on >512 bytes!
+        self.assertEqual(rc_at(t0 + 122 * M, "hello", "claude", "--session", "s4", "--as", "os/dev", cwd=repo_b).returncode, 0)
+        # Even after migration, repo-a still shows busy for s4 (3 minutes since +119m)!
+        for sf in list((self.store / "sessions").iterdir()):
+            if s4_hex not in sf.name and f"+r{hashlib.sha256(b's4').hexdigest()[:32]}+" not in sf.name:
+                sf.unlink()
+        mig_job = rc_at(t0 + 122 * M + 100, "ask", "path:docs/mig.md", "Migrated", "--as", "os/main", cwd=repo_a, body=b"work").stdout.decode().strip()
+        mig_post = (self.store / f"messages/{mig_job}.post").read_text()
+        self.assertIn("to: os/all\n", mig_post)
+        self.assertIn("repository: repo-a\n", mig_post)
+
 
 if __name__ == "__main__":
     unittest.main()
