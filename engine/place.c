@@ -62,42 +62,55 @@ static void format_line_error(char *buf, size_t room, size_t lineno, const char 
     text_free(&t);
 }
 
+static bool is_sep(char c) { return c == '/' || c == '\\'; }
+
+static size_t path_root_len(const char *path) {
+    if (!path || !*path) return 0;
+    if (is_sep(path[0]) && is_sep(path[1])) {
+        /* UNC root: \\server\share (or //server/share) */
+        size_t i = 2;
+        while (path[i] && !is_sep(path[i])) i++;
+        if (is_sep(path[i])) {
+            i++;
+            while (path[i] && !is_sep(path[i])) i++;
+        }
+        return i;
+    }
+    if (is_sep(path[0])) return 1;
+    if (((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) && path[1] == ':')
+        return is_sep(path[2]) ? 3 : 2;
+    return 0;
+}
+
 s_result place_open(place *p, const char **why) {
     *p = (place){0};
     p->silent_minutes = PLACE_SILENT_DEFAULT;
-    text at = {0};
-    bool reached_root = false;
-    for (int up = 0; up < 4096 && !p->file; up++) {
+    char *cwd = NULL;
+    if (p_cwd(&cwd) != P_OK || !cwd || !*cwd) {
+        p_free(cwd);
+        return *why = "helio.conf cannot be read", S_DAMAGED;
+    }
+    size_t root = path_root_len(cwd);
+    size_t dir_len = len(cwd);
+    while (dir_len > root && is_sep(cwd[dir_len - 1])) dir_len--;
+    for (;;) {
         text file = {0};
-        add(&file, at.data ? at.data : ""), add(&file, "helio.conf");
-        size_t length;
+        add_bytes(&file, cwd, dir_len);
+        if (dir_len && !is_sep(cwd[dir_len - 1])) add(&file, "/");
+        add(&file, "helio.conf");
+        size_t length = 0;
         p_result result = file.failed ? P_FAILED : p_read(file.data, 65536, &p->file, &length);
         text_free(&file);
         if (result != P_OK && result != P_MISSING) {
-            text_free(&at);
+            p_free(cwd);
             return *why = "helio.conf cannot be read", S_DAMAGED;
         }
-        if (p->file) break;
-        bool at_root = false;
-        if (p_at_root(at.data ? at.data : ".", &at_root) != P_OK) {
-            text_free(&at);
-            return *why = "helio.conf cannot be read", S_DAMAGED;
-        }
-        if (at_root) {
-            reached_root = true;
-            break;
-        }
-        add(&at, "../");
-        if (at.failed) {
-            text_free(&at);
-            return *why = "out of memory", S_DAMAGED;
-        }
+        if (p->file || dir_len <= root) break;
+        while (dir_len > root && !is_sep(cwd[dir_len - 1])) dir_len--;
+        while (dir_len > root && is_sep(cwd[dir_len - 1])) dir_len--;
     }
-    text_free(&at);
-    if (!p->file) {
-        if (!reached_root) return *why = "helio.conf search reached depth limit before filesystem root", S_DAMAGED;
-        return S_OK;
-    }
+    p_free(cwd);
+    if (!p->file) return S_OK;
     size_t lineno = 1;
     for (const char *line = p->file; *line; line = next_line(line), lineno++) {
         const char *value = line;

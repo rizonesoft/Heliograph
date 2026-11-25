@@ -238,20 +238,11 @@ bool p_is_real_dir(const char *path) {
     return !lstat(path, &info) && S_ISDIR(info.st_mode);
 }
 
-p_result p_at_root(const char *dir, bool *at_root) {
-    *at_root = false;
-    struct stat cur, par;
-    if (stat(dir, &cur) != 0) return P_FAILED;
-    size_t n = strlen(dir);
-    char *up = malloc(n + 4);
-    if (!up) return P_FAILED;
-    memcpy(up, dir, n);
-    if (n && dir[n - 1] != '/') up[n++] = '/';
-    memcpy(up + n, "..", 3);
-    int rc = stat(up, &par);
-    free(up);
-    if (rc != 0) return P_FAILED;
-    *at_root = cur.st_dev == par.st_dev && cur.st_ino == par.st_ino;
+p_result p_cwd(char **path_out) {
+    *path_out = NULL;
+    char *buf = getcwd(NULL, 0);
+    if (!buf) return P_FAILED;
+    *path_out = buf;
     return P_OK;
 }
 

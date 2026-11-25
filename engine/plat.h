@@ -22,8 +22,8 @@ p_result p_sync(const char *path);
 p_result p_folder(const char *path);
 /* True iff path exists and is a real directory (never a symlink or reparse point). */
 bool p_is_real_dir(const char *path);
-/* Sets *at_root to true once dir has reached the filesystem root (exact on POSIX; bounded by MAX_PATH depth on Windows). */
-p_result p_at_root(const char *dir, bool *at_root);
+/* Current working directory as newly allocated UTF-8 string, or P_FAILED. */
+p_result p_cwd(char **path_out);
 p_result p_list(const char *path, bool (*each)(void *user, const char *name), void *user);
 p_result p_input(size_t most, char **data, size_t *length);
 uint64_t p_now(void); /* microseconds since 1970 */
