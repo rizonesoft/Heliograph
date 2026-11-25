@@ -16,4 +16,6 @@ char *copy(const char *s, size_t length);
 void add_time(text *t, uint64_t microseconds);
 /* The opposite, or false when it is not such a time. */
 bool read_time(const char *t, uint64_t *microseconds);
+/* 64 lowercase hex characters of SHA-256 over data[0..length-1]. */
+void add_sha256_hex(text *t, const char *data, size_t length);
 void *memcpy(void *restrict to, const void *restrict from, size_t bytes);

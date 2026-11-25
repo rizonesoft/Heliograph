@@ -9,6 +9,8 @@ size_t store_max_names = MOST_NAMES;
 
 typedef enum { TAKE, RELEASE, FINISH, REFUSE } change;
 
+static const char *nz(const char *s) { return s ? s : ""; }
+
 static s_result say(store *s, s_result result, const char *why) {
     s->why = why;
     return result;
@@ -165,15 +167,31 @@ s_result store_parse_post(char *data, size_t length, const char *id, message *ou
     data[split + 1] = 0;
     uint64_t body = 0;
     for (const char *d = field(data, "length"); *d >= '0' && *d <= '9' && body < MOST_FILE; d++) body = body * 10 + (uint64_t)(*d - '0');
-    *out = (message){data, field(data, "id"), field(data, "time"), field(data, "from"), field(data, "to"), field(data, "kind"),
-                     field(data, "about"), field(data, "urgency"), field(data, "re"), field(data, "subject"), data + split + 2, 0, false};
+    *out = (message){
+        .file = data,
+        .id = field(data, "id"),
+        .time = field(data, "time"),
+        .from = field(data, "from"),
+        .to = field(data, "to"),
+        .for_session = field(data, "for"),
+        .kind = field(data, "kind"),
+        .about = field(data, "about"),
+        .urgency = field(data, "urgency"),
+        .re = field(data, "re"),
+        .subject = field(data, "subject"),
+        .body = data + split + 2,
+        .due = 0,
+        .archived = false,
+    };
     const char *due = field(data, "due");
     for (int digits = 0; *due >= '0' && *due <= '9' && digits < 17; digits++) out->due = out->due * 10 + (uint64_t)(*due++ - '0');
     bool due_ok = !*due || *due == '\n';
-    const char *all[] = {out->id, out->time, out->from, out->to, out->kind, out->about, out->urgency, out->re, out->subject};
+    const char *all[] = {out->id, out->time, out->from, out->to, out->for_session, out->kind, out->about, out->urgency, out->re, out->subject};
     for (size_t i = 0; i < sizeof all / sizeof *all; i++) if (*all[i]) cut(all[i]);
-    if (!same(out->id, id) || !address_ok(out->from, false) || !address_ok(out->to, true) || !*out->subject
-        || !due_ok || !time_ok(out->time) || (*out->re && !id_ok(out->re)) || !one_of(out->kind, kinds) || !one_of(out->urgency, urgencies) || !*out->body || len(out->body) != body) {
+    if (!same(out->id, id) || !address_ok(out->from, false) || !address_ok(out->to, true)
+        || !session_ok(out->for_session) || (*out->for_session && !address_ok(out->to, false))
+        || !*out->subject || !due_ok || !time_ok(out->time) || (*out->re && !id_ok(out->re))
+        || !one_of(out->kind, kinds) || !one_of(out->urgency, urgencies) || !*out->body || len(out->body) != body) {
         message_free(out);
         if (why) *why = "the message is not what its name says";
         return S_DAMAGED;
@@ -208,48 +226,103 @@ s_result store_message(store *s, const char *id, message *out) {
 
 bool is_job(const message *m) { return same(m->kind, "request") || same(m->kind, "handoff"); }
 
-bool is_for(const message *m, const char *me) {
+static bool lane_is_for(const message *m, const char *lane) {
     size_t n = len(m->to);
-    if (same(m->to, me)) return true;
-    if (n <= 4 || !same(m->to + n - 4, "/all") || same(m->from, me)) return false;
+    if (same(m->to, lane)) return true;
+    if (n <= 4 || !same(m->to + n - 4, "/all") || same(m->from, lane)) return false;
     for (size_t i = 0; i < n - 3; i++) /* the project and its slash */
-        if (me[i] != m->to[i]) return false;
+        if (lane[i] != m->to[i]) return false;
     return true;
 }
 
-static bool has(const store *s, const char *id, const char *event) {
-    size_t n = len(id), low = 0, high = s->count;
-    while (low < high) {
-        size_t mid = low + (high - low) / 2;
-        const char *name = s->names[mid];
-        int order = 0;
-        size_t i = 0;
-        for (; i < n && !order; i++) order = (unsigned char)name[i] - (unsigned char)id[i];
-        if (!order) order = (unsigned char)name[n] - '.';
-        if (!order) order = compare(name + n + 1, event);
-        if (!order) return true;
-        if (order < 0) low = mid + 1;
-        else high = mid;
+bool is_for(const message *m, actor me) {
+    if (!lane_is_for(m, nz(me.lane))) return false;
+    const char *for_s = nz(m->for_session);
+    return !*for_s || same(for_s, nz(me.session));
+}
+
+static bool is_hex_lower(char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+}
+
+bool store_valid_seen_event(const char *ev) {
+    if (!ev || !starts(ev, "seen.")) return false;
+    const char *who = ev + 5;
+    size_t n = len(who);
+    if (!n) return false;
+    bool alert = n > 6 && same(who + n - 6, "~alert");
+    size_t base_n = alert ? n - 6 : n;
+    size_t plus_pos[2] = {0, 0};
+    int plus = 0;
+    for (size_t i = 0; i < base_n; i++) {
+        if (who[i] == '/' || who[i] == '~') return false;
+        if (who[i] == '+') {
+            if (plus < 2) plus_pos[plus] = i;
+            plus++;
+        }
+    }
+    if (alert) {
+        if (plus != 1 || base_n >= 72) return false;
+        char addr[72];
+        for (size_t i = 0; i < base_n; i++) addr[i] = who[i] == '+' ? '/' : who[i];
+        addr[base_n] = 0;
+        return address_ok(addr, false) && base_n > 6 && same(addr + base_n - 6, "/owner");
+    }
+    if (plus == 1) {
+        if (base_n >= 72) return false;
+        char addr[72];
+        for (size_t i = 0; i < base_n; i++) addr[i] = who[i] == '+' ? '/' : who[i];
+        addr[base_n] = 0;
+        return address_ok(addr, false);
+    }
+    if (plus == 2) {
+        size_t lane_n = plus_pos[1];
+        if (lane_n >= 72 || base_n - lane_n - 1 != 64) return false;
+        char addr[72];
+        for (size_t i = 0; i < lane_n; i++) addr[i] = who[i] == '+' ? '/' : who[i];
+        addr[lane_n] = 0;
+        if (!address_ok(addr, false)) return false;
+        for (size_t i = lane_n + 1; i < base_n; i++)
+            if (!is_hex_lower(who[i])) return false;
+        return true;
     }
     return false;
 }
 
-static void seen_name(text *out, const char *me) {
+static void seen_name_ex(text *out, actor me, bool alert) {
     add(out, "seen.");
-    for (; *me; me++) add_bytes(out, *me == '/' ? "+" : me, 1);
+    for (const char *p = nz(me.lane); *p; p++) add_bytes(out, *p == '/' ? "+" : p, 1);
+    if (alert) {
+        add(out, "~alert");
+    } else if (*nz(me.session)) {
+        add(out, "+");
+        add_sha256_hex(out, me.session, len(me.session));
+    }
 }
 
 static s_result event_of(store *s, const char *id, const char *event, char **data);
 static const char SEEN[] = "seen\n";
 
-bool was_seen(store *s, const char *id, const char *me) {
+s_result store_was_seen(store *s, const char *id, actor me, bool alert, bool *seen_out) {
+    if (seen_out) *seen_out = false;
+    if (!address_ok(nz(me.lane), false) || (!alert && !session_ok(me.session)))
+        return say(s, S_DAMAGED, "invalid seen actor");
     text event = {0};
-    seen_name(&event, me);
+    seen_name_ex(&event, me, alert);
+    if (event.failed) return text_free(&event), say(s, S_DAMAGED, "out of memory");
     char *data = NULL;
-    bool found = !event.failed && has(s, id, event.data) && event_of(s, id, event.data, &data) == S_OK && same(data, SEEN);
-    p_free(data);
+    s_result er = event_of(s, id, event.data, &data);
     text_free(&event);
-    return found;
+    if (er == S_NOTHING) return S_OK;
+    if (er != S_OK) {
+        p_free(data);
+        return er;
+    }
+    bool ok = same(data, SEEN);
+    p_free(data);
+    if (!ok) return say(s, S_DAMAGED, "a seen mark is damaged");
+    if (seen_out) *seen_out = true;
+    return S_OK;
 }
 
 static s_result make_ex(store *s, const char *id, const char *event, const char *data, bool *published) {
@@ -474,7 +547,9 @@ static s_result reserve(store *s, const message *m, const char *key, text *id) {
 }
 
 static bool same_post_content(const message *there, const message *m, const char *about, const char *subject, const char *body) {
-    return same(there->from, m->from) && same(there->to, m->to) && same(there->kind, m->kind)
+    return same(there->from, m->from) && same(there->to, m->to)
+           && same(nz(there->for_session), nz(m->for_session))
+           && same(there->kind, m->kind)
            && same(there->about, about ? about : "") && same(there->urgency, m->urgency)
            && same(there->re, m->re) && same(there->subject, subject) && same(there->body, body);
 }
@@ -509,8 +584,11 @@ static s_result find_reserved(store *s, const message *m, const char *key, text 
 }
 
 s_result store_post(store *s, const message *m, const char *key, text *id) {
+    const char *for_s = nz(m->for_session);
     if (!address_ok(m->from, false)) return say(s, S_REFUSED, "say who you are: --as project/lane");
     if (!address_ok(m->to, true)) return say(s, S_REFUSED, "the reader is project/lane, or project/all");
+    if (!session_ok(for_s)) return say(s, S_REFUSED, "the target session name is invalid or too long");
+    if (*for_s && !address_ok(m->to, false)) return say(s, S_REFUSED, "a message for one session must name a lane, not /all");
     if (!one_of(m->kind, kinds)) return say(s, S_REFUSED, "the kind is request, handoff, answer, finding or headsup");
     if (!one_of(m->urgency, urgencies)) return say(s, S_REFUSED, "the urgency is now, next or whenever");
     if (len(m->subject) > 120 || len(m->about) > 1000 || len(m->body) > MOST_BODY) return say(s, S_REFUSED, "the message is too long");
@@ -588,7 +666,9 @@ s_result store_post(store *s, const message *m, const char *key, text *id) {
                 if (*p == '-' && parsed) stamp = parsed;
             }
             add(&out, "id: "), add(&out, id->data), add(&out, "\ntime: "), add_time(&out, stamp);
-            add(&out, "\nfrom: "), add(&out, m->from), add(&out, "\nto: "), add(&out, m->to), add(&out, "\nkind: "), add(&out, m->kind);
+            add(&out, "\nfrom: "), add(&out, m->from), add(&out, "\nto: "), add(&out, m->to);
+            if (*for_s) add(&out, "\nfor: "), add(&out, for_s);
+            add(&out, "\nkind: "), add(&out, m->kind);
             add(&out, "\nabout: "), add(&out, about.data ? about.data : ""), add(&out, "\nurgency: "), add(&out, m->urgency);
             add(&out, "\nre: "), add(&out, m->re), add(&out, "\ndue: ");
             if (m->due) add_number(&out, m->due, 0);
@@ -657,6 +737,14 @@ static s_result add_link(store *s, const char *id, const job *now, actor me, con
     return result;
 }
 
+bool dest_owns(const char *lane, const message *m) {
+    size_t n = len(lane);
+    if (n <= 6 || !same(lane + n - 6, "/owner")) return false;
+    for (size_t i = 0; i <= n - 6; i++)
+        if (lane[i] != m->to[i]) return false;
+    return true;
+}
+
 bool owns(const char *lane, const message *m) {
     size_t n = len(lane);
     if (n <= 6 || !same(lane + n - 6, "/owner")) return false;
@@ -670,13 +758,19 @@ bool owns(const char *lane, const message *m) {
 }
 
 static const char *objection(const message *m, const job *now, actor me, change what) {
-    bool taker = now->state == TAKEN && same(now->by, me.lane) && (!*now->session || same(now->session, me.session));
+    const char *for_s = nz(m->for_session);
+    const char *my_s = nz(me.session);
+    bool taker = now->state == TAKEN && same(now->by, me.lane) && (!*now->session || same(now->session, my_s));
+    bool wrong_dest_session = *for_s && same(m->to, me.lane) && !same(for_s, my_s);
     if (now->state == DONE || now->state == REFUSED) return "it is already closed";
     switch (what) {
-    case TAKE: return now->state == TAKEN ? "it is already taken" : is_for(m, me.lane) ? NULL : "it is not for you";
+    case TAKE: return now->state == TAKEN ? "it is already taken" : is_for(m, me) ? NULL : "it is not for you";
     case RELEASE: return now->state != TAKEN ? "it is not taken" : taker || owns(me.lane, m) ? NULL : "someone else took it";
     case FINISH: return now->state != TAKEN ? "take it first" : taker ? NULL : "someone else took it";
-    default: return taker || same(m->from, me.lane) || owns(me.lane, m) || (now->state == OPEN && is_for(m, me.lane)) ? NULL : "it is not yours to refuse";
+    default:
+        if (taker || (now->state == OPEN && is_for(m, me))) return NULL;
+        if (!wrong_dest_session && (same(m->from, me.lane) || owns(me.lane, m))) return NULL;
+        return "it is not yours to refuse";
     }
 }
 
@@ -745,10 +839,16 @@ s_result store_take(store *s, const char *id, actor me) { return change_job(s, i
 s_result store_release(store *s, const char *id, actor me) { return change_job(s, id, me, RELEASE, ""); }
 s_result store_end(store *s, const char *id, actor me, bool done, const char *note) { return change_job(s, id, me, done ? FINISH : REFUSE, note); }
 
-s_result store_seen(store *s, const char *id, const char *me) {
-    if (!address_ok(me, false)) return say(s, S_REFUSED, "say who you are: --as project/lane");
+static s_result write_seen_ex(store *s, const char *id, actor me, bool alert) {
+    if (!address_ok(nz(me.lane), false)) return say(s, S_REFUSED, "say who you are: --as project/lane");
+    if (alert) {
+        size_t n = len(me.lane);
+        if (n <= 6 || !same(me.lane + n - 6, "/owner")) return say(s, S_REFUSED, "only an owner lane can acknowledge an alert");
+    } else if (!session_ok(me.session)) {
+        return say(s, S_REFUSED, "the session name is invalid or too long");
+    }
     text event = {0};
-    seen_name(&event, me);
+    seen_name_ex(&event, me, alert);
     if (event.failed) return text_free(&event), say(s, S_DAMAGED, "out of memory");
     if (s->pause) s->pause(s->pause_user, "seen");
     bool published = false;
@@ -773,15 +873,26 @@ s_result store_seen(store *s, const char *id, const char *me) {
     return result;
 }
 
-s_result store_seen_archived(store *s, const char *id, const char *me) {
-    if (!address_ok(me, false)) return say(s, S_REFUSED, "say who you are: --as project/lane");
+static s_result write_seen_archived_ex(store *s, const char *id, actor me, bool alert) {
+    if (!address_ok(nz(me.lane), false)) return say(s, S_REFUSED, "say who you are: --as project/lane");
+    if (alert) {
+        size_t n = len(me.lane);
+        if (n <= 6 || !same(me.lane + n - 6, "/owner")) return say(s, S_REFUSED, "only an owner lane can acknowledge an alert");
+    } else if (!session_ok(me.session)) {
+        return say(s, S_REFUSED, "the session name is invalid or too long");
+    }
     text event = {0};
-    seen_name(&event, me);
+    seen_name_ex(&event, me, alert);
     if (event.failed) return text_free(&event), say(s, S_DAMAGED, "out of memory");
     s_result result = archive_write_seen(s, id, event.data);
     text_free(&event);
     return result;
 }
+
+s_result store_seen(store *s, const char *id, actor me) { return write_seen_ex(s, id, me, false); }
+s_result store_seen_archived(store *s, const char *id, actor me) { return write_seen_archived_ex(s, id, me, false); }
+s_result store_seen_alert(store *s, const char *id, const char *owner_lane) { return write_seen_ex(s, id, (actor){owner_lane, ""}, true); }
+s_result store_seen_alert_archived(store *s, const char *id, const char *owner_lane) { return write_seen_archived_ex(s, id, (actor){owner_lane, ""}, true); }
 
 s_result store_check(store *s, text *report) {
     s_result all = S_OK;
@@ -818,16 +929,20 @@ s_result store_check(store *s, text *report) {
                 if (jr != S_OK && jr != S_REFUSED) why = s->why;
             } else if (starts(dot, ".seen.")) {
                 if (s->pause) s->pause(s->pause_user, "check-seen");
-                char *data = NULL;
-                s_result er = event_of(s, id, dot + 1, &data);
-                if (er == S_NOTHING) {
-                    s_result lp = live_post(s, id);
-                    if (lp == S_OK) why = "a seen mark is damaged";
-                    else if (lp != S_REFUSED) why = s->why;
-                } else if (er != S_OK || !same(data, SEEN)) {
+                if (!store_valid_seen_event(dot + 1)) {
                     why = "a seen mark is damaged";
+                } else {
+                    char *data = NULL;
+                    s_result er = event_of(s, id, dot + 1, &data);
+                    if (er == S_NOTHING) {
+                        s_result lp = live_post(s, id);
+                        if (lp == S_OK) why = "a seen mark is damaged";
+                        else if (lp != S_REFUSED) why = s->why;
+                    } else if (er != S_OK || !same(data, SEEN)) {
+                        why = "a seen mark is damaged";
+                    }
+                    p_free(data);
                 }
-                p_free(data);
             }
         }
         if (why) {

@@ -82,7 +82,7 @@ static int run_pause(int count, char **args) {
     } else if (same(op, "take")) {
         r = store_take(&s, id, (actor){lane, ""});
     } else if (same(op, "seen")) {
-        r = store_seen(&s, id, lane);
+        r = store_seen(&s, id, (actor){lane, ""});
     } else {
         r = S_DAMAGED;
         s.why = "unknown op";

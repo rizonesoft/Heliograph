@@ -167,7 +167,7 @@ s_result archive_has_terminal_job(const char *folder, const char *id, unsigned *
 bool archive_is_clean_remnant(const char *folder, const char *id, const char *event, const char *data, size_t length) {
     unsigned arch_links = 0;
     if (archive_has_terminal_job(folder, id, &arch_links) != S_OK) return false;
-    if (starts(event, "seen.")) return length == len(ARCHIVE_SEEN) && same(data, ARCHIVE_SEEN);
+    if (starts(event, "seen.")) return store_valid_seen_event(event) && length == len(ARCHIVE_SEEN) && same(data, ARCHIVE_SEEN);
     unsigned idx = 0;
     if (!parse_link_index(event, &idx)) return false;
     if (idx >= arch_links) return true; /* late step from a writer that raced post removal */
@@ -1403,24 +1403,7 @@ typedef struct {
 
 static bool valid_arch_event(const char *ev) {
     if (same(ev, "post")) return true;
-    if (starts(ev, "seen.")) {
-        const char *who = ev + 5;
-        size_t n = len(who);
-        if (!n || n >= 72) return false;
-        char addr[72];
-        int plus = 0;
-        for (size_t i = 0; i < n; i++) {
-            if (who[i] == '/') return false;
-            if (who[i] == '+') {
-                addr[i] = '/';
-                plus++;
-            } else {
-                addr[i] = who[i];
-            }
-        }
-        addr[n] = 0;
-        return plus == 1 && address_ok(addr, false);
-    }
+    if (starts(ev, "seen.")) return store_valid_seen_event(ev);
     unsigned idx = 0;
     return len(ev) == 9 && starts(ev, "link.") && parse_link_index(ev, &idx);
 }

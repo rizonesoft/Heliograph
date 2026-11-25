@@ -32,11 +32,22 @@ bool is_overdue(const message *m, const job *now);
    for at least silent_us microseconds. */
 bool is_silent(const session_info *sessions, size_t session_count, const job *now, uint64_t clock_now, uint64_t silent_us);
 
+/* Pure function of the loaded sessions, a targeted lane+session, a reference time
+   (send time or release time), and the clock: true when that session has shown no
+   sign of life since since_us for at least silent_us microseconds. */
+bool is_session_silent(const session_info *sessions, size_t session_count, const char *lane, const char *session,
+                       uint64_t since_us, uint64_t clock_now, uint64_t silent_us);
+
 /* Shared overdue + silence classifier using one captured clock_now and lazy
    session + per-project threshold caching. Returns false when liveness or threshold
    could not be read (leaving *silent_out false). */
 bool watch_classify_job(store *s, const place *here, const message *m, const job *now, uint64_t clock_now,
                         session_cache *sc, bool *overdue_out, bool *silent_out);
+
+/* Targeted-session silence classifier using the destination project's threshold.
+   Returns false when liveness or threshold could not be read (leaving *silent_out false). */
+bool watch_classify_session_silent(store *s, const place *here, const message *m, uint64_t since_us, uint64_t clock_now,
+                                   session_cache *sc, bool *silent_out);
 
 /* Writes summary/<day>.md once a day, UTC. */
 s_result watch_summary(store *s, const place *here);

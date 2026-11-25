@@ -25,6 +25,19 @@ bool is_silent(const session_info *sessions, size_t session_count, const job *no
     return clock_now > last && (clock_now - last) >= silent_us;
 }
 
+bool is_session_silent(const session_info *sessions, size_t session_count, const char *lane, const char *session,
+                       uint64_t since_us, uint64_t clock_now, uint64_t silent_us) {
+    if (!lane || !*lane || !session || !*session || !silent_us) return false;
+    uint64_t last = since_us;
+    for (size_t i = 0; i < session_count; i++) {
+        if (same(sessions[i].lane, lane) && same(sessions[i].session, session)) {
+            if (sessions[i].when > last) last = sessions[i].when;
+            break;
+        }
+    }
+    return clock_now > last && (clock_now - last) >= silent_us;
+}
+
 typedef struct {
     session_cache *cache;
     bool oom;
@@ -116,6 +129,20 @@ bool watch_classify_job(store *s, const place *here, const message *m, const job
     uint64_t silent_us = 0;
     if (cached_silent_us(s, here, sc, proj, &silent_us) != P_OK) return false;
     *silent_out = is_silent(sc->items, sc->count, now, clock_now, silent_us);
+    return true;
+}
+
+bool watch_classify_session_silent(store *s, const place *here, const message *m, uint64_t since_us, uint64_t clock_now,
+                                   session_cache *sc, bool *silent_out) {
+    *silent_out = false;
+    if (!m || !m->for_session || !*m->for_session || !sc) return true;
+    sessions_cache_load(s, sc);
+    if (sc->state == SESS_FAILED) return false;
+    char proj[36];
+    job_project(m->to, proj, sizeof proj);
+    uint64_t silent_us = 0;
+    if (cached_silent_us(s, here, sc, proj, &silent_us) != P_OK) return false;
+    *silent_out = is_session_silent(sc->items, sc->count, m->to, m->for_session, since_us, clock_now, silent_us);
     return true;
 }
 

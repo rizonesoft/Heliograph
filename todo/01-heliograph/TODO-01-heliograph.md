@@ -199,7 +199,9 @@ A job taken by a lane that has gone quiet is reported even when it has no due ti
 
 ## 6. Messages for one session
 
-The design lets a message be for a session, not only a lane. `--for-session <name>` adds it to the reader.
+> **Started:** 2026-11-25T12:36Z
+
+The design lets a message be for a session, not only a lane. `--for-session <name>` adds it to the reader. **Corrected 2026-11-25:** Plan review (`docs/reviews/01-heliograph/D01-T01-s6.md`) clarified: validate `seen.*` filenames through one shared `store_valid_seen_event` grammar in both `store_check` and `archive.c` (`seen.<proj>+<lane>`, `seen.<proj>+<lane>+<64-hex-sha256>`, and lane-wide owner alert ack `seen.<proj>+<lane>~alert`); refuse `--for-session` with literal or `path:`-resolved `/all` in `store_post` (before key reservation) and `store_parse_post`; block mismatched or unnamed sessions on the addressed lane from refusing self-addressed or owner-addressed targeted jobs in `objection` and replay; acknowledge silent-session owner alerts on successful `helio show <id>` using a lane-wide `~alert` mark scoped to the destination project's owner without hiding the message from the target or clearing independent overdue reporting; distinguish absent/seen/error in live-disk `store_was_seen` (suppressing escalation on read error); measure silence from send time (or release time for reopened jobs); display `--for-session` in `help` and the targeted session in `show`/listings; and update both installed WSL and Windows binaries before sending the first targeted post in a shared store (legacy posts remain fully compatible).
 
 **Phase:** 2
 **Needs:** none
@@ -210,11 +212,11 @@ The design lets a message be for a session, not only a lane. `--for-session <nam
 1. Add the field in `engine/store.c`. Done when: a message without it is read as before.
 2. Use it in `is_for` of `engine/store.c`. Done when: the other sessions of the lane do not see it.
 
-- [ ] Write and read `for:` in `store_post` and `store_message` of `engine/store.c` (design, "What does a message hold?"). Done when: old messages pass `helio check` and a bad name is refused. Cheaper substitute: a name in the subject.
-- [ ] Compare the session in `is_for` and `objection` of `engine/store.c`. Done when: another session of the lane neither sees nor takes it. Cheaper substitute: hiding it in the inbox alone.
-- [ ] Mark it seen for a session in `store_seen` of `engine/store.c`. Done when: one session's look does not hide another's message. Cheaper substitute: one mark for the lane.
-- [ ] Show it to the owner when the session is silent in `engine/helio.c`. Done when: it appears once for the owner after the time of §5. Cheaper substitute: it waits unseen.
-- [ ] Commit: `messages: for one session`
+- [x] Write and read `for:` in `store_post` and `store_message` of `engine/store.c` (design, "What does a message hold?"). Done when: old messages pass `helio check` and a bad name is refused. Cheaper substitute: a name in the subject.
+- [x] Compare the session in `is_for` and `objection` of `engine/store.c`. Done when: another session of the lane neither sees nor takes it. Cheaper substitute: hiding it in the inbox alone.
+- [x] Mark it seen for a session in `store_seen` of `engine/store.c`. Done when: one session's look does not hide another's message. Cheaper substitute: one mark for the lane.
+- [x] Show it to the owner when the session is silent in `engine/helio.c`. Done when: it appears once for the owner after the time of §5. Cheaper substitute: it waits unseen.
+- [x] Commit: `messages: for one session`
 
 **Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
 

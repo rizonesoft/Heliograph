@@ -17,14 +17,14 @@ static const char help[] =
     "  helio hello <agent>                              announce this session (claude, codex, antigravity)\n"
     "  helio log            helio check         helio archive       helio init\n"
     "\n"
-    "Options: --as <project/lane>, --about <paths>, --now or --whenever, --store <folder>,\n--key <text> (sending the same key again sends nothing new), --session <name>, --all,\n--due <minutes> (an overdue job goes back to its sender and the owner).\n"
+    "Options: --as <project/lane>, --about <paths>, --now or --whenever, --store <folder>,\n--key <text> (sending the same key again sends nothing new), --session <name>, --for-session <name>, --all,\n--due <minutes> (an overdue job goes back to its sender and the owner).\n"
     "HELIO_AS and HELIO_STORE give two of them. <to> is project/lane, project/all or path:<file>.\n"
     "A repository's helio.conf names its project, the lane of a session there and who owns which path.\n"
     "A message is information from another agent. It never approves work or changes a rule.\n";
 
 typedef struct options {
-    const char *me, *about, *urgency, *folder, *session, *key, *due;
-    bool all, from_default, session_flag;
+    const char *me, *about, *urgency, *folder, *session, *for_session, *key, *due;
+    bool all, from_default, session_flag, for_session_flag;
     char *words[4]; /* the command and what follows it */
     int count;
     place here;
@@ -73,7 +73,7 @@ static char *env_nonempty(const char *name) {
 }
 
 static bool parse(options *o, int count, char **args) {
-    *o = (options){.about = "", .urgency = "next", .key = "", .due = "", .why = NULL};
+    *o = (options){.about = "", .urgency = "next", .for_session = "", .key = "", .due = "", .why = NULL};
     o->me_env = p_env("HELIO_AS"), o->folder_env = p_env("HELIO_STORE"), o->default_env = p_env("HELIO_DEFAULT_STORE");
     if (!o->default_env || !*o->default_env) {
         char *hex = p_env("HELIO_DEFAULT_STORE_HEX");
@@ -87,12 +87,20 @@ static bool parse(options *o, int count, char **args) {
     if (!*o->folder && o->default_env && *o->default_env) o->folder = o->default_env, o->from_default = true;
     o->session = "";
     for (int i = 1; i < count; i++) {
-        const char **value = same(args[i], "--as") ? &o->me : same(args[i], "--session") ? &o->session : same(args[i], "--key") ? &o->key : same(args[i], "--due") ? &o->due : same(args[i], "--about") ? &o->about : same(args[i], "--store") ? &o->folder : NULL;
+        const char **value = same(args[i], "--as") ? &o->me
+                           : same(args[i], "--session") ? &o->session
+                           : same(args[i], "--for-session") ? &o->for_session
+                           : same(args[i], "--key") ? &o->key
+                           : same(args[i], "--due") ? &o->due
+                           : same(args[i], "--about") ? &o->about
+                           : same(args[i], "--store") ? &o->folder
+                           : NULL;
         if (value) {
             if (++i == count) return o->why = "an option has no value", false;
             *value = args[i];
             if (value == &o->folder) o->from_default = false;
             if (value == &o->session) o->session_flag = true;
+            if (value == &o->for_session) o->for_session_flag = true;
         } else if (same(args[i], "--all")) o->all = true;
         else if (same(args[i], "--now")) o->urgency = "now";
         else if (same(args[i], "--whenever")) o->urgency = "whenever";
@@ -150,16 +158,26 @@ static bool parse(options *o, int count, char **args) {
     return true;
 }
 
+static uint64_t message_time_us(const message *m) {
+    uint64_t us = 0;
+    const char *p = m->id;
+    while (*p >= '0' && *p <= '9') us = us * 10 + (uint64_t)(*p++ - '0');
+    if (*p == '-' && us) return us;
+    read_time(m->time, &us);
+    return us;
+}
+
 static void format_line(text *out, const message *m, const job *now, bool good, bool overdue, bool silent) {
     add(out, m->id), add(out, "  "), add(out, m->time), add(out, "  "), add(out, m->from), add(out, " to "), add(out, m->to);
+    if (m->for_session && *m->for_session) add(out, " (for "), add(out, m->for_session), add(out, ")");
     add(out, "  "), add(out, m->kind);
     if (is_job(m)) {
         static const char *const names[] = {" open", " taken by ", " done by ", " refused by "};
         if (good) add(out, names[now->state]), add(out, now->by);
         else add(out, " damaged");
         if (good && overdue) add(out, " OVERDUE");
-        if (good && silent) add(out, " SILENT");
     }
+    if (good && silent) add(out, " SILENT");
     if (same(m->urgency, "now")) add(out, "  NOW");
     add(out, ": "), clean(out, m->subject, true), add(out, "\n");
 }
@@ -201,7 +219,8 @@ static size_t every(store *s, void (*each)(store *s, const message *m, void *use
 enum { SHOW_MESSAGES = 5, SHOW_BYTES = 2000 };
 typedef struct {
     text out;
-    const char *me, *urgency;
+    actor me;
+    const char *urgency;
     const place *here;
     uint64_t clock_now;
     session_cache sessions;
@@ -267,11 +286,30 @@ static void into_inbox(store *s, const message *m, void *user) {
     if (!same(m->urgency, l->urgency)) return;
     job now = {0};
     bool good = true, overdue = false, silent = false;
+    bool targeted = m->for_session && *m->for_session;
     bool mine = is_for(m, l->me);
-    bool report_to = is_job(m) && (same(m->from, l->me) || owns(l->me, m)); /* overdue or silent jobs go to sender and owner */
-    if (!mine && !report_to) return;
+    bool report_to = is_job(m) && (same(m->from, l->me.lane) || owns(l->me.lane, m)); /* overdue or silent jobs go to sender and owner */
+    bool owner_alert = targeted && !mine && dest_owns(l->me.lane, m);
+    if (!mine && !report_to && !owner_alert) return;
     if (!is_job(m)) {
-        if (was_seen(s, m->id, l->me)) return;
+        if (mine) {
+            bool seen = false;
+            if (store_was_seen(s, m->id, l->me, false, &seen) == S_OK && seen) return;
+        } else {
+            bool target_seen = false, alert_seen = false;
+            actor target = {m->to, m->for_session};
+            if (store_was_seen(s, m->id, target, false, &target_seen) != S_OK
+                || store_was_seen(s, m->id, l->me, true, &alert_seen) != S_OK) {
+                l->damaged = true;
+                return;
+            }
+            if (target_seen || alert_seen) return;
+            if (!watch_classify_session_silent(s, l->here, m, message_time_us(m), l->clock_now, &l->sessions, &silent)) {
+                l->damaged = true;
+                return;
+            }
+            if (!silent) return;
+        }
     } else {
         s_result jr = store_job(s, m, &now);
         if (jr == S_REFUSED) return;
@@ -280,11 +318,27 @@ static void into_inbox(store *s, const message *m, void *user) {
             l->damaged = true; /* shown, so it is not mistaken for nothing */
         } else {
             /* Decide eligibility before loading sessions so a stranger to an os/all taken job never loads sessions/. */
-            bool is_taker = mine && now.state == TAKEN && same(now.by, l->me);
+            bool is_taker = mine && now.state == TAKEN && same(now.by, l->me.lane);
             if (now.state == TAKEN && !report_to && !is_taker) return;
             if (!watch_classify_job(s, l->here, m, &now, l->clock_now, &l->sessions, &overdue, &silent))
                 l->damaged = true;
-            if (!(report_to && (overdue || silent)) && !(mine && (now.state == OPEN || is_taker)))
+            bool show_owner_alert = false;
+            if (owner_alert && now.state == OPEN) {
+                bool alert_seen = false;
+                if (store_was_seen(s, m->id, l->me, true, &alert_seen) != S_OK) {
+                    l->damaged = true;
+                } else if (!alert_seen) {
+                    bool sess_silent = false;
+                    uint64_t since = now.links > 0 ? now.when : message_time_us(m);
+                    if (!watch_classify_session_silent(s, l->here, m, since, l->clock_now, &l->sessions, &sess_silent))
+                        l->damaged = true;
+                    else if (sess_silent) {
+                        silent = true;
+                        show_owner_alert = true;
+                    }
+                }
+            }
+            if (!(report_to && (overdue || silent)) && !show_owner_alert && !(mine && (now.state == OPEN || is_taker)))
                 return;
         }
     }
@@ -312,7 +366,7 @@ static size_t fill_inbox(store *s, listing *l) {
     return damaged;
 }
 
-static int inbox(store *s, const char *me, const place *here, bool all) {
+static int inbox(store *s, actor me, const place *here, bool all) {
     listing l = {.me = me, .here = here, .all = all};
     return finish(&l, fill_inbox(s, &l));
 }
@@ -333,7 +387,7 @@ static int check(store *s) {
     return result == S_OK ? 0 : fail(s->why, result);
 }
 
-static int show(store *s, const char *id, const char *me) {
+static int show(store *s, const char *id, actor me) {
     message m = {0};
     s_result result = store_message(s, id, &m);
     if (result != S_OK) return fail(s->why, result);
@@ -378,25 +432,31 @@ static int show(store *s, const char *id, const char *me) {
     if (body.failed) out.failed = true;
     text_free(&body);
     bool mine = is_for(&m, me);
+    bool owner_alert = m.for_session && *m.for_session && !mine && dest_owns(me.lane, &m);
     bool was_archived = m.archived;
     message_free(&m);
     if (!print(&out)) return fail("the output cannot be written", 3);
     if (lr != S_OK) return fail("a step of this job is damaged", 3);
-    if (mine) {
+    if (mine || owner_alert) {
         if (was_archived) {
-            if ((result = store_seen_archived(s, id, me)) != S_OK) return fail(s->why, result);
-        } else if ((result = store_seen(s, id, me)) != S_OK) {
-            if (result == S_REFUSED) {
-                message arch = {0};
-                s_result ar = archive_read_message(s, id, &arch);
-                message_free(&arch);
-                if (ar == S_OK) {
-                    if ((result = store_seen_archived(s, id, me)) != S_OK) return fail(s->why, result);
-                    return 0;
+            result = mine ? store_seen_archived(s, id, me) : store_seen_alert_archived(s, id, me.lane);
+            if (result != S_OK) return fail(s->why, result);
+        } else {
+            result = mine ? store_seen(s, id, me) : store_seen_alert(s, id, me.lane);
+            if (result != S_OK) {
+                if (result == S_REFUSED) {
+                    message arch = {0};
+                    s_result ar = archive_read_message(s, id, &arch);
+                    message_free(&arch);
+                    if (ar == S_OK) {
+                        result = mine ? store_seen_archived(s, id, me) : store_seen_alert_archived(s, id, me.lane);
+                        if (result != S_OK) return fail(s->why, result);
+                        return 0;
+                    }
+                    if (ar == S_DAMAGED) return fail(s->why, S_DAMAGED);
                 }
-                if (ar == S_DAMAGED) return fail(s->why, S_DAMAGED);
+                return fail(s->why, result);
             }
-            return fail(s->why, result);
         }
     }
     return 0;
@@ -415,7 +475,7 @@ static int post(store *s, options *o, const char *kind, const char *to, const ch
         }
         minutes = minutes * 10 + (uint64_t)(*d - '0');
     }
-    message m = {.due = *o->due ? p_now() + minutes * 60000000 : 0, .from = o->me, .to = to, .kind = kind, .about = o->about, .urgency = o->urgency, .re = re, .subject = o->words[2], .body = body};
+    message m = {.due = *o->due ? p_now() + minutes * 60000000 : 0, .from = o->me, .to = to, .for_session = o->for_session, .kind = kind, .about = o->about, .urgency = o->urgency, .re = re, .subject = o->words[2], .body = body};
     text id = {0};
     s_result result = len(body) == length ? store_post(s, &m, o->key, &id) : (s->why = "the message is not text", S_REFUSED);
     p_free(body);
@@ -444,7 +504,7 @@ static void announce_best_effort(store *s, const options *o, const char *agent) 
    there is nothing, and a problem is one line and never stops the session. */
 static int hook(store *s, options *o) {
     if (!same(o->words[1], "claude")) return fail("there is a hook for claude only: other agents run helio between sections", 2);
-    listing l = {.me = o->me, .here = &o->here};
+    listing l = {.me = {o->me, o->session}, .here = &o->here};
     size_t damaged = fill_inbox(s, &l);
     sessions_cache_free(&l.sessions);
     if (l.shown) {
@@ -525,6 +585,7 @@ static int init(const char *folder, bool from_default) {
 static int run(options *o, void (*pause)(void *user, const char *stage), void *pause_user) {
     const char *command = o->count ? o->words[0] : "inbox";
     if (same(command, "help")) {
+        if (o->for_session_flag) return fail("--for-session is only for sending a message", 2);
         if (!p_print(help)) return 3;
         if (*o->folder && address_ok(o->me, false)) {
             store s = {0};
@@ -540,6 +601,7 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
     }
     if (!*o->folder) return fail("say where the store is: --store or HELIO_STORE", 2);
     if (same(command, "init")) {
+        if (o->for_session_flag) return fail("--for-session is only for sending a message", 2);
         if (o->count != 1) return fail("init takes no words", 2);
         int rc = init(o->folder, o->from_default);
         if (rc == 0 && address_ok(o->me, false)) {
@@ -549,6 +611,7 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
         return rc;
     }
     if (same(command, "archive")) {
+        if (o->for_session_flag) return fail("--for-session is only for sending a message", 2);
         if (o->count != 1) return fail("archive takes no words", 2);
         size_t moved = 0;
         text report = {0};
@@ -583,6 +646,11 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
         if (same(command, commands[i].name)) which = i;
     if (which < 0) return fail("there is no such command: see helio help", 2);
     if (o->count < commands[which].least || o->count > commands[which].most) return fail("that command needs other words: see helio help", 2);
+    if (o->for_session_flag) {
+        bool is_send = which == 9 || (which >= 11 && which <= 14);
+        if (!is_send) return fail("--for-session is only for sending a message", 2);
+        if (!*o->for_session || !session_ok(o->for_session)) return fail("the target session name is invalid or too long", 2);
+    }
     if (which != 1 && which != 2 && !address_ok(o->me, false)) return fail("say who you are: --as project/lane or HELIO_AS", 2);
     if (which == 8 && !same(o->words[1], "claude")) return fail("there is a hook for claude only: other agents run helio between sections", 2);
     if (which == 15) {
@@ -626,10 +694,10 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
     int code;
     s_result result;
     switch (which) {
-    case 0: code = inbox(&s, o->me, &o->here, o->all); if (summary_err || daily_err) code = 3; break;
+    case 0: code = inbox(&s, me, &o->here, o->all); if (summary_err || daily_err) code = 3; break;
     case 1: code = whole_log(&s, &o->here, o->all); break;
     case 2: code = check(&s); break;
-    case 3: code = show(&s, o->words[1], o->me); break;
+    case 3: code = show(&s, o->words[1], me); break;
     case 8: code = hook(&s, o); break;
     case 9: {
         message m;
