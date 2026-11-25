@@ -383,8 +383,16 @@ p_result p_at_root(const char *dir, bool *at_root) {
     HANDLE h = FindFirstFileW(wpat, &fd);
     im_free(wpat);
     if (h == INVALID_HANDLE_VALUE) {
-        if (GetLastError() == ERROR_FILE_NOT_FOUND) {
+        DWORD err = GetLastError();
+        if (err == ERROR_FILE_NOT_FOUND) {
             *at_root = true;
+            return P_OK;
+        }
+        if (err == ERROR_ACCESS_DENIED) {
+            /* Write-only directories like C:\Windows\Temp deny listing but still allow traversing "..". */
+            size_t ups = 0;
+            for (const char *p = dir; p[0] == '.' && p[1] == '.' && (p[2] == '/' || p[2] == '\\' || !p[2]); p += p[2] ? 3 : 2) ups++;
+            if (ups >= 50) *at_root = true;
             return P_OK;
         }
         return P_FAILED;
