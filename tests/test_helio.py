@@ -1763,7 +1763,8 @@ class Archive(Base):
         lin_moved = int(arch_lin_out.decode().strip())
         self.assertGreater(win_moved, 0, f"Windows archiver moved 0 jobs (lin={lin_moved})")
         self.assertGreater(lin_moved, 0, f"Linux archiver moved 0 jobs (win={win_moved})")
-        self.assertEqual(win_moved + lin_moved, 1000, (win_moved, lin_moved))
+        # On \\wsl.localhost 9p, DeleteFileW (open+delete-on-close) and Linux unlink() can both return OK on one raced file.
+        self.assertGreaterEqual(win_moved + lin_moved, 1000, (win_moved, lin_moved))
         self.assertEqual(read_win_rc, 0, read_win_err)
         self.assertEqual(read_lin_rc, 0, read_lin_err)
         # Every live control job taken exactly once (per-job check, not aggregate!) and zero eligible old jobs taken!
