@@ -3507,6 +3507,16 @@ class ProjectIsolation(Base):
                 self.assertIn(a_arch, r_rp_all.stdout.decode(), where)
                 self.assertNotIn(b_live, r_rp_all.stdout.decode(), where)
                 self.assertNotIn(b_arch, r_rp_all.stdout.decode(), where)
+            if not ON_WINDOWS:
+                # On POSIX, a trailing literal backslash is part of the directory name, not a separator.
+                bs_repo = no_conf / "repo_bs\\"
+                bs_repo.mkdir()
+                put(bs_repo / "helio.conf", "project: alpha\n")
+                r_bs = run(self.store, "log", "--all", me=None, cwd=bs_repo)
+                self.assertEqual(r_bs.returncode, 0, r_bs.stderr)
+                self.assertIn(a_live, r_bs.stdout.decode())
+                self.assertNotIn(b_live, r_bs.stdout.decode())
+                self.assertNotIn(b_arch, r_bs.stdout.decode())
 
         # 4. Foreign damaged archived job chain does NOT fail alpha's scoped `log --all`!
         bad_link = self.store / f"archive/2025-02/{b_arch}.link.0001"

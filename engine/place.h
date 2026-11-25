@@ -50,3 +50,6 @@ p_result place_lane_sessions(store *s, const char *lane, bool (*each)(void *user
 
 /* A lane of this project, other than me, said hello within the time. */
 s_result place_busy(store *s, const char *project, const char *me, uint64_t within, bool *busy);
+
+/* Root prefix length of an absolute path; sets *win_out when Windows separators apply. */
+size_t place_path_root_len(const char *path, bool *win_out);

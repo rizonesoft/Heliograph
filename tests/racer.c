@@ -449,6 +449,23 @@ int racer(int count, char **args) {
             message m = {.from = cases[i].from, .to = cases[i].to};
             if (may_see(&m, cases[i].lane) != cases[i].expect) return (int)(10 + i);
         }
+        static const struct { const char *path; size_t root; bool win; } roots[] = {
+            {"/", 1, false},
+            {"/tmp/repo\\", 1, false},
+            {"C:\\", 3, true},
+            {"C:\\work\\sub", 3, true},
+            {"\\\\server\\share\\work", 14, true},
+            {"\\\\?\\C:\\work\\sub", 7, true},
+            {"\\\\?\\UNC\\server\\share\\work", 20, true},
+            {"\\\\?\\unc\\srv\\shr", 15, true},
+            {"\\\\.\\C:\\work", 7, true},
+            {"relative/path", 0, false},
+        };
+        for (size_t i = 0; i < sizeof roots / sizeof *roots; i++) {
+            bool w = false;
+            size_t got = place_path_root_len(roots[i].path, &w);
+            if (got != roots[i].root || w != roots[i].win) return (int)(40 + i);
+        }
         return 0;
     }
     if (count >= 2 && same(args[1], "--pause")) return run_pause(count, args);

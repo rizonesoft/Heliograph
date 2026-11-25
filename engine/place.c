@@ -62,24 +62,54 @@ static void format_line_error(char *buf, size_t room, size_t lineno, const char 
     text_free(&t);
 }
 
-static bool is_sep(char c) { return c == '/' || c == '\\'; }
+static bool is_win_path(const char *path) {
+    if (!path || !*path) return false;
+    if (path[0] == '\\') return true;
+    if (((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) && path[1] == ':') return true;
+    return false;
+}
 
-static size_t path_root_len(const char *path) {
+static bool is_sep_for(char c, bool win) { return win ? (c == '\\' || c == '/') : (c == '/'); }
+
+static bool ascii_eq_ci(char a, char b) {
+    if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+    if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+    return a == b;
+}
+
+size_t place_path_root_len(const char *path, bool *win_out) {
+    bool win = is_win_path(path);
+    if (win_out) *win_out = win;
     if (!path || !*path) return 0;
-    if (is_sep(path[0]) && is_sep(path[1])) {
-        /* UNC root: \\server\share (or //server/share) */
+    if (!win) return path[0] == '/' ? 1 : 0;
+    if (((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) && path[1] == ':')
+        return is_sep_for(path[2], true) ? 3 : 2;
+    if (path[0] == '\\' && path[1] == '\\' && (path[2] == '?' || path[2] == '.') && path[3] == '\\') {
+        if (ascii_eq_ci(path[4], 'u') && ascii_eq_ci(path[5], 'n') && ascii_eq_ci(path[6], 'c') && path[7] == '\\') {
+            size_t i = 8;
+            while (path[i] && path[i] != '\\') i++;
+            if (path[i] == '\\') {
+                i++;
+                while (path[i] && path[i] != '\\') i++;
+            }
+            return i;
+        }
+        if (((path[4] >= 'A' && path[4] <= 'Z') || (path[4] >= 'a' && path[4] <= 'z')) && path[5] == ':')
+            return path[6] == '\\' ? 7 : 6;
+        size_t i = 4;
+        while (path[i] && path[i] != '\\') i++;
+        return path[i] == '\\' ? i + 1 : i;
+    }
+    if (path[0] == '\\' && path[1] == '\\') {
         size_t i = 2;
-        while (path[i] && !is_sep(path[i])) i++;
-        if (is_sep(path[i])) {
+        while (path[i] && !is_sep_for(path[i], true)) i++;
+        if (is_sep_for(path[i], true)) {
             i++;
-            while (path[i] && !is_sep(path[i])) i++;
+            while (path[i] && !is_sep_for(path[i], true)) i++;
         }
         return i;
     }
-    if (is_sep(path[0])) return 1;
-    if (((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) && path[1] == ':')
-        return is_sep(path[2]) ? 3 : 2;
-    return 0;
+    return 1;
 }
 
 s_result place_open(place *p, const char **why) {
@@ -90,13 +120,18 @@ s_result place_open(place *p, const char **why) {
         p_free(cwd);
         return *why = "helio.conf cannot be read", S_DAMAGED;
     }
-    size_t root = path_root_len(cwd);
+    bool win = false;
+    size_t root = place_path_root_len(cwd, &win);
+    if (root == 0) {
+        p_free(cwd);
+        return *why = "helio.conf cannot be read", S_DAMAGED;
+    }
     size_t dir_len = len(cwd);
-    while (dir_len > root && is_sep(cwd[dir_len - 1])) dir_len--;
+    while (dir_len > root && is_sep_for(cwd[dir_len - 1], win)) dir_len--;
     for (;;) {
         text file = {0};
         add_bytes(&file, cwd, dir_len);
-        if (dir_len && !is_sep(cwd[dir_len - 1])) add(&file, "/");
+        if (dir_len && !is_sep_for(cwd[dir_len - 1], win)) add(&file, win ? "\\" : "/");
         add(&file, "helio.conf");
         size_t length = 0;
         p_result result = file.failed ? P_FAILED : p_read(file.data, 65536, &p->file, &length);
@@ -106,8 +141,8 @@ s_result place_open(place *p, const char **why) {
             return *why = "helio.conf cannot be read", S_DAMAGED;
         }
         if (p->file || dir_len <= root) break;
-        while (dir_len > root && !is_sep(cwd[dir_len - 1])) dir_len--;
-        while (dir_len > root && is_sep(cwd[dir_len - 1])) dir_len--;
+        while (dir_len > root && !is_sep_for(cwd[dir_len - 1], win)) dir_len--;
+        while (dir_len > root && is_sep_for(cwd[dir_len - 1], win)) dir_len--;
     }
     p_free(cwd);
     if (!p->file) return S_OK;
