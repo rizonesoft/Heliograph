@@ -372,6 +372,22 @@ s_result place_hello(store *s, const char *lane, const char *agent, const char *
             text_free(&base);
             return s->why = "the existing session cannot be read", S_DAMAGED;
         }
+        /* If max_seq is an incomplete/0-byte file, only treat it as an abandoned Windows crash
+           once it is >= 5 seconds old; otherwise it may be an in-flight WriteFile from a concurrent
+           hello, so retry instead of jumping past it with stale predecessor metadata. */
+        if (any_found && (!have_existing || max_seq != valid_seq)) {
+            text max_path = {0};
+            session_seq_path(s, &max_path, base.data, max_seq);
+            uint64_t mtime = 0, wall = p_now();
+            p_result mr = max_path.failed ? P_FAILED : p_file_mtime(max_path.data, &mtime);
+            text_free(&max_path);
+            if (mr == P_MISSING) continue;
+            if (mr != P_OK) {
+                text_free(&base);
+                return s->why = "the existing session cannot be read", S_DAMAGED;
+            }
+            if (wall <= mtime || wall - mtime < 5000000ull) continue;
+        }
 
         uint64_t next_seq = any_found ? max_seq + 1 : 0;
         uint64_t now = p_now();
