@@ -584,6 +584,7 @@ typedef struct {
 typedef struct {
     latest_entry *items;
     size_t count, cap;
+    const char *only_project;
     bool failed;
 } latest_map;
 
@@ -593,6 +594,10 @@ static bool collect_latest_cb(void *user, const char *name) {
     char lane[72];
     uint64_t seq = 0;
     if (!parse_session_filename(name, &blen, lane, sizeof lane, &seq)) return true;
+    if (m->only_project) {
+        size_t pn = len(m->only_project);
+        if (!starts(lane, m->only_project) || lane[pn] != '/') return true;
+    }
     for (size_t i = 0; i < m->count; i++) {
         if (len(m->items[i].base) == blen) {
             bool eq = true;
@@ -620,14 +625,14 @@ static bool collect_latest_cb(void *user, const char *name) {
     return true;
 }
 
-p_result place_each_session(store *s, bool (*each)(void *user, const session_info *info), void *user) {
+static p_result each_session_filtered(store *s, const char *only_project, bool (*each)(void *user, const session_info *info), void *user) {
     text folder = {0};
     add(&folder, s->folder), add(&folder, "/sessions");
     if (folder.failed) {
         text_free(&folder);
         return P_FAILED;
     }
-    latest_map map = {0};
+    latest_map map = {.only_project = only_project};
     p_result r = p_list(folder.data, collect_latest_cb, &map);
     text_free(&folder);
     if (r != P_OK || map.failed) {
@@ -662,6 +667,14 @@ p_result place_each_session(store *s, bool (*each)(void *user, const session_inf
     for (size_t i = 0; i < map.count; i++) p_free(map.items[i].base);
     p_free(map.items);
     return had_error ? P_FAILED : P_OK;
+}
+
+p_result place_each_session(store *s, bool (*each)(void *user, const session_info *info), void *user) {
+    return each_session_filtered(s, NULL, each, user);
+}
+
+p_result place_project_sessions(store *s, const char *project, bool (*each)(void *user, const session_info *info), void *user) {
+    return each_session_filtered(s, project, each, user);
 }
 
 typedef struct { const char *project, *me; uint64_t since; bool busy; } look;

@@ -61,6 +61,7 @@ s_result store_check(store *s, text *report);       /* S_DAMAGED when anything i
 
 bool is_job(const message *m);
 bool is_for(const message *m, actor me);
+bool may_see(const message *m, const char *lane); /* same project on either side, or addressed to lane */
 s_result store_was_seen(store *s, const char *id, actor me, bool alert, unsigned alert_links, bool *seen_out);
 s_result store_job(store *s, const message *m, job *out);
 void clean(text *out, const char *in, bool one_line);

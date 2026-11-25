@@ -17,6 +17,7 @@ s_result archive_write_seen(store *s, const char *id, const char *seen_event);
 /* Visits archived messages newest month first in bounded batches, skipping IDs already emitted by the live pass.
    Returns count of damaged months or messages encountered. */
 size_t archive_every(store *s, char *const *emitted, size_t emitted_count,
+                     bool (*visible)(const message *m, void *user),
                      void (*each)(store *s, const message *m, const job *known, void *user), void *user);
 
 /* Validates all archived month folders and files structurally (and against live copies during interrupted moves). */

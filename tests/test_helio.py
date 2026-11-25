@@ -2049,7 +2049,8 @@ class Archive(Base):
         self.assertNotIn(jan_id, plain_s)
         self.assertNotIn(mar_ids[0], plain_s)
         # `helio log --all` with small --batch-size 2 traverses all 5 in 2025-03, newest month (2025-03) before 2025-01, dedups dup_id!
-        r_all = subprocess.run([str(RACER), "--batch-size", "2", "log", "--all", "--store", str(self.store)], capture_output=True, text=True, timeout=30)
+        clean_env = {k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "ANTIGRAVITY_CONVERSATION_ID")}
+        r_all = subprocess.run([str(RACER), "--batch-size", "2", "log", "--all", "--store", str(self.store)], capture_output=True, text=True, timeout=30, cwd=self.store, env=clean_env)
         self.assertEqual(r_all.returncode, 0, r_all.stderr)
         lines = r_all.stdout.splitlines()
         dup_lines = [ln for ln in lines if dup_id in ln]
@@ -2067,7 +2068,7 @@ class Archive(Base):
             put(st / f"messages/{j_mv}.link.0000", "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: taken\nnote: \nend: yes\n")
             put(st / f"messages/{j_mv}.link.0001", "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: done\nnote: ok\nend: yes\n")
             p_log = subprocess.Popen([str(RACER), "--pause-cli", "before-read", str(st), "log", "--all", "--store", str(st)],
-                                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=st)
+                                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=st, env=clean_env)
             try:
                 self.wait_for(st / "paused.before-read")
                 self.assertEqual(run(st, "archive", me=None).returncode, 0)
@@ -3341,6 +3342,169 @@ class SessionTargeting(Base):
         self.assertEqual(r_show_err.returncode, 3)
         self.assertIn(b"Damaged seen", r_show_err.stdout)
         bad_target_seen.unlink()
+        self.assertEqual(self.helio("check", me=None).returncode, 0)
+
+
+class ProjectIsolation(Base):
+    def test_may_see_truth_table(self):
+        r = subprocess.run([str(RACER), "--test-may-see"], capture_output=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_foreign_ids_match_missing_id_exactly_with_zero_side_effects(self):
+        # Create live non-job, live open job, live taken job, and archived done job in project alpha.
+        old_us = 1739577600_000_000
+        clean_env = {k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "ANTIGRAVITY_CONVERSATION_ID")}
+
+        def rc_at(now_us, *args, body=b""):
+            return subprocess.run(
+                [str(RACER), "--now", str(now_us), *args, "--store", str(self.store)],
+                input=body, capture_output=True, timeout=30, cwd=self.store, env=clean_env,
+            )
+
+        live_note = self.send("tell", "alpha/apps", "alpha/main", "Alpha secret", "secret body")
+        live_open = self.send("ask", "alpha/apps", "alpha/main", "Alpha open", "open body")
+        live_taken = self.send("ask", "alpha/apps", "alpha/main", "Alpha taken", "taken body")
+        self.assertEqual(self.helio("take", live_taken, me="alpha/apps").returncode, 0)
+        arch_done = rc_at(old_us, "ask", "alpha/apps", "Alpha archived", "--as", "alpha/main", body=b"arch").stdout.decode().strip()
+        self.assertEqual(rc_at(old_us + 1000, "take", arch_done, "--as", "alpha/apps").returncode, 0)
+        self.assertEqual(rc_at(old_us + 2000, "done", arch_done, "ok", "--as", "alpha/apps").returncode, 0)
+        self.assertEqual(self.helio("archive", me=None).returncode, 0)
+
+        absent = "1739577600999999-abcdef"
+        foreign_ids = (live_note, live_open, live_taken, arch_done)
+
+        # For beta/apps (foreign project) and alpha2/apps (prefix-similar project), every command must match absent ID identically!
+        for stranger in ("beta/apps", "alpha2/apps"):
+            for cmd_args, body in (
+                (("show",), ""),
+                (("answer", "Reply"), "reply body"),
+                (("take",), ""),
+                (("release",), ""),
+                (("done", "ok"), ""),
+                (("refuse", "no"), ""),
+            ):
+                if cmd_args[0] == "answer":
+                    ref = self.helio("answer", absent, "Reply", "--key", "k-absent", me=stranger, body=body)
+                else:
+                    ref = self.helio(cmd_args[0], absent, *cmd_args[1:], me=stranger, body=body)
+                self.assertEqual(ref.returncode, 2, (stranger, cmd_args))
+                self.assertIn(b"there is no such message", ref.stderr)
+
+                for fid in foreign_ids:
+                    live_before = set((self.store / "messages").iterdir())
+                    arch_dir = self.store / "archive/2025-02"
+                    arch_before = set(arch_dir.iterdir()) if arch_dir.exists() else set()
+                    if cmd_args[0] == "answer":
+                        got = self.helio("answer", fid, "Reply", "--key", f"k-for-{fid}", me=stranger, body=body)
+                    else:
+                        got = self.helio(cmd_args[0], fid, *cmd_args[1:], me=stranger, body=body)
+                    self.assertEqual((got.returncode, got.stdout, got.stderr), (ref.returncode, ref.stdout, ref.stderr), (stranger, cmd_args, fid))
+                    # Zero side effects: no seen mark, no ~alert, no reply, no key reservation!
+                    self.assertEqual(set((self.store / "messages").iterdir()), live_before, (stranger, cmd_args, fid))
+                    self.assertEqual(set(arch_dir.iterdir()) if arch_dir.exists() else set(), arch_before, (stranger, cmd_args, fid))
+
+        # Positive: same-project non-recipient (alpha/ui) CAN show live & archived alpha messages and answer them!
+        self.assertEqual(self.helio("show", live_note, me="alpha/ui").returncode, 0)
+        self.assertEqual(self.helio("show", arch_done, me="alpha/ui").returncode, 0)
+        self.assertEqual(self.helio("answer", live_note, "Same proj reply", me="alpha/ui", body="ok").returncode, 0)
+
+        # Cross-project message (alpha/dev -> beta/dev) is visible to both alpha/* and beta/*, hidden from gamma/*!
+        cross = self.send("tell", "beta/dev", "alpha/dev", "Cross note", "hello beta")
+        self.assertEqual(self.helio("show", cross, me="alpha/other").returncode, 0)
+        self.assertEqual(self.helio("show", cross, me="beta/other").returncode, 0)
+        r_gamma = self.helio("show", cross, me="gamma/other")
+        self.assertEqual(r_gamma.returncode, 2)
+        self.assertIn(b"there is no such message", r_gamma.stderr)
+
+    def test_log_scoping_owner_mode_and_foreign_damage_isolation(self):
+        old_us = 1739577600_000_000
+        clean_env = {k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "ANTIGRAVITY_CONVERSATION_ID")}
+
+        def rc_at(now_us, *args, body=b"", cwd=None):
+            return subprocess.run(
+                [str(RACER), "--now", str(now_us), *args, "--store", str(self.store)],
+                input=body, capture_output=True, timeout=30, cwd=cwd or self.store, env=clean_env,
+            )
+
+        a_live = self.send("tell", "alpha/apps", "alpha/main", "Alpha live", "a")
+        b_live = self.send("tell", "beta/apps", "beta/main", "Beta live", "b")
+        ab_cross = self.send("tell", "beta/apps", "alpha/main", "Cross live", "ab")
+        a_arch = rc_at(old_us, "ask", "alpha/apps", "Alpha arch", "--as", "alpha/main", body=b"aa").stdout.decode().strip()
+        self.assertEqual(rc_at(old_us + 1000, "take", a_arch, "--as", "alpha/apps").returncode, 0)
+        self.assertEqual(rc_at(old_us + 2000, "done", a_arch, "ok", "--as", "alpha/apps").returncode, 0)
+        b_arch = rc_at(old_us + 5000, "ask", "beta/apps", "Beta arch", "--as", "beta/main", body=b"bb").stdout.decode().strip()
+        self.assertEqual(rc_at(old_us + 6000, "take", b_arch, "--as", "beta/apps").returncode, 0)
+        self.assertEqual(rc_at(old_us + 7000, "done", b_arch, "ok", "--as", "beta/apps").returncode, 0)
+        self.assertEqual(self.helio("archive", me=None).returncode, 0)
+
+        # 1. CLI --as scopes both `log` and `log --all` to that project (including cross-project, excluding foreign).
+        r_a = self.helio("log", "--all", me="alpha/ui")
+        self.assertEqual(r_a.returncode, 0, r_a.stderr)
+        out_a = r_a.stdout.decode()
+        self.assertIn(a_live, out_a)
+        self.assertIn(ab_cross, out_a)
+        self.assertIn(a_arch, out_a)
+        self.assertNotIn(b_live, out_a)
+        self.assertNotIn(b_arch, out_a)
+
+        # 2. Scoped log exits 1 when every healthy row is foreign.
+        self.assertEqual(self.helio("log", "--all", me="gamma/ui").returncode, 1)
+
+        # 3. Explicitly empty or malformed --as / HELIO_AS is rejected with exit 2 (never widens to all-project log!).
+        with tempfile.TemporaryDirectory() as no_conf_dir:
+            no_conf = Path(no_conf_dir)
+            self.assertEqual(run(self.store, "log", "--all", "--as", "", me=None, cwd=no_conf, extra_env={"HELIO_AS": "alpha/ui"}).returncode, 2)
+            self.assertEqual(run(self.store, "log", "--all", me=None, cwd=no_conf, extra_env={"HELIO_AS": "bad"}).returncode, 2)
+            # HELIO_AS keeps log --all scoped!
+            r_env = run(self.store, "log", "--all", me=None, cwd=no_conf, extra_env={"HELIO_AS": "alpha/ui"})
+            self.assertEqual(r_env.returncode, 0)
+            self.assertIn(a_live, r_env.stdout.decode())
+            self.assertNotIn(b_live, r_env.stdout.decode())
+            # Outside any repository with no lane: plain `log` exits 2; `log --all` shows EVERY project (owner mode)!
+            r_plain = run(self.store, "log", me=None, cwd=no_conf)
+            self.assertEqual(r_plain.returncode, 2)
+            r_owner = run(self.store, "log", "--all", me=None, cwd=no_conf)
+            self.assertEqual(r_owner.returncode, 0, r_owner.stderr)
+            out_owner = r_owner.stdout.decode()
+            for mid in (a_live, b_live, ab_cross, a_arch, b_arch):
+                self.assertIn(mid, out_owner)
+
+            # Inferred repo lane keeps `log --all` scoped!
+            repo_lane = no_conf / "repo_lane"
+            repo_lane.mkdir()
+            put(repo_lane / "helio.conf", "project: alpha\nlane: dev\n")
+            r_rl = run(self.store, "log", "--all", me=None, cwd=repo_lane)
+            self.assertEqual(r_rl.returncode, 0)
+            self.assertIn(a_arch, r_rl.stdout.decode())
+            self.assertNotIn(b_arch, r_rl.stdout.decode())
+
+            # Project-only helio.conf scopes plain `log` to that project; `log --all` with no lane shows all projects!
+            repo_proj = no_conf / "repo_proj"
+            repo_proj.mkdir()
+            put(repo_proj / "helio.conf", "project: alpha\n")
+            r_rp = run(self.store, "log", me=None, cwd=repo_proj)
+            self.assertEqual(r_rp.returncode, 0)
+            self.assertIn(a_live, r_rp.stdout.decode())
+            self.assertNotIn(b_live, r_rp.stdout.decode())
+
+        # 4. Foreign damaged archived job chain does NOT fail alpha's scoped `log --all`!
+        bad_link = self.store / f"archive/2025-02/{b_arch}.link.0001"
+        saved_link = bad_link.read_bytes()
+        put(bad_link, "corrupt step\n")
+        r_a_ok = self.helio("log", "--all", me="alpha/ui")
+        self.assertEqual(r_a_ok.returncode, 0, r_a_ok.stderr)
+        self.assertIn(a_arch, r_a_ok.stdout.decode())
+        self.assertNotIn(b_arch, r_a_ok.stdout.decode())
+        bad_link.write_bytes(saved_link)
+
+        # 5. Foreign unreadable/corrupt session file does NOT fail alpha's scoped `log` on a visible taken job!
+        a_job = self.send("ask", "alpha/apps", "alpha/main", "Alpha taken", "work")
+        self.assertEqual(self.helio("take", a_job, me="alpha/apps").returncode, 0)
+        put(self.store / "sessions/beta+apps", "corrupt session\n")
+        r_a_sess = self.helio("log", me="alpha/ui")
+        self.assertEqual(r_a_sess.returncode, 0, r_a_sess.stderr)
+        self.assertIn(a_job, r_a_sess.stdout.decode())
+        (self.store / "sessions/beta+apps").unlink()
         self.assertEqual(self.helio("check", me=None).returncode, 0)
 
 

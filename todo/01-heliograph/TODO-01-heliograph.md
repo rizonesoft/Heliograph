@@ -225,7 +225,9 @@ The design lets a message be for a session, not only a lane. `--for-session <nam
 
 ## 7. Projects kept apart in log and show
 
-The design says a session sees only its own project's messages and those sent to it by name. Today `log` prints every project and `show` opens any id.
+> **Started:** 2026-11-25T13:57Z
+
+The design says a session sees only its own project's messages and those sent to it by name. Today `log` prints every project and `show` opens any id. **Corrected 2026-11-25:** Plan review (`docs/reviews/01-heliograph/D01-T01-s7.md`) clarified: enforce `may_see` in `change_job` (`take`, `release`, `done`, `refuse`) immediately after loading the post so foreign IDs return the exact missing-message refusal (`there is no such message`) without disclosing state; reject explicitly empty or malformed `--as` / `HELIO_AS` and fail closed on lane allocation failure in `log` so a scoped call can never silently widen to owner all-project mode; require `--as` or `--all` for `log` outside a repository while scoping project-only `helio.conf` checkouts to that project and keeping named-lane `log --all` inside its project; pass a visibility predicate into `archive_every` before archived chain replay so foreign damaged archived chains cannot affect a scoped caller; scope `watch_classify_job` / `watch_classify_session_silent` session reads to the taker/target project (`place_project_sessions` / `place_session`) so foreign unreadable session files never mark a visible `log` damaged; keep `inbox`'s automatic `archive_daily` error message generic (no foreign IDs on stderr; detailed report stays on explicit `helio archive`), noting that `summary/<day>.md` remains a persisted store-wide owner report; check `may_see` at the top of each `show` rendering pass (including concurrent-archive fallback) and in `into_inbox`; update `help` and `README.md`; and verify exact `(rc, stdout, stderr)` missing-ID equivalence and zero side effects across live and archived foreign IDs.
 
 **Phase:** 2
 **Needs:** none
@@ -236,10 +238,10 @@ The design says a session sees only its own project's messages and those sent to
 1. Write one rule in `engine/store.c`. Done when: it decides from the message and the lane alone.
 2. Use it in `engine/helio.c`. Done when: each command that prints a message passes through it.
 
-- [ ] Write `may_see` in `engine/store.c`: the project of either side, or sent to this lane (design, "How does it find the reader?"). Done when: a table of both sides passes. Cheaper substitute: the receiving side alone.
-- [ ] Keep to it in `log`, `show` and `answer` of `engine/helio.c`. Done when: a stranger's id exits 2 with the words of a missing one. Cheaper substitute: a warning.
-- [ ] Show every project with `log --all` and no lane in `engine/helio.c`, for the owner's terminal. Done when: a call that names a lane stays inside its project. Cheaper substitute: no way to see all.
-- [ ] Commit: `messages: projects stay apart`
+- [x] Write `may_see` in `engine/store.c`: the project of either side, or sent to this lane (design, "How does it find the reader?"). Done when: a table of both sides passes. Cheaper substitute: the receiving side alone.
+- [x] Keep to it in `log`, `show` and `answer` of `engine/helio.c`. Done when: a stranger's id exits 2 with the words of a missing one. Cheaper substitute: a warning.
+- [x] Show every project with `log --all` and no lane in `engine/helio.c`, for the owner's terminal. Done when: a call that names a lane stays inside its project. Cheaper substitute: no way to see all.
+- [x] Commit: `messages: projects stay apart`
 
 **Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
 

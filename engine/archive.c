@@ -1298,6 +1298,7 @@ static bool gather_arch_post_batch(void *user, const char *name) {
 static bool attach_arch_events(void *user, const char *name);
 
 size_t archive_every(store *s, char *const *emitted, size_t emitted_count,
+                     bool (*visible)(const message *m, void *user),
                      void (*each)(store *s, const message *m, const job *known, void *user), void *user) {
     text root = {0};
     add(&root, s->folder), add(&root, "/archive");
@@ -1364,6 +1365,10 @@ size_t archive_every(store *s, char *const *emitted, size_t emitted_count,
                         message m = {0};
                         s_result mr = archive_read_message(s, id, &m);
                         if (mr == S_OK) {
+                            if (visible && !visible(&m, user)) {
+                                message_free(&m);
+                                continue;
+                            }
                             if (is_job(&m)) {
                                 job known = {0};
                                 s_result jr = archive_read_job_ex(s, &m, &be.items[i].links, &known);

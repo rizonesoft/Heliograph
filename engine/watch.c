@@ -122,13 +122,20 @@ bool watch_classify_job(store *s, const place *here, const message *m, const job
     *overdue_out = m->due && (now->state == OPEN || now->state == TAKEN) && m->due < clock_now;
     *silent_out = false;
     if (now->state != TAKEN || !sc) return true;
-    sessions_cache_load(s, sc);
-    if (sc->state == SESS_FAILED) return false;
-    char proj[36];
+    char proj[36], taker_proj[36];
     job_project(m->to, proj, sizeof proj);
+    job_project(now->by, taker_proj, sizeof taker_proj);
     uint64_t silent_us = 0;
     if (cached_silent_us(s, here, sc, proj, &silent_us) != P_OK) return false;
-    *silent_out = is_silent(sc->items, sc->count, now, clock_now, silent_us);
+    session_cache proj_sc = {0};
+    sess_collect col = {&proj_sc, false};
+    p_result pr = place_project_sessions(s, taker_proj, collect_session_cb, &col);
+    if (col.oom || (pr != P_OK && pr != P_MISSING)) {
+        sessions_cache_free(&proj_sc);
+        return false;
+    }
+    *silent_out = is_silent(proj_sc.items, proj_sc.count, now, clock_now, silent_us);
+    sessions_cache_free(&proj_sc);
     return true;
 }
 
@@ -136,13 +143,14 @@ bool watch_classify_session_silent(store *s, const place *here, const message *m
                                    session_cache *sc, bool *silent_out) {
     *silent_out = false;
     if (!m || !m->for_session || !*m->for_session || !sc) return true;
-    sessions_cache_load(s, sc);
-    if (sc->state == SESS_FAILED) return false;
     char proj[36];
     job_project(m->to, proj, sizeof proj);
     uint64_t silent_us = 0;
     if (cached_silent_us(s, here, sc, proj, &silent_us) != P_OK) return false;
-    *silent_out = is_session_silent(sc->items, sc->count, m->to, m->for_session, since_us, clock_now, silent_us);
+    session_info info = {0};
+    s_result sr = place_session(s, m->to, m->for_session, &info);
+    if (sr == S_DAMAGED) return false;
+    *silent_out = is_session_silent(sr == S_OK ? &info : NULL, sr == S_OK ? 1 : 0, m->to, m->for_session, since_us, clock_now, silent_us);
     return true;
 }
 

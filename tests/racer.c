@@ -431,6 +431,26 @@ int racer(int count, char **args) {
         if (is_silent(sess, 4, &j7, T, 120 * M)) return 22;
         return 0;
     }
+    if (count >= 2 && same(args[1], "--test-may-see")) {
+        static const struct { const char *from, *to, *lane; bool expect; } cases[] = {
+            {"os/main", "os/apps", "os/ui", true},
+            {"os/main", "os/all", "os/ui", true},
+            {"alpha/dev", "beta/dev", "alpha/other", true},
+            {"alpha/dev", "beta/dev", "beta/other", true},
+            {"alpha/dev", "beta/dev", "beta/dev", true},
+            {"alpha/dev", "beta/dev", "gamma/dev", false},
+            {"os/main", "os/apps", "os2/apps", false},
+            {"os2/main", "os2/apps", "os/apps", false},
+            {"os/main", "os/apps", "", false},
+            {"os/main", "os/apps", "os/all", false},
+            {"os/main", "os/apps", "badlane", false},
+        };
+        for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
+            message m = {.from = cases[i].from, .to = cases[i].to};
+            if (may_see(&m, cases[i].lane) != cases[i].expect) return (int)(10 + i);
+        }
+        return 0;
+    }
     if (count >= 2 && same(args[1], "--pause")) return run_pause(count, args);
     if (count >= 4 && same(args[1], "--pause-cli")) {
         pause_ctx ctx = {args[3], args[2]};

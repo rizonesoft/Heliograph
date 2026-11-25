@@ -241,6 +241,17 @@ bool is_for(const message *m, actor me) {
     return !*for_s || same(for_s, nz(me.session));
 }
 
+static bool same_project(const char *a, const char *b) {
+    size_t i = 0;
+    while (a[i] && a[i] != '/' && a[i] == b[i]) i++;
+    return i > 0 && a[i] == '/' && b[i] == '/';
+}
+
+bool may_see(const message *m, const char *lane) {
+    if (!m || !lane || !address_ok(lane, false)) return false;
+    return same(m->to, lane) || same_project(m->from, lane) || same_project(m->to, lane);
+}
+
 static bool is_hex_lower(char c) {
     return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
 }
@@ -816,6 +827,10 @@ static s_result change_job(store *s, const char *id, actor me, change what, cons
     message m;
     s_result result = store_message(s, id, &m);
     if (result != S_OK) return result;
+    if (!may_see(&m, me.lane)) {
+        message_free(&m);
+        return say(s, S_REFUSED, "there is no such message");
+    }
     if (m.archived) result = say(s, S_REFUSED, "it was archived");
     else if (!is_job(&m)) result = say(s, S_REFUSED, "only a request or a handoff can be taken");
     if (result == S_OK) {
