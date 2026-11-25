@@ -115,8 +115,8 @@ p_result p_create_excl(const char *path, const char *data, size_t length) {
     if (!wide) return P_FAILED;
     HANDLE file = CreateFileW(wide, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_NEW, 0, NULL);
     DWORD err = file == INVALID_HANDLE_VALUE ? GetLastError() : 0;
-    im_free(wide);
     if (file == INVALID_HANDLE_VALUE) {
+        im_free(wide);
         if (err == ERROR_FILE_EXISTS || err == ERROR_ALREADY_EXISTS) return P_EXISTS;
         if (err == ERROR_PATH_NOT_FOUND || err == ERROR_FILE_NOT_FOUND) return P_MISSING;
         return P_FAILED;
@@ -130,7 +130,12 @@ p_result p_create_excl(const char *path, const char *data, size_t length) {
     }
     good = good && FlushFileBuffers(file);
     CloseHandle(file);
-    if (!good) return P_FAILED;
+    if (!good) {
+        DeleteFileW(wide);
+        im_free(wide);
+        return P_FAILED;
+    }
+    im_free(wide);
 #ifdef HELIO_TEST_HOOKS
     if (plat_fail_write_flush) return P_UNFLUSHED;
 #endif

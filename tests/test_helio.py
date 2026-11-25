@@ -2597,13 +2597,40 @@ class Sessions(Base):
             self.assertEqual(self.helio("hello", "antigravity", "--session", "race-1", me=None, cwd=repo).returncode, 0)
             _, info2 = self.read_session("os/apps", "race-1")
 
-        # Truncated/incomplete session record (missing end: yes) is refused by place_session and NOT silently wiped by ordinary refresh.
+        # Truncated/incomplete session record with NO intact predecessor is refused by place_session and NOT silently wiped.
         put(self.store / "sessions/os+truncated", "time: 12345\nagent: codex\n")
         self.assertNotEqual(self.read_session("os/truncated", "")[0], 0)
         r_trunc = self.helio("inbox", me="os/truncated")
         self.assertEqual(r_trunc.returncode, 1)
         self.assertIn(b"cannot be read", r_trunc.stderr)
         (self.store / "sessions/os+truncated").unlink()
+
+        # Interrupted Windows publication: 0-byte higher generation beside intact predecessor falls back to predecessor
+        # in both C readers, and the next announcement self-heals to a new valid generation preserving agent and sweeping the 0-byte file!
+        base_r1 = f"os+apps+{'race-1'.encode().hex()}"
+        put(self.store / f"sessions/{base_r1}~9999", "")
+        rc_fb, info_fb = self.read_session("os/apps", "race-1")
+        self.assertEqual((rc_fb, info_fb["agent"], info_fb["repository"], info_fb["when"]), (0, "antigravity", "race-repo", info2["when"]))
+        listed_fb = [row for row in self.list_sessions() if row["session"] == "race-1"]
+        self.assertEqual((len(listed_fb), listed_fb[0]["agent"]), (1, "antigravity"))
+        r_heal = self.helio("inbox", "--session", "race-1", me=None, cwd=repo)
+        self.assertEqual((r_heal.returncode, r_heal.stderr), (1, b""))
+        self.assertFalse((self.store / f"sessions/{base_r1}~9999").exists())
+        rc_healed, info_healed = self.read_session("os/apps", "race-1")
+        self.assertEqual((rc_healed, info_healed["agent"], info_healed["repository"]), (0, "antigravity", "race-repo"))
+        self.assertGreater(int(info_healed["when"]), int(info2["when"]))
+        info2 = info_healed
+
+        # Backward compatibility with 4-field structured records without `end: yes` (written by 8509054):
+        # both C readers parse them and an ordinary refresh advances them cleanly preserving agent.
+        self.backdate_session("os/apps", "compat-4f", "time: 2000\nagent: codex\nrepository: race-repo\nsession: compat-4f\n")
+        rc_4f, info_4f = self.read_session("os/apps", "compat-4f")
+        self.assertEqual((rc_4f, info_4f["agent"], info_4f["repository"], info_4f["when"]), (0, "codex", "race-repo", "2000"))
+        r_4f = self.helio("inbox", "--session", "compat-4f", me=None, cwd=repo)
+        self.assertEqual((r_4f.returncode, r_4f.stderr), (1, b""))
+        rc_4f2, info_4f2 = self.read_session("os/apps", "compat-4f")
+        self.assertEqual((rc_4f2, info_4f2["agent"], info_4f2["repository"]), (0, "codex", "race-repo"))
+        self.assertGreater(int(info_4f2["when"]), 2000)
 
         # Case 3a: pre-rename failure (--fail-sync-cli) leaves existing announcement 100% untouched.
         r_sync_fail = subprocess.run(
