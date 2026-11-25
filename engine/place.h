@@ -56,6 +56,7 @@ s_result place_session_repo(store *s, const char *lane, const char *session, con
 uint64_t place_session_repo_when(const session_info *info, const char *repository);
 p_result place_each_session(store *s, bool (*each)(void *user, const session_info *info), void *user);
 p_result place_lane_sessions(store *s, const char *lane, bool (*each)(void *user, const session_info *info), void *user);
+p_result place_lane_sessions_repo(store *s, const char *lane, const char *repository, bool (*each)(void *user, const session_info *info), void *user);
 
 /* A lane of this project (and repository, when non-empty), other than me, said hello within the time. */
 s_result place_busy(store *s, const char *project, const char *repository, const char *me, uint64_t within, bool *busy);

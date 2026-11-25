@@ -841,87 +841,100 @@ static bool collect_latest_cb(void *user, const char *name) {
     return true;
 }
 
-static p_result each_session_filtered(store *s, const char *only_lane, bool include_named_repos, bool (*each)(void *user, const session_info *info), void *user) {
+static p_result each_session_filtered(store *s, const char *only_lane, const char *target_repo, bool include_named_repos, bool (*each)(void *user, const session_info *info), void *user) {
     text folder = {0};
     add(&folder, s->folder), add(&folder, "/sessions");
     if (folder.failed) {
         text_free(&folder);
         return P_FAILED;
     }
-    bool had_error = false, keep = true;
-    /* When include_named_repos is true, a concurrent cross-repo refresh or legacy migration may create
-       a new per-repo key after our p_list and sweep the listed canonical generation before we read it.
-       If any listed generation disappears (rr == P_MISSING), run one follow-up listing pass so newly
-       created per-repo keys are never missed by place_busy or place_lane_sessions. */
-    for (int pass = 0; pass < 2 && keep; pass++) {
-        latest_map map = {.only_lane = only_lane, .include_named_repos = include_named_repos};
-        p_result r = p_list(folder.data, collect_latest_cb, &map);
-        if (r != P_OK || map.failed) {
-            for (size_t i = 0; i < map.count; i++) p_free(map.items[i].base);
-            p_free(map.items);
-            text_free(&folder);
-            return r != P_OK ? r : P_FAILED;
-        }
-        if (pass == 0 && s->pause) s->pause(s->pause_user, "sessions-after-list");
-        bool saw_missing = false;
-        for (size_t i = 0; i < map.count && keep; i++) {
-            session_info info = {0};
-            bool ok = false, gone = false, rescan = false;
-            text fast = {0};
-            session_seq_path(s, &fast, map.items[i].base, map.items[i].seq);
-            if (fast.failed) {
-                text_free(&fast);
-                had_error = true;
-                continue;
-            }
-            bool parsed = false, is_empty = false;
-            p_result rr = read_session_file(fast.data, &info, &parsed, &is_empty);
-            text_free(&fast);
-            if (rr == P_OK && parsed) {
-                copy_str(info.lane, sizeof info.lane, map.items[i].lane);
-                ok = true;
-            } else if (rr == P_MISSING || (rr == P_OK && is_empty)) {
-                if (rr == P_MISSING) saw_missing = true;
-                rescan = true;
-            } else {
-                had_error = true;
-            }
-            if (rescan) {
-                for (int attempt = 0; attempt < 8; attempt++) {
-                    bool any_found = false, valid_found = false;
-                    uint64_t max_seq = 0, valid_seq = 0;
-                    p_result br = read_best_generation(s, map.items[i].base, &any_found, &max_seq, &valid_found, &valid_seq, NULL, false, &info);
-                    if (br == P_MISSING) continue;
-                    if (br == P_OK && !any_found) {
-                        gone = true;
-                        break;
-                    }
-                    if (br == P_OK && valid_found) {
-                        copy_str(info.lane, sizeof info.lane, map.items[i].lane);
-                        ok = true;
-                    } else {
-                        had_error = true;
-                    }
-                    break;
-                }
-                if (!ok && !gone) had_error = true;
-            }
-            if (ok) keep = each(user, &info);
-        }
+    latest_map map = {.only_lane = only_lane, .include_named_repos = include_named_repos};
+    p_result r = p_list(folder.data, collect_latest_cb, &map);
+    text_free(&folder);
+    if (r != P_OK || map.failed) {
         for (size_t i = 0; i < map.count; i++) p_free(map.items[i].base);
         p_free(map.items);
-        if (!include_named_repos || !saw_missing) break;
+        return r != P_OK ? r : P_FAILED;
     }
-    text_free(&folder);
+    if (s->pause) s->pause(s->pause_user, "sessions-after-list");
+    bool had_error = false, keep = true;
+    for (size_t i = 0; i < map.count && keep; i++) {
+        session_info info = {0};
+        bool ok = false, gone = false, rescan = false;
+        text fast = {0};
+        session_seq_path(s, &fast, map.items[i].base, map.items[i].seq);
+        if (fast.failed) {
+            text_free(&fast);
+            had_error = true;
+            continue;
+        }
+        bool parsed = false, is_empty = false;
+        p_result rr = read_session_file(fast.data, &info, &parsed, &is_empty);
+        text_free(&fast);
+        if (rr == P_OK && parsed) {
+            copy_str(info.lane, sizeof info.lane, map.items[i].lane);
+            ok = true;
+        } else if (rr == P_MISSING || (rr == P_OK && is_empty)) {
+            rescan = true;
+        } else {
+            had_error = true;
+        }
+        if (rescan) {
+            for (int attempt = 0; attempt < 8; attempt++) {
+                bool any_found = false, valid_found = false;
+                uint64_t max_seq = 0, valid_seq = 0;
+                p_result br = read_best_generation(s, map.items[i].base, &any_found, &max_seq, &valid_found, &valid_seq, NULL, false, &info);
+                if (br == P_MISSING) continue;
+                if (br == P_OK && !any_found) {
+                    gone = true;
+                    break;
+                }
+                if (br == P_OK && valid_found) {
+                    copy_str(info.lane, sizeof info.lane, map.items[i].lane);
+                    ok = true;
+                } else {
+                    had_error = true;
+                }
+                break;
+            }
+            if (!ok && !gone) had_error = true;
+        }
+        if (ok) {
+            /* Canonical-first handoff for bulk lookups: for any discovered named session, directly resolve
+               the requested `target_repo` per-repo copy AFTER reading the canonical record, independent of
+               whether `readdir` observed the newly created per-repo filename during a live migration. */
+            if (target_repo && *target_repo && *info.session && repo_ok(target_repo)) {
+                text rbase = {0};
+                session_base(&rbase, info.lane, info.session, target_repo);
+                if (rbase.failed) {
+                    had_error = true;
+                } else {
+                    session_info rinfo = {0};
+                    s_result rsr = read_session_by_base(s, info.lane, rbase.data, &rinfo);
+                    if (rsr == S_DAMAGED) had_error = true;
+                    else if (rsr == S_OK && same(rinfo.repository, target_repo) && rinfo.when > place_session_repo_when(&info, target_repo))
+                        info = rinfo;
+                }
+                text_free(&rbase);
+            }
+            keep = each(user, &info);
+        }
+    }
+    for (size_t i = 0; i < map.count; i++) p_free(map.items[i].base);
+    p_free(map.items);
     return had_error ? P_FAILED : P_OK;
 }
 
 p_result place_each_session(store *s, bool (*each)(void *user, const session_info *info), void *user) {
-    return each_session_filtered(s, NULL, false, each, user);
+    return each_session_filtered(s, NULL, NULL, false, each, user);
 }
 
 p_result place_lane_sessions(store *s, const char *lane, bool (*each)(void *user, const session_info *info), void *user) {
-    return each_session_filtered(s, lane, true, each, user);
+    return each_session_filtered(s, lane, NULL, true, each, user);
+}
+
+p_result place_lane_sessions_repo(store *s, const char *lane, const char *repository, bool (*each)(void *user, const session_info *info), void *user) {
+    return each_session_filtered(s, lane, repository, true, each, user);
 }
 
 typedef struct { const char *project, *repository, *me; uint64_t since; bool busy; } look;
@@ -939,7 +952,7 @@ s_result place_busy(store *s, const char *project, const char *repository, const
     *busy = false;
     uint64_t now = p_now();
     look l = {project, repository, me, now > within ? now - within : 0, false};
-    p_result r = each_session_filtered(s, NULL, true, busy_each, &l);
+    p_result r = each_session_filtered(s, NULL, repository, true, busy_each, &l);
     if (r == P_MISSING) return S_OK;
     if (r != P_OK) return s->why = "the sessions folder cannot be read", S_DAMAGED;
     *busy = l.busy;

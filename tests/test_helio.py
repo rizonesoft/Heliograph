@@ -4504,6 +4504,7 @@ class RepositoryRouting(Base):
                 time.sleep(0.01)
             self.assertTrue(hit.exists(), "reader did not reach sessions-after-list pause")
             self.assertEqual(self.helio("hello", "claude", "--session", "s5", me="os/dev", cwd=repo_b).returncode, 0)
+            self.assertIsNone(paused.poll(), "reader exited before resume (pause timed out)")
         finally:
             put(go, "go")
             out_p, err_p = paused.communicate(timeout=30)

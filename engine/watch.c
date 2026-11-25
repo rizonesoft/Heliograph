@@ -60,7 +60,7 @@ static bool collect_session_cb(void *user, const session_info *info) {
 
 static bool ensure_session_loaded(store *s, session_cache *c, const char *lane, const char *session, const char *repository) {
     const char *sess = session ? session : "";
-    const char *repo = (*sess && repository) ? repository : "";
+    const char *repo = repository ? repository : "";
     for (size_t i = 0; i < c->query_count; i++) {
         if (same(c->queries[i].lane, lane) && same(c->queries[i].session, sess) && same(c->queries[i].repository, repo))
             return !c->queries[i].failed;
@@ -77,7 +77,7 @@ static bool ensure_session_loaded(store *s, session_cache *c, const char *lane, 
         }
     } else {
         sess_collect col = {c, false};
-        p_result pr = place_lane_sessions(s, lane, collect_session_cb, &col);
+        p_result pr = place_lane_sessions_repo(s, lane, repo, collect_session_cb, &col);
         if (col.oom || (pr != P_OK && pr != P_MISSING)) failed = true;
     }
     if (c->query_count == c->query_cap) {
