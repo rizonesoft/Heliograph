@@ -406,7 +406,7 @@ static s_result sweep_item_tail(const char *folder, const batch_item *it,
         size_t length = 0;
         p_result sr = src.failed || dst.failed ? P_FAILED : p_read(src.data, MOST_FILE, &data, &length);
         if (sr == P_OK) {
-            bool valid_seen = length == len(ARCHIVE_SEEN) && same(data, ARCHIVE_SEEN);
+            bool valid_seen = store_valid_seen_event(it->seen.items[i]) && length == len(ARCHIVE_SEEN) && same(data, ARCHIVE_SEEN);
             p_free(data);
             if (!valid_seen) {
                 *why = "a seen mark is damaged";
@@ -651,7 +651,7 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
                 text_free(&src);
                 continue;
             }
-            bool ok_seen = sr == P_OK && sl == len(ARCHIVE_SEEN) && same(sd, ARCHIVE_SEEN);
+            bool ok_seen = sr == P_OK && store_valid_seen_event(it->seen.items[i]) && sl == len(ARCHIVE_SEEN) && same(sd, ARCHIVE_SEEN);
             p_free(sd);
             if (!ok_seen) {
                 text_free(&src), text_free(&post_p);
@@ -738,7 +738,7 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
         p_result sr = sp.failed ? P_FAILED : p_read(sp.data, MOST_FILE, &sd, &sl);
         text_free(&sp);
         if (sr == P_MISSING) continue;
-        bool ok_seen = sr == P_OK && sl == len(ARCHIVE_SEEN) && same(sd, ARCHIVE_SEEN);
+        bool ok_seen = sr == P_OK && store_valid_seen_event(it->seen.items[i]) && sl == len(ARCHIVE_SEEN) && same(sd, ARCHIVE_SEEN);
         p_free(sd);
         if (!ok_seen) {
             message_free(&m);
@@ -1211,8 +1211,23 @@ s_result archive_write_seen(store *s, const char *id, const char *seen_event) {
     arch_path(s->folder, month, &at, id, seen_event);
     add_number(&unique, p_tick(), 0);
     p_result r = at.failed || unique.failed ? P_FAILED : p_write(at.data, ARCHIVE_SEEN, len(ARCHIVE_SEEN), false, unique.data);
-    text_free(&at), text_free(&unique);
-    if (r == P_OK || r == P_EXISTS) return S_OK;
+    text_free(&unique);
+    if (r == P_OK) {
+        text_free(&at);
+        return S_OK;
+    }
+    if (r == P_EXISTS) {
+        char *data = NULL;
+        size_t length = 0;
+        p_result rr = p_read(at.data, MOST_FILE, &data, &length);
+        text_free(&at);
+        bool ok = rr == P_OK && length == len(ARCHIVE_SEEN) && same(data, ARCHIVE_SEEN);
+        p_free(data);
+        if (ok) return S_OK;
+        s->why = "a seen mark is damaged";
+        return S_DAMAGED;
+    }
+    text_free(&at);
     s->why = r == P_UNFLUSHED ? "the store cannot be flushed" : "the archive cannot be written";
     return S_DAMAGED;
 }
@@ -1680,7 +1695,7 @@ s_result archive_check(store *s, text *report) {
                         size_t sl = 0;
                         p_result sr = ap.failed ? P_FAILED : p_read(ap.data, MOST_FILE, &sd, &sl);
                         text_free(&ap);
-                        bool ok_seen = sr == P_OK && sl == len(ARCHIVE_SEEN) && same(sd, ARCHIVE_SEEN);
+                        bool ok_seen = sr == P_OK && store_valid_seen_event(it->seen.items[k]) && sl == len(ARCHIVE_SEEN) && same(sd, ARCHIVE_SEEN);
                         p_free(sd);
                         if (!ok_seen) {
                             report_arch_file(report, month, it->id, it->seen.items[k], "a seen mark is damaged");

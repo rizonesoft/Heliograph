@@ -250,75 +250,106 @@ bool store_valid_seen_event(const char *ev) {
     const char *who = ev + 5;
     size_t n = len(who);
     if (!n) return false;
-    bool alert = n > 6 && same(who + n - 6, "~alert");
-    size_t base_n = alert ? n - 6 : n;
+    size_t tilde = n;
+    for (size_t i = 0; i < n; i++) {
+        if (who[i] == '/') return false;
+        if (who[i] == '~') {
+            if (tilde != n) return false;
+            tilde = i;
+        }
+    }
+    if (tilde < n) {
+        const char *suf = who + tilde;
+        if (!starts(suf, "~alert")) return false;
+        const char *rest = suf + 6;
+        if (*rest) {
+            if (len(rest) != 4) return false;
+            bool nonzero = false;
+            for (int i = 0; i < 4; i++) {
+                if (rest[i] < '0' || rest[i] > '9') return false;
+                if (rest[i] != '0') nonzero = true;
+            }
+            if (!nonzero) return false;
+        }
+        if (tilde >= 72) return false;
+        char addr[72];
+        int plus = 0;
+        for (size_t i = 0; i < tilde; i++) {
+            if (who[i] == '+') plus++, addr[i] = '/';
+            else addr[i] = who[i];
+        }
+        addr[tilde] = 0;
+        return plus == 1 && address_ok(addr, false) && tilde > 6 && same(addr + tilde - 6, "/owner");
+    }
     size_t plus_pos[2] = {0, 0};
     int plus = 0;
-    for (size_t i = 0; i < base_n; i++) {
-        if (who[i] == '/' || who[i] == '~') return false;
+    for (size_t i = 0; i < n; i++) {
         if (who[i] == '+') {
             if (plus < 2) plus_pos[plus] = i;
             plus++;
         }
     }
-    if (alert) {
-        if (plus != 1 || base_n >= 72) return false;
-        char addr[72];
-        for (size_t i = 0; i < base_n; i++) addr[i] = who[i] == '+' ? '/' : who[i];
-        addr[base_n] = 0;
-        return address_ok(addr, false) && base_n > 6 && same(addr + base_n - 6, "/owner");
-    }
     if (plus == 1) {
-        if (base_n >= 72) return false;
+        if (n >= 72) return false;
         char addr[72];
-        for (size_t i = 0; i < base_n; i++) addr[i] = who[i] == '+' ? '/' : who[i];
-        addr[base_n] = 0;
+        for (size_t i = 0; i < n; i++) addr[i] = who[i] == '+' ? '/' : who[i];
+        addr[n] = 0;
         return address_ok(addr, false);
     }
     if (plus == 2) {
         size_t lane_n = plus_pos[1];
-        if (lane_n >= 72 || base_n - lane_n - 1 != 64) return false;
+        if (lane_n >= 72 || n - lane_n - 1 != 32) return false;
         char addr[72];
         for (size_t i = 0; i < lane_n; i++) addr[i] = who[i] == '+' ? '/' : who[i];
         addr[lane_n] = 0;
         if (!address_ok(addr, false)) return false;
-        for (size_t i = lane_n + 1; i < base_n; i++)
+        for (size_t i = lane_n + 1; i < n; i++)
             if (!is_hex_lower(who[i])) return false;
         return true;
     }
     return false;
 }
 
-static void seen_name_ex(text *out, actor me, bool alert) {
+static void seen_name_ex(text *out, actor me, bool alert, unsigned alert_links) {
     add(out, "seen.");
     for (const char *p = nz(me.lane); *p; p++) add_bytes(out, *p == '/' ? "+" : p, 1);
     if (alert) {
         add(out, "~alert");
+        if (alert_links > 0) add_number(out, alert_links, 4);
     } else if (*nz(me.session)) {
-        add(out, "+");
-        add_sha256_hex(out, me.session, len(me.session));
+        text h = {0};
+        add_sha256_hex(&h, me.session, len(me.session));
+        if (h.failed || h.length < 32) out->failed = true;
+        else add(out, "+"), add_bytes(out, h.data, 32);
+        text_free(&h);
     }
 }
 
+static s_result event_of_len(store *s, const char *id, const char *event, char **data, size_t *length_out);
 static s_result event_of(store *s, const char *id, const char *event, char **data);
 static const char SEEN[] = "seen\n";
 
-s_result store_was_seen(store *s, const char *id, actor me, bool alert, bool *seen_out) {
+static bool valid_seen_payload(const char *data, size_t length) {
+    return data && length == len(SEEN) && same(data, SEEN);
+}
+
+s_result store_was_seen(store *s, const char *id, actor me, bool alert, unsigned alert_links, bool *seen_out) {
     if (seen_out) *seen_out = false;
     if (!address_ok(nz(me.lane), false) || (!alert && !session_ok(me.session)))
         return say(s, S_DAMAGED, "invalid seen actor");
     text event = {0};
-    seen_name_ex(&event, me, alert);
+    seen_name_ex(&event, me, alert, alert_links);
     if (event.failed) return text_free(&event), say(s, S_DAMAGED, "out of memory");
     char *data = NULL;
-    s_result er = event_of(s, id, event.data, &data);
+    size_t length = 0;
+    s_result er = event_of_len(s, id, event.data, &data, &length);
     text_free(&event);
     if (er == S_NOTHING) return S_OK;
     if (er != S_OK) {
         p_free(data);
         return er;
     }
-    bool ok = same(data, SEEN);
+    bool ok = valid_seen_payload(data, length);
     p_free(data);
     if (!ok) return say(s, S_DAMAGED, "a seen mark is damaged");
     if (seen_out) *seen_out = true;
@@ -350,13 +381,18 @@ static s_result make(store *s, const char *id, const char *event, const char *da
 }
 
 /* Read from the disk and not from the listing, because others write meanwhile. */
-static s_result event_of(store *s, const char *id, const char *event, char **data) {
+static s_result event_of_len(store *s, const char *id, const char *event, char **data, size_t *length_out) {
     text at = {0};
     path(s, &at, id, event);
-    size_t length;
+    size_t length = 0;
     p_result result = at.failed ? P_FAILED : p_read(at.data, MOST_FILE, data, &length);
     text_free(&at);
+    if (length_out) *length_out = length;
     return result == P_OK ? S_OK : result == P_MISSING ? S_NOTHING : say(s, S_DAMAGED, "an event cannot be read");
+}
+
+static s_result event_of(store *s, const char *id, const char *event, char **data) {
+    return event_of_len(s, id, event, data, NULL);
 }
 
 static s_result live_post(store *s, const char *id) {
@@ -607,7 +643,7 @@ s_result store_post(store *s, const message *m, const char *key, text *id) {
         result = say(s, S_DAMAGED, "out of memory");
     } else if (blank || !body.length) {
         s->why = "a message needs a subject and a body";
-    } else if (secret(subject.data) || secret(body.data) || secret(about.data ? about.data : "")) {
+    } else if (secret(subject.data) || secret(body.data) || secret(about.data ? about.data : "") || secret(for_s)) {
         s->why = "this looks like it contains a secret, so it was not sent";
     } else {
         /* At live admission capacity, still allow an exact retry of an already-reserved key (live or archived)
@@ -839,7 +875,7 @@ s_result store_take(store *s, const char *id, actor me) { return change_job(s, i
 s_result store_release(store *s, const char *id, actor me) { return change_job(s, id, me, RELEASE, ""); }
 s_result store_end(store *s, const char *id, actor me, bool done, const char *note) { return change_job(s, id, me, done ? FINISH : REFUSE, note); }
 
-static s_result write_seen_ex(store *s, const char *id, actor me, bool alert) {
+static s_result write_seen_ex(store *s, const char *id, actor me, bool alert, unsigned alert_links) {
     if (!address_ok(nz(me.lane), false)) return say(s, S_REFUSED, "say who you are: --as project/lane");
     if (alert) {
         size_t n = len(me.lane);
@@ -848,7 +884,7 @@ static s_result write_seen_ex(store *s, const char *id, actor me, bool alert) {
         return say(s, S_REFUSED, "the session name is invalid or too long");
     }
     text event = {0};
-    seen_name_ex(&event, me, alert);
+    seen_name_ex(&event, me, alert, alert_links);
     if (event.failed) return text_free(&event), say(s, S_DAMAGED, "out of memory");
     if (s->pause) s->pause(s->pause_user, "seen");
     bool published = false;
@@ -867,32 +903,41 @@ static s_result write_seen_ex(store *s, const char *id, actor me, bool alert) {
             s->why = write_why;
         }
     } else if (result == S_NOTHING) {
-        result = live_post(s, id);
+        char *existing = NULL;
+        size_t elen = 0;
+        s_result er = event_of_len(s, id, event.data, &existing, &elen);
+        if (er == S_OK) {
+            bool ok = valid_seen_payload(existing, elen);
+            p_free(existing);
+            result = ok ? live_post(s, id) : say(s, S_DAMAGED, "a seen mark is damaged");
+        } else if (er == S_NOTHING) {
+            p_free(existing);
+            result = live_post(s, id);
+        } else {
+            p_free(existing);
+            result = er;
+        }
     }
     text_free(&event);
     return result;
 }
 
-static s_result write_seen_archived_ex(store *s, const char *id, actor me, bool alert) {
+s_result store_seen(store *s, const char *id, actor me) { return write_seen_ex(s, id, me, false, 0); }
+
+s_result store_seen_archived(store *s, const char *id, actor me) {
     if (!address_ok(nz(me.lane), false)) return say(s, S_REFUSED, "say who you are: --as project/lane");
-    if (alert) {
-        size_t n = len(me.lane);
-        if (n <= 6 || !same(me.lane + n - 6, "/owner")) return say(s, S_REFUSED, "only an owner lane can acknowledge an alert");
-    } else if (!session_ok(me.session)) {
-        return say(s, S_REFUSED, "the session name is invalid or too long");
-    }
+    if (!session_ok(me.session)) return say(s, S_REFUSED, "the session name is invalid or too long");
     text event = {0};
-    seen_name_ex(&event, me, alert);
+    seen_name_ex(&event, me, false, 0);
     if (event.failed) return text_free(&event), say(s, S_DAMAGED, "out of memory");
     s_result result = archive_write_seen(s, id, event.data);
     text_free(&event);
     return result;
 }
 
-s_result store_seen(store *s, const char *id, actor me) { return write_seen_ex(s, id, me, false); }
-s_result store_seen_archived(store *s, const char *id, actor me) { return write_seen_archived_ex(s, id, me, false); }
-s_result store_seen_alert(store *s, const char *id, const char *owner_lane) { return write_seen_ex(s, id, (actor){owner_lane, ""}, true); }
-s_result store_seen_alert_archived(store *s, const char *id, const char *owner_lane) { return write_seen_archived_ex(s, id, (actor){owner_lane, ""}, true); }
+s_result store_seen_alert(store *s, const char *id, const char *owner_lane, unsigned alert_links) {
+    return write_seen_ex(s, id, (actor){owner_lane, ""}, true, alert_links);
+}
 
 s_result store_check(store *s, text *report) {
     s_result all = S_OK;
@@ -933,12 +978,13 @@ s_result store_check(store *s, text *report) {
                     why = "a seen mark is damaged";
                 } else {
                     char *data = NULL;
-                    s_result er = event_of(s, id, dot + 1, &data);
+                    size_t dlen = 0;
+                    s_result er = event_of_len(s, id, dot + 1, &data, &dlen);
                     if (er == S_NOTHING) {
                         s_result lp = live_post(s, id);
                         if (lp == S_OK) why = "a seen mark is damaged";
                         else if (lp != S_REFUSED) why = s->why;
-                    } else if (er != S_OK || !same(data, SEEN)) {
+                    } else if (er != S_OK || !valid_seen_payload(data, dlen)) {
                         why = "a seen mark is damaged";
                     }
                     p_free(data);

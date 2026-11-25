@@ -53,16 +53,15 @@ s_result store_release(store *s, const char *id, actor me);
 s_result store_end(store *s, const char *id, actor me, bool done, const char *note);
 s_result store_seen(store *s, const char *id, actor me);
 s_result store_seen_archived(store *s, const char *id, actor me);
-s_result store_seen_alert(store *s, const char *id, const char *owner_lane);
-s_result store_seen_alert_archived(store *s, const char *id, const char *owner_lane);
+s_result store_seen_alert(store *s, const char *id, const char *owner_lane, unsigned alert_links);
 bool owns(const char *lane, const message *m);      /* the owner of a project on either side */
 bool dest_owns(const char *lane, const message *m); /* the owner of the destination project only */
-bool store_valid_seen_event(const char *ev);        /* seen.<proj>+<lane>[+<64-hex>|~alert] */
+bool store_valid_seen_event(const char *ev);        /* seen.<proj>+<lane>[+<32-hex>|~alert[NNNN]] */
 s_result store_check(store *s, text *report);       /* S_DAMAGED when anything is wrong */
 
 bool is_job(const message *m);
 bool is_for(const message *m, actor me);
-s_result store_was_seen(store *s, const char *id, actor me, bool alert, bool *seen_out);
+s_result store_was_seen(store *s, const char *id, actor me, bool alert, unsigned alert_links, bool *seen_out);
 s_result store_job(store *s, const message *m, job *out);
 void clean(text *out, const char *in, bool one_line);
 s_result store_parse_post(char *data, size_t length, const char *id, message *out, const char **why);

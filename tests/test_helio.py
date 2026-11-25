@@ -3002,8 +3002,11 @@ class SilentTaker(unittest.TestCase):
 
 class SessionTargeting(Base):
     def test_for_session_header_validation_help_and_legacy_compat(self):
-        # 1. help mentions --for-session.
-        self.assertIn(b"--for-session", self.helio("help", me=None).stdout)
+        # 1. help mentions --for-session and explains both session roles.
+        help_out = self.helio("help", me=None).stdout
+        self.assertIn(b"--for-session", help_out)
+        self.assertIn(b"who is calling", help_out)
+        self.assertIn(b"limit a sent message to one session", help_out)
 
         # 2. Legacy post without for: header passes check and works as before.
         leg_id = "1739577600000001-a00001"
@@ -3011,8 +3014,8 @@ class SessionTargeting(Base):
             f"id: {leg_id}\ntime: 2025-02-15T00:00:00Z\nfrom: os/main\nto: os/apps\nkind: headsup\nabout: \nurgency: next\nre: \ndue: \nlength: 2\nsubject: legacy\n\nhi")
         self.assertEqual(self.helio("check", me=None).returncode, 0)
 
-        # 3. Bad --for-session values refused with exit 2.
-        for bad in ("", "x" * 65, "a\nb", "a\x1bb"):
+        # 3. Bad and secret-looking --for-session values refused with exit 2.
+        for bad in ("", "x" * 65, "a\nb", "a\x1bb", "ghp_" + "a" * 36, "sk-" + "b" * 30):
             r = self.helio("tell", "os/apps", "sub", "--for-session", bad, body="hi")
             self.assertEqual(r.returncode, 2, repr(bad))
 
@@ -3031,9 +3034,11 @@ class SessionTargeting(Base):
             r = self.helio(*cmd, "--for-session", "s1")
             self.assertEqual(r.returncode, 2, cmd)
 
-        # 5. --for-session with literal /all refused BEFORE key reservation (same key still works for a real lane).
+        # 5. --for-session with literal /all refused BEFORE key reservation (creates no key.* file!).
+        self.assertEqual(list((self.store / "messages").glob("key.*")), [])
         r_all = self.helio("tell", "os/all", "sub", "--for-session", "s1", "--key", "k-all", body="hi")
         self.assertEqual(r_all.returncode, 2)
+        self.assertEqual(list((self.store / "messages").glob("key.*")), [])
         ok_id = self.send("tell", "os/apps", "os/main", "sub", "hi", "--for-session", "s1", "--key", "k-all")
         self.assertIn(b"for: s1\n", (self.store / f"messages/{ok_id}.post").read_bytes())
 
@@ -3042,10 +3047,12 @@ class SessionTargeting(Base):
         self.assertEqual(self.helio("tell", "os/apps", "sub", "--for-session", "s2", "--key", "k-all", body="hi").returncode, 2)
         self.assertEqual(self.helio("tell", "os/apps", "sub", "--key", "k-all", body="hi").returncode, 2)
 
-        # 7. --for-session with path: resolving to /all (unowned path while another lane is active) is refused before key reservation.
+        # 7. --for-session with path: resolving to /all (unowned path while another lane is active) is refused before key reservation (no new key.* file!).
         self.assertEqual(self.helio("hello", "codex", me="os/apps", extra_env={"HELIO_SESSION": "s1"}).returncode, 0)
+        keys_before = set((self.store / "messages").glob("key.*"))
         r_path_all = self.helio("tell", "path:unowned/file.c", "sub", "--for-session", "s1", "--key", "k-path", body="hi")
         self.assertEqual(r_path_all.returncode, 2)
+        self.assertEqual(set((self.store / "messages").glob("key.*")), keys_before)
         ok_path = self.send("tell", "os/apps", "os/main", "sub", "hi", "--for-session", "s1", "--key", "k-path")
         self.assertTrue(ok_path)
 
@@ -3121,7 +3128,7 @@ class SessionTargeting(Base):
         self.assertEqual(self.helio("--session", "s1", me="os/apps").returncode, 0)
         self.assertEqual(self.helio("--session", "s2", me="os/apps").returncode, 0)
         self.assertEqual(self.helio("show", msg_id, "--session", "s2", me="os/apps").returncode, 0)
-        h_s2 = hashlib.sha256(b"s2").hexdigest()
+        h_s2 = hashlib.sha256(b"s2").hexdigest()[:32]
         self.assertTrue((self.store / f"messages/{msg_id}.seen.os+apps+{h_s2}").exists())
         self.assertEqual(self.helio("--session", "s2", me="os/apps").returncode, 1)
         self.assertEqual(self.helio("--session", "s1", me="os/apps").returncode, 0)
@@ -3129,15 +3136,24 @@ class SessionTargeting(Base):
         self.assertEqual(self.helio("--session", "s1", me="os/apps").returncode, 1)
         self.assertEqual(self.helio("check", me=None).returncode, 0)
 
-        # 2. Invalid seen filenames fail check (bad hash length, non-owner ~alert).
-        for bad_ev in ("seen.os+apps+short", "seen.os+apps~alert"):
+        # 2. Trailing bytes after NUL in seen payload fail live check and do not count as seen.
+        msg_nul = self.send("tell", "os/apps", "os/main", "Nul seen", "body")
+        (self.store / f"messages/{msg_nul}.seen.os+apps").write_bytes(b"seen\n\x00trailing")
+        self.assertEqual(self.helio("check", me=None).returncode, 3)
+        self.assertEqual(self.helio(me="os/apps").returncode, 0)  # empty/corrupt seen hides nothing
+        self.assertEqual(self.helio("show", msg_nul, me="os/apps").returncode, 3)  # P_EXISTS verifies existing payload
+        (self.store / f"messages/{msg_nul}.seen.os+apps").unlink()
+
+        # 3. Invalid seen filenames fail check AND archive refuses to move them into archive/.
+        for bad_ev in ("seen.os+apps+short", "seen.os+apps~alert", "seen.os+owner~alert0000"):
             p = self.store / f"messages/{msg_id}.{bad_ev}"
             put(p, "seen\n")
             self.assertEqual(self.helio("check", me=None).returncode, 3, bad_ev)
             p.unlink()
         self.assertEqual(self.helio("check", me=None).returncode, 0)
 
-        # 3. Max-length project(32)/lane(32) + 64-char session: live seen, archive, archived seen, check (MAX_PATH safe on Windows).
+        # 4. Max-length project(32)/lane(32) + 64-char session inside a deeper nested store root:
+        #    live seen, invalid-seen archive refusal, valid archive, archived seen, corrupt archived seen retry, check.
         proj = "p" * 32
         lane = "l" * 32
         sess1 = "a" * 64
@@ -3145,11 +3161,15 @@ class SessionTargeting(Base):
         addr = f"{proj}/{lane}"
         old_us = 1739577600_000_000  # 2025-02-15
         clean_env = {k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "ANTIGRAVITY_CONVERSATION_ID")}
+        deep_store = self.store / "nested_store_root" / "sub_store_dir"
+        deep_store.mkdir(parents=True)
+        put(deep_store / "helio.conf", f"project: {proj}\n")
+        self.assertEqual(run(deep_store, "init", me=None).returncode, 0)
 
         def rc_at(now_us, *args, body=b""):
             return subprocess.run(
-                [str(RACER), "--now", str(now_us), *args, "--store", str(self.store)],
-                input=body, capture_output=True, timeout=30, cwd=self.store, env=clean_env,
+                [str(RACER), "--now", str(now_us), *args, "--store", str(deep_store)],
+                input=body, capture_output=True, timeout=30, cwd=deep_store, env=clean_env,
             )
 
         r_ask = rc_at(old_us, "ask", addr, "Maxlen job", "--as", f"{proj}/main", "--for-session", sess1, body=b"work")
@@ -3158,11 +3178,21 @@ class SessionTargeting(Base):
         self.assertEqual(rc_at(old_us + 1000, "take", jid, "--as", addr, "--session", sess1).returncode, 0)
         self.assertEqual(rc_at(old_us + 2000, "done", jid, "ok", "--as", addr, "--session", sess1).returncode, 0)
         self.assertEqual(rc_at(old_us + 3000, "show", jid, "--as", addr, "--session", sess1).returncode, 0)
-        self.assertEqual(self.helio("archive", me=None).returncode, 0)
-        # Show archived job as a second 64-char session (owner lane writing ~alert, and target sess1 re-showing).
-        self.assertEqual(self.helio("show", jid, "--session", sess2, me=f"{proj}/owner").returncode, 0)
-        self.assertEqual(self.helio("show", jid, "--session", sess1, me=addr).returncode, 0)
-        self.assertEqual(self.helio("check", me=None).returncode, 0)
+        # Plant an invalid seen filename with valid payload: archive must refuse to move it!
+        bad_seen = deep_store / f"messages/{jid}.seen.{proj}+{lane}+short"
+        put(bad_seen, "seen\n")
+        self.assertEqual(run(deep_store, "archive", me=None).returncode, 3)
+        bad_seen.unlink()
+        self.assertEqual(run(deep_store, "archive", me=None).returncode, 0)
+        # Show archived job as target sess1 (P_EXISTS valid) and verify corrupt archived seen mark fails show retry!
+        self.assertEqual(run(deep_store, "show", jid, "--session", sess1, me=addr).returncode, 0)
+        self.assertEqual(run(deep_store, "check", me=None).returncode, 0)
+        h_s1 = hashlib.sha256(sess1.encode()).hexdigest()[:32]
+        arch_seen = deep_store / f"archive/2025-02/{jid}.seen.{proj}+{lane}+{h_s1}"
+        put(arch_seen, "corrupt\n")
+        self.assertEqual(run(deep_store, "show", jid, "--session", sess1, me=addr).returncode, 3)
+        put(arch_seen, "seen\n")
+        self.assertEqual(run(deep_store, "check", me=None).returncode, 0)
 
     def test_silent_targeted_session_owner_escalation_and_ack(self):
         M = 60_000_000
@@ -3185,14 +3215,20 @@ class SessionTargeting(Base):
         self.assertEqual(r_ask.returncode, 0, r_ask.stderr)
         job_id = r_ask.stdout.decode().strip()
 
-        # At +30m: neither owner sees them yet.
-        self.assertEqual(rc_at(base_us + 30 * M, "inbox", "--as", "os/owner", "--session", "own-a").returncode, 1)
-        self.assertEqual(rc_at(base_us + 30 * M, "inbox", "--as", "other/owner").returncode, 1)
+        # Owner inspecting by ID BEFORE target is silent must NOT prematurely write ~alert!
+        self.assertEqual(rc_at(base_us + 20 * M, "show", note_id, "--as", "os/owner", "--session", "own-a").returncode, 0)
+        self.assertEqual(rc_at(base_us + 20 * M, "show", job_id, "--as", "os/owner", "--session", "own-a").returncode, 0)
+        self.assertFalse((self.store / f"messages/{note_id}.seen.os+owner~alert").exists())
+        self.assertFalse((self.store / f"messages/{job_id}.seen.os+owner~alert").exists())
 
-        # At +61m: destination owner (os/owner) sees BOTH with SILENT in inbox AND hook claude; sender project's owner (other/owner) does NOT.
-        t61 = base_us + 61 * M
-        self.assertEqual(rc_at(t61, "inbox", "--as", "other/owner").returncode, 1)
-        r_own = rc_at(t61, "inbox", "--as", "os/owner", "--session", "own-a")
+        # Target s1 refreshes liveness at +50m -> resets silence deadline to +110m!
+        self.assertEqual(rc_at(base_us + 50 * M, "hello", "codex", "--as", "os/apps", "--session", "s1").returncode, 0)
+        self.assertEqual(rc_at(base_us + 61 * M, "inbox", "--as", "os/owner", "--session", "own-a").returncode, 1)
+        # Exact boundary: +110m - 1us is NOT silent; +110m IS silent!
+        self.assertEqual(rc_at(base_us + 110 * M - 1, "inbox", "--as", "os/owner", "--session", "own-a").returncode, 1)
+        t_silent = base_us + 110 * M
+        self.assertEqual(rc_at(t_silent, "inbox", "--as", "other/owner").returncode, 1)
+        r_own = rc_at(t_silent, "inbox", "--as", "os/owner", "--session", "own-a")
         self.assertEqual(r_own.returncode, 0, r_own.stderr)
         own_out = r_own.stdout.decode()
         self.assertIn(note_id, own_out)
@@ -3201,47 +3237,63 @@ class SessionTargeting(Base):
         self.assertIn("request open SILENT", own_out)
         self.assertIn("(for s1)", own_out)
 
-        r_hook = rc_at(t61, "hook", "claude", "--as", "os/owner", "--session", "own-a")
+        r_hook = rc_at(t_silent, "hook", "claude", "--as", "os/owner", "--session", "own-a")
         self.assertEqual(r_hook.returncode, 0, r_hook.stderr)
-        self.assertIn(note_id, r_hook.stdout.decode())
-        self.assertIn(job_id, r_hook.stdout.decode())
+        hook_out = r_hook.stdout.decode()
+        self.assertIn(note_id, hook_out)
+        self.assertIn(job_id, hook_out)
+        self.assertIn("headsup SILENT", hook_out)
+        self.assertIn("request open SILENT", hook_out)
+        self.assertIn("(for s1)", hook_out)
 
         # Owner acknowledges BOTH via show -> writes lane-wide ~alert; a DIFFERENT owner session (own-b) no longer sees them!
-        self.assertEqual(rc_at(t61 + M, "show", note_id, "--as", "os/owner", "--session", "own-a").returncode, 0)
-        self.assertEqual(rc_at(t61 + M, "show", job_id, "--as", "os/owner", "--session", "own-a").returncode, 0)
+        self.assertEqual(rc_at(t_silent + M, "show", note_id, "--as", "os/owner", "--session", "own-a").returncode, 0)
+        self.assertEqual(rc_at(t_silent + M, "show", job_id, "--as", "os/owner", "--session", "own-a").returncode, 0)
         self.assertTrue((self.store / f"messages/{note_id}.seen.os+owner~alert").exists())
         self.assertTrue((self.store / f"messages/{job_id}.seen.os+owner~alert").exists())
-        self.assertEqual(rc_at(t61 + 2 * M, "inbox", "--as", "os/owner", "--session", "own-b").returncode, 1)
-        self.assertEqual(rc_at(t61 + 2 * M, "hook", "claude", "--as", "os/owner", "--session", "own-b").stdout, b"")
+        self.assertEqual(rc_at(t_silent + 2 * M, "inbox", "--as", "os/owner", "--session", "own-b").returncode, 1)
+        self.assertEqual(rc_at(t_silent + 2 * M, "hook", "claude", "--as", "os/owner", "--session", "own-b").stdout, b"")
 
         # Target s1 STILL sees both unread in its inbox!
-        r_targ = rc_at(t61 + 2 * M, "inbox", "--as", "os/apps", "--session", "s1")
+        r_targ = rc_at(t_silent + 2 * M, "inbox", "--as", "os/apps", "--session", "s1")
         self.assertEqual(r_targ.returncode, 0)
         self.assertIn(note_id, r_targ.stdout.decode())
         self.assertIn(job_id, r_targ.stdout.decode())
 
         # Target reading a non-job clears escalation eligibility before owner ever looks.
-        t2 = base_us + 200 * M
+        t2 = base_us + 250 * M
         read_note = rc_at(t2, "tell", "os/apps", "Already read", "--as", "os/main", "--for-session", "s2", body=b"x").stdout.decode().strip()
         self.assertEqual(rc_at(t2 + 5 * M, "show", read_note, "--as", "os/apps", "--session", "s2").returncode, 0)
         self.assertEqual(rc_at(t2 + 70 * M, "inbox", "--as", "os/owner").returncode, 1)
 
-        # Reopened targeted job measures silence from release time (now.when), not send time!
-        t3 = base_us + 400 * M
+        # Reopened targeted job measures silence from release time (now.when) AND gets a fresh alert generation (~alert0002) even if earlier alert was acked!
+        t3 = base_us + 450 * M
         reopen_job = rc_at(t3, "ask", "os/apps", "Reopened", "--as", "os/main", "--for-session", "s3", body=b"r").stdout.decode().strip()
-        self.assertEqual(rc_at(t3 + 10 * M, "take", reopen_job, "--as", "os/apps", "--session", "s3").returncode, 0)
-        self.assertEqual(rc_at(t3 + 50 * M, "release", reopen_job, "--as", "os/apps", "--session", "s3").returncode, 0)
-        # At +70m (20m since release, 70m since send): NOT silent yet.
-        self.assertEqual(rc_at(t3 + 70 * M, "inbox", "--as", "os/owner").returncode, 1)
-        # At +111m (61m since release): SILENT!
-        r_reopen = rc_at(t3 + 111 * M, "inbox", "--as", "os/owner")
+        # Owner acks initial silence at +61m, then s3 takes and releases at +70m/+80m.
+        self.assertEqual(rc_at(t3 + 61 * M, "show", reopen_job, "--as", "os/owner").returncode, 0)
+        self.assertTrue((self.store / f"messages/{reopen_job}.seen.os+owner~alert").exists())
+        self.assertEqual(rc_at(t3 + 70 * M, "take", reopen_job, "--as", "os/apps", "--session", "s3").returncode, 0)
+        self.assertEqual(rc_at(t3 + 80 * M, "release", reopen_job, "--as", "os/apps", "--session", "s3").returncode, 0)
+        # At +100m (20m since release): NOT silent yet.
+        self.assertEqual(rc_at(t3 + 100 * M, "inbox", "--as", "os/owner").returncode, 1)
+        # At +140m (60m since release): SILENT again for generation links=2!
+        r_reopen = rc_at(t3 + 140 * M, "inbox", "--as", "os/owner")
         self.assertEqual(r_reopen.returncode, 0)
         self.assertIn(reopen_job, r_reopen.stdout.decode())
         self.assertIn("SILENT", r_reopen.stdout.decode())
-        self.assertEqual(rc_at(t3 + 112 * M, "show", reopen_job, "--as", "os/owner").returncode, 0)
+        self.assertEqual(rc_at(t3 + 141 * M, "show", reopen_job, "--as", "os/owner").returncode, 0)
+        self.assertTrue((self.store / f"messages/{reopen_job}.seen.os+owner~alert0002").exists())
+        self.assertEqual(rc_at(t3 + 142 * M, "inbox", "--as", "os/owner").returncode, 1)
+
+        # Owner-addressed targeted job (os/main -> os/owner --for-session s-own): when s-own goes silent and opens it, ~alert is also written!
+        t3b = base_us + 620 * M
+        own_targ = rc_at(t3b, "ask", "os/owner", "Owner targeted", "--as", "os/main", "--for-session", "s-own", body=b"ot").stdout.decode().strip()
+        self.assertEqual(rc_at(t3b + 65 * M, "show", own_targ, "--as", "os/owner", "--session", "s-own").returncode, 0)
+        self.assertTrue((self.store / f"messages/{own_targ}.seen.os+owner~alert").exists())
+        self.assertEqual(rc_at(t3b + 130 * M, "inbox", "--as", "os/owner", "--session", "other-own").returncode, 1)
 
         # Overdue + silent targeted job: owner show clears SILENT (~alert) but preserves OVERDUE!
-        t4 = base_us + 600 * M
+        t4 = base_us + 800 * M
         ov_job = rc_at(t4, "ask", "os/apps", "Overdue targeted", "--as", "os/main", "--for-session", "s4", "--due", "30", body=b"ov").stdout.decode().strip()
         r_ov1 = rc_at(t4 + 65 * M, "inbox", "--as", "os/owner")
         self.assertEqual(r_ov1.returncode, 0)
@@ -3253,8 +3305,8 @@ class SessionTargeting(Base):
         self.assertIn("OVERDUE", r_ov2.stdout.decode())
         self.assertNotIn("SILENT", r_ov2.stdout.decode())
 
-        # Corrupt seen mark suppresses silent escalation and returns exit 3 in inbox (nonblocking damaged notice in hook).
-        t5 = base_us + 800 * M
+        # Corrupt seen mark suppresses silent escalation (exit 3 in inbox, nonblocking damaged notice in hook) AND show retry fails with exit 3!
+        t5 = base_us + 1000 * M
         dmg_note = rc_at(t5, "tell", "os/apps", "Damaged seen", "--as", "os/main", "--for-session", "s5", body=b"d").stdout.decode().strip()
         put(self.store / f"messages/{dmg_note}.seen.os+owner~alert", "corrupt\n")
         r_dmg = rc_at(t5 + 65 * M, "inbox", "--as", "os/owner")
@@ -3264,6 +3316,7 @@ class SessionTargeting(Base):
         self.assertEqual(r_dmg_hook.returncode, 0)
         self.assertNotIn(dmg_note, r_dmg_hook.stdout.decode())
         self.assertIn("damaged", r_dmg_hook.stdout.decode().lower())
+        self.assertEqual(rc_at(t5 + 65 * M, "show", dmg_note, "--as", "os/owner").returncode, 3)
         (self.store / f"messages/{dmg_note}.seen.os+owner~alert").unlink()
         self.assertEqual(self.helio("check", me=None).returncode, 0)
 
