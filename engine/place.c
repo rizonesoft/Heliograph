@@ -401,11 +401,11 @@ s_result place_hello(store *s, const char *lane, const char *agent, const char *
             uint64_t chk_max = 0, chk_vseq = 0;
             session_info chk_info = {0};
             p_result chkr = read_best_generation(s, base.data, &chk_any, &chk_max, &chk_valid, &chk_vseq, NULL, &chk_info);
-            if (chkr != P_OK || !chk_any || (chk_max == next_seq && (!chk_valid || chk_vseq != next_seq))) {
+            if (chkr != P_OK || !chk_any || !chk_valid || chk_vseq < next_seq) {
                 text_free(&next_path), text_free(&base);
                 return s->why = "the session was written, but could not be verified", S_DAMAGED;
             }
-            if (chk_max > next_seq) {
+            if (chk_vseq > next_seq) {
                 p_remove(next_path.data);
                 text_free(&next_path);
                 if (s->pause) s->pause(s->pause_user, "hello-retry");
