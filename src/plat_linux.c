@@ -132,6 +132,12 @@ static bool linux_lock_matches(const char *path, const char *token) {
     return ok;
 }
 
+static bool linux_deadline_passed(struct timespec deadline) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return now.tv_sec > deadline.tv_sec || (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec);
+}
+
 p_result p_lock(const char *path, void **handle) {
     *handle = NULL;
     size_t plen = strlen(path);
@@ -146,11 +152,19 @@ p_result p_lock(const char *path, void **handle) {
     snprintf(lk->token, sizeof lk->token, "%llu", (unsigned long long)p_tick());
     size_t tlen = strlen(lk->token);
 
+    char reclaim[4096];
+    bool have_reclaim_path = (size_t)snprintf(reclaim, sizeof reclaim, "%s.reclaim", path) < sizeof reclaim;
+
     struct timespec deadline;
     clock_gettime(CLOCK_MONOTONIC, &deadline);
     deadline.tv_sec += 2;
 
-    for (;;) {
+    for (bool first = true;; first = false) {
+        if (!first && linux_deadline_passed(deadline)) {
+            free(lk->path);
+            free(lk);
+            return P_FAILED;
+        }
         p_result r = p_create_excl(path, lk->token, tlen);
         if (r == P_OK) {
             *handle = lk;
@@ -162,17 +176,30 @@ p_result p_lock(const char *path, void **handle) {
             return r;
         }
         uint64_t mtime = 0, wall = p_now();
-        if (p_file_mtime(path, &mtime) == P_OK && wall > mtime && wall - mtime >= 60000000ull) {
-            p_result cr = p_claim_remove(path, lk->token);
-            if (cr != P_OK && cr != P_MISSING) {
-                free(lk->path);
-                free(lk);
-                return P_FAILED;
+        if (have_reclaim_path && p_file_mtime(path, &mtime) == P_OK && wall > mtime && wall - mtime >= 60000000ull) {
+            p_result gr = p_create_excl(reclaim, lk->token, tlen);
+            if (gr == P_OK) {
+                /* Re-check staleness inside the exclusive reclaim guard so two reclaimers
+                   can never race and remove a freshly acquired lock. */
+                uint64_t mtime2 = 0, wall2 = p_now();
+                p_result ar = P_EXISTS;
+                if (p_file_mtime(path, &mtime2) == P_OK && wall2 > mtime2 && wall2 - mtime2 >= 60000000ull) {
+                    p_result cr = p_claim_remove(path, lk->token);
+                    if ((cr == P_OK || cr == P_MISSING) && !linux_deadline_passed(deadline))
+                        ar = p_create_excl(path, lk->token, tlen);
+                }
+                if (linux_lock_matches(reclaim, lk->token)) p_remove(reclaim);
+                if (ar == P_OK) {
+                    *handle = lk;
+                    return P_OK;
+                }
+            } else if (gr == P_EXISTS) {
+                uint64_t rmtime = 0, rwall = p_now();
+                if (p_file_mtime(reclaim, &rmtime) == P_OK && rwall > rmtime && rwall - rmtime >= 120000000ull)
+                    p_claim_remove(reclaim, lk->token);
             }
         }
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        if (now.tv_sec > deadline.tv_sec || (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec)) {
+        if (linux_deadline_passed(deadline)) {
             free(lk->path);
             free(lk);
             return P_FAILED;

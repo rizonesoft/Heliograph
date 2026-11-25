@@ -212,6 +212,7 @@ s_result place_hello(store *s, const char *lane, const char *agent, const char *
     if (s->pause) s->pause(s->pause_user, "hello-write");
 
     void *lock_handle = NULL;
+    if (s->pause) s->pause(s->pause_user, "hello-before-lock");
     result = p_lock(lock_path.data, &lock_handle);
     if (result != P_OK) {
         text_free(&folder), text_free(&path), text_free(&lock_path), text_free(&unique);

@@ -54,6 +54,13 @@ static bool win_lock_matches(const char *path, const char *token) {
     return ok;
 }
 
+static bool win_deadline_passed(LARGE_INTEGER start, uint64_t limit) {
+    if (!limit) return false;
+    LARGE_INTEGER now = {0};
+    QueryPerformanceCounter(&now);
+    return (uint64_t)(now.QuadPart - start.QuadPart) >= limit;
+}
+
 p_result p_lock(const char *path, void **handle) {
     *handle = NULL;
     size_t plen = im_length(path);
@@ -67,33 +74,62 @@ p_result p_lock(const char *path, void **handle) {
     for (size_t i = 0; i <= plen; i++) lk->path[i] = path[i];
     size_t tlen = format_u64_win(lk->token, p_tick());
 
-    LARGE_INTEGER freq = {0}, start = {0}, now = {0};
+    char *reclaim = im_alloc(plen + 9);
+    if (reclaim) {
+        const char *sfx = ".reclaim";
+        for (size_t i = 0; i < plen; i++) reclaim[i] = path[i];
+        for (size_t i = 0; i <= 8; i++) reclaim[plen + i] = sfx[i];
+    }
+
+    LARGE_INTEGER freq = {0}, start = {0};
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&start);
     uint64_t limit = freq.QuadPart > 0 ? (uint64_t)freq.QuadPart * 2ull : 0;
 
-    for (;;) {
+    for (bool first = true;; first = false) {
+        if (!first && win_deadline_passed(start, limit)) {
+            im_free(reclaim);
+            im_free(lk->path);
+            im_free(lk);
+            return P_FAILED;
+        }
         p_result r = p_create_excl(path, lk->token, tlen);
         if (r == P_OK) {
+            im_free(reclaim);
             *handle = lk;
             return P_OK;
         }
         if (r != P_EXISTS) {
+            im_free(reclaim);
             im_free(lk->path);
             im_free(lk);
             return r;
         }
         uint64_t mtime = 0, wall = p_now();
-        if (p_file_mtime(path, &mtime) == P_OK && wall > mtime && wall - mtime >= 60000000ull) {
-            p_result cr = p_claim_remove(path, lk->token);
-            if (cr != P_OK && cr != P_MISSING) {
-                im_free(lk->path);
-                im_free(lk);
-                return P_FAILED;
+        if (reclaim && p_file_mtime(path, &mtime) == P_OK && wall > mtime && wall - mtime >= 60000000ull) {
+            p_result gr = p_create_excl(reclaim, lk->token, tlen);
+            if (gr == P_OK) {
+                uint64_t mtime2 = 0, wall2 = p_now();
+                p_result ar = P_EXISTS;
+                if (p_file_mtime(path, &mtime2) == P_OK && wall2 > mtime2 && wall2 - mtime2 >= 60000000ull) {
+                    p_result cr = p_claim_remove(path, lk->token);
+                    if ((cr == P_OK || cr == P_MISSING) && !win_deadline_passed(start, limit))
+                        ar = p_create_excl(path, lk->token, tlen);
+                }
+                if (win_lock_matches(reclaim, lk->token)) p_remove(reclaim);
+                if (ar == P_OK) {
+                    im_free(reclaim);
+                    *handle = lk;
+                    return P_OK;
+                }
+            } else if (gr == P_EXISTS) {
+                uint64_t rmtime = 0, rwall = p_now();
+                if (p_file_mtime(reclaim, &rmtime) == P_OK && rwall > rmtime && rwall - rmtime >= 120000000ull)
+                    p_claim_remove(reclaim, lk->token);
             }
         }
-        QueryPerformanceCounter(&now);
-        if (limit > 0 && (uint64_t)(now.QuadPart - start.QuadPart) >= limit) {
+        if (win_deadline_passed(start, limit)) {
+            im_free(reclaim);
             im_free(lk->path);
             im_free(lk);
             return P_FAILED;

@@ -2496,11 +2496,16 @@ class Sessions(Base):
         self.assertEqual((rc, info["agent"], info["repository"]), (0, "codex", "race-repo"))
         self.assertGreater(int(info["when"]), int(mid["when"]))
 
-        # Case 2: real lock contention on an established session! Process 1 acquires OS lock, reads existing,
-        # and pauses at hello-in-lock; Process 2 starts while Process 1 holds the lock and MUST wait until
-        # Process 1 releases, then both updates complete in serial order with monotonic time and preserved metadata!
+        # Case 2: real lock contention on an established session with BOTH publications independently observable!
+        # p2 (hello antigravity in repo) holds the lock at hello-in-lock; p3 (inbox in repo_other, which preserves
+        # p2's agent while setting repository=other-repo) pauses right before p_lock, resumes into contention,
+        # blocks while p2 holds the lock, then publishes after p2 releases -> final state MUST have BOTH
+        # agent=antigravity (only p2) AND repository=other-repo (only p3)!
+        repo_other = self.store / "repo-other"
+        repo_other.mkdir()
+        put(repo_other / "helio.conf", "project: os\nlane: apps\nrepository: other-repo\n")
         p2 = subprocess.Popen(
-            [str(RACER), "--pause-cli", "hello-in-lock", str(self.store), "inbox", "--store", str(self.store), "--as", "os/apps", "--session", "race-1"],
+            [str(RACER), "--pause-cli", "hello-in-lock", str(self.store), "hello", "antigravity", "--store", str(self.store), "--as", "os/apps", "--session", "race-1"],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=repo, env=clean,
         )
         p3 = None
@@ -2509,40 +2514,44 @@ class Sessions(Base):
             while not (self.store / "paused.hello-in-lock").exists():
                 self.assertLess(time.time(), deadline)
                 time.sleep(0.01)
-            # Launch contender while p2 holds the OS lock after reading existing!
             p3 = subprocess.Popen(
-                [str(PROGRAM), "hello", "antigravity", "--store", str(self.store), "--as", "os/apps", "--session", "race-1"],
-                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=repo, env=clean,
+                [str(RACER), "--pause-cli", "hello-before-lock", str(self.store), "inbox", "--store", str(self.store), "--as", "os/apps", "--session", "race-1"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=repo_other, env=clean,
             )
+            while not (self.store / "paused.hello-before-lock").exists():
+                self.assertLess(time.time(), deadline)
+                time.sleep(0.01)
+            put(self.store / "resume.hello-before-lock", "go")
             time.sleep(0.1)
-            self.assertIsNone(p3.poll(), "contender must wait while p2 holds OS lock")
+            self.assertIsNone(p3.poll(), "contender must block inside p_lock while p2 holds lock")
             put(self.store / "resume.hello-in-lock", "go")
             _, p2_err = p2.communicate(timeout=30)
             _, p3_err = p3.communicate(timeout=30)
-            self.assertEqual(p2.returncode, 1, p2_err)
-            self.assertEqual(p2_err, b"")
-            self.assertEqual(p3.returncode, 0, p3_err)
-            self.assertEqual(p3_err, b"")
+            self.assertEqual((p2.returncode, p2_err), (0, b""))
+            self.assertEqual((p3.returncode, p3_err), (1, b""))
         finally:
             for proc in (p2, p3):
                 if proc is not None and proc.poll() is None:
                     proc.kill()
-        for f in ("paused.hello-in-lock", "resume.hello-in-lock"):
+        for f in ("paused.hello-in-lock", "resume.hello-in-lock", "paused.hello-before-lock", "resume.hello-before-lock"):
             if (self.store / f).exists():
                 (self.store / f).unlink()
         rc2, info2 = self.read_session("os/apps", "race-1")
-        self.assertEqual((rc2, info2["agent"], info2["repository"]), (0, "antigravity", "race-repo"))
-        # Both p2 (inbox refresh) and p3 (hello antigravity) published monotonically -> at least +2 over info["when"]!
-        self.assertGreaterEqual(int(info2["when"]), int(info["when"]) + 2)
+        self.assertEqual((rc2, info2["agent"], info2["repository"]), (0, "antigravity", "other-repo"))
+        self.assertGreater(int(info2["when"]), int(info["when"]))
         listed = [row for row in self.list_sessions() if row["session"] == "race-1"]
         self.assertEqual(len(listed), 1)
-        self.assertEqual((listed[0]["agent"], listed[0]["repository"], listed[0]["when"]), ("antigravity", "race-repo", info2["when"]))
+        self.assertEqual((listed[0]["agent"], listed[0]["repository"], listed[0]["when"]), ("antigravity", "other-repo", info2["when"]))
 
         # Case 2b: cross-host WSL/Windows lock serialization on the same session over \\wsl.localhost!
-        if not ON_WINDOWS and (BUILD / "helio.exe").exists():
+        # Linux p_lin (hello codex in repo) holds the lock at hello-in-lock; Windows p_win (racer.exe inbox in repo_other)
+        # synchronizes at hello-before-lock (proving Windows process is booted and entering p_lock), blocks while Linux
+        # holds the lock, then publishes after Linux releases -> final state MUST have BOTH agent=codex (only Linux)
+        # AND repository=other-repo (only Windows)!
+        if not ON_WINDOWS and (BUILD / "racer.exe").exists():
             win_store = subprocess.run(["wslpath", "-w", str(self.store)], capture_output=True, text=True, check=True, timeout=30).stdout.strip()
             p_lin = subprocess.Popen(
-                [str(RACER), "--pause-cli", "hello-in-lock", str(self.store), "inbox", "--store", str(self.store), "--as", "os/apps", "--session", "race-1"],
+                [str(RACER), "--pause-cli", "hello-in-lock", str(self.store), "hello", "codex", "--store", str(self.store), "--as", "os/apps", "--session", "race-1"],
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=repo, env=clean,
             )
             p_win = None
@@ -2552,27 +2561,35 @@ class Sessions(Base):
                     self.assertLess(time.time(), deadline)
                     time.sleep(0.01)
                 p_win = subprocess.Popen(
-                    [str(BUILD / "helio.exe"), "hello", "codex", "--store", win_store, "--as", "os/apps", "--session", "race-1"],
-                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=repo, env=clean,
+                    [str(BUILD / "racer.exe"), "--pause-cli", "hello-before-lock", win_store, "inbox", "--store", win_store, "--as", "os/apps", "--session", "race-1"],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=repo_other, env=clean,
                 )
+                while not (self.store / "paused.hello-before-lock").exists():
+                    self.assertLess(time.time(), deadline)
+                    time.sleep(0.01)
+                put(self.store / "resume.hello-before-lock", "go")
                 time.sleep(0.15)
-                self.assertIsNone(p_win.poll(), "Windows helio.exe must wait while Linux holds the cross-host lock")
+                self.assertIsNone(p_win.poll(), "Windows racer.exe must block inside p_lock while Linux holds the cross-host lock")
                 put(self.store / "resume.hello-in-lock", "go")
                 _, lin_err = p_lin.communicate(timeout=30)
                 _, win_err = p_win.communicate(timeout=30)
-                self.assertEqual((p_lin.returncode, lin_err), (1, b""))
-                self.assertEqual((p_win.returncode, win_err), (0, b""))
+                self.assertEqual((p_lin.returncode, lin_err), (0, b""))
+                self.assertEqual((p_win.returncode, win_err), (1, b""))
             finally:
                 for proc in (p_lin, p_win):
                     if proc is not None and proc.poll() is None:
                         proc.kill()
-            for f in ("paused.hello-in-lock", "resume.hello-in-lock"):
+            for f in ("paused.hello-in-lock", "resume.hello-in-lock", "paused.hello-before-lock", "resume.hello-before-lock"):
                 if (self.store / f).exists():
                     (self.store / f).unlink()
             rc_xh, info_xh = self.read_session("os/apps", "race-1")
-            self.assertEqual((rc_xh, info_xh["agent"]), (0, "codex"))
-            self.assertGreaterEqual(int(info_xh["when"]), int(info2["when"]) + 2)
-            # Restore antigravity state so Case 3a/3b below stay deterministic.
+            self.assertEqual((rc_xh, info_xh["agent"], info_xh["repository"]), (0, "codex", "other-repo"))
+            self.assertGreater(int(info_xh["when"]), int(info2["when"]))
+            # Restore antigravity + race-repo state so Case 3a/3b below stay deterministic.
+            self.assertEqual(self.helio("hello", "antigravity", "--session", "race-1", me=None, cwd=repo).returncode, 0)
+            _, info2 = self.read_session("os/apps", "race-1")
+        else:
+            # Restore race-repo so Case 3a/3b below expect race-repo consistently on Windows too.
             self.assertEqual(self.helio("hello", "antigravity", "--session", "race-1", me=None, cwd=repo).returncode, 0)
             _, info2 = self.read_session("os/apps", "race-1")
 
