@@ -276,6 +276,8 @@ A linked commit marks a job landed and closes nothing. The engine starts no prog
 
 ## 9. Fixed marks around every shown message
 
+> **Started:** 2026-11-25T17:30Z
+
 `show` puts a bar before each line. The inbox, the log and the hook print a sender's subject with no closing mark.
 
 **Phase:** 2
