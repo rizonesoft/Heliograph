@@ -1011,6 +1011,7 @@ def _ensure_store_ready(helio_bin: Path, store_dir: Path) -> None:
     store_dir.parent.mkdir(parents=True, exist_ok=True)
     init_res = subprocess.run(
         [str(helio_bin), "init", "--store", str(store_dir)],
+        cwd=str(store_dir.parent),
         capture_output=True,
         text=True,
         check=False,

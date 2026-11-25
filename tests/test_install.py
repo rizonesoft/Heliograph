@@ -3705,16 +3705,17 @@ class TestPhaseInstaller(unittest.TestCase):
                 self.assertEqual(st_win["exe_sha"], self.mod.sha256_file(prev_e))
 
                 # Verify restored WSL c4de2fe reader: check, show, job state/taker, and keyed-send idempotence!
-                chk = subprocess.run([str(wrapper), "check"], env=clean_env, capture_output=True, text=True)
+                chk = subprocess.run([str(wrapper), "check"], cwd=str(store_dir.parent), env=clean_env, capture_output=True, text=True)
                 self.assertEqual(chk.returncode, 0, chk.stdout + chk.stderr)
-                show_tell = subprocess.run([str(wrapper), "show", tell_id, "--as", "impossible/b"], env=clean_env, capture_output=True, text=True, check=True).stdout
+                show_tell = subprocess.run([str(wrapper), "show", tell_id, "--as", "impossible/b"], cwd=str(store_dir.parent), env=clean_env, capture_output=True, text=True, check=True).stdout
                 self.assertIn("hello from candidate", show_tell)
-                show_job = subprocess.run([str(wrapper), "show", job_id, "--as", "impossible/b"], env=clean_env, capture_output=True, text=True, check=True).stdout
+                show_job = subprocess.run([str(wrapper), "show", job_id, "--as", "impossible/b"], cwd=str(store_dir.parent), env=clean_env, capture_output=True, text=True, check=True).stdout
                 self.assertIn("job body from candidate", show_job)
                 self.assertIn("impossible/b", show_job)
                 self.assertIn("done", show_job.lower())
                 retry_keyed_id = subprocess.run(
                     [str(wrapper), "tell", "impossible/all", "compat keyed", "--as", "impossible/a", "--key", "compat-k1"],
+                    cwd=str(store_dir.parent),
                     env=clean_env,
                     input="keyed body\n",
                     capture_output=True,
