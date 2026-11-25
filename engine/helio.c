@@ -153,7 +153,7 @@ static bool parse(options *o, int count, char **args) {
         o->session = o->session_env ? o->session_env : "";
     }
     if (place_open(&o->here, &o->why) != S_OK) return false;
-    if (!o->me_flag && !*o->me && o->here.found && *o->here.lane) {
+    if (!o->me_flag && o->me_env == NULL && o->here.found && *o->here.lane) {
         add(&o->lane, o->here.project), add(&o->lane, "/"), add(&o->lane, o->here.lane);
         if (o->lane.failed) return o->why = "out of memory", false;
         o->me = o->lane.data;

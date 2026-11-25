@@ -344,6 +344,20 @@ bool p_is_real_dir(const char *path) {
     im_free(wide);
     return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) && !(attrs & FILE_ATTRIBUTE_REPARSE_POINT);
 }
+
+p_result p_at_root(const char *dir, bool *at_root) {
+    *at_root = false;
+    wchar_t *wide = im_wide(dir);
+    if (!wide) return P_FAILED;
+    DWORD attrs = GetFileAttributesW(wide);
+    im_free(wide);
+    if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY)) return P_FAILED;
+    /* Under Windows MAX_PATH (260), no path has more than 129 directory levels; 130 "../" steps guarantees the drive root. */
+    size_t ups = 0;
+    for (const char *p = dir; p[0] == '.' && p[1] == '.' && (p[2] == '/' || p[2] == '\\' || !p[2]); p += p[2] ? 3 : 2) ups++;
+    if (ups >= 130) *at_root = true;
+    return P_OK;
+}
 p_result p_input(size_t most, char **data, size_t *length) { return from(im_read_input(most, data, length)); }
 uint64_t p_now(void) {
 #ifdef HELIO_TEST_HOOKS

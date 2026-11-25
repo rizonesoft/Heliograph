@@ -236,11 +236,11 @@ The design says a session sees only its own project's messages and those sent to
 **Build order:**
 
 1. Write one rule in `engine/store.c`. Done when: it decides from the message and the lane alone.
-2. Use it in `engine/helio.c`. Done when: each command that prints a message passes through it.
+2. Use it in `engine/helio.c`. Done when: a same-project sibling can read a session-targeted message through `log` and `show`, while `inbox` and `hook` withhold it and its read leaves the target's unread state intact.
 
 - [x] Write `may_see` in `engine/store.c`: the project of either side, or sent to this lane (design, "How does it find the reader?"). Done when: a table of both sides passes. Cheaper substitute: the receiving side alone.
 - [x] Keep to it in `log`, `show` and `answer` of `engine/helio.c`. Done when: a stranger's id exits 2 with the words of a missing one. Cheaper substitute: a warning.
-- [x] Show every project with `log --all` and no lane in `engine/helio.c`, for the owner's terminal. Done when: a call that names a lane stays inside its project. Cheaper substitute: no way to see all.
+- [x] Show every project with `log --all` when no lane is named outside a configured repository in `engine/helio.c`, for the owner's terminal. Done when: a call with a lane or inside a configured checkout stays inside its project. Cheaper substitute: no way to see all.
 - [x] Commit: `messages: projects stay apart`
 
 **Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.

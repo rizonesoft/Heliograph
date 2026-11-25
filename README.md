@@ -121,7 +121,7 @@ helio: it is already taken
 | `helio show <id>` | Shows one message and marks it seen |
 | `helio take`, `release`, `done`, `refuse` `<id>` | Moves a job on |
 | `helio working <paths>` | Says what I touch, and warns when someone else touches it |
-| `helio log`, `check`, `help` | Shows your project's messages (`log --all` with no lane shows every project), examines the store, or lists every option |
+| `helio log`, `check`, `help` | Shows your project's messages (`log --all` with no lane outside a configured repository shows every project), examines the store, or lists every option |
 
 Exit codes: 0 done, 1 nothing, 2 refused, 3 something failed or is damaged, and what was asked may have happened. Send with `--key` to repeat a send safely.
 

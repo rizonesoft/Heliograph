@@ -66,7 +66,8 @@ s_result place_open(place *p, const char **why) {
     *p = (place){0};
     p->silent_minutes = PLACE_SILENT_DEFAULT;
     text at = {0};
-    for (int up = 0; up < 256 && !p->file; up++) {
+    bool reached_root = false;
+    for (int up = 0; up < 4096 && !p->file; up++) {
         text file = {0};
         add(&file, at.data ? at.data : ""), add(&file, "helio.conf");
         size_t length;
@@ -76,10 +77,27 @@ s_result place_open(place *p, const char **why) {
             text_free(&at);
             return *why = "helio.conf cannot be read", S_DAMAGED;
         }
+        if (p->file) break;
+        bool at_root = false;
+        if (p_at_root(at.data ? at.data : ".", &at_root) != P_OK) {
+            text_free(&at);
+            return *why = "helio.conf cannot be read", S_DAMAGED;
+        }
+        if (at_root) {
+            reached_root = true;
+            break;
+        }
         add(&at, "../");
+        if (at.failed) {
+            text_free(&at);
+            return *why = "out of memory", S_DAMAGED;
+        }
     }
     text_free(&at);
-    if (!p->file) return S_OK;
+    if (!p->file) {
+        if (!reached_root) return *why = "helio.conf search reached depth limit before filesystem root", S_DAMAGED;
+        return S_OK;
+    }
     size_t lineno = 1;
     for (const char *line = p->file; *line; line = next_line(line), lineno++) {
         const char *value = line;

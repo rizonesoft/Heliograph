@@ -3476,7 +3476,7 @@ class ProjectIsolation(Base):
             for mid in (a_live, b_live, ab_cross, a_arch, b_arch):
                 self.assertIn(mid, out_owner)
 
-            # Inferred repo lane keeps `log --all` scoped!
+            # Inferred repo lane keeps `log --all` scoped, and explicit empty HELIO_AS="" still exits 2 even inside a configured checkout!
             repo_lane = no_conf / "repo_lane"
             repo_lane.mkdir()
             put(repo_lane / "helio.conf", "project: alpha\nlane: dev\n")
@@ -3484,6 +3484,9 @@ class ProjectIsolation(Base):
             self.assertEqual(r_rl.returncode, 0)
             self.assertIn(a_arch, r_rl.stdout.decode())
             self.assertNotIn(b_arch, r_rl.stdout.decode())
+            r_rl_empty = run(self.store, "log", "--all", me=None, cwd=repo_lane, extra_env={"HELIO_AS": ""})
+            self.assertEqual(r_rl_empty.returncode, 2)
+            self.assertEqual(r_rl_empty.stdout, b"")
 
             # Project-only helio.conf scopes BOTH `log` and `log --all` to that project (including from 30 nested dirs deep)!
             repo_proj = no_conf / "repo_proj"
@@ -3514,14 +3517,40 @@ class ProjectIsolation(Base):
         self.assertNotIn(b_arch, r_a_ok.stdout.decode())
         bad_link.write_bytes(saved_link)
 
-        # 5. Unrelated lane's corrupt session file (even in taker's own project on a cross-project job) does NOT fail alpha's `log`!
+        # 5. Session lookup isolation:
+        #    (a) Named take (beta/dev --session s-dev): corrupt same-lane sibling session leaves log exit 0; corrupt required taker session exits 3!
         cross_job = self.send("ask", "beta/dev", "alpha/main", "Cross taken", "work")
         self.assertEqual(self.helio("take", cross_job, "--session", "s-dev", me="beta/dev").returncode, 0)
-        put(self.store / "sessions/beta+docs", "corrupt session\n")
+        sib_sess = self.store / f"sessions/beta+dev+{'s-other'.encode().hex()}"
+        put(sib_sess, "corrupt sibling session\n")
         r_a_sess = self.helio("log", me="alpha/ui")
         self.assertEqual(r_a_sess.returncode, 0, r_a_sess.stderr)
         self.assertIn(cross_job, r_a_sess.stdout.decode())
-        (self.store / "sessions/beta+docs").unlink()
+        sib_sess.unlink()
+        req_sess = self.store / f"sessions/beta+dev+{'s-dev'.encode().hex()}~99"
+        req_sess.mkdir()
+        self.assertEqual(self.helio("log", me="alpha/ui").returncode, 3)
+        req_sess.rmdir()
+        #    (b) Sessionless take (beta/ui --session ""): corrupt other-lane session (beta/docs) leaves log exit 0; corrupt taker-lane session exits 3!
+        cross_sl = self.send("ask", "beta/ui", "alpha/main", "Cross sessionless", "work")
+        self.assertEqual(self.helio("take", cross_sl, me="beta/ui").returncode, 0)
+        other_lane_sess = self.store / "sessions/beta+docs"
+        put(other_lane_sess, "corrupt other lane\n")
+        r_sl_ok = self.helio("log", me="alpha/ui")
+        self.assertEqual(r_sl_ok.returncode, 0, r_sl_ok.stderr)
+        self.assertIn(cross_sl, r_sl_ok.stdout.decode())
+        other_lane_sess.unlink()
+        taker_lane_sess = self.store / f"sessions/beta+ui+{'any'.encode().hex()}"
+        put(taker_lane_sess, "corrupt taker lane\n")
+        self.assertEqual(self.helio("log", me="alpha/ui").returncode, 3)
+        taker_lane_sess.unlink()
+        #    (c) Same-project sibling can read a session-targeted message via log and show while inbox/hook withhold it and target's unread state stays intact!
+        targ_a = self.send("tell", "alpha/apps", "alpha/main", "Targeted alpha", "secret", "--for-session", "s1")
+        self.assertIn(targ_a, self.helio("log", me="alpha/ui").stdout.decode())
+        self.assertEqual(self.helio("show", targ_a, me="alpha/ui").returncode, 0)
+        self.assertEqual(self.helio(me="alpha/ui").returncode, 1)
+        self.assertEqual(self.helio("hook", "claude", me="alpha/ui").stdout, b"")
+        self.assertIn(targ_a, self.helio("--session", "s1", me="alpha/apps").stdout.decode())
 
         # 6. Automatic daily archive on Alpha's inbox hides foreign Beta IDs on stderr while explicit `helio archive` keeps them!
         bad_beta = rc_at(old_us + 9000, "ask", "beta/apps", "Bad beta arch", "--as", "beta/main", body=b"bad").stdout.decode().strip()
