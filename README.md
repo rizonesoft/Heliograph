@@ -59,7 +59,7 @@ Legend: ✅ works · 📋 planned
 | Due times, overlap warnings | ✅ | Shown by the inbox and by `helio working` |
 | Daily summary | ✅ | Written by the first inbox or hook of the day |
 | Archive by month, expiry | 📋 | [§1 to §3 and §12](todo/01-heliograph/TODO-01-heliograph.md) |
-| Silent takers, messages for one session | 📋 | [§4 to §6](todo/01-heliograph/TODO-01-heliograph.md) |
+| Silent takers, messages for one session | ✅ | `helio hello`, `silent:` reporting, and `--for-session` targeting |
 | Projects kept apart, landed work, fixed marks | 📋 | [§7 to §9](todo/01-heliograph/TODO-01-heliograph.md) |
 | JSON, taking the next job as a queue | 📋 | [§10 and §11](todo/01-heliograph/TODO-01-heliograph.md) |
 

@@ -3090,6 +3090,10 @@ class SessionTargeting(Base):
             self.assertIn(msg_id, out)
             self.assertIn(job_id, out)
 
+        # Sibling s2 opening the targeted non-job by explicit ID does NOT hide it from target s1.
+        self.assertEqual(self.helio("show", msg_id, "--session", "s2", me="os/apps").returncode, 0)
+        self.assertIn(msg_id, self.helio("--session", "s1", me="os/apps").stdout.decode())
+
         # Sibling s2 and unnamed cannot take or refuse targeted job.
         for args in (("--session", "s2"), ()):
             self.assertEqual(self.helio("take", job_id, *args, me="os/apps").returncode, 2)
@@ -3172,7 +3176,7 @@ class SessionTargeting(Base):
                 input=body, capture_output=True, timeout=30, cwd=deep_store, env=clean_env,
             )
 
-        r_ask = rc_at(old_us, "ask", addr, "Maxlen job", "--as", f"{proj}/main", "--for-session", sess1, body=b"work")
+        r_ask = rc_at(old_us, "ask", addr, "Maxlen job", "--as", f"{proj}/main", "--for-session", sess1, "--key", "k-arch-targ", body=b"work")
         self.assertEqual(r_ask.returncode, 0, r_ask.stderr)
         jid = r_ask.stdout.decode().strip()
         self.assertEqual(rc_at(old_us + 1000, "take", jid, "--as", addr, "--session", sess1).returncode, 0)
@@ -3184,6 +3188,16 @@ class SessionTargeting(Base):
         self.assertEqual(run(deep_store, "archive", me=None).returncode, 3)
         bad_seen.unlink()
         self.assertEqual(run(deep_store, "archive", me=None).returncode, 0)
+        # Keyed retry after archive: exact same target returns original ID with no new live post; changed or omitted target is refused!
+        live_before = set((deep_store / "messages").iterdir())
+        r_retry_ok = run(deep_store, "ask", addr, "Maxlen job", "--for-session", sess1, "--key", "k-arch-targ", me=f"{proj}/main", body="work")
+        self.assertEqual(r_retry_ok.returncode, 0, r_retry_ok.stderr)
+        self.assertEqual(r_retry_ok.stdout.decode().strip(), jid)
+        self.assertEqual(set((deep_store / "messages").iterdir()), live_before)
+        for bad_retry in (("--for-session", sess2), ()):
+            r_retry_bad = run(deep_store, "ask", addr, "Maxlen job", *bad_retry, "--key", "k-arch-targ", me=f"{proj}/main", body="work")
+            self.assertEqual(r_retry_bad.returncode, 2, bad_retry)
+            self.assertEqual(set((deep_store / "messages").iterdir()), live_before)
         # Show archived job as target sess1 (P_EXISTS valid) and verify corrupt archived seen mark fails show retry!
         self.assertEqual(run(deep_store, "show", jid, "--session", sess1, me=addr).returncode, 0)
         self.assertEqual(run(deep_store, "check", me=None).returncode, 0)
