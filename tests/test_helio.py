@@ -4441,11 +4441,12 @@ class RepositoryRouting(Base):
             if f"os+dev+{s3_hex}" == sf.name or sf.name.startswith(f"os+dev+{s3_hex}~"):
                 sf.unlink()
         put(self.store / f"sessions/os+dev+{s3_hex}", f"time: {t0 + 119 * M}\nagent: claude\nrepository: repo-a\nsession: s3\nend: yes\n")
-        # Both BEFORE and AFTER the subsequent repo-b refresh at +120m, repo-a (+119m) is preserved -> NOT silent!
-        r_ok3_pre = rc_at(t0 + 120 * M - 100, "inbox", "--as", "os/main", cwd=repo_a)
+        # Pre-refresh check at t0 + 120m + 500us (PAST the take's 120m silence threshold at t0 + 200us + 120m)
+        # MUST read canonical +119m; post-refresh check after repo-b at +120m + 600us MUST read preserved per-repo copy!
+        r_ok3_pre = rc_at(t0 + 120 * M + 500, "inbox", "--as", "os/main", cwd=repo_a)
         self.assertEqual(r_ok3_pre.returncode, 1, r_ok3_pre.stderr)
         self.assertNotIn(scoped3, r_ok3_pre.stdout.decode())
-        self.assertEqual(rc_at(t0 + 120 * M, "hello", "claude", "--session", "s3", "--as", "os/dev", cwd=repo_b).returncode, 0)
+        self.assertEqual(rc_at(t0 + 120 * M + 600, "hello", "claude", "--session", "s3", "--as", "os/dev", cwd=repo_b).returncode, 0)
         r_ok3 = rc_at(t0 + 121 * M, "inbox", "--as", "os/main", cwd=repo_a)
         self.assertEqual(r_ok3.returncode, 1, r_ok3.stderr)
         self.assertNotIn(scoped3, r_ok3.stdout.decode())
@@ -4479,6 +4480,38 @@ class RepositoryRouting(Base):
         mig_post = (self.store / f"messages/{mig_job}.post").read_text()
         self.assertIn("to: os/all\n", mig_post)
         self.assertIn("repository: repo-a\n", mig_post)
+
+        # Paused mid-enumeration migration handoff: sender lists sessions while s5 only has canonical repo-a,
+        # pauses at sessions-after-list while s5 refreshes in repo-b (creating per-repo A and sweeping canonical A),
+        # then resumes -> place_busy rescans and STILL routes to os/all (in repo-a), NOT os/owner!
+        s5_hex = "s5".encode().hex()
+        for sf in list((self.store / "sessions").iterdir()):
+            sf.unlink()
+        now_us = int(time.time() * 1_000_000)
+        put(self.store / f"sessions/os+dev+{s5_hex}", f"time: {now_us}\nagent: claude\nrepository: repo-a\nsession: s5\nend: yes\n")
+        hit = self.store / "paused.sessions-after-list"
+        go = self.store / "resume.sessions-after-list"
+        paused = subprocess.Popen(
+            [str(RACER), "--pause-cli", "sessions-after-list", str(self.store),
+             "ask", "path:docs/handoff.md", "Paused handoff", "--as", "os/main5", "--store", str(self.store)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=repo_a, env=clean_env,
+        )
+        try:
+            paused.stdin.write(b"work")
+            paused.stdin.close()
+            deadline = time.time() + 10
+            while not hit.exists() and time.time() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(hit.exists(), "reader did not reach sessions-after-list pause")
+            self.assertEqual(self.helio("hello", "claude", "--session", "s5", me="os/dev", cwd=repo_b).returncode, 0)
+        finally:
+            put(go, "go")
+            out_p, err_p = paused.communicate(timeout=30)
+        self.assertEqual(paused.returncode, 0, err_p)
+        handoff_id = out_p.decode().strip()
+        handoff_post = (self.store / f"messages/{handoff_id}.post").read_text()
+        self.assertIn("to: os/all\n", handoff_post)
+        self.assertIn("repository: repo-a\n", handoff_post)
 
 
 if __name__ == "__main__":

@@ -848,60 +848,71 @@ static p_result each_session_filtered(store *s, const char *only_lane, bool incl
         text_free(&folder);
         return P_FAILED;
     }
-    latest_map map = {.only_lane = only_lane, .include_named_repos = include_named_repos};
-    p_result r = p_list(folder.data, collect_latest_cb, &map);
-    text_free(&folder);
-    if (r != P_OK || map.failed) {
-        for (size_t i = 0; i < map.count; i++) p_free(map.items[i].base);
-        p_free(map.items);
-        return r != P_OK ? r : P_FAILED;
-    }
     bool had_error = false, keep = true;
-    for (size_t i = 0; i < map.count && keep; i++) {
-        session_info info = {0};
-        bool ok = false, gone = false, rescan = false;
-        text fast = {0};
-        session_seq_path(s, &fast, map.items[i].base, map.items[i].seq);
-        if (fast.failed) {
+    /* When include_named_repos is true, a concurrent cross-repo refresh or legacy migration may create
+       a new per-repo key after our p_list and sweep the listed canonical generation before we read it.
+       If any listed generation disappears (rr == P_MISSING), run one follow-up listing pass so newly
+       created per-repo keys are never missed by place_busy or place_lane_sessions. */
+    for (int pass = 0; pass < 2 && keep; pass++) {
+        latest_map map = {.only_lane = only_lane, .include_named_repos = include_named_repos};
+        p_result r = p_list(folder.data, collect_latest_cb, &map);
+        if (r != P_OK || map.failed) {
+            for (size_t i = 0; i < map.count; i++) p_free(map.items[i].base);
+            p_free(map.items);
+            text_free(&folder);
+            return r != P_OK ? r : P_FAILED;
+        }
+        if (pass == 0 && s->pause) s->pause(s->pause_user, "sessions-after-list");
+        bool saw_missing = false;
+        for (size_t i = 0; i < map.count && keep; i++) {
+            session_info info = {0};
+            bool ok = false, gone = false, rescan = false;
+            text fast = {0};
+            session_seq_path(s, &fast, map.items[i].base, map.items[i].seq);
+            if (fast.failed) {
+                text_free(&fast);
+                had_error = true;
+                continue;
+            }
+            bool parsed = false, is_empty = false;
+            p_result rr = read_session_file(fast.data, &info, &parsed, &is_empty);
             text_free(&fast);
-            had_error = true;
-            continue;
-        }
-        bool parsed = false, is_empty = false;
-        p_result rr = read_session_file(fast.data, &info, &parsed, &is_empty);
-        text_free(&fast);
-        if (rr == P_OK && parsed) {
-            copy_str(info.lane, sizeof info.lane, map.items[i].lane);
-            ok = true;
-        } else if (rr == P_MISSING || (rr == P_OK && is_empty)) {
-            rescan = true;
-        } else {
-            had_error = true;
-        }
-        if (rescan) {
-            for (int attempt = 0; attempt < 8; attempt++) {
-                bool any_found = false, valid_found = false;
-                uint64_t max_seq = 0, valid_seq = 0;
-                p_result br = read_best_generation(s, map.items[i].base, &any_found, &max_seq, &valid_found, &valid_seq, NULL, false, &info);
-                if (br == P_MISSING) continue;
-                if (br == P_OK && !any_found) {
-                    gone = true;
+            if (rr == P_OK && parsed) {
+                copy_str(info.lane, sizeof info.lane, map.items[i].lane);
+                ok = true;
+            } else if (rr == P_MISSING || (rr == P_OK && is_empty)) {
+                if (rr == P_MISSING) saw_missing = true;
+                rescan = true;
+            } else {
+                had_error = true;
+            }
+            if (rescan) {
+                for (int attempt = 0; attempt < 8; attempt++) {
+                    bool any_found = false, valid_found = false;
+                    uint64_t max_seq = 0, valid_seq = 0;
+                    p_result br = read_best_generation(s, map.items[i].base, &any_found, &max_seq, &valid_found, &valid_seq, NULL, false, &info);
+                    if (br == P_MISSING) continue;
+                    if (br == P_OK && !any_found) {
+                        gone = true;
+                        break;
+                    }
+                    if (br == P_OK && valid_found) {
+                        copy_str(info.lane, sizeof info.lane, map.items[i].lane);
+                        ok = true;
+                    } else {
+                        had_error = true;
+                    }
                     break;
                 }
-                if (br == P_OK && valid_found) {
-                    copy_str(info.lane, sizeof info.lane, map.items[i].lane);
-                    ok = true;
-                } else {
-                    had_error = true;
-                }
-                break;
+                if (!ok && !gone) had_error = true;
             }
-            if (!ok && !gone) had_error = true;
+            if (ok) keep = each(user, &info);
         }
-        if (ok) keep = each(user, &info);
+        for (size_t i = 0; i < map.count; i++) p_free(map.items[i].base);
+        p_free(map.items);
+        if (!include_named_repos || !saw_missing) break;
     }
-    for (size_t i = 0; i < map.count; i++) p_free(map.items[i].base);
-    p_free(map.items);
+    text_free(&folder);
     return had_error ? P_FAILED : P_OK;
 }
 
