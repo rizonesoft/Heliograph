@@ -4441,7 +4441,10 @@ class RepositoryRouting(Base):
             if f"os+dev+{s3_hex}" == sf.name or sf.name.startswith(f"os+dev+{s3_hex}~"):
                 sf.unlink()
         put(self.store / f"sessions/os+dev+{s3_hex}", f"time: {t0 + 119 * M}\nagent: claude\nrepository: repo-a\nsession: s3\nend: yes\n")
-        # Subsequent refresh in repo-b at +120m must durably preserve repo-a (+119m) BEFORE replacing canonical!
+        # Both BEFORE and AFTER the subsequent repo-b refresh at +120m, repo-a (+119m) is preserved -> NOT silent!
+        r_ok3_pre = rc_at(t0 + 120 * M - 100, "inbox", "--as", "os/main", cwd=repo_a)
+        self.assertEqual(r_ok3_pre.returncode, 1, r_ok3_pre.stderr)
+        self.assertNotIn(scoped3, r_ok3_pre.stdout.decode())
         self.assertEqual(rc_at(t0 + 120 * M, "hello", "claude", "--session", "s3", "--as", "os/dev", cwd=repo_b).returncode, 0)
         r_ok3 = rc_at(t0 + 121 * M, "inbox", "--as", "os/main", cwd=repo_a)
         self.assertEqual(r_ok3.returncode, 1, r_ok3.stderr)
@@ -4470,8 +4473,9 @@ class RepositoryRouting(Base):
         self.assertEqual(len(s4_lines), 1, r_log4.stdout.decode())
         self.assertNotIn("SILENT", s4_lines[0])
         # (b) refreshing s4 in repo-b migrates repo-a's legacy timestamp BEFORE superseding canonical, keeping repo-a busy!
+        # Send as `os/main4` so os/main4's own heartbeat from inbox/log is excluded by busy_each!
         self.assertEqual(rc_at(t0 + 122 * M, "hello", "claude", "--session", "s4", "--as", "os/dev", cwd=repo_b).returncode, 0)
-        mig_job = rc_at(t0 + 122 * M + 100, "ask", "path:docs/mig.md", "Migrated", "--as", "os/main", cwd=repo_a, body=b"work").stdout.decode().strip()
+        mig_job = rc_at(t0 + 122 * M + 100, "ask", "path:docs/mig.md", "Migrated", "--as", "os/main4", cwd=repo_a, body=b"work").stdout.decode().strip()
         mig_post = (self.store / f"messages/{mig_job}.post").read_text()
         self.assertIn("to: os/all\n", mig_post)
         self.assertIn("repository: repo-a\n", mig_post)

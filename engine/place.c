@@ -568,10 +568,15 @@ static p_result read_best_generation(const store *s, const char *base, bool *any
    `<base>~<seq+1>` via p_create_excl. On P_EXISTS another writer won that slot,
    so we re-read the latest generation, merge monotonically, and retry. After
    publishing, the superseded generation is removed best-effort. */
+static s_result preserve_named_repo(store *s, const char *lane, const char *ag, const char *repo, const char *ss, uint64_t at);
+
 /* Publishes a monotonic session generation for `base`. When `preserve_at` is non-zero,
    ensures the key records at least `preserve_at` (a no-op if an existing generation already
-   has `when >= preserve_at`). */
-static s_result publish_session_key(store *s, const char *base, const char *ag, const char *rp, const char *ss, uint64_t preserve_at, bool use_pauses) {
+   has `when >= preserve_at`). When `preserve_lane` is non-NULL (canonical named-session write),
+   durably preserves the exact `existing` predecessor's prior repository and legacy `repo-time:`
+   entries on every CAS attempt (including retries) BEFORE superseding `existing`. */
+static s_result publish_session_key(store *s, const char *base, const char *ag, const char *rp, const char *ss,
+                                    uint64_t preserve_at, const char *preserve_lane, bool use_pauses) {
     if (use_pauses && s->pause) s->pause(s->pause_user, "hello-write");
 
     for (int attempt = 0; attempt < MOST_CAS_ATTEMPTS; attempt++) {
@@ -585,10 +590,22 @@ static s_result publish_session_key(store *s, const char *base, const char *ag, 
 
         if (preserve_at && have_existing && existing.when >= preserve_at) return S_OK;
 
+        const char *use_agent = *ag ? ag : (have_existing && *existing.agent ? existing.agent : "");
+        if (preserve_lane && *ss && have_existing) {
+            if (*existing.repository && (!*rp || !same(existing.repository, rp))) {
+                s_result pr = preserve_named_repo(s, preserve_lane, use_agent, existing.repository, ss, existing.when);
+                if (pr != S_OK) return pr;
+            }
+            for (size_t i = 0; i < existing.legacy_repo_count; i++) {
+                if (*rp && same(existing.legacy_repos[i].name, rp)) continue;
+                s_result pr = preserve_named_repo(s, preserve_lane, use_agent, existing.legacy_repos[i].name, ss, existing.legacy_repos[i].when);
+                if (pr != S_OK) return pr;
+            }
+        }
+
         uint64_t next_seq = any_found ? max_seq + 1 : 0;
         uint64_t now = preserve_at ? preserve_at : p_now();
         if (have_existing && now <= existing.when) now = existing.when + 1;
-        const char *use_agent = *ag ? ag : (have_existing && *existing.agent ? existing.agent : "");
 
         text next_path = {0}, data = {0};
         session_seq_path(s, &next_path, base, next_seq);
@@ -649,8 +666,6 @@ static s_result publish_session_key(store *s, const char *base, const char *ag, 
     return s->why = "the session cannot be announced", S_DAMAGED;
 }
 
-static s_result read_session_by_base(store *s, const char *lane, const char *base, session_info *out);
-
 static s_result preserve_named_repo(store *s, const char *lane, const char *ag, const char *repo, const char *ss, uint64_t at) {
     if (!repo || !*repo || !repo_ok(repo)) return S_OK;
     text rbase = {0};
@@ -659,7 +674,7 @@ static s_result preserve_named_repo(store *s, const char *lane, const char *ag, 
         text_free(&rbase);
         return s->why = "out of memory", S_DAMAGED;
     }
-    s_result r = publish_session_key(s, rbase.data, ag, repo, ss, at, false);
+    s_result r = publish_session_key(s, rbase.data, ag, repo, ss, at, NULL, false);
     text_free(&rbase);
     return r;
 }
@@ -686,29 +701,9 @@ s_result place_hello(store *s, const char *lane, const char *agent, const char *
     }
     text_free(&folder);
 
-    /* Write-before-supersede: for named sessions, durably preserve any prior canonical repository
-       heartbeat (when changing repositories) and any legacy 6a2b21a inline `repo-time:` entries
-       BEFORE superseding the canonical record. Any crash or write error leaves the prior canonical
-       record intact for retry; a crash after canonical publication is still preserved on the next
-       cross-repository refresh by this same step. */
-    if (*ss) {
-        session_info cur = {0};
-        s_result cr = read_session_by_base(s, lane, base.data, &cur);
-        if (cr == S_OK) {
-            const char *use_ag = *ag ? ag : cur.agent;
-            if (*cur.repository && (!*rp || !same(cur.repository, rp))) {
-                s_result pr = preserve_named_repo(s, lane, use_ag, cur.repository, ss, cur.when);
-                if (pr != S_OK) { text_free(&base); return pr; }
-            }
-            for (size_t i = 0; i < cur.legacy_repo_count; i++) {
-                if (*rp && same(cur.legacy_repos[i].name, rp)) continue;
-                s_result pr = preserve_named_repo(s, lane, use_ag, cur.legacy_repos[i].name, ss, cur.legacy_repos[i].when);
-                if (pr != S_OK) { text_free(&base); return pr; }
-            }
-        }
-    }
-
-    s_result r = publish_session_key(s, base.data, ag, rp, ss, 0, true);
+    /* Write-before-supersede happens inside publish_session_key's CAS loop on every attempt
+       (preserving the exact predecessor generation being superseded before creating next_seq). */
+    s_result r = publish_session_key(s, base.data, ag, rp, ss, 0, *ss ? lane : NULL, true);
     text_free(&base);
     if (r != S_OK || !*ss || !*rp) return r;
     return preserve_named_repo(s, lane, ag, rp, ss, 0);
@@ -764,30 +759,34 @@ s_result place_session_repo(store *s, const char *lane, const char *session, con
         text_free(&base);
         return s->why = "out of memory", S_DAMAGED;
     }
-    session_info repo_info = {0}, canon_info = {0};
+    /* Read canonical FIRST and per-repo copy SECOND to match the writer's write-before-supersede
+       handoff order (writer preserves per-repo copy BEFORE superseding canonical): if canonical has
+       already moved on to another repository, the per-repo copy is guaranteed to be on disk. */
+    session_info canon_info = {0}, repo_info = {0};
+    s_result cr = place_session(s, lane, session, &canon_info);
+    if (cr == S_DAMAGED) {
+        text_free(&base);
+        return S_DAMAGED;
+    }
     s_result rr = read_session_by_base(s, lane, base.data, &repo_info);
     text_free(&base);
     if (rr == S_DAMAGED) return S_DAMAGED;
-    s_result cr = place_session(s, lane, session, &canon_info);
-    if (cr == S_DAMAGED) return S_DAMAGED;
 
-    /* Combine both records so an interrupted refresh or legacy 6a2b21a canonical record
-       never loses the newest qualifying heartbeat for `repository`. */
     uint64_t best_when = 0;
     bool have = false;
-    if (rr == S_OK && same(repo_info.repository, repository)) {
-        *out = repo_info;
-        best_when = repo_info.when;
-        have = true;
-    }
     if (cr == S_OK) {
         uint64_t ct = place_session_repo_when(&canon_info, repository);
-        if (ct && (!have || ct > best_when)) {
+        if (ct) {
             *out = canon_info;
             copy_str(out->repository, sizeof out->repository, repository);
             out->when = ct;
+            best_when = ct;
             have = true;
         }
+    }
+    if (rr == S_OK && same(repo_info.repository, repository) && (!have || repo_info.when > best_when)) {
+        *out = repo_info;
+        have = true;
     }
     return have ? S_OK : S_NOTHING;
 }
