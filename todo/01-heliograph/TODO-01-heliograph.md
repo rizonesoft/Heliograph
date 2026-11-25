@@ -146,7 +146,9 @@ An archived message must still be found by its id. Without this a keyed send rep
 
 ## 4. Sessions announced by every call
 
-Only the Claude hook announces a session, and it records a time alone. Codex and Antigravity never hook, so they look silent. Every call that names its lane becomes a sign of life, and `helio hello` records agent and repository.
+> **Started:** 2026-11-25T06:28Z
+
+Only the Claude hook announces a session, and it records a time alone. Codex and Antigravity never hook, so they look silent. Every call that names its lane becomes a sign of life, and `helio hello` records agent and repository. **Corrected 2026-11-25:** Plan review (`docs/reviews/01-heliograph/D01-T01-s4.md`) clarified: preserve explicit `hello`/`hook` metadata safely across concurrent ordinary refreshes via a `hello`-only `.meta` sidecar + `replace=false` retry + read-error non-overwrite; resolve integration session IDs from `HELIO_SESSION`, `CODEX_THREAD_ID`, `ANTIGRAVITY_CONVERSATION_ID`, and `CLAUDE_CODE_SESSION_ID`; read optional `repository: <name>` from `helio.conf` (leaving it empty outside a configured repository); announce best-effort across `help` (when store and lane are available), `init` (after creation), `archive`, and valid `hook` (continuing delivery on warning); validate `<agent>` and `session_ok` (1..64 bytes unchanged by `clean`) before `store_open`; and exercise `place_session`/`place_each_session` through the C test harness with a 512-byte read cap.
 
 **Phase:** 2
 **Needs:** none

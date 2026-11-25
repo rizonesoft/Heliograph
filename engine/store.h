@@ -39,6 +39,7 @@ typedef struct job {
 } job;
 
 bool address_ok(const char *address, bool may_be_all); /* project/lane, or project/all */
+bool session_ok(const char *session); /* empty, or 1..64 bytes unchanged by clean(..., true) */
 s_result store_open(store *s, const char *folder);
 void store_close(store *s);
 s_result store_message(store *s, const char *id, message *out);

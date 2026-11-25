@@ -28,6 +28,17 @@ bool address_ok(const char *a, bool may_be_all) {
     return may_be_all || !same(a + slash + 1, "all");
 }
 
+bool session_ok(const char *s) {
+    if (!s || !*s) return true;
+    size_t n = len(s);
+    if (n > 64) return false;
+    text cleaned = {0};
+    clean(&cleaned, s, true);
+    bool good = !cleaned.failed && cleaned.length == n && same(cleaned.data ? cleaned.data : "", s);
+    text_free(&cleaned);
+    return good;
+}
+
 static bool id_ok(const char *id) {
     size_t n = len(id);
     if (n < 8 || n > 40) return false;
@@ -630,18 +641,19 @@ s_result store_post(store *s, const message *m, const char *key, text *id) {
 static s_result add_link(store *s, const char *id, const job *now, actor me, const char *state, const char *note, bool *published) {
     if (published) *published = false;
     if (now->links >= MOST_LINKS - 2 && !same(state, "done") && !same(state, "refused")) return say(s, S_REFUSED, "this job changed hands too often: close it and ask again");
-    text out = {0}, line = {0}, name = {0}, session = {0};
-    clean(&line, note, true), clean(&session, me.session, true), link_name(&name, now->links);
+    if (!session_ok(me.session)) return say(s, S_REFUSED, "the session name is invalid or too long");
+    text out = {0}, line = {0}, name = {0};
+    clean(&line, note, true), link_name(&name, now->links);
     s_result result;
-    if (line.length > MOST_NOTE || session.length > 64) result = say(s, S_REFUSED, "the note or the session name is too long");
+    if (line.length > MOST_NOTE) result = say(s, S_REFUSED, "the note or the session name is too long");
     else if (secret(line.data ? line.data : "")) result = say(s, S_REFUSED, "the note looks like it contains a secret");
     else {
-        add(&out, "by: "), add(&out, me.lane), add(&out, "\ntime: "), add_time(&out, p_now()), add(&out, "\nsession: "), add(&out, session.data ? session.data : "");
+        add(&out, "by: "), add(&out, me.lane), add(&out, "\ntime: "), add_time(&out, p_now()), add(&out, "\nsession: "), add(&out, me.session ? me.session : "");
         add(&out, "\nstate: "), add(&out, state), add(&out, "\nnote: "), add(&out, line.data ? line.data : ""), add(&out, "\nend: yes\n");
-        bool full = out.failed || line.failed || name.failed || session.failed;
+        bool full = out.failed || line.failed || name.failed;
         result = full ? say(s, S_DAMAGED, "out of memory") : make_ex(s, id, name.data, out.data, published);
     }
-    text_free(&out), text_free(&line), text_free(&name), text_free(&session);
+    text_free(&out), text_free(&line), text_free(&name);
     return result;
 }
 

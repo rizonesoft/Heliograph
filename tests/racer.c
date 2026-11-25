@@ -7,6 +7,7 @@
    racer --pause-cli <stages> <store> <helio-args...>: runs helio_paused. */
 #include "archive.h"
 #include "helio.h"
+#include "place.h"
 #include "store.h"
 
 #ifdef HELIO_TEST_HOOKS
@@ -146,8 +147,38 @@ static void sort_names_simple(char **names, size_t count) {
     }
 }
 
+static bool print_one_session(void *user, const session_info *info) {
+    (void)user;
+    text out = {0};
+    add(&out, "lane="), add(&out, info->lane);
+    add(&out, "\twhen="), add_number(&out, info->when, 0);
+    add(&out, "\tagent="), add(&out, info->agent);
+    add(&out, "\trepository="), add(&out, info->repository);
+    add(&out, "\tsession="), add(&out, info->session);
+    add(&out, "\tlegacy="), add(&out, info->legacy ? "1" : "0");
+    add(&out, "\n");
+    if (!out.failed) p_print(out.data);
+    text_free(&out);
+    return true;
+}
+
 int racer(int count, char **args) {
     if (count >= 3 && same(args[1], "--remove")) return (int)p_remove(args[2]);
+    if (count >= 4 && same(args[1], "--read-session")) {
+        store s = {.folder = args[2]};
+        const char *lane = args[3];
+        const char *sess = count >= 5 ? args[4] : "";
+        session_info info = {0};
+        s_result r = place_session(&s, lane, sess, &info);
+        if (r == S_OK) print_one_session(NULL, &info);
+        else if (s.why) p_error(s.why), p_error("\n");
+        return (int)r;
+    }
+    if (count >= 3 && same(args[1], "--list-sessions")) {
+        store s = {.folder = args[2]};
+        p_result r = place_each_session(&s, print_one_session, NULL);
+        return r == P_OK ? 0 : (int)r;
+    }
 #ifdef HELIO_TEST_HOOKS
     if (count >= 3 && same(args[1], "--remove-fail-flush")) {
         plat_fail_flush = true;

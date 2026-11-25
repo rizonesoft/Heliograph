@@ -14,6 +14,7 @@ static const char help[] =
     "  helio show <id>      helio take <id>     helio release <id>\n"
     "  helio done <id> [note]                   helio refuse <id> [note]\n"
     "  helio working <paths>                            what I touch, for the overlap warning\n"
+    "  helio hello <agent>                              announce this session (claude, codex, antigravity)\n"
     "  helio log            helio check         helio archive       helio init\n"
     "\n"
     "Options: --as <project/lane>, --about <paths>, --now or --whenever, --store <folder>,\n--key <text> (sending the same key again sends nothing new), --session <name>, --all,\n--due <minutes> (an overdue job goes back to its sender and the owner).\n"
@@ -23,7 +24,7 @@ static const char help[] =
 
 typedef struct options {
     const char *me, *about, *urgency, *folder, *session, *key, *due;
-    bool all, from_default;
+    bool all, from_default, session_flag;
     char *words[4]; /* the command and what follows it */
     int count;
     place here;
@@ -62,6 +63,15 @@ static char *decode_hex_env(const char *hex) {
     return out;
 }
 
+static char *env_nonempty(const char *name) {
+    char *v = p_env(name);
+    if (v && !*v) {
+        p_free(v);
+        return NULL;
+    }
+    return v;
+}
+
 static bool parse(options *o, int count, char **args) {
     *o = (options){.about = "", .urgency = "next", .key = "", .due = "", .why = NULL};
     o->me_env = p_env("HELIO_AS"), o->folder_env = p_env("HELIO_STORE"), o->default_env = p_env("HELIO_DEFAULT_STORE");
@@ -75,20 +85,33 @@ static bool parse(options *o, int count, char **args) {
     }
     o->me = o->me_env ? o->me_env : "", o->folder = o->folder_env ? o->folder_env : "";
     if (!*o->folder && o->default_env && *o->default_env) o->folder = o->default_env, o->from_default = true;
-    if (!(o->session_env = p_env("HELIO_SESSION"))) o->session_env = p_env("CLAUDE_CODE_SESSION_ID");
-    o->session = o->session_env ? o->session_env : "";
+    o->session = "";
     for (int i = 1; i < count; i++) {
         const char **value = same(args[i], "--as") ? &o->me : same(args[i], "--session") ? &o->session : same(args[i], "--key") ? &o->key : same(args[i], "--due") ? &o->due : same(args[i], "--about") ? &o->about : same(args[i], "--store") ? &o->folder : NULL;
         if (value) {
             if (++i == count) return o->why = "an option has no value", false;
             *value = args[i];
             if (value == &o->folder) o->from_default = false;
+            if (value == &o->session) o->session_flag = true;
         } else if (same(args[i], "--all")) o->all = true;
         else if (same(args[i], "--now")) o->urgency = "now";
         else if (same(args[i], "--whenever")) o->urgency = "whenever";
         else if (starts(args[i], "--")) return o->why = "there is no such option: see helio help", false;
         else if (o->count == 4) return o->why = "too many words: put the subject in quotes", false;
         else o->words[o->count++] = args[i];
+    }
+    if (!o->session_flag) {
+        o->session_env = env_nonempty("HELIO_SESSION");
+        if (!o->session_env && o->count >= 2 && (same(o->words[0], "hello") || same(o->words[0], "hook"))) {
+            const char *preferred = same(o->words[1], "claude") ? "CLAUDE_CODE_SESSION_ID"
+                                  : same(o->words[1], "codex") ? "CODEX_THREAD_ID"
+                                  : same(o->words[1], "antigravity") ? "ANTIGRAVITY_CONVERSATION_ID" : NULL;
+            if (preferred) o->session_env = env_nonempty(preferred);
+        }
+        if (!o->session_env) o->session_env = env_nonempty("CODEX_THREAD_ID");
+        if (!o->session_env) o->session_env = env_nonempty("ANTIGRAVITY_CONVERSATION_ID");
+        if (!o->session_env) o->session_env = env_nonempty("CLAUDE_CODE_SESSION_ID");
+        o->session = o->session_env ? o->session_env : "";
     }
     if (place_open(&o->here, &o->why) != S_OK) return false;
     if (!*o->me && o->here.found && *o->here.lane) {
@@ -356,11 +379,24 @@ static int post(store *s, options *o, const char *kind, const char *to, const ch
     return print(&id) ? 0 : fail("it was sent, but its id cannot be written", 3);
 }
 
+static bool agent_ok(const char *agent) {
+    return same(agent, "claude") || same(agent, "codex") || same(agent, "antigravity");
+}
+
+static s_result announce_session(store *s, const options *o, const char *agent) {
+    const char *repo = o->here.found ? o->here.repository : "";
+    return place_hello(s, o->me, agent, repo, o->session);
+}
+
+static void announce_best_effort(store *s, const options *o, const char *agent) {
+    if (announce_session(s, o, agent) != S_OK) fail(s->why, 0);
+}
+
 /* Lets a session's start or prompt show what waits for it. It is quiet when
    there is nothing, and a problem is one line and never stops the session. */
 static int hook(store *s, options *o) {
     if (!same(o->words[1], "claude")) return fail("there is a hook for claude only: other agents run helio between sections", 2);
-    if (place_hello(s, o->me) != S_OK) return fail(s->why, 3);
+    announce_best_effort(s, o, "claude");
     listing l = {.me = o->me};
     size_t damaged = fill_inbox(s, &l);
     if (l.shown) {
@@ -437,9 +473,30 @@ static int init(const char *folder, bool from_default) {
 
 static int run(options *o, void (*pause)(void *user, const char *stage), void *pause_user) {
     const char *command = o->count ? o->words[0] : "inbox";
-    if (same(command, "help")) return p_print(help) ? 0 : 3;
+    if (same(command, "help")) {
+        if (!p_print(help)) return 3;
+        if (*o->folder && address_ok(o->me, false)) {
+            store s = {0};
+            if (store_open(&s, o->folder) == S_OK) {
+                s.pause = pause, s.pause_user = pause_user;
+                announce_best_effort(&s, o, "");
+                store_close(&s);
+            } else {
+                store_close(&s);
+            }
+        }
+        return 0;
+    }
     if (!*o->folder) return fail("say where the store is: --store or HELIO_STORE", 2);
-    if (same(command, "init")) return o->count == 1 ? init(o->folder, o->from_default) : fail("init takes no words", 2);
+    if (same(command, "init")) {
+        if (o->count != 1) return fail("init takes no words", 2);
+        int rc = init(o->folder, o->from_default);
+        if (rc == 0 && address_ok(o->me, false)) {
+            store s = {.folder = o->folder, .pause = pause, .pause_user = pause_user};
+            announce_best_effort(&s, o, "");
+        }
+        return rc;
+    }
     if (same(command, "archive")) {
         if (o->count != 1) return fail("archive takes no words", 2);
         size_t moved = 0;
@@ -447,22 +504,40 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
         s_result ar = archive_store(o->folder, 0, &moved, &report, pause, pause_user);
         if (report.length && !report.failed) p_error(report.data);
         text_free(&report);
-        if (ar == S_DAMAGED) return fail("archive stopped with errors", 3);
-        if (ar == S_NOTHING) return 1;
-        text out = {0};
-        add_number(&out, (uint64_t)moved, 0), add(&out, " archived\n");
-        return print(&out) ? 0 : fail("the output cannot be written", 3);
+        int rc;
+        if (ar == S_DAMAGED) rc = fail("archive stopped with errors", 3);
+        else if (ar == S_NOTHING) rc = 1;
+        else {
+            text out = {0};
+            add_number(&out, (uint64_t)moved, 0), add(&out, " archived\n");
+            rc = print(&out) ? 0 : fail("the output cannot be written", 3);
+        }
+        if (address_ok(o->me, false)) {
+            store s = {0};
+            if (store_open(&s, o->folder) == S_OK) {
+                s.pause = pause, s.pause_user = pause_user;
+                announce_best_effort(&s, o, "");
+            }
+            store_close(&s);
+        }
+        return rc;
     }
 
     static const struct { const char *name; int least, most; } commands[] = {
         {"inbox", 0, 1}, {"log", 1, 1}, {"check", 1, 1}, {"show", 2, 2}, {"take", 2, 2}, {"release", 2, 2}, {"done", 2, 3},
-        {"refuse", 2, 3}, {"hook", 2, 2}, {"answer", 3, 3}, {"working", 2, 2}, {"ask", 3, 3}, {"hand", 3, 3}, {"tell", 3, 3}, {"find", 3, 3}};
+        {"refuse", 2, 3}, {"hook", 2, 2}, {"answer", 3, 3}, {"working", 2, 2}, {"ask", 3, 3}, {"hand", 3, 3}, {"tell", 3, 3}, {"find", 3, 3},
+        {"hello", 2, 2}};
     int which = -1;
     for (int i = 0; i < (int)(sizeof commands / sizeof *commands); i++)
         if (same(command, commands[i].name)) which = i;
     if (which < 0) return fail("there is no such command: see helio help", 2);
     if (o->count < commands[which].least || o->count > commands[which].most) return fail("that command needs other words: see helio help", 2);
     if (which != 1 && which != 2 && !address_ok(o->me, false)) return fail("say who you are: --as project/lane or HELIO_AS", 2);
+    if (which == 8 && !same(o->words[1], "claude")) return fail("there is a hook for claude only: other agents run helio between sections", 2);
+    if (which == 15) {
+        if (!agent_ok(o->words[1])) return fail("unknown agent: use claude, codex or antigravity", 2);
+        if (!session_ok(o->session)) return fail("the session name is invalid or too long", 2);
+    }
 
     store s;
     if (store_open(&s, o->folder) != S_OK) {
@@ -515,11 +590,16 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
     case 12: code = post(&s, o, "handoff", reader(&s, o, o->words[1]), ""); break;
     case 13: code = post(&s, o, "headsup", reader(&s, o, o->words[1]), ""); break;
     case 14: code = post(&s, o, "finding", reader(&s, o, o->words[1]), ""); break;
+    case 15:
+        result = announce_session(&s, o, o->words[1]);
+        code = result == S_OK ? 0 : fail(s.why, result);
+        break;
     default:
         result = which == 4 ? store_take(&s, o->words[1], me) : which == 5 ? store_release(&s, o->words[1], me)
                                                                            : store_end(&s, o->words[1], me, which == 6, note);
         code = result == S_OK ? 0 : fail(s.why, result);
     }
+    if (which != 8 && which != 15 && address_ok(o->me, false)) announce_best_effort(&s, o, "");
     store_close(&s);
     return code;
 }
