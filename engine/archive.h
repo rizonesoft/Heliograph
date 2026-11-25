@@ -24,10 +24,10 @@ s_result archive_promote_landed(const char *folder, const char *id, const char *
 s_result archive_each_landed(const char *folder, const char *id, bool (*each)(void *user, const char *commit), void *user, const char **why);
 
 /* Visits archived messages newest month first in bounded batches, skipping IDs already emitted by the live pass.
-   Returns count of damaged months or messages encountered. */
+   Stops early when each returns false. Returns count of damaged months or messages encountered. */
 size_t archive_every(store *s, char *const *emitted, size_t emitted_count,
                      bool (*visible)(const message *m, void *user),
-                     void (*each)(store *s, const message *m, const job *known, const char *landed, void *user), void *user);
+                     bool (*each)(store *s, const message *m, const job *known, const char *landed, void *user), void *user);
 
 /* Validates all archived month folders and files structurally (and against live copies during interrupted moves). */
 s_result archive_check(store *s, text *report);

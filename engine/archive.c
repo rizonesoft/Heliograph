@@ -1663,7 +1663,7 @@ s_result archive_each_landed(const char *folder, const char *id, bool (*each)(vo
 
 size_t archive_every(store *s, char *const *emitted, size_t emitted_count,
                      bool (*visible)(const message *m, void *user),
-                     void (*each)(store *s, const message *m, const job *known, const char *landed, void *user), void *user) {
+                     bool (*each)(store *s, const message *m, const job *known, const char *landed, void *user), void *user) {
     text root = {0};
     add(&root, s->folder), add(&root, "/archive");
     if (root.failed) return 1;
@@ -1718,7 +1718,8 @@ size_t archive_every(store *s, char *const *emitted, size_t emitted_count,
                 if (p_list(mdir.data, attach_arch_events, &be) != P_OK || be.failed) {
                     damaged++;
                 } else {
-                    for (size_t i = 0; i < be.count; i++) {
+                    bool keep_going = true;
+                    for (size_t i = 0; keep_going && i < be.count; i++) {
                         const char *id = be.items[i].id;
                         char derived[8];
                         if (!valid_id(id) || !archive_month(id, derived) || !same(derived, month)) {
@@ -1741,20 +1742,21 @@ size_t archive_every(store *s, char *const *emitted, size_t emitted_count,
                                 s_result lr2 = jr == S_OK ? format_arch_landed_events(s, month, id, &be.items[i].landed, &landed_t, &lwhy) : S_OK;
                                 if (jr == S_OK) {
                                     if (lr2 != S_OK) damaged++;
-                                    each(s, &m, &known, lr2 == S_OK ? landed_t.data : NULL, user);
+                                    keep_going = each(s, &m, &known, lr2 == S_OK ? landed_t.data : NULL, user);
                                 } else {
-                                    each(s, &m, NULL, NULL, user);
+                                    keep_going = each(s, &m, NULL, NULL, user);
                                     damaged++;
                                 }
                                 text_free(&landed_t);
                             } else {
-                                each(s, &m, NULL, NULL, user);
+                                keep_going = each(s, &m, NULL, NULL, user);
                             }
                         } else if (mr != S_NOTHING) {
                             damaged++;
                         }
                         message_free(&m);
                     }
+                    if (!keep_going) b.truncated = false;
                 }
                 for (size_t i = 0; i < be.count; i++) {
                     list_free(&be.items[i].seen);

@@ -62,7 +62,7 @@ Legend: ✅ works · 📋 planned
 | Silent takers, messages for one session | ✅ | `helio hello`, `silent:` reporting, and `--for-session` targeting |
 | Projects kept apart in log and show | ✅ | `may_see` scopes `log`, `show`, `answer`, and job commands to your project |
 | Mark for landed work | ✅ | `helio landed <id> <commit>` links a commit without closing the job |
-| Fixed marks around shown messages | ✅ | `inbox`, `log`, `show`, and `hook` wrap every message line behind `| ` between fixed marks |
+| Fixed marks around shown messages | ✅ | `inbox`, `log`, `show`, and `hook` wrap every message line behind a bar between fixed marks |
 | JSON, taking the next job as a queue | 📋 | [§10 and §11](todo/01-heliograph/TODO-01-heliograph.md) |
 
 ## Quick start

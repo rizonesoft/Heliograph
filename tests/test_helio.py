@@ -4127,6 +4127,76 @@ class FixedMarks(Base):
             rows_over, tr_over = unframe(self, "\n".join(hl_over[1:]) + "\n")
             self.assertEqual((len(rows_over), tr_over), (2, "and 1 more: helio --all"))
 
+    def test_closed_pipe_write_errors_and_transient_first_pass_damage(self):
+        # 1. Transient first-pass-only damage (cleared at after-urgent-pass): hook MUST still report HOOK_DAMAGE!
+        clean_env = {k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "ANTIGRAVITY_CONVERSATION_ID")}
+        bad = self.store / "messages/0000000000000001-trans0.post"
+        put(bad, "corrupt\n")
+        p_h = subprocess.Popen(
+            [str(RACER), "--pause-cli", "after-urgent-pass", str(self.store), "hook", "claude", "--as", "os/apps", "--store", str(self.store)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=clean_env,
+        )
+        try:
+            for _ in range(200):
+                if (self.store / "paused.after-urgent-pass").exists():
+                    break
+                time.sleep(0.02)
+            self.assertTrue((self.store / "paused.after-urgent-pass").exists())
+            bad.unlink()
+            put(self.store / "resume.after-urgent-pass", "x")
+            out_h, _ = p_h.communicate(timeout=30)
+            self.assertEqual(p_h.returncode, 0)
+            self.assertEqual(out_h.decode(), HOOK_DAMAGE + "\n")
+        finally:
+            if p_h.poll() is None:
+                p_h.kill()
+                p_h.wait(timeout=10)
+            if p_h.stdout:
+                p_h.stdout.close()
+            if p_h.stderr:
+                p_h.stderr.close()
+            for f in ("paused.after-urgent-pass", "resume.after-urgent-pass"):
+                if (self.store / f).exists():
+                    (self.store / f).unlink()
+            if bad.exists():
+                bad.unlink()
+
+        # 2. Closed stdout pipe on Linux: SIGPIPE is ignored so log exits 3, hook exits 0, and failed show (live + archived) exits 3 leaving messages unread!
+        if not ON_WINDOWS:
+            old_us = 1739577600_000_000
+            live_m = self.send("tell", "os/apps", "os/main", "Unread live", "body")
+            arch_m = subprocess.run(
+                [str(RACER), "--now", str(old_us), "ask", "os/apps", "Unread arch", "--as", "os/main", "--store", str(self.store)],
+                input=b"body", capture_output=True, timeout=30, cwd=self.store, env=clean_env,
+            ).stdout.decode().strip()
+            self.assertEqual(subprocess.run(
+                [str(RACER), "--now", str(old_us + 100), "take", arch_m, "--as", "os/apps", "--store", str(self.store)],
+                capture_output=True, timeout=30, cwd=self.store, env=clean_env,
+            ).returncode, 0)
+            self.assertEqual(subprocess.run(
+                [str(RACER), "--now", str(old_us + 200), "done", arch_m, "ok", "--as", "os/apps", "--store", str(self.store)],
+                capture_output=True, timeout=30, cwd=self.store, env=clean_env,
+            ).returncode, 0)
+            self.assertEqual(self.helio("archive", me=None).returncode, 0)
+
+            def run_closed_pipe(*args):
+                r_fd, w_fd = os.pipe()
+                os.close(r_fd)
+                try:
+                    return subprocess.run(
+                        [str(PROGRAM), *args, "--store", str(self.store), "--as", "os/apps"],
+                        stdout=w_fd, stderr=subprocess.PIPE, timeout=30, cwd=self.store, env=clean_env,
+                    )
+                finally:
+                    os.close(w_fd)
+
+            self.assertEqual(run_closed_pipe("log", "--all").returncode, 3)
+            self.assertEqual(run_closed_pipe("hook", "claude").returncode, 0)
+            self.assertEqual(run_closed_pipe("show", live_m).returncode, 3)
+            self.assertEqual(list((self.store / "messages").glob(f"{live_m}.seen.*")), [])
+            self.assertEqual(run_closed_pipe("show", arch_m).returncode, 3)
+            self.assertEqual(list((self.store / "archive/2025-02").glob(f"{arch_m}.seen.*")), [])
+
 
 if __name__ == "__main__":
     unittest.main()
