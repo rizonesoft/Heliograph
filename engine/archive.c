@@ -292,10 +292,22 @@ static bool is_rm_part(const char *name, size_t n) {
     return n > 8 && same(name + n - 8, ".rm.part");
 }
 
+static bool is_post_part_ev(const char *ev, size_t n) {
+    return n > 10 && starts(ev, "post.") && same(ev + n - 5, ".part");
+}
+
+static bool is_post_part_name(const char *name, size_t n) {
+    if (n <= 10 || !same(name + n - 5, ".part")) return false;
+    const char *dot = name;
+    while (*dot && *dot != '.') dot++;
+    if (!*dot) return false;
+    return starts(dot + 1, "post.");
+}
+
 static bool attach_events(void *user, const char *name) {
     batch_events *be = user;
     size_t n = len(name);
-    if (n > 5 && same(name + n - 5, ".part") && !is_rm_part(name, n)) return true;
+    if (n > 5 && same(name + n - 5, ".part") && !is_post_part_name(name, n)) return true;
     const char *dot = name;
     while (*dot && *dot != '.') dot++;
     if (!*dot) return true;
@@ -306,7 +318,7 @@ static bool attach_events(void *user, const char *name) {
     if (same(ev, "post")) return true;
     if (starts(ev, "seen.")) list_push(&be->items[idx].seen, ev, len(ev));
     else if (starts(ev, "link.")) list_push(&be->items[idx].links, ev, len(ev));
-    else if (is_rm_part(ev, len(ev))) list_push(&be->items[idx].rm_parts, ev, len(ev));
+    else if (is_post_part_ev(ev, len(ev))) list_push(&be->items[idx].rm_parts, ev, len(ev));
     if (be->items[idx].seen.failed || be->items[idx].links.failed || be->items[idx].rm_parts.failed) return be->failed = true, false;
     return true;
 }
@@ -461,7 +473,7 @@ static bool list_contains(const str_list *l, const char *s, size_t n) {
 static bool gather_batch(void *user, const char *name) {
     batch_ctx *b = user;
     size_t n = len(name);
-    if (n > 5 && same(name + n - 5, ".part") && !is_rm_part(name, n)) return true;
+    if (n > 5 && same(name + n - 5, ".part") && !is_post_part_name(name, n)) return true;
     const char *dot = name;
     while (*dot && *dot != '.') dot++;
     if (!*dot) return true;
@@ -525,8 +537,12 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
         unsigned alinks = 0;
         s_result tr = archive_has_terminal_job(folder, it->id, &alinks);
         if (tr != S_OK) {
-            /* Live link/seen/rm.part without live post and without a validated archived terminal job is genuine damage! */
-            if (it->links.count > 0 || it->seen.count > 0 || it->rm_parts.count > 0) {
+            /* Live link/seen/rm.part without live post and without a validated archived terminal job is genuine damage!
+               An ordinary <id>.post.<u >.part without an archived job is a live store_post in flight and is ignored. */
+            bool has_rm_part = false;
+            for (size_t i = 0; i < it->rm_parts.count; i++)
+                if (is_rm_part(it->rm_parts.items[i], len(it->rm_parts.items[i]))) has_rm_part = true;
+            if (it->links.count > 0 || it->seen.count > 0 || has_rm_part) {
                 add_report(report, it->id, tr == S_DAMAGED ? "archived terminal chain is damaged or incomplete" : "orphan event without post");
                 return S_DAMAGED;
             }
@@ -1001,14 +1017,15 @@ s_result archive_daily(const char *folder, text *report, void (*pause)(void *use
                 char *sd = NULL;
                 size_t sl = 0;
                 p_result sr = sp.failed ? P_FAILED : p_read(sp.data, 64, &sd, &sl);
-                text_free(&sp);
                 if (sr == P_MISSING) {
                     p_free(sd);
+                    text_free(&sp);
                     all_finished = false;
                     break;
                 }
                 if (sr != P_OK) {
                     p_free(sd);
+                    text_free(&sp);
                     res = S_DAMAGED;
                     all_finished = false;
                     break;
@@ -1018,7 +1035,25 @@ s_result archive_daily(const char *folder, text *report, void (*pause)(void *use
                 bool has_nl = (sl > 0 && sd[sl - 1] == '\n');
                 while (*p >= '0' && *p <= '9') sts = sts * 10 + (uint64_t)(*p++ - '0');
                 p_free(sd);
-                if (!(has_nl && sts > 0 && check_now > sts && check_now - sts >= 60ull * 1000000ull)) all_finished = false;
+                if (!(has_nl && sts > 0)) {
+                    /* Empty or partial slot from an interrupted create: fall back to file mtime so it expires at 60s
+                       without falsely treating a brand-new slot in flight as stale. */
+                    uint64_t mt = 0;
+                    p_result mr = p_file_mtime(sp.data, &mt);
+                    if (mr == P_OK) sts = mt;
+                    else if (mr != P_MISSING) {
+                        text_free(&sp);
+                        res = S_DAMAGED;
+                        all_finished = false;
+                        break;
+                    } else {
+                        text_free(&sp);
+                        all_finished = false;
+                        break;
+                    }
+                }
+                text_free(&sp);
+                if (!(sts > 0 && check_now > sts && check_now - sts >= 60ull * 1000000ull)) all_finished = false;
             }
         }
         if (all_finished) {

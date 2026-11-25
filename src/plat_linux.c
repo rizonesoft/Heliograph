@@ -127,6 +127,14 @@ p_result p_create_excl(const char *path, const char *data, size_t length) {
     return settle(path) ? P_OK : P_UNFLUSHED;
 }
 
+p_result p_file_mtime(const char *path, uint64_t *mtime_us) {
+    struct stat st;
+    if (lstat(path, &st) < 0) return why();
+    if (st.st_mtim.tv_sec < 0) return P_FAILED;
+    *mtime_us = (uint64_t)st.st_mtim.tv_sec * 1000000ull + (uint64_t)st.st_mtim.tv_nsec / 1000ull;
+    return P_OK;
+}
+
 p_result p_claim_remove(const char *path, const char *unique) {
     char temp[4096];
     if ((size_t)snprintf(temp, sizeof temp, "%s.%s.rm.part", path, unique) >= sizeof temp) return P_FAILED;

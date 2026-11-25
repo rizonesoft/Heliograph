@@ -121,6 +121,25 @@ p_result p_create_excl(const char *path, const char *data, size_t length) {
     return settle_win(path) ? P_OK : P_UNFLUSHED;
 }
 
+p_result p_file_mtime(const char *path, uint64_t *mtime_us) {
+    wchar_t *wide = im_wide(path);
+    if (!wide) return P_FAILED;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(wide, &fd);
+    DWORD err = h == INVALID_HANDLE_VALUE ? GetLastError() : 0;
+    im_free(wide);
+    if (h == INVALID_HANDLE_VALUE) {
+        if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) return P_MISSING;
+        return P_FAILED;
+    }
+    FindClose(h);
+    uint64_t ticks = ((uint64_t)fd.ftLastWriteTime.dwHighDateTime << 32) | (uint64_t)fd.ftLastWriteTime.dwLowDateTime;
+    uint64_t us = ticks / 10ull;
+    if (us < 11644473600000000ull) return P_FAILED;
+    *mtime_us = us - 11644473600000000ull;
+    return P_OK;
+}
+
 p_result p_claim_remove(const char *path, const char *unique) {
     im_text temp_t = {0};
     im_add(&temp_t, path), im_add(&temp_t, "."), im_add(&temp_t, unique), im_add(&temp_t, ".rm.part");

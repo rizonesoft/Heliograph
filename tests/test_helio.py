@@ -1576,6 +1576,19 @@ class Archive(Base):
             self.assertIn(run(st, "inbox", me="os/userland").returncode, (0, 1))
             self.assertTrue((st / f"messages/{j}.post").exists())
             self.assertTrue((st / f"summary/{today_iso}.archived").exists())
+            # Empty 0-byte slot (interrupted create before timestamp write): fresh mtime MUST NOT publish .archived,
+            # while stale mtime (>= 60s old) MUST expire and publish .archived!
+            (st / f"summary/{today_iso}.archived").unlink()
+            for s_idx in range(9):
+                put(st / f"summary/{today_iso}.done.{s_idx}", "done\n")
+            s9 = st / f"summary/{today_iso}.slot.9"
+            put(s9, "")
+            self.assertIn(run(st, "inbox", me="os/userland").returncode, (0, 1))
+            self.assertFalse((st / f"summary/{today_iso}.archived").exists(), "fresh 0-byte slot must not publish .archived prematurely")
+            old_t = time.time() - 120
+            os.utime(s9, (old_t, old_t))
+            self.assertIn(run(st, "inbox", me="os/userland").returncode, (0, 1))
+            self.assertTrue((st / f"summary/{today_iso}.archived").exists(), "stale 0-byte slot must expire and publish .archived")
 
         # Recovery day cap: 1 interrupted job (complete archive chain + surviving live post) ahead of 200 fresh
         # eligible jobs -> daily inbox MUST debit the recovered live-post removal against the 200-job daily cap
@@ -1739,11 +1752,16 @@ class Archive(Base):
             self.assertEqual(len(list((st / "archive/2025-02").glob("*.post"))), 1)
             self.assertEqual(list((st / "messages").iterdir()), [])
             self.assertEqual(run(st, "archive", me=None).returncode, 1)
-            # Interrupted rename-before-unlink remnant (<id>.post.<unique>.rm.part) MUST be cleaned up by a subsequent archive!
+            # Interrupted rename-before-unlink remnants (both current .rm.part and legacy <id>.post.<unique>.part)
+            # MUST be cleaned up by a subsequent archive!
             rem = st / f"messages/{j}.post.99999.rm.part"
-            put(rem, (st / f"archive/2025-02/{j}.post").read_text())
+            rem_legacy = st / f"messages/{j}.post.88888.part"
+            archived_post = (st / f"archive/2025-02/{j}.post").read_text()
+            put(rem, archived_post)
+            put(rem_legacy, archived_post)
             self.assertEqual(run(st, "archive", me=None).returncode, 0)
             self.assertFalse(rem.exists(), "interrupted .rm.part remnant must be removed by subsequent archive")
+            self.assertFalse(rem_legacy.exists(), "legacy .post.<unique>.part remnant must be removed by subsequent archive")
             self.assertEqual(list((st / "messages").iterdir()), [])
 
     @unittest.skipUnless(WSL, "needs WSL")
