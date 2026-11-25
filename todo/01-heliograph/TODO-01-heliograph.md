@@ -172,7 +172,9 @@ Only the Claude hook announces a session, and it records a time alone. Codex and
 
 ## 5. Report of a silent taker
 
-A job taken by a lane that has gone quiet is reported even when it has no due time. It is never handed on by itself.
+> **Started:** 2026-11-25T11:27Z
+
+A job taken by a lane that has gone quiet is reported even when it has no due time. It is never handed on by itself. **Corrected 2026-11-25:** Plan review (`docs/reviews/01-heliograph/D01-T01-s5.md`) clarified: initialize silence thresholds and lazy session loading in shared `fill_inbox` so `hook claude` and `inbox` behave identically; load sessions lazily with an explicit failure state (`SESS_FAILED`) only when a relevant `TAKEN` job needs classification so unreadable sessions never break unrelated exit codes or fabricate false `SILENT` labels; persist each repository's configured `silent:` threshold per project (`<store>/silent/<project>`, overridden by live `helio.conf` for its own project, defaulting to 120 minutes) so shared-store summaries and out-of-repo readers use each job's project threshold regardless of first-caller order; accept positive integers up to the checked `uint64_t` conversion bound (`UINT64_MAX / 60000000` minutes); refresh the calling session before `watch_summary` on `inbox`/`hook` so a returning taker clears its own alert; and list overdue+silent jobs under both `Overdue` and `Silent` (excluding them from `Taken`) in the daily summary.
 
 **Phase:** 2
 **Needs:** none

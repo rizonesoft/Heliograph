@@ -2750,5 +2750,219 @@ class Sessions(Base):
         self.assertEqual(self.helio("hello", "claude", "--session", s65_utf8, me="os/apps").returncode, 2)
 
 
+class SilentTaker(unittest.TestCase):
+    """D01 T01 §5: silent taker reporting in inbox, hook, log, summary, and helio.conf."""
+
+    def setUp(self):
+        self.folder = tempfile.TemporaryDirectory()
+        self.store = Path(self.folder.name) / "store"
+        self.store.mkdir()
+        self.assertEqual(run(self.store, "init", me=None).returncode, 0)
+
+    def tearDown(self):
+        self.folder.cleanup()
+
+    def helio(self, *args, me="os/main", body="", cwd=None, extra_env=None):
+        return run(self.store, *args, me=me, body=body, cwd=cwd, extra_env=extra_env)
+
+    def racer_cli(self, now_us, *args, cwd=None, extra_env=None, body=b""):
+        clean = {k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "ANTIGRAVITY_CONVERSATION_ID")}
+        if extra_env:
+            clean.update(extra_env)
+        return subprocess.run(
+            [str(RACER), "--now", str(now_us), *args, "--store", str(self.store)],
+            input=body, capture_output=True, timeout=30, cwd=cwd, env=clean,
+        )
+
+    def test_is_silent_truth_table_and_helio_conf_silent_validation(self):
+        # Pure C truth table in tests/racer.c covering named session, sibling session, lane fallback,
+        # missing session fallback to take time, boundary == silent_us, clock skew, and non-TAKEN states.
+        r_tbl = subprocess.run([str(RACER), "--test-is-silent"], capture_output=True, timeout=30)
+        self.assertEqual(r_tbl.returncode, 0, r_tbl.stderr)
+
+        # helio.conf silent: parsing: default 120, valid positive, max uint64/60e6 accepted, +1 refused with line number.
+        repo = Path(self.folder.name) / "repo-conf"
+        repo.mkdir()
+        for bad_line, desc in [
+            ("project: os\nsilent: 0\n", "zero"),
+            ("project: os\n# comment\nsilent: -5\n", "negative"),
+            ("project: os\nsilent: abc\n", "non-digit"),
+            ("project: os\nsilent: 30 extra\n", "extra token"),
+            ("project: os\nsilent: 307445734562\n", "overflow +1"),
+            ("project: os\nsilent:\n", "missing value"),
+        ]:
+            put(repo / "helio.conf", bad_line)
+            r = self.helio("inbox", me="os/apps", cwd=repo)
+            self.assertEqual(r.returncode, 2, f"{desc}: {r.stderr}")
+            expected_lineno = b"line 3" if "# comment" in bad_line else b"line 2"
+            self.assertIn(expected_lineno, r.stderr, f"{desc}: {r.stderr}")
+
+        # Largest checked conversion bound (UINT64_MAX // 60_000_000 = 307445734561) is accepted!
+        put(repo / "helio.conf", "project: os\nsilent: 307445734561\n")
+        r_max = self.helio("inbox", me="os/apps", cwd=repo)
+        self.assertEqual(r_max.returncode, 1, r_max.stderr)
+
+    def test_silent_job_reported_to_sender_owner_hook_log_summary_and_release_retake(self):
+        repo = Path(self.folder.name) / "repo-os"
+        repo.mkdir()
+        put(repo / "helio.conf", "project: os\nsilent: 60\n")
+        base_us = 1795600000_000_000  # 2026-11-25T...
+        M = 60_000_000
+
+        # Project-wide request (no --due) so os/apps and os/other are both eligible takers.
+        r_ask = self.racer_cli(base_us, "ask", "os/all", "Build widget", "--as", "os/sender", cwd=repo, body=b"please build")
+        self.assertEqual(r_ask.returncode, 0, r_ask.stderr)
+        jid = r_ask.stdout.decode().strip()
+
+        # os/apps (session s1) takes the job at base_us.
+        r_take = self.racer_cli(base_us, "take", jid, "--as", "os/apps", "--session", "s1", cwd=repo)
+        self.assertEqual(r_take.returncode, 0, r_take.stderr)
+
+        # At +30m (under 60m threshold): neither sender nor owner sees it; log has no SILENT.
+        self.assertEqual(self.racer_cli(base_us + 30 * M, "inbox", "--as", "os/sender", cwd=repo).returncode, 1)
+        self.assertEqual(self.racer_cli(base_us + 30 * M, "inbox", "--as", "os/owner", cwd=repo).returncode, 1)
+        r_log30 = self.racer_cli(base_us + 30 * M, "log", cwd=repo)
+        self.assertEqual(r_log30.returncode, 0)
+        self.assertNotIn(b"SILENT", r_log30.stdout)
+
+        # Dynamic threshold proof: change ONLY helio.conf to silent: 20 -> at +30m BOTH inbox and log show SILENT!
+        put(repo / "helio.conf", "project: os\nsilent: 20\n")
+        r_snd20 = self.racer_cli(base_us + 30 * M, "inbox", "--as", "os/sender", cwd=repo)
+        self.assertEqual(r_snd20.returncode, 0, r_snd20.stderr)
+        self.assertIn(jid.encode(), r_snd20.stdout)
+        self.assertIn(b"SILENT", r_snd20.stdout)
+        r_log20 = self.racer_cli(base_us + 30 * M, "log", cwd=repo)
+        self.assertEqual(r_log20.returncode, 0)
+        self.assertIn(b"SILENT", r_log20.stdout)
+
+        # Restore silent: 60 and advance to +70m (silent!).
+        put(repo / "helio.conf", "project: os\nsilent: 60\n")
+        t_silent = base_us + 70 * M
+
+        # Sibling session s2 of os/apps announcing does NOT clear s1's silence!
+        self.assertEqual(self.racer_cli(t_silent, "hello", "codex", "--as", "os/apps", "--session", "s2", cwd=repo).returncode, 0)
+
+        # Sender sees SILENT; owner sees SILENT; stranger does NOT; hook claude as sender & owner sees SILENT (exit 0)!
+        r_sender = self.racer_cli(t_silent, "inbox", "--as", "os/sender", cwd=repo)
+        self.assertEqual(r_sender.returncode, 0, r_sender.stderr)
+        self.assertIn(b"SILENT", r_sender.stdout)
+        r_owner = self.racer_cli(t_silent, "inbox", "--as", "os/owner", cwd=repo)
+        self.assertEqual(r_owner.returncode, 0, r_owner.stderr)
+        self.assertIn(b"SILENT", r_owner.stdout)
+        r_stranger = self.racer_cli(t_silent, "inbox", "--as", "os/other", cwd=repo)
+        self.assertEqual(r_stranger.returncode, 1, r_stranger.stderr)
+        r_hook_s = self.racer_cli(t_silent, "hook", "claude", "--as", "os/sender", cwd=repo)
+        self.assertEqual(r_hook_s.returncode, 0, r_hook_s.stderr)
+        self.assertIn(jid.encode(), r_hook_s.stdout)
+        self.assertIn(b"SILENT", r_hook_s.stdout)
+        r_hook_o = self.racer_cli(t_silent, "hook", "claude", "--as", "os/owner", cwd=repo)
+        self.assertEqual(r_hook_o.returncode, 0, r_hook_o.stderr)
+        self.assertIn(jid.encode(), r_hook_o.stdout)
+        self.assertIn(b"SILENT", r_hook_o.stdout)
+
+        # Same eligible second lane os/other is REFUSED with "already taken" while silent; taker keeps it!
+        r_steal = self.racer_cli(t_silent, "take", jid, "--as", "os/other", cwd=repo)
+        self.assertEqual(r_steal.returncode, 2, r_steal.stderr)
+        self.assertIn(b"already taken", r_steal.stderr)
+
+        # Only helio release frees it; then os/other takes and owns it!
+        r_rel = self.racer_cli(t_silent, "release", jid, "--as", "os/owner", cwd=repo)
+        self.assertEqual(r_rel.returncode, 0, r_rel.stderr)
+        r_retake = self.racer_cli(t_silent, "take", jid, "--as", "os/other", cwd=repo)
+        self.assertEqual(r_retake.returncode, 0, r_retake.stderr)
+        r_log_after = self.racer_cli(t_silent, "log", cwd=repo)
+        self.assertIn(b"taken by os/other", r_log_after.stdout)
+
+    def test_summary_silent_overdue_returning_taker_damaged_sessions_and_two_repos(self):
+        M = 60_000_000
+        base_us = 1795600000_000_000  # 2026-11-25
+
+        # 1. Summary: overdue+silent job counted under BOTH Overdue and Silent, excluded from Taken;
+        # returning taker's first call clears its own silent alert before summary is written!
+        with tempfile.TemporaryDirectory() as tmp:
+            st = Path(tmp) / "st"
+            st.mkdir()
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            put(repo / "helio.conf", "project: os\nsilent: 60\n")
+            self.assertEqual(run(st, "init", me=None).returncode, 0)
+
+            def rc_at(now_us, *args, cwd=repo, body=b""):
+                return subprocess.run(
+                    [str(RACER), "--now", str(now_us), *args, "--store", str(st)],
+                    input=body, capture_output=True, timeout=30, cwd=cwd,
+                )
+
+            r_ov = rc_at(base_us, "ask", "os/a", "Overdue and silent", "--due", "30", "--as", "os/sender", body=b"do it")
+            self.assertEqual(r_ov.returncode, 0, r_ov.stderr)
+            j_ov_si = r_ov.stdout.decode().strip()
+            r_rt = rc_at(base_us, "ask", "os/b", "Returning taker", "--as", "os/sender", body=b"do it")
+            self.assertEqual(r_rt.returncode, 0, r_rt.stderr)
+            j_ret = r_rt.stdout.decode().strip()
+            self.assertEqual(rc_at(base_us, "take", j_ov_si, "--as", "os/a", "--session", "sa").returncode, 0)
+            self.assertEqual(rc_at(base_us, "take", j_ret, "--as", "os/b", "--session", "sb").returncode, 0)
+
+            # At +90m, returning taker os/b (session sb) runs the day's FIRST inbox: refreshes sb BEFORE summary!
+            t_later = base_us + 90 * M
+            self.assertEqual(rc_at(t_later, "inbox", "--as", "os/b", "--session", "sb").returncode, 0)
+            sum_files = list((st / "summary").glob("*.md"))
+            self.assertEqual(len(sum_files), 1)
+            text = sum_files[0].read_text()
+            self.assertIn("## Overdue: 1\n", text)
+            self.assertIn("## Silent: 1\n", text)
+            self.assertIn("## Taken: 1\n", text)
+            self.assertIn(j_ov_si, text.split("## Overdue: 1")[1].split("## Silent:")[0])
+            self.assertIn(j_ov_si, text.split("## Silent: 1")[1].split("## Open:")[0])
+            self.assertIn(j_ret, text.split("## Taken: 1")[1].split("## Done")[0])
+
+            # 2. Damaged session file: produces diagnostic (exit 3) WITHOUT false SILENT label!
+            bad_sess = st / f"sessions/os+b+{'bad'.encode().hex()}"
+            bad_sess.mkdir()
+            r_dmg = rc_at(t_later, "inbox", "--as", "os/sender")
+            self.assertEqual(r_dmg.returncode, 3)
+            self.assertNotIn(b"SILENT", r_dmg.stdout)
+            bad_sess.rmdir()
+
+        # 3. Two repositories sharing one store with different silent thresholds in BOTH first-caller orders!
+        for first_order in ("alpha-first", "beta-first"):
+            with tempfile.TemporaryDirectory() as tmp:
+                st = Path(tmp) / "st"
+                st.mkdir()
+                r_a = Path(tmp) / "alpha"
+                r_b = Path(tmp) / "beta"
+                r_a.mkdir(), r_b.mkdir()
+                put(r_a / "helio.conf", "project: alpha\nsilent: 30\n")
+                put(r_b / "helio.conf", "project: beta\nsilent: 180\n")
+                self.assertEqual(run(st, "init", me=None).returncode, 0)
+
+                def rc_in(now_us, cwd, *args, body=b""):
+                    return subprocess.run(
+                        [str(RACER), "--now", str(now_us), *args, "--store", str(st)],
+                        input=body, capture_output=True, timeout=30, cwd=cwd,
+                    )
+
+                ja = rc_in(base_us, r_a, "ask", "alpha/dev", "Alpha task", "--as", "alpha/owner", body=b"a").stdout.decode().strip()
+                jb = rc_in(base_us, r_b, "ask", "beta/dev", "Beta task", "--as", "beta/owner", body=b"b").stdout.decode().strip()
+                self.assertEqual(rc_in(base_us, r_a, "take", ja, "--as", "alpha/dev").returncode, 0)
+                self.assertEqual(rc_in(base_us, r_b, "take", jb, "--as", "beta/dev").returncode, 0)
+
+                # At +60m: alpha (30m) is SILENT, beta (180m) is NOT silent, regardless of which checkout calls first!
+                t60 = base_us + 60 * M
+                if first_order == "alpha-first":
+                    self.assertEqual(rc_in(t60, r_a, "inbox", "--as", "alpha/owner").returncode, 0)
+                else:
+                    self.assertEqual(rc_in(t60, r_b, "inbox", "--as", "beta/owner").returncode, 1)
+                sum_text = list((st / "summary").glob("*.md"))[0].read_text()
+                self.assertIn("## Silent: 1\n", sum_text, first_order)
+                self.assertIn(ja, sum_text.split("## Silent: 1")[1].split("## Open:")[0], first_order)
+                self.assertIn(jb, sum_text.split("## Taken: 1")[1].split("## Done")[0], first_order)
+                # Out-of-repo owner call also uses each project's own threshold!
+                r_out_a = rc_in(t60, Path(tmp), "inbox", "--as", "alpha/owner")
+                self.assertEqual(r_out_a.returncode, 0, first_order)
+                self.assertIn(b"SILENT", r_out_a.stdout, first_order)
+                r_out_b = rc_in(t60, Path(tmp), "inbox", "--as", "beta/owner")
+                self.assertEqual(r_out_b.returncode, 1, first_order)
+
+
 if __name__ == "__main__":
     unittest.main()

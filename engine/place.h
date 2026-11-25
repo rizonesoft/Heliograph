@@ -4,14 +4,19 @@
      project: impossible        the project, as in project/lane
      lane: apps                 the lane of a session here that names none
      repository: heliograph     optional repository identity
+     silent: 120                optional minutes before a taker is silent (default 120)
      path: ui/ apps             this lane owns what is under ui/ (any number) */
 #pragma once
 #include "store.h"
+
+enum { PLACE_SILENT_DEFAULT = 120 };
 
 typedef struct place {
     char *file;
     bool found;
     char project[36], lane[36], repository[36];
+    uint64_t silent_minutes;
+    char why[128];
 } place;
 
 typedef struct session_info {
@@ -25,6 +30,11 @@ typedef struct session_info {
 
 s_result place_open(place *p, const char **why); /* from this folder or one above it */
 void place_close(place *p);
+
+/* Records this repository's configured silence threshold in the store (best-effort)
+   and resolves the silence threshold in microseconds for a given project. */
+void place_record_silent(store *s, const place *here);
+uint64_t place_silent_us(const store *s, const place *here, const char *project);
 
 /* "project/lane" for a path, from the longest owner; "" when nobody owns it. */
 void place_owner(const place *p, const char *path, text *to);

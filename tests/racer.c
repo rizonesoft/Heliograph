@@ -9,6 +9,7 @@
 #include "helio.h"
 #include "place.h"
 #include "store.h"
+#include "watch.h"
 
 #ifdef HELIO_TEST_HOOKS
 extern bool plat_fail_flush;
@@ -384,6 +385,50 @@ int racer(int count, char **args) {
         text_free(&done);
         p_free(old_ids);
         p_free(wdata);
+        return 0;
+    }
+    if (count >= 2 && same(args[1], "--test-is-silent")) {
+        const uint64_t T = 1000000000000ull; /* 1e12 us */
+        const uint64_t M = 60000000ull;      /* 1 min in us */
+        session_info sess[4] = {
+            {.when = T - 10 * M, .lane = "os/apps", .session = "s-alive"},
+            {.when = T - 200 * M, .lane = "os/apps", .session = "s-quiet"},
+            {.when = T - 30 * M, .lane = "os/ui", .session = "s-ui"},
+            {.when = T - 150 * M, .lane = "os/net", .session = ""},
+        };
+        /* 1. Active named session -> not silent. */
+        job j1 = {.state = TAKEN, .when = T - 300 * M, .by = "os/apps", .session = "s-alive"};
+        if (is_silent(sess, 4, &j1, T, 120 * M)) return 10;
+        /* 2. Quiet named session, EVEN THOUGH sibling s-alive on same lane is active -> SILENT! */
+        job j2 = {.state = TAKEN, .when = T - 300 * M, .by = "os/apps", .session = "s-quiet"};
+        if (!is_silent(sess, 4, &j2, T, 120 * M)) return 11;
+        /* 3. Named session missing from sessions[] -> falls back to j.when: recent take is alive, old take is silent. */
+        job j3a = {.state = TAKEN, .when = T - 30 * M, .by = "os/apps", .session = "s-missing"};
+        if (is_silent(sess, 4, &j3a, T, 120 * M)) return 12;
+        job j3b = {.state = TAKEN, .when = T - 130 * M, .by = "os/apps", .session = "s-missing"};
+        if (!is_silent(sess, 4, &j3b, T, 120 * M)) return 13;
+        /* 4. Unnamed taker (session=="") -> uses max across ALL sessions of that lane (s-alive keeps os/apps alive). */
+        job j4a = {.state = TAKEN, .when = T - 300 * M, .by = "os/apps", .session = ""};
+        if (is_silent(sess, 4, &j4a, T, 120 * M)) return 14;
+        /* 5. Unnamed taker whose only lane session is quiet -> SILENT. */
+        job j4b = {.state = TAKEN, .when = T - 300 * M, .by = "os/net", .session = ""};
+        if (!is_silent(sess, 4, &j4b, T, 120 * M)) return 15;
+        /* 6. Boundary: exact == silent_us is silent; silent_us - 1 is not silent. */
+        job j5 = {.state = TAKEN, .when = T - 120 * M, .by = "os/none", .session = "x"};
+        if (!is_silent(sess, 4, &j5, T, 120 * M)) return 16;
+        if (is_silent(sess, 4, &j5, T - 1, 120 * M)) return 17;
+        /* 7. Clock skew (clock_now <= last) -> never silent, no underflow. */
+        if (is_silent(sess, 4, &j5, T - 200 * M, 120 * M)) return 18;
+        /* 8. Non-TAKEN states (OPEN, DONE, REFUSED) -> never silent. */
+        job j6 = {.state = OPEN, .when = T - 500 * M, .by = "os/net", .session = ""};
+        if (is_silent(sess, 4, &j6, T, 120 * M)) return 19;
+        j6.state = DONE;
+        if (is_silent(sess, 4, &j6, T, 120 * M)) return 20;
+        j6.state = REFUSED;
+        if (is_silent(sess, 4, &j6, T, 120 * M)) return 21;
+        /* 9. Fresh take overrides stale session file (max(session.when, j.when)). */
+        job j7 = {.state = TAKEN, .when = T - 5 * M, .by = "os/apps", .session = "s-quiet"};
+        if (is_silent(sess, 4, &j7, T, 120 * M)) return 22;
         return 0;
     }
     if (count >= 2 && same(args[1], "--pause")) return run_pause(count, args);

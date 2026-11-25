@@ -6,6 +6,71 @@ bool is_overdue(const message *m, const job *now) {
     return m->due && (now->state == OPEN || now->state == TAKEN) && m->due < p_now();
 }
 
+bool is_silent(const session_info *sessions, size_t session_count, const job *now, uint64_t clock_now, uint64_t silent_us) {
+    if (!now || now->state != TAKEN || !*now->by || !silent_us) return false;
+    uint64_t last = now->when;
+    if (*now->session) {
+        for (size_t i = 0; i < session_count; i++) {
+            if (same(sessions[i].lane, now->by) && same(sessions[i].session, now->session)) {
+                if (sessions[i].when > last) last = sessions[i].when;
+                break;
+            }
+        }
+    } else {
+        for (size_t i = 0; i < session_count; i++) {
+            if (same(sessions[i].lane, now->by) && sessions[i].when > last)
+                last = sessions[i].when;
+        }
+    }
+    return clock_now > last && (clock_now - last) >= silent_us;
+}
+
+typedef struct {
+    session_cache *cache;
+    bool oom;
+} sess_collect;
+
+static bool collect_session_cb(void *user, const session_info *info) {
+    sess_collect *sc = user;
+    session_cache *c = sc->cache;
+    if (c->count == c->cap) {
+        size_t next = c->cap ? c->cap * 2 : 16;
+        session_info *grown = p_alloc(next * sizeof *grown);
+        if (!grown) { sc->oom = true; return false; }
+        for (size_t i = 0; i < c->count; i++) grown[i] = c->items[i];
+        p_free(c->items);
+        c->items = grown, c->cap = next;
+    }
+    c->items[c->count++] = *info;
+    return true;
+}
+
+void sessions_cache_load(store *s, session_cache *c) {
+    if (c->state != SESS_UNLOADED) return;
+    sess_collect sc = {c, false};
+    p_result r = place_each_session(s, collect_session_cb, &sc);
+    if (sc.oom || (r != P_OK && r != P_MISSING)) {
+        p_free(c->items);
+        c->items = NULL, c->count = 0, c->cap = 0;
+        c->state = SESS_FAILED;
+        return;
+    }
+    c->state = SESS_OK;
+}
+
+void sessions_cache_free(session_cache *c) {
+    p_free(c->items);
+    *c = (session_cache){0};
+}
+
+static void job_project(const char *address, char *out, size_t room) {
+    if (!room) return;
+    size_t i = 0;
+    if (address)
+        while (i + 1 < room && address[i] && address[i] != '/') out[i] = address[i], i++;
+    out[i] = 0;
+}
+
 static const char *word(const char *at, const char **from, size_t *n) {
     while (*at == ' ') at++;
     *from = at;
@@ -114,7 +179,16 @@ s_result watch_working(store *s, const place *p, const char *me, const char *pat
     return result;
 }
 
-s_result watch_summary(store *s) {
+static void add_summary_item(text *part, unsigned *count, const message *m, const job *j) {
+    (*count)++;
+    if (*count <= 100) {
+        add(part, "- "), add(part, m->id), add(part, " "), add(part, m->from), add(part, " to "), add(part, m->to);
+        if (*j->by) add(part, ", by "), add(part, j->by);
+        add(part, ": "), clean(part, m->subject, true), add(part, "\n");
+    }
+}
+
+s_result watch_summary(store *s, const place *here) {
     text day = {0}, folder = {0}, path = {0}, unique = {0};
     add_time(&day, p_now());
     if (day.data) day.data[day.length = 10] = 0;
@@ -128,10 +202,12 @@ s_result watch_summary(store *s) {
     p_result got = full ? P_FAILED : p_read(path.data, 1 << 20, &there, &length);
     if (got != P_OK && got != P_MISSING) result = S_DAMAGED;
     else if (got == P_MISSING) {
-        static const char *const titles[] = {"Overdue", "Open", "Taken", "Done in the last day", "Refused in the last day"};
-        text parts[5] = {0}, out = {0};
-        unsigned counts[5] = {0}, damaged = 0;
+        static const char *const titles[] = {"Overdue", "Silent", "Open", "Taken", "Done in the last day", "Refused in the last day"};
+        text parts[6] = {0}, out = {0};
+        unsigned counts[6] = {0}, damaged = 0;
         uint64_t now = p_now();
+        session_cache sc = {0};
+        bool sess_err_counted = false;
         for (size_t i = 0; i < s->count; i++) {
             size_t n = len(s->names[i]);
             if (n <= 5 || !same(s->names[i] + n - 5, ".post")) continue;
@@ -151,21 +227,35 @@ s_result watch_summary(store *s) {
             }
             if (jr != S_OK) damaged++;
             else if (is_job(&m)) {
-                int part = is_overdue(&m, &j) ? 0 : j.state == OPEN ? 1 : j.state == TAKEN ? 2 : j.state == DONE ? 3 : 4;
-                if (part < 3 || j.when + 86400000000ull > now) {
-                    counts[part]++;
-                    if (counts[part] <= 100) {
-                        add(&parts[part], "- "), add(&parts[part], m.id), add(&parts[part], " "), add(&parts[part], m.from), add(&parts[part], " to "), add(&parts[part], m.to);
-                        if (*j.by) add(&parts[part], ", by "), add(&parts[part], j.by);
-                        add(&parts[part], ": "), clean(&parts[part], m.subject, true), add(&parts[part], "\n");
+                bool ov = m.due && (j.state == OPEN || j.state == TAKEN) && m.due < now;
+                bool si = false;
+                if (j.state == TAKEN) {
+                    sessions_cache_load(s, &sc);
+                    if (sc.state == SESS_FAILED) {
+                        if (!sess_err_counted) damaged++, sess_err_counted = true;
+                    } else {
+                        char proj[36];
+                        job_project(m.to, proj, sizeof proj);
+                        si = is_silent(sc.items, sc.count, &j, now, place_silent_us(s, here, proj));
+                    }
+                }
+                if (ov) add_summary_item(&parts[0], &counts[0], &m, &j);
+                if (si) add_summary_item(&parts[1], &counts[1], &m, &j);
+                if (!ov && !si) {
+                    if (j.state == OPEN) add_summary_item(&parts[2], &counts[2], &m, &j);
+                    else if (j.state == TAKEN) add_summary_item(&parts[3], &counts[3], &m, &j);
+                    else if (j.when + 86400000000ull > now) {
+                        int part = j.state == DONE ? 4 : 5;
+                        add_summary_item(&parts[part], &counts[part], &m, &j);
                     }
                 }
             }
             message_free(&m);
             p_free(id);
         }
+        sessions_cache_free(&sc);
         add(&out, "# Heliograph "), add(&out, day.data), add(&out, "\n\nAs it stood at "), add_time(&out, now), add(&out, ".\n");
-        for (int i = 0; i < 5; i++) {
+        for (int i = 0; i < 6; i++) {
             add(&out, "\n## "), add(&out, titles[i]), add(&out, ": "), add_number(&out, counts[i], 0), add(&out, "\n\n");
             if (parts[i].data) add(&out, parts[i].data);
             if (counts[i] > 100) add(&out, "- and more: helio log\n");

@@ -39,8 +39,32 @@ static void copy_str(char *to, size_t room, const char *from) {
     to[i] = 0;
 }
 
+static const uint64_t MAX_SILENT_MINUTES = (~(uint64_t)0) / 60000000ull;
+
+static bool parse_silent_minutes(const char *word, uint64_t *out) {
+    if (!word || !*word) return false;
+    uint64_t v = 0;
+    for (const char *c = word; *c; c++) {
+        if (*c < '0' || *c > '9') return false;
+        uint64_t d = (uint64_t)(*c - '0');
+        if (v > MAX_SILENT_MINUTES / 10 || (v == MAX_SILENT_MINUTES / 10 && d > MAX_SILENT_MINUTES % 10)) return false;
+        v = v * 10 + d;
+    }
+    if (v == 0) return false;
+    *out = v;
+    return true;
+}
+
+static void format_line_error(char *buf, size_t room, size_t lineno, const char *detail) {
+    text t = {0};
+    add(&t, "helio.conf line "), add_number(&t, (uint64_t)lineno, 0), add(&t, ": "), add(&t, detail);
+    copy_str(buf, room, t.failed ? detail : t.data);
+    text_free(&t);
+}
+
 s_result place_open(place *p, const char **why) {
     *p = (place){0};
+    p->silent_minutes = PLACE_SILENT_DEFAULT;
     text at = {0};
     for (int up = 0; up < 24 && !p->file; up++) {
         text file = {0};
@@ -56,20 +80,69 @@ s_result place_open(place *p, const char **why) {
     }
     text_free(&at);
     if (!p->file) return S_OK;
-    for (const char *line = p->file; *line; line = next_line(line)) {
+    size_t lineno = 1;
+    for (const char *line = p->file; *line; line = next_line(line), lineno++) {
         const char *value = line;
         bool good = true;
-        char path[512], lane[36];
+        char path[512], lane[36], word[32];
         if (starts(line, "project:")) value += 8, good = take_word(p->project, sizeof p->project, &value) && line_end(value);
         else if (starts(line, "lane:")) value += 5, good = take_word(p->lane, sizeof p->lane, &value) && line_end(value);
         else if (starts(line, "repository:")) value += 11, good = take_word(p->repository, sizeof p->repository, &value) && pair_ok("x", p->repository) && line_end(value);
+        else if (starts(line, "silent:")) {
+            value += 7;
+            uint64_t mins = 0;
+            if (!take_word(word, sizeof word, &value) || !parse_silent_minutes(word, &mins) || !line_end(value)) {
+                format_line_error(p->why, sizeof p->why, lineno, "silent must be a positive number of minutes");
+                return *why = p->why, S_DAMAGED;
+            }
+            p->silent_minutes = mins;
+        }
         else if (starts(line, "path:")) value += 5, good = take_word(path, sizeof path, &value) && take_word(lane, sizeof lane, &value) && pair_ok("x", lane) && line_end(value);
         else if (*line != '\n' && *line != '\r' && *line != '#') good = false;
-        if (!good) return *why = "helio.conf has a line that is not project, lane, repository or path", S_DAMAGED;
+        if (!good) {
+            format_line_error(p->why, sizeof p->why, lineno, "expected project, lane, repository, silent or path");
+            return *why = p->why, S_DAMAGED;
+        }
     }
     if (!pair_ok(p->project, *p->lane ? p->lane : "x")) return *why = "helio.conf names no project, or a bad lane", S_DAMAGED;
     p->found = true;
     return S_OK;
+}
+
+void place_record_silent(store *s, const place *here) {
+    if (!s || !s->folder || !here || !here->found || !*here->project) return;
+    text folder = {0}, path = {0}, data = {0}, unique = {0};
+    add(&folder, s->folder), add(&folder, "/silent");
+    add(&path, folder.data ? folder.data : ""), add(&path, "/"), add(&path, here->project);
+    add_number(&data, here->silent_minutes, 0), add(&data, "\n");
+    add_number(&unique, p_tick(), 0);
+    if (!folder.failed && !path.failed && !data.failed && !unique.failed && p_folder(folder.data) == P_OK)
+        (void)p_write(path.data, data.data, data.length, true, unique.data);
+    text_free(&folder), text_free(&path), text_free(&data), text_free(&unique);
+}
+
+uint64_t place_silent_us(const store *s, const place *here, const char *project) {
+    if (here && here->found && project && same(here->project, project))
+        return here->silent_minutes * 60000000ull;
+    if (s && s->folder && project && *project && pair_ok(project, "x")) {
+        text path = {0};
+        add(&path, s->folder), add(&path, "/silent/"), add(&path, project);
+        char *data = NULL;
+        size_t length = 0;
+        if (!path.failed && p_read(path.data, 64, &data, &length) == P_OK) {
+            const char *at = data;
+            char word[32];
+            uint64_t mins = 0;
+            if (take_word(word, sizeof word, &at) && parse_silent_minutes(word, &mins) && line_end(at)) {
+                p_free(data);
+                text_free(&path);
+                return mins * 60000000ull;
+            }
+            p_free(data);
+        }
+        text_free(&path);
+    }
+    return (uint64_t)PLACE_SILENT_DEFAULT * 60000000ull;
 }
 
 void place_close(place *p) {
