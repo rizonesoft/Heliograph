@@ -3798,41 +3798,23 @@ class Landed(Base):
         self.assertEqual(self.helio("archive", me=None).returncode, 3)
         lone.unlink()
 
-        # 4. Concurrency via pause harness:
-        #    (a) Taker A loses authority (owner releases, B takes) between authorization and publication -> exits 2, zero mark left!
+        # 4. Interrupted archive with live-only acknowledged mark: BOTH show and log --all display it before sweep!
+        late_live = self.store / f"messages/{jid}.landed.eeee555"
+        put(late_live, "by: os/main\ntime: 2025-02-15T00:01:00Z\nsession: \ncommit: eeee555\nend: yes\n")
+        self.assertIn("landed 1111111,2222222,eeee555", self.helio("show", jid, me="os/ui").stdout.decode())
+        self.assertIn("landed 1111111,2222222,eeee555", self.helio("log", "--all", me="os/ui").stdout.decode())
+        self.assertEqual(self.helio("archive", me=None).returncode, 0)
+        self.assertFalse(late_live.exists())
+        self.assertTrue((self.store / f"archive/2025-02/{jid}.landed.eeee555").exists())
+        self.assertEqual(self.helio("check", me=None).returncode, 0)
+
+        # 5. Concurrency via pause harness:
+        #    (a) Taker A publishes and pauses at after-landed; owner releases; sender repeats same commit -> BOTH exit 0 and mark survives untouched!
         race_a = self.send("ask", "os/all", "os/main", "Race auth", "work")
         self.assertEqual(self.helio("take", race_a, "--session", "sA", me="os/apps").returncode, 0)
         p_a = subprocess.Popen(
-            [str(RACER), "--pause-cli", "landed", str(self.store), "landed", race_a, "aaaa111", "--as", "os/apps", "--session", "sA", "--store", str(self.store)],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
-        try:
-            for _ in range(200):
-                if (self.store / "paused.landed").exists():
-                    break
-                time.sleep(0.02)
-            self.assertTrue((self.store / "paused.landed").exists())
-            self.assertEqual(self.helio("release", race_a, me="os/owner").returncode, 0)
-            self.assertEqual(self.helio("take", race_a, "--session", "sB", me="os/ui").returncode, 0)
-            put(self.store / "resume.landed", "x")
-            _, err_a = p_a.communicate(timeout=30)
-            self.assertEqual(p_a.returncode, 2, err_a)
-            self.assertFalse((self.store / f"messages/{race_a}.landed.aaaa111").exists())
-        finally:
-            if p_a.poll() is None:
-                p_a.kill()
-                p_a.wait(timeout=10)
-            for f in ("paused.landed", "resume.landed"):
-                if (self.store / f).exists():
-                    (self.store / f).unlink()
-
-        #    (b) Publication before archive scan (paused at after-landed): archiver captures mark -> writer exits 0 and mark survives!
-        race_b = rc_at(old_us + 500, "ask", "os/apps", "Race arch capture", "--as", "os/main", body=b"w").stdout.decode().strip()
-        self.assertEqual(rc_at(old_us + 600, "take", race_b, "--as", "os/apps").returncode, 0)
-        self.assertEqual(rc_at(old_us + 700, "done", race_b, "ok", "--as", "os/apps").returncode, 0)
-        p_b = subprocess.Popen(
-            [str(RACER), "--pause-cli", "after-landed", str(self.store), "landed", race_b, "bbbb222", "--as", "os/main", "--store", str(self.store)],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            [str(RACER), "--pause-cli", "after-landed", str(self.store), "landed", race_a, "aaaa111", "--as", "os/apps", "--session", "sA", "--store", str(self.store)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=clean_env,
         )
         try:
             for _ in range(200):
@@ -3840,27 +3822,67 @@ class Landed(Base):
                     break
                 time.sleep(0.02)
             self.assertTrue((self.store / "paused.after-landed").exists())
-            self.assertEqual(self.helio("archive", me=None).returncode, 0)
+            orig_bytes = (self.store / f"messages/{race_a}.landed.aaaa111").read_bytes()
+            self.assertEqual(self.helio("release", race_a, me="os/owner").returncode, 0)
+            self.assertEqual(self.helio("take", race_a, "--session", "sB", me="os/ui").returncode, 0)
+            self.assertEqual(self.helio("landed", race_a, "aaaa111", me="os/main").returncode, 0)
             put(self.store / "resume.after-landed", "x")
-            _, err_b = p_b.communicate(timeout=30)
-            self.assertEqual(p_b.returncode, 0, err_b)
-            self.assertTrue((self.store / f"archive/2025-02/{race_b}.landed.bbbb222").exists())
-            self.assertFalse((self.store / f"messages/{race_b}.landed.bbbb222").exists())
+            _, err_a = p_a.communicate(timeout=30)
+            self.assertEqual(p_a.returncode, 0, err_a)
+            self.assertEqual((self.store / f"messages/{race_a}.landed.aaaa111").read_bytes(), orig_bytes)
+            # And after release+retake, superseded taker A attempting a NEW commit is refused with exit 2 and writes nothing.
+            self.assertEqual(self.helio("landed", race_a, "aaaa222", "--session", "sA", me="os/apps").returncode, 2)
+            self.assertFalse((self.store / f"messages/{race_a}.landed.aaaa222").exists())
         finally:
-            if p_b.poll() is None:
-                p_b.kill()
-                p_b.wait(timeout=10)
+            if p_a.poll() is None:
+                p_a.kill()
+                p_a.wait(timeout=10)
             for f in ("paused.after-landed", "resume.after-landed"):
                 if (self.store / f).exists():
                     (self.store / f).unlink()
 
-        #    (c) Publication after archive unlink (paused at landed): writer removes orphan mark -> exits 2, zero archived mark!
-        race_c = rc_at(old_us + 800, "ask", "os/apps", "Race arch refuse", "--as", "os/main", body=b"w").stdout.decode().strip()
+        #    (b) Archiver pauses at before-copy-landed (after reading live mark, before writing archive dest); concurrent landed succeeds and both agree!
+        race_b = rc_at(old_us + 500, "ask", "os/apps", "Race arch copy", "--as", "os/main", body=b"w").stdout.decode().strip()
+        self.assertEqual(rc_at(old_us + 600, "take", race_b, "--as", "os/apps").returncode, 0)
+        self.assertEqual(rc_at(old_us + 700, "done", race_b, "ok", "--as", "os/apps").returncode, 0)
+        self.assertEqual(rc_at(old_us + 750, "landed", race_b, "bbbb222", "--as", "os/main").returncode, 0)
+        orig_b = (self.store / f"messages/{race_b}.landed.bbbb222").read_bytes()
+        p_arch = subprocess.Popen(
+            [str(RACER), "--pause-cli", "before-copy-landed", str(self.store), "archive", "--store", str(self.store)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=clean_env,
+        )
+        try:
+            for _ in range(200):
+                if (self.store / "paused.before-copy-landed").exists():
+                    break
+                time.sleep(0.02)
+            self.assertTrue((self.store / "paused.before-copy-landed").exists())
+            r_mid = self.helio("landed", race_b, "bbbb222", me="os/main")
+            self.assertEqual(r_mid.returncode, 0, r_mid.stderr)
+            put(self.store / "resume.before-copy-landed", "x")
+            _, err_arch = p_arch.communicate(timeout=30)
+            self.assertEqual(p_arch.returncode, 0, err_arch)
+            self.assertEqual((self.store / f"archive/2025-02/{race_b}.landed.bbbb222").read_bytes(), orig_b)
+            self.assertFalse((self.store / f"messages/{race_b}.landed.bbbb222").exists())
+        finally:
+            if p_arch.poll() is None:
+                p_arch.kill()
+                p_arch.wait(timeout=10)
+            if p_arch.stdout:
+                p_arch.stdout.close()
+            if p_arch.stderr:
+                p_arch.stderr.close()
+            for f in ("paused.before-copy-landed", "resume.before-copy-landed"):
+                if (self.store / f).exists():
+                    (self.store / f).unlink()
+
+        #    (c) Writer pauses at landed before make_ex; archiver moves job; writer resumes -> promotes durably to archive with exit 0 and zero live remnants!
+        race_c = rc_at(old_us + 800, "ask", "os/apps", "Race arch promote", "--as", "os/main", body=b"w").stdout.decode().strip()
         self.assertEqual(rc_at(old_us + 900, "take", race_c, "--as", "os/apps").returncode, 0)
         self.assertEqual(rc_at(old_us + 950, "done", race_c, "ok", "--as", "os/apps").returncode, 0)
         p_c = subprocess.Popen(
             [str(RACER), "--pause-cli", "landed", str(self.store), "landed", race_c, "cccc333", "--as", "os/main", "--store", str(self.store)],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=clean_env,
         )
         try:
             for _ in range(200):
@@ -3871,8 +3893,8 @@ class Landed(Base):
             self.assertEqual(self.helio("archive", me=None).returncode, 0)
             put(self.store / "resume.landed", "x")
             _, err_c = p_c.communicate(timeout=30)
-            self.assertEqual(p_c.returncode, 2, err_c)
-            self.assertFalse((self.store / f"archive/2025-02/{race_c}.landed.cccc333").exists())
+            self.assertEqual(p_c.returncode, 0, err_c)
+            self.assertTrue((self.store / f"archive/2025-02/{race_c}.landed.cccc333").exists())
             self.assertFalse((self.store / f"messages/{race_c}.landed.cccc333").exists())
         finally:
             if p_c.poll() is None:
@@ -3882,13 +3904,27 @@ class Landed(Base):
                 if (self.store / f).exists():
                     (self.store / f).unlink()
 
-        # 5. Flush failure on landed publication preserves exit 3.
+        # 6. Flush failure on publication exits 3, retry with failed p_sync STILL exits 3, and clean retry flushes and exits 0!
         flush_job = self.send("ask", "os/apps", "os/main", "Flush fault", "work")
         r_fl = subprocess.run(
             [str(RACER), "--fail-write-flush-cli", "landed", flush_job, "dddd444", "--as", "os/main", "--store", str(self.store)],
             capture_output=True, timeout=30, env=clean_env,
         )
         self.assertEqual(r_fl.returncode, 3, r_fl.stderr)
+        fl_path = self.store / f"messages/{flush_job}.landed.dddd444"
+        fl_exists = fl_path.exists()
+        if fl_exists:
+            fl_bytes = fl_path.read_bytes()
+            r_sy = subprocess.run(
+                [str(RACER), "--fail-sync-cli", "landed", flush_job, "dddd444", "--as", "os/main", "--store", str(self.store)],
+                capture_output=True, timeout=30, env=clean_env,
+            )
+            self.assertEqual(r_sy.returncode, 3, r_sy.stderr)
+        r_retry = self.helio("landed", flush_job, "dddd444", me="os/main")
+        self.assertEqual(r_retry.returncode, 0, r_retry.stderr)
+        self.assertTrue(fl_path.exists())
+        if fl_exists:
+            self.assertEqual(fl_path.read_bytes(), fl_bytes)
         self.assertEqual(self.helio("check", me=None).returncode, 0)
 
 

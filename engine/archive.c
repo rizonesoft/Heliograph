@@ -1429,6 +1429,42 @@ s_result archive_read_landed_one(const char *folder, const char *id, const char 
     return ok ? S_OK : S_DAMAGED;
 }
 
+s_result archive_promote_landed(const char *folder, const char *id, const char *commit, const char **why) {
+    char month[8];
+    if (!valid_id(id) || !archive_month(id, month)) {
+        if (why) *why = "the message id has no valid date";
+        return S_DAMAGED;
+    }
+    if (!ensure_archive_month(folder, month)) {
+        if (why) *why = "archive folder cannot be created";
+        return S_DAMAGED;
+    }
+    text ev = {0}, src = {0}, dst = {0};
+    add(&ev, "landed."), add(&ev, commit);
+    if (ev.failed || !store_valid_landed_event(ev.data)) {
+        text_free(&ev);
+        if (why) *why = "a landed mark is damaged";
+        return S_DAMAGED;
+    }
+    live_path(folder, &src, id, ev.data);
+    arch_path(folder, month, &dst, id, ev.data);
+    text_free(&ev);
+    const char *cwhy = NULL;
+    s_result cr = (src.failed || dst.failed) ? (cwhy = "out of memory", S_DAMAGED) : copy_durable(src.data, dst.data, &cwhy);
+    if (cr == S_DAMAGED) {
+        text_free(&src), text_free(&dst);
+        if (why) *why = cwhy ? cwhy : "an archive copy cannot be written";
+        return S_DAMAGED;
+    }
+    p_result rm = p_remove(src.data);
+    text_free(&src), text_free(&dst);
+    if (rm != P_OK && rm != P_MISSING) {
+        if (why) *why = "a landed mark could not be removed";
+        return S_DAMAGED;
+    }
+    return S_OK;
+}
+
 typedef struct {
     const char *prefix;
     size_t prefix_len;
@@ -1454,38 +1490,98 @@ static bool gather_arch_landed(void *user, const char *name) {
     return list_push(&c->events, ev, len(ev));
 }
 
-static s_result format_arch_landed_events(const char *folder, const char *month, const char *id,
-                                          str_list *events, bool compact, text *out, const char **why) {
-    sort_list(events);
-    size_t shown = 0;
-    for (size_t i = 0; i < events->count; i++) {
-        const char *ev = events->items[i];
+static s_result format_arch_landed_events(const store *s, const char *month, const char *id,
+                                          str_list *events, text *out, const char **why) {
+    /* Also include any un-swept live <id>.landed.* marks from s->names (interrupted archive recovery). */
+    text prefix = {0}, bare = {0};
+    add(&prefix, id), add(&prefix, ".landed.");
+    add(&bare, id), add(&bare, ".landed");
+    if (prefix.failed || bare.failed) {
+        text_free(&prefix), text_free(&bare);
+        if (why) *why = "out of memory";
+        return S_DAMAGED;
+    }
+    str_list live_extra = {0};
+    size_t low = 0, high = s->count;
+    while (low < high) {
+        size_t mid = low + (high - low) / 2;
+        if (compare(s->names[mid], bare.data) < 0) low = mid + 1;
+        else high = mid;
+    }
+    for (size_t i = low; i < s->count; i++) {
+        if (same(s->names[i], bare.data)) {
+            list_free(&live_extra), text_free(&prefix), text_free(&bare);
+            if (why) *why = "a landed mark is damaged";
+            return S_DAMAGED;
+        }
+        if (!starts(s->names[i], prefix.data)) {
+            if (compare(s->names[i], prefix.data) > 0) break;
+            continue;
+        }
+        const char *ev = s->names[i] + len(id) + 1;
         if (!store_valid_landed_event(ev)) {
+            list_free(&live_extra), text_free(&prefix), text_free(&bare);
             if (why) *why = "a landed mark is damaged";
             return S_DAMAGED;
         }
-        const char *commit = ev + 7;
-        text ap = {0};
-        arch_path(folder, month, &ap, id, ev);
-        char *data = NULL;
-        size_t length = 0;
-        p_result r = ap.failed ? P_FAILED : p_read(ap.data, MOST_FILE, &data, &length);
-        text_free(&ap);
-        bool ok = r == P_OK && store_valid_landed_payload(data, length, commit);
-        p_free(data);
-        if (!ok) {
-            if (why) *why = "a landed mark is damaged";
+        text lp = {0};
+        live_path(s->folder, &lp, id, ev);
+        char *ld = NULL;
+        size_t ll = 0;
+        p_result lr = lp.failed ? P_FAILED : p_read(lp.data, MOST_FILE, &ld, &ll);
+        text_free(&lp);
+        if (lr == P_MISSING) continue;
+        bool ok = lr == P_OK && store_valid_landed_payload(ld, ll, ev + 7);
+        p_free(ld);
+        if (!ok || !list_push(&live_extra, ev, len(ev))) {
+            list_free(&live_extra), text_free(&prefix), text_free(&bare);
+            if (why) *why = ok ? "out of memory" : "a landed mark is damaged";
             return S_DAMAGED;
         }
-        if (!compact || shown < 2) {
-            if (shown) add(out, ",");
-            add(out, commit);
+    }
+    text_free(&prefix), text_free(&bare);
+
+    sort_list(events);
+    sort_list(&live_extra);
+    size_t ai = 0, li = 0, shown = 0;
+    while (ai < events->count || li < live_extra.count) {
+        const char *ev = NULL;
+        bool from_arch = false;
+        if (ai < events->count && li < live_extra.count) {
+            int cmp = compare(events->items[ai], live_extra.items[li]);
+            if (cmp < 0) ev = events->items[ai++], from_arch = true;
+            else if (cmp > 0) ev = live_extra.items[li++];
+            else ev = events->items[ai++], li++, from_arch = true;
+        } else if (ai < events->count) {
+            ev = events->items[ai++], from_arch = true;
+        } else {
+            ev = live_extra.items[li++];
         }
+        if (from_arch) {
+            if (!store_valid_landed_event(ev)) {
+                list_free(&live_extra);
+                if (why) *why = "a landed mark is damaged";
+                return S_DAMAGED;
+            }
+            text ap = {0};
+            arch_path(s->folder, month, &ap, id, ev);
+            char *data = NULL;
+            size_t length = 0;
+            p_result r = ap.failed ? P_FAILED : p_read(ap.data, MOST_FILE, &data, &length);
+            text_free(&ap);
+            bool ok = r == P_OK && store_valid_landed_payload(data, length, ev + 7);
+            p_free(data);
+            if (!ok) {
+                list_free(&live_extra);
+                if (why) *why = "a landed mark is damaged";
+                return S_DAMAGED;
+            }
+        }
+        if (shown) add(out, ",");
+        add(out, ev + 7);
         shown++;
     }
-    if (compact && shown > 2) {
-        add(out, " (+"), add_number(out, (uint64_t)(shown - 2), 0), add(out, " more)");
-    }
+    list_free(&live_extra);
     if (out->failed) {
         if (why) *why = "out of memory";
         return S_DAMAGED;
@@ -1493,7 +1589,7 @@ static s_result format_arch_landed_events(const char *folder, const char *month,
     return S_OK;
 }
 
-s_result archive_read_landed_commits(const char *folder, const char *id, bool compact, text *out, const char **why) {
+s_result archive_each_landed(const char *folder, const char *id, bool (*each)(void *user, const char *commit), void *user, const char **why) {
     char month[8];
     if (!valid_id(id) || !archive_month(id, month)) return S_OK;
     text mdir = {0}, prefix = {0}, bare = {0};
@@ -1517,9 +1613,30 @@ s_result archive_read_landed_commits(const char *folder, const char *id, bool co
         if (why) *why = ctx.bad ? "a landed mark is damaged" : "the archive month cannot be read";
         return S_DAMAGED;
     }
-    s_result res = format_arch_landed_events(folder, month, id, &ctx.events, compact, out, why);
+    sort_list(&ctx.events);
+    for (size_t i = 0; i < ctx.events.count; i++) {
+        const char *ev = ctx.events.items[i];
+        text ap = {0};
+        arch_path(folder, month, &ap, id, ev);
+        char *data = NULL;
+        size_t length = 0;
+        p_result r = ap.failed ? P_FAILED : p_read(ap.data, MOST_FILE, &data, &length);
+        text_free(&ap);
+        bool ok = r == P_OK && store_valid_landed_payload(data, length, ev + 7);
+        p_free(data);
+        if (!ok) {
+            list_free(&ctx.events);
+            if (why) *why = "a landed mark is damaged";
+            return S_DAMAGED;
+        }
+        if (!each(user, ev + 7)) {
+            list_free(&ctx.events);
+            if (why) *why = "out of memory";
+            return S_DAMAGED;
+        }
+    }
     list_free(&ctx.events);
-    return res;
+    return S_OK;
 }
 
 size_t archive_every(store *s, char *const *emitted, size_t emitted_count,
@@ -1599,7 +1716,7 @@ size_t archive_every(store *s, char *const *emitted, size_t emitted_count,
                                 s_result jr = archive_read_job_ex(s, &m, &be.items[i].links, &known);
                                 text landed_t = {0};
                                 const char *lwhy = NULL;
-                                s_result lr2 = jr == S_OK ? format_arch_landed_events(s->folder, month, id, &be.items[i].landed, false, &landed_t, &lwhy) : S_OK;
+                                s_result lr2 = jr == S_OK ? format_arch_landed_events(s, month, id, &be.items[i].landed, &landed_t, &lwhy) : S_OK;
                                 if (jr == S_OK) {
                                     if (lr2 != S_OK) damaged++;
                                     each(s, &m, &known, lr2 == S_OK ? landed_t.data : NULL, user);

@@ -17,8 +17,11 @@ s_result archive_write_seen(store *s, const char *id, const char *seen_event);
 /* Checks archive/<YYYY-MM>/<id>.landed.<commit>. Returns S_OK (valid), S_NOTHING (missing), or S_DAMAGED. */
 s_result archive_read_landed_one(const char *folder, const char *id, const char *commit);
 
-/* Reads and validates all archived landed marks for id into sorted comma-separated commits (or compact form). */
-s_result archive_read_landed_commits(const char *folder, const char *id, bool compact, text *out, const char **why);
+/* Durably copies live messages/<id>.landed.<commit> into archive/<YYYY-MM>/ and removes the live copy. */
+s_result archive_promote_landed(const char *folder, const char *id, const char *commit, const char **why);
+
+/* Visits every validated archived landed commit for id in sorted order. */
+s_result archive_each_landed(const char *folder, const char *id, bool (*each)(void *user, const char *commit), void *user, const char **why);
 
 /* Visits archived messages newest month first in bounded batches, skipping IDs already emitted by the live pass.
    Returns count of damaged months or messages encountered. */
