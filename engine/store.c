@@ -462,8 +462,9 @@ static s_result reserve(store *s, const message *m, const char *key, text *id) {
     return result;
 }
 
-static bool same_post_content(const message *there, const message *m, const char *subject, const char *body) {
+static bool same_post_content(const message *there, const message *m, const char *about, const char *subject, const char *body) {
     return same(there->from, m->from) && same(there->to, m->to) && same(there->kind, m->kind)
+           && same(there->about, about ? about : "") && same(there->urgency, m->urgency)
            && same(there->re, m->re) && same(there->subject, subject) && same(there->body, body);
 }
 
@@ -529,7 +530,7 @@ s_result store_post(store *s, const message *m, const char *key, text *id) {
                     message there = {0};
                     s_result mr = store_message(s, id->data, &there);
                     if (mr == S_OK) {
-                        bool match = same_post_content(&there, m, subject.data, body.data);
+                        bool match = same_post_content(&there, m, about.data, subject.data, body.data);
                         message_free(&there);
                         text_free(&subject), text_free(&about), text_free(&body), text_free(&out);
                         return match ? S_OK : say(s, S_REFUSED, "that key stands for another message");
@@ -555,7 +556,7 @@ s_result store_post(store *s, const message *m, const char *key, text *id) {
             message arch = {0};
             s_result ar = archive_read_message(s, id->data, &arch);
             if (ar == S_OK) {
-                if (!same_post_content(&arch, m, subject.data, body.data))
+                if (!same_post_content(&arch, m, about.data, subject.data, body.data))
                     result = say(s, S_REFUSED, "that key stands for another message");
                 message_free(&arch);
                 text_free(&subject), text_free(&about), text_free(&body), text_free(&out);
@@ -594,7 +595,7 @@ s_result store_post(store *s, const message *m, const char *key, text *id) {
                 s_result ar = archive_read_message(s, id->data, &arch);
                 if (ar == S_OK) {
                     s_result rm = remove_event(s, id->data, "post");
-                    bool match = same_post_content(&arch, m, subject.data, body.data);
+                    bool match = same_post_content(&arch, m, about.data, subject.data, body.data);
                     message_free(&arch);
                     if (rm != S_OK) result = rm;
                     else if (!match) result = say(s, S_REFUSED, "that key stands for another message");
@@ -613,7 +614,7 @@ s_result store_post(store *s, const message *m, const char *key, text *id) {
                     s_result ar = archive_read_message(s, id->data, &there);
                     result = ar == S_OK ? S_OK : ar == S_NOTHING ? say(s, S_REFUSED, "there is no such message") : S_DAMAGED;
                 }
-                if (result == S_OK && !same_post_content(&there, m, subject.data, body.data))
+                if (result == S_OK && !same_post_content(&there, m, about.data, subject.data, body.data))
                     result = say(s, S_REFUSED, "that key stands for another message");
                 message_free(&there);
             } else if (result == S_NOTHING) {

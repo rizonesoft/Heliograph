@@ -1997,10 +1997,17 @@ class Archive(Base):
             self.assertEqual(rep.returncode, 0, rep.stderr)
             self.assertEqual(rep.stdout.decode().strip(), orig_id)
             self.assertEqual(sorted(p.name for p in (st / "messages").iterdir()), live_before)
-            # Conflicting repeat at capacity refuses (exit 2) and creates no new file!
+            # Conflicting repeat at capacity refuses (exit 2) for body, --about, or urgency change and creates no new file!
             conf = subprocess.run([str(RACER), "--max-names", "10", "ask", "os/userland", "cap-key-subj", "--key", "cap-k", "--store", str(st), "--as", "os/main"],
                                   input=b"different-body", capture_output=True, timeout=30)
             self.assertEqual(conf.returncode, 2, conf.stderr)
+            self.assertEqual(sorted(p.name for p in (st / "messages").iterdir()), live_before)
+            conf_about = run(st, "ask", "os/userland", "cap-key-subj", "--key", "cap-k", "--about", "engine/other.c", me="os/main", body="cap-body")
+            self.assertEqual(conf_about.returncode, 2, conf_about.stderr)
+            self.assertIn(b"another message", conf_about.stderr.lower())
+            conf_urg = run(st, "ask", "os/userland", "cap-key-subj", "--key", "cap-k", "--now", me="os/main", body="cap-body")
+            self.assertEqual(conf_urg.returncode, 2, conf_urg.stderr)
+            self.assertIn(b"another message", conf_urg.stderr.lower())
             self.assertEqual(sorted(p.name for p in (st / "messages").iterdir()), live_before)
             # Genuinely new send at capacity still refuses with store-full!
             fresh_new = subprocess.run([str(RACER), "--max-names", "10", "ask", "os/userland", "new-subj", "--key", "brand-new", "--store", str(st), "--as", "os/main"],
@@ -2066,8 +2073,9 @@ class Archive(Base):
                 if p_log.poll() is None:
                     p_log.kill()
             self.assertEqual(p_log.returncode, 0, err_l)
-            self.assertIn(j_mv.encode(), out_l)
-            self.assertIn(b"done by os/userland", out_l)
+            conc_lines = [ln for ln in out_l.decode().splitlines() if j_mv in ln]
+            self.assertEqual(len(conc_lines), 1, out_l)
+            self.assertIn("done by os/userland", conc_lines[0])
         self.assertIn(live_id, r_all.stdout)
         for mid in mar_ids:
             self.assertIn(mid, r_all.stdout)
