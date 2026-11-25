@@ -406,7 +406,7 @@ A path that no lane owns goes to whoever works in that repository, and to the ow
 - [x] Replace `test_an_unowned_path_goes_to_whoever_works_there` in `tests/test_helio.py` with the three cases, its lane announced from inside the repository. Done when: it fails with the old `reader`. Cheaper substitute: keeping the project-wide expectation.
 - [x] Commit: `routing: an unowned path stays in its repository`
 
-**Test checkpoint:** `python3 ../SDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
+**Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted. **Corrected 2026-11-26:** Impossible SDK's folder is now `SDK` (051e1c9), so the command is `python3 ../SDK/tools/app_build.py .`.
 
 ## 15. Quick installer
 

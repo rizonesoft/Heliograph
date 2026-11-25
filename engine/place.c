@@ -269,24 +269,31 @@ static void add_hex(text *out, const char *s) {
     }
 }
 
+/* `<lane>+r<32-hex>+<repo>` for a named session in a repository, `<lane>+o<32-hex>` for one outside
+   any, `<lane>++<repo>` or `<lane>` for a sessionless lane. 'r' and 'o' are not hex digits, so neither
+   meets the `<lane>+<hex>` key older builds wrote for a named session, which this build only reads. */
 static void session_base(text *out, const char *lane, const char *session, const char *repository) {
     for (; *lane; lane++) add_bytes(out, *lane == '/' ? "+" : lane, 1);
     if (session && *session) {
-        if (repository && *repository) {
-            text digest = {0};
-            add_sha256_hex(&digest, session, len(session));
-            if (digest.failed || digest.length < 32) {
-                out->failed = true;
-            } else {
-                add(out, "+r"), add_bytes(out, digest.data, 32), add(out, "+"), add(out, repository);
-            }
-            text_free(&digest);
+        text digest = {0};
+        add_sha256_hex(&digest, session, len(session));
+        if (digest.failed || digest.length < 32) {
+            out->failed = true;
+        } else if (repository && *repository) {
+            add(out, "+r"), add_bytes(out, digest.data, 32), add(out, "+"), add(out, repository);
         } else {
-            add(out, "+"), add_hex(out, session);
+            add(out, "+o"), add_bytes(out, digest.data, 32);
         }
+        text_free(&digest);
     } else if (repository && *repository) {
         add(out, "++"), add(out, repository);
     }
+}
+
+/* The key older builds wrote for a named session (`<lane>+<hex of the session>`), read and never written. */
+static void legacy_session_base(text *out, const char *lane, const char *session) {
+    for (; *lane; lane++) add_bytes(out, *lane == '/' ? "+" : lane, 1);
+    add(out, "+"), add_hex(out, session);
 }
 
 static void session_seq_path(const store *s, text *out, const char *base, uint64_t seq) {
@@ -393,7 +400,7 @@ static p_result read_session_file(const char *path, session_info *out, bool *par
     return r;
 }
 
-/* Validates `<project>+<lane>[+<even-hex>|++<repo>|+r<32-hex>+<repo>][~<seq>]`. Sets base_len, lane, seq, and is_named_repo. */
+/* Validates `<project>+<lane>[+<even-hex>|++<repo>|+r<32-hex>+<repo>|+o<32-hex>][~<seq>]`. Sets base_len, lane, seq, and is_named_repo. */
 static bool parse_session_filename(const char *name, size_t *base_len, char *lane, size_t lane_room, uint64_t *seq, bool *is_named_repo) {
     if (is_named_repo) *is_named_repo = false;
     size_t n = len(name);
@@ -435,6 +442,12 @@ static bool parse_session_filename(const char *name, size_t *base_len, char *lan
             copy_slice(repo, sizeof repo, name + plus2 + 35, rlen);
             if (!repo_ok(repo)) return false;
             if (is_named_repo) *is_named_repo = true;
+        } else if (plus2 + 1 < blen && name[plus2 + 1] == 'o') {
+            if (blen != plus2 + 34) return false;
+            for (size_t i = plus2 + 2; i < blen; i++) {
+                char c = name[i];
+                if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+            }
         } else {
             size_t hlen = blen - plus2 - 1;
             if (hlen < 2 || hlen > 128 || (hlen & 1u)) return false;
@@ -576,7 +589,7 @@ static p_result read_best_generation(const store *s, const char *base, bool *any
    p_create_excl. On P_EXISTS another writer won that slot, so we re-read the latest generation,
    merge monotonically, and retry. After publishing, the superseded generation is removed
    best-effort. */
-static s_result publish_session_key(store *s, const char *base, const char *ag, const char *fallback_agent, const char *rp, const char *ss) {
+static s_result publish_session_key(store *s, const char *base, const char *ag, const session_info *newest, const char *rp, const char *ss) {
     if (s->pause) s->pause(s->pause_user, "hello-write");
 
     for (int attempt = 0; attempt < MOST_CAS_ATTEMPTS; attempt++) {
@@ -588,7 +601,12 @@ static s_result publish_session_key(store *s, const char *base, const char *ag, 
         if (br != P_OK || (any_found && !have_existing && !only_empty))
             return s->why = "the existing session cannot be read", S_DAMAGED;
 
-        const char *use_agent = *ag ? ag : (have_existing && *existing.agent ? existing.agent : fallback_agent);
+        /* No agent named: the newer of this key's record and the session's newest record says it. */
+        const char *use_agent = ag;
+        if (!*use_agent) {
+            bool newest_wins = newest && *newest->agent && (!have_existing || newest->when > existing.when);
+            use_agent = newest_wins ? newest->agent : (have_existing ? existing.agent : "");
+        }
         uint64_t next_seq = any_found ? max_seq + 1 : 0;
         uint64_t now = p_now();
         if (have_existing && now <= existing.when) now = existing.when + 1;
@@ -672,11 +690,11 @@ s_result place_hello(store *s, const char *lane, const char *agent, const char *
         return s->why = "the session cannot be announced", S_DAMAGED;
     }
     text_free(&folder);
-    /* A call that names no agent keeps the one the session last gave, read from its newest record in
-       any repository: only the name is read, no heartbeat moves between keys. */
+    /* A call that names no agent keeps the one the session last gave: its newest record in any
+       repository, unless this key's own record is newer. Only the name is read; no heartbeat moves. */
     session_info newest = {0};
     if (!*ag && *ss && place_session(s, lane, ss, &newest) != S_OK) newest = (session_info){0};
-    s_result r = publish_session_key(s, base.data, ag, newest.agent, rp, ss);
+    s_result r = publish_session_key(s, base.data, ag, &newest, rp, ss);
     text_free(&base);
     return r;
 }
@@ -734,8 +752,8 @@ static bool collect_repo_keys_cb(void *user, const char *name) {
     return true;
 }
 
-/* The session's newest heartbeat in any repository: its key outside a repository (or the record an
-   older build wrote there) and each of its repository keys. */
+/* The session's newest heartbeat in any repository: its key outside a repository, the record an older
+   build wrote under the session's name, and each of its repository keys. */
 s_result place_session(store *s, const char *lane, const char *session, session_info *out) {
     *out = (session_info){0};
     if (!lane || !address_ok(lane, false) || !session_ok(session)) return s->why = "invalid lane or session", S_REFUSED;
@@ -750,6 +768,13 @@ s_result place_session(store *s, const char *lane, const char *session, session_
     text_free(&base);
     if (r == S_DAMAGED || !*ss) return r;
     bool have = r == S_OK;
+    text old = {0};
+    legacy_session_base(&old, lane, ss);
+    session_info oi = {0};
+    s_result orr = old.failed ? (s->why = "out of memory", S_DAMAGED) : read_session_by_base(s, lane, old.data, &oi);
+    text_free(&old);
+    if (orr == S_DAMAGED) return S_DAMAGED;
+    if (orr == S_OK && (!have || oi.when > out->when)) *out = oi, have = true;
 
     text prefix = {0}, folder = {0};
     session_base(&prefix, lane, ss, "x");
@@ -795,7 +820,7 @@ s_result place_session_repo(store *s, const char *lane, const char *session, con
     if (!repo_ok(repository)) return s->why = "invalid repository", S_REFUSED;
     const char *ss = session ? session : "";
     text cbase = {0}, rbase = {0};
-    session_base(&cbase, lane, ss, "");
+    legacy_session_base(&cbase, lane, ss);
     session_base(&rbase, lane, ss, repository);
     if (cbase.failed || rbase.failed) {
         text_free(&cbase), text_free(&rbase);

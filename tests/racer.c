@@ -22,7 +22,10 @@ extern size_t store_max_names;
 typedef struct {
     const char *folder;
     const char *stages;
+    bool timed_out; /* a pause released by its 30-second limit, not by the test: the run proves nothing */
 } pause_ctx;
+
+enum { PAUSE_TIMED_OUT = 105 };
 
 static bool want_stage(const char *stages, const char *stage) {
     size_t n = len(stage);
@@ -54,7 +57,10 @@ static void on_pause(void *user, const char *stage) {
                 p_free(data);
                 break;
             }
-            if (p_now() > until) break;
+            if (p_now() > until) {
+                ctx->timed_out = true;
+                break;
+            }
         }
     }
     text_free(&paused);
@@ -70,7 +76,7 @@ static int run_pause(int count, char **args) {
         if (s.why) p_error(s.why), p_error("\n");
         return (int)r;
     }
-    pause_ctx ctx = {folder, stages};
+    pause_ctx ctx = {folder, stages, false};
     s.pause = on_pause;
     s.pause_user = &ctx;
     if (same(op, "job")) {
@@ -89,6 +95,7 @@ static int run_pause(int count, char **args) {
     }
     if (r != S_OK && s.why) p_error(s.why), p_error("\n");
     store_close(&s);
+    if (ctx.timed_out) return p_error("racer: a pause timed out before the test resumed it\n"), PAUSE_TIMED_OUT;
     return (int)r;
 }
 
@@ -470,8 +477,10 @@ int racer(int count, char **args) {
     }
     if (count >= 2 && same(args[1], "--pause")) return run_pause(count, args);
     if (count >= 4 && same(args[1], "--pause-cli")) {
-        pause_ctx ctx = {args[3], args[2]};
-        return helio_paused(count - 3, args + 3, on_pause, &ctx);
+        pause_ctx ctx = {args[3], args[2], false};
+        int code = helio_paused(count - 3, args + 3, on_pause, &ctx);
+        if (ctx.timed_out) return p_error("racer: a pause timed out before the test resumed it\n"), PAUSE_TIMED_OUT;
+        return code;
     }
     char *data = NULL;
     size_t length = 0;

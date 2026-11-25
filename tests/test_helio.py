@@ -4534,13 +4534,16 @@ class RepositoryRouting(Base):
         def snapshot():
             return {p.name: p.read_bytes() for p in (self.store / "sessions").iterdir()}
 
-        own = f"os+dev+r{hashlib.sha256(b'w').hexdigest()[:32]}+"
-        for target in ("repo-b", "repo-c", "repo-d", "repo-b", "repo-a"):
+        digest = hashlib.sha256(b'w').hexdigest()[:32]
+        nowhere = self.store / "nowhere"
+        nowhere.mkdir()
+        # None: a refresh outside any configured repository, which must not touch the older build's record either.
+        for target in ("repo-b", None, "repo-c", "repo-d", None, "repo-b", "repo-a"):
             before = snapshot()
-            r = self.helio("inbox", "--session", "w", me="os/dev", cwd=repos[target])
+            r = self.helio("inbox", "--session", "w", me="os/dev", cwd=repos[target] if target else nowhere)
             self.assertIn(r.returncode, (0, 1), r.stderr)
             after = snapshot()
-            mine = own + target
+            mine = f"os+dev+r{digest}+{target}" if target else f"os+dev+o{digest}"
             for name, data in before.items():
                 if name == mine or name.startswith(mine + "~"):
                     continue
@@ -4550,13 +4553,27 @@ class RepositoryRouting(Base):
             rc, info = self.read_session("os/dev", "w")
             self.assertEqual((rc, info["agent"]), (0, "claude"))
 
+        # The older build's record still gives repo-d's inline time after every refresh above.
+        rc_d, info_d = self.read_session("os/dev", "w")
+        self.assertEqual(rc_d, 0)
+        r_live = subprocess.run([str(RACER), "--list-sessions", str(self.store)], capture_output=True, timeout=30)
+        self.assertIn(f"repository=repo-c".encode(), r_live.stdout)
+
+        # Returning to a repository keeps the agent the session gave last, not the one that key held.
+        self.assertEqual(self.helio("hello", "codex", "--session", "w", me="os/dev", cwd=repos["repo-b"]).returncode, 0)
+        r_back = self.helio("inbox", "--session", "w", me="os/dev", cwd=repos["repo-a"])
+        self.assertIn(r_back.returncode, (0, 1), r_back.stderr)
+        rc_a, info_a = self.read_session("os/dev", "w")
+        self.assertEqual((rc_a, info_a["agent"], info_a["repository"]), (0, "codex", "repo-a"))
+
         # End to end: while the session refreshes in b, c and d over and over, every unowned path sent
         # in repo-a still finds the worker there and stays in repo-a.
         stop = time.time() + 6
+        refreshes = []
         def churn():
             i = 0
             while time.time() < stop:
-                self.helio("inbox", "--session", "w", me="os/dev", cwd=repos[("repo-b", "repo-c", "repo-d")[i % 3]])
+                refreshes.append(self.helio("inbox", "--session", "w", me="os/dev", cwd=repos[("repo-b", "repo-c", "repo-d")[i % 3]]).returncode)
                 i += 1
         import threading
         worker = threading.Thread(target=churn)
@@ -4568,6 +4585,8 @@ class RepositoryRouting(Base):
         finally:
             worker.join()
         self.assertGreater(len(sent), 5)
+        self.assertGreater(len(refreshes), 5)
+        self.assertTrue(all(code in (0, 1) for code in refreshes), refreshes)
         for mid in sent:
             post = (self.store / f"messages/{mid}.post").read_text()
             self.assertIn("to: os/all\n", post, mid)
