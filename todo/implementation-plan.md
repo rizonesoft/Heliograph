@@ -36,7 +36,7 @@ Sections: 7 | Checklist items: 37
 | [x]    | D01 T01 §5  | Report of a silent taker               | none  | 6     |
 | [x]    | D01 T01 §6  | Messages for one session               | none  | 5     |
 | [x]    | D01 T01 §7  | Projects kept apart in log and show    | none  | 4     |
-| [ ]    | D01 T01 §8  | Mark for landed work                   | none  | 5     |
+| [x]    | D01 T01 §8  | Mark for landed work                   | none  | 5     |
 | [ ]    | D01 T01 §9  | Fixed marks around every shown message | none  | 4     |
 | [ ]    | D01 T01 §14 | Unowned paths kept to their repository | none  | 8     |
 
@@ -51,6 +51,6 @@ Sections: 4 | Checklist items: 19
 | [ ]    | D01 T01 §12 | Expiry of seen heads-ups and findings  | none  | 4     |
 | [ ]    | D01 T01 §13 | Design and help that match the program | none  | 4     |
 
-Progress: 10/17 verified sections, 4 ready to run now.
+Progress: 11/17 verified sections, 3 ready to run now.
 
 Checklist: 68/99 items completed (includes Commit items).

@@ -42,7 +42,7 @@ title: "TODO-01 -- Heliograph"
 | 5 | §5 | Report of a silent taker | §4 | [x] |
 | 6 | §6 | Messages for one session | §5 | [x] |
 | 7 | §7 | Projects kept apart in log and show | -- | [x] |
-| 8 | §8 | Mark for landed work | §2 | [ ] |
+| 8 | §8 | Mark for landed work | §2 | [x] |
 | 9 | §9 | Fixed marks around every shown message | §7 | [ ] |
 | 10 | §10 | JSON output on every command | §3, §5, §6, §8, §9 | [ ] |
 | 11 | §11 | Take the next job as a queue | §10 | [ ] |
@@ -270,6 +270,9 @@ A linked commit marks a job landed and closes nothing. The engine starts no prog
 - [x] Commit: `jobs: a commit marks them landed`
 
 **Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
+
+> **Verified:** 2026-11-25 | §8 | 3eb564fd010360898f86137fe69d3fc7aeee91d1
+> **Review:** `docs/reviews/d01-t01-s8.json`
 
 ## 9. Fixed marks around every shown message
 
