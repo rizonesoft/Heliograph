@@ -2646,19 +2646,21 @@ class Sessions(Base):
             if p.name == "os+emptygen0" or p.name.startswith("os+emptygen0~"):
                 p.unlink()
 
-        # Concurrent refresh sweeps hello's newly published N+1 before hello verifies: hello retries cleanly and succeeds!
+        # Concurrent refresh sweeps hello's newly published N+1 AFTER verification has listed [N+1, N] and BEFORE
+        # verification opens N+1 (leaving predecessor N intact): hello must rescan on P_MISSING, see N+2, retry, and succeed!
         p_ver = subprocess.Popen(
-            [str(RACER), "--pause-cli", "hello-verify", str(self.store), "hello", "antigravity", "--store", str(self.store), "--as", "os/apps", "--session", "race-1"],
+            [str(RACER), "--pause-cli", "hello-verify-read", str(self.store), "hello", "antigravity", "--store", str(self.store), "--as", "os/apps", "--session", "race-1"],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=repo, env=clean,
         )
         try:
             deadline = time.time() + 15
-            while not (self.store / "paused.hello-verify").exists():
+            while not (self.store / "paused.hello-verify-read").exists():
                 self.assertLess(time.time(), deadline)
                 time.sleep(0.01)
+            # N is still intact while N+1 exists; inbox reads N+1, publishes N+2, and sweeps N+1 (leaving N intact).
             r_sweep = self.helio("inbox", "--session", "race-1", me=None, cwd=repo)
             self.assertEqual((r_sweep.returncode, r_sweep.stderr), (1, b""))
-            put(self.store / "resume.hello-verify", "go")
+            put(self.store / "resume.hello-verify-read", "go")
             _, ver_err = p_ver.communicate(timeout=30)
             self.assertEqual((p_ver.returncode, ver_err), (0, b""))
         finally:

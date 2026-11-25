@@ -269,7 +269,7 @@ static bool collect_base_seqs_cb(void *user, const char *name) {
    (or report only_empty so place_hello can self-heal), while NEVER falling back past
    an I/O read error or a non-empty corrupt/truncated file. */
 static p_result read_best_generation(const store *s, const char *base, bool *any_found, uint64_t *max_seq,
-                                     bool *valid_found, uint64_t *valid_seq, bool *only_empty, session_info *out) {
+                                     bool *valid_found, uint64_t *valid_seq, bool *only_empty, bool verifying, session_info *out) {
     *any_found = false, *max_seq = 0, *valid_found = false, *valid_seq = 0;
     if (only_empty) *only_empty = false;
     *out = (session_info){0};
@@ -302,7 +302,8 @@ static p_result read_best_generation(const store *s, const char *base, bool *any
             }
     *any_found = true;
     *max_seq = sl.seqs[0];
-    bool any_missing = false, saw_empty = false;
+    if (verifying && s->pause) s->pause(s->pause_user, "hello-verify-read");
+    bool saw_empty = false;
     for (size_t i = 0; i < sl.count; i++) {
         text path = {0};
         session_seq_path(s, &path, base, sl.seqs[i]);
@@ -315,8 +316,10 @@ static p_result read_best_generation(const store *s, const char *base, bool *any
         p_result rr = read_session_file(path.data, out, &parsed, &is_empty);
         text_free(&path);
         if (rr == P_MISSING) {
-            any_missing = true;
-            continue;
+            /* A listed generation disappeared (swept by a newer publication): force a fresh scan
+               instead of falling back to a stale predecessor. */
+            p_free(sl.seqs);
+            return P_MISSING;
         }
         if (rr != P_OK) {
             p_free(sl.seqs);
@@ -341,7 +344,7 @@ static p_result read_best_generation(const store *s, const char *base, bool *any
         if (only_empty) *only_empty = true;
         return P_OK;
     }
-    return any_missing ? P_MISSING : P_OK;
+    return P_OK;
 }
 
 /* Lock-free monotonic CAS: each update atomically creates `<base>` (seq 0) or
@@ -375,7 +378,7 @@ s_result place_hello(store *s, const char *lane, const char *agent, const char *
         bool any_found = false, have_existing = false, only_empty = false;
         uint64_t max_seq = 0, valid_seq = 0;
         session_info existing = {0};
-        p_result br = read_best_generation(s, base.data, &any_found, &max_seq, &have_existing, &valid_seq, &only_empty, &existing);
+        p_result br = read_best_generation(s, base.data, &any_found, &max_seq, &have_existing, &valid_seq, &only_empty, false, &existing);
         if (br == P_MISSING) continue; /* Concurrent writer swept all seen generations; retry. */
         if (br != P_OK || (any_found && !have_existing && !only_empty)) {
             text_free(&base);
@@ -406,14 +409,13 @@ s_result place_hello(store *s, const char *lane, const char *agent, const char *
         }
         if (cr == P_OK || cr == P_UNFLUSHED) {
             /* Verify our newly written generation next_seq itself is readable and not superseded.
-               Retry P_MISSING if a concurrent peer swept next_seq while publishing next_seq+1. */
-            if (s->pause) s->pause(s->pause_user, "hello-verify");
+               Retry P_MISSING if a concurrent peer swept next_seq between enumeration and open. */
             bool chk_any = false, chk_valid = false;
             uint64_t chk_max = 0, chk_vseq = 0;
             session_info chk_info = {0};
             p_result chkr = P_MISSING;
             for (int v = 0; v < 8; v++) {
-                chkr = read_best_generation(s, base.data, &chk_any, &chk_max, &chk_valid, &chk_vseq, NULL, &chk_info);
+                chkr = read_best_generation(s, base.data, &chk_any, &chk_max, &chk_valid, &chk_vseq, NULL, v == 0, &chk_info);
                 if (chkr != P_MISSING) break;
             }
             if (chkr != P_OK || !chk_any || !chk_valid || chk_vseq < next_seq) {
@@ -462,7 +464,7 @@ s_result place_session(store *s, const char *lane, const char *session, session_
     for (int attempt = 0; attempt < 8; attempt++) {
         bool any_found = false, valid_found = false;
         uint64_t max_seq = 0, valid_seq = 0;
-        p_result br = read_best_generation(s, base.data, &any_found, &max_seq, &valid_found, &valid_seq, NULL, out);
+        p_result br = read_best_generation(s, base.data, &any_found, &max_seq, &valid_found, &valid_seq, NULL, false, out);
         if (br == P_MISSING) continue;
         text_free(&base);
         if (br == P_OK && !any_found) return S_NOTHING;
@@ -541,7 +543,7 @@ p_result place_each_session(store *s, bool (*each)(void *user, const session_inf
         for (int attempt = 0; attempt < 8; attempt++) {
             bool any_found = false, valid_found = false;
             uint64_t max_seq = 0, valid_seq = 0;
-            p_result br = read_best_generation(s, map.items[i].base, &any_found, &max_seq, &valid_found, &valid_seq, NULL, &info);
+            p_result br = read_best_generation(s, map.items[i].base, &any_found, &max_seq, &valid_found, &valid_seq, NULL, false, &info);
             if (br == P_MISSING) continue;
             if (br == P_OK && !any_found) {
                 gone = true;
