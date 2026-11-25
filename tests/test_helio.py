@@ -2927,8 +2927,9 @@ class SilentTaker(unittest.TestCase):
             j_pw = r_pw.stdout.decode().strip()
             self.assertEqual(rc_at(base_us, "take", j_pw, "--as", "os/a", "--session", "sa").returncode, 0)
             t_later = base_us + 90 * M
-            bad_sess = st / f"sessions/os+b+{'bad'.encode().hex()}"
-            bad_sess.mkdir()
+            bad_a = st / f"sessions/os+a+{'sa'.encode().hex()}~99"
+            bad_b = st / f"sessions/os+b+{'sb'.encode().hex()}~99"
+            bad_a.mkdir(), bad_b.mkdir()
             r_str_first = rc_at(t_later, "inbox", "--as", "os/other")
             self.assertEqual(r_str_first.returncode, 1, r_str_first.stderr)
             self.assertIn(b"summary was deferred", r_str_first.stderr)
@@ -2937,7 +2938,7 @@ class SilentTaker(unittest.TestCase):
             self.assertEqual(r_dmg.returncode, 3)
             self.assertNotIn(b"SILENT", r_dmg.stdout)
             self.assertEqual(list((st / "summary").glob("*.md")) if (st / "summary").exists() else [], [])
-            bad_sess.rmdir()
+            bad_a.rmdir(), bad_b.rmdir()
 
             # 1b. Recovery: returning taker os/b (session sb) runs the day's first successful inbox:
             # refreshes sb BEFORE summary! (j_ov_si is overdue+silent; j_pw is silent; j_ret is taken/alive.)
@@ -3450,11 +3451,17 @@ class ProjectIsolation(Base):
         # 2. Scoped log exits 1 when every healthy row is foreign.
         self.assertEqual(self.helio("log", "--all", me="gamma/ui").returncode, 1)
 
-        # 3. Explicitly empty or malformed --as / HELIO_AS is rejected with exit 2 (never widens to all-project log!).
+        # 3. Explicitly empty or malformed --as / HELIO_AS is rejected with exit 2 and empty stdout (never widens to all-project log!).
         with tempfile.TemporaryDirectory() as no_conf_dir:
             no_conf = Path(no_conf_dir)
-            self.assertEqual(run(self.store, "log", "--all", "--as", "", me=None, cwd=no_conf, extra_env={"HELIO_AS": "alpha/ui"}).returncode, 2)
-            self.assertEqual(run(self.store, "log", "--all", me=None, cwd=no_conf, extra_env={"HELIO_AS": "bad"}).returncode, 2)
+            for args, env_extra in (
+                (("log", "--all", "--as", ""), {"HELIO_AS": "alpha/ui"}),
+                (("log", "--all"), {"HELIO_AS": ""}),
+                (("log", "--all"), {"HELIO_AS": "bad"}),
+            ):
+                r_bad = run(self.store, *args, me=None, cwd=no_conf, extra_env=env_extra)
+                self.assertEqual(r_bad.returncode, 2, (args, env_extra))
+                self.assertEqual(r_bad.stdout, b"", (args, env_extra))
             # HELIO_AS keeps log --all scoped!
             r_env = run(self.store, "log", "--all", me=None, cwd=no_conf, extra_env={"HELIO_AS": "alpha/ui"})
             self.assertEqual(r_env.returncode, 0)
@@ -3478,14 +3485,24 @@ class ProjectIsolation(Base):
             self.assertIn(a_arch, r_rl.stdout.decode())
             self.assertNotIn(b_arch, r_rl.stdout.decode())
 
-            # Project-only helio.conf scopes plain `log` to that project; `log --all` with no lane shows all projects!
+            # Project-only helio.conf scopes BOTH `log` and `log --all` to that project (including from 30 nested dirs deep)!
             repo_proj = no_conf / "repo_proj"
-            repo_proj.mkdir()
+            deep = repo_proj
+            for i in range(30):
+                deep = deep / f"d{i}"
+            deep.mkdir(parents=True)
             put(repo_proj / "helio.conf", "project: alpha\n")
             r_rp = run(self.store, "log", me=None, cwd=repo_proj)
             self.assertEqual(r_rp.returncode, 0)
             self.assertIn(a_live, r_rp.stdout.decode())
             self.assertNotIn(b_live, r_rp.stdout.decode())
+            for where in (repo_proj, deep):
+                r_rp_all = run(self.store, "log", "--all", me=None, cwd=where)
+                self.assertEqual(r_rp_all.returncode, 0, where)
+                self.assertIn(a_live, r_rp_all.stdout.decode(), where)
+                self.assertIn(a_arch, r_rp_all.stdout.decode(), where)
+                self.assertNotIn(b_live, r_rp_all.stdout.decode(), where)
+                self.assertNotIn(b_arch, r_rp_all.stdout.decode(), where)
 
         # 4. Foreign damaged archived job chain does NOT fail alpha's scoped `log --all`!
         bad_link = self.store / f"archive/2025-02/{b_arch}.link.0001"
@@ -3497,14 +3514,34 @@ class ProjectIsolation(Base):
         self.assertNotIn(b_arch, r_a_ok.stdout.decode())
         bad_link.write_bytes(saved_link)
 
-        # 5. Foreign unreadable/corrupt session file does NOT fail alpha's scoped `log` on a visible taken job!
-        a_job = self.send("ask", "alpha/apps", "alpha/main", "Alpha taken", "work")
-        self.assertEqual(self.helio("take", a_job, me="alpha/apps").returncode, 0)
-        put(self.store / "sessions/beta+apps", "corrupt session\n")
+        # 5. Unrelated lane's corrupt session file (even in taker's own project on a cross-project job) does NOT fail alpha's `log`!
+        cross_job = self.send("ask", "beta/dev", "alpha/main", "Cross taken", "work")
+        self.assertEqual(self.helio("take", cross_job, "--session", "s-dev", me="beta/dev").returncode, 0)
+        put(self.store / "sessions/beta+docs", "corrupt session\n")
         r_a_sess = self.helio("log", me="alpha/ui")
         self.assertEqual(r_a_sess.returncode, 0, r_a_sess.stderr)
-        self.assertIn(a_job, r_a_sess.stdout.decode())
-        (self.store / "sessions/beta+apps").unlink()
+        self.assertIn(cross_job, r_a_sess.stdout.decode())
+        (self.store / "sessions/beta+docs").unlink()
+
+        # 6. Automatic daily archive on Alpha's inbox hides foreign Beta IDs on stderr while explicit `helio archive` keeps them!
+        bad_beta = rc_at(old_us + 9000, "ask", "beta/apps", "Bad beta arch", "--as", "beta/main", body=b"bad").stdout.decode().strip()
+        self.assertEqual(rc_at(old_us + 9500, "take", bad_beta, "--as", "beta/apps").returncode, 0)
+        self.assertEqual(rc_at(old_us + 9600, "done", bad_beta, "ok", "--as", "beta/apps").returncode, 0)
+        put(self.store / f"messages/{bad_beta}.seen.beta+apps", "corrupt\n")
+        # Reset today's .archived marker if present so Alpha's inbox triggers archive_daily.
+        if (self.store / "summary").exists():
+            for f in (self.store / "summary").glob("*.archived"):
+                f.unlink()
+        r_inb = self.helio(me="alpha/apps")
+        self.assertEqual(r_inb.returncode, 3)
+        self.assertIn(a_live, r_inb.stdout.decode())
+        self.assertNotIn(bad_beta, r_inb.stdout.decode())
+        self.assertNotIn(bad_beta, r_inb.stderr.decode())
+        r_arch = self.helio("archive", me=None)
+        self.assertEqual(r_arch.returncode, 3)
+        self.assertIn(bad_beta, r_arch.stderr.decode())
+        (self.store / f"messages/{bad_beta}.seen.beta+apps").unlink()
+        self.assertEqual(self.helio("archive", me=None).returncode, 0)
         self.assertEqual(self.helio("check", me=None).returncode, 0)
 
 

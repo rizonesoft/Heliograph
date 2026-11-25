@@ -66,7 +66,7 @@ s_result place_open(place *p, const char **why) {
     *p = (place){0};
     p->silent_minutes = PLACE_SILENT_DEFAULT;
     text at = {0};
-    for (int up = 0; up < 24 && !p->file; up++) {
+    for (int up = 0; up < 256 && !p->file; up++) {
         text file = {0};
         add(&file, at.data ? at.data : ""), add(&file, "helio.conf");
         size_t length;
@@ -584,7 +584,7 @@ typedef struct {
 typedef struct {
     latest_entry *items;
     size_t count, cap;
-    const char *only_project;
+    const char *only_lane;
     bool failed;
 } latest_map;
 
@@ -594,10 +594,7 @@ static bool collect_latest_cb(void *user, const char *name) {
     char lane[72];
     uint64_t seq = 0;
     if (!parse_session_filename(name, &blen, lane, sizeof lane, &seq)) return true;
-    if (m->only_project) {
-        size_t pn = len(m->only_project);
-        if (!starts(lane, m->only_project) || lane[pn] != '/') return true;
-    }
+    if (m->only_lane && !same(lane, m->only_lane)) return true;
     for (size_t i = 0; i < m->count; i++) {
         if (len(m->items[i].base) == blen) {
             bool eq = true;
@@ -625,14 +622,14 @@ static bool collect_latest_cb(void *user, const char *name) {
     return true;
 }
 
-static p_result each_session_filtered(store *s, const char *only_project, bool (*each)(void *user, const session_info *info), void *user) {
+static p_result each_session_filtered(store *s, const char *only_lane, bool (*each)(void *user, const session_info *info), void *user) {
     text folder = {0};
     add(&folder, s->folder), add(&folder, "/sessions");
     if (folder.failed) {
         text_free(&folder);
         return P_FAILED;
     }
-    latest_map map = {.only_project = only_project};
+    latest_map map = {.only_lane = only_lane};
     p_result r = p_list(folder.data, collect_latest_cb, &map);
     text_free(&folder);
     if (r != P_OK || map.failed) {
@@ -673,8 +670,8 @@ p_result place_each_session(store *s, bool (*each)(void *user, const session_inf
     return each_session_filtered(s, NULL, each, user);
 }
 
-p_result place_project_sessions(store *s, const char *project, bool (*each)(void *user, const session_info *info), void *user) {
-    return each_session_filtered(s, project, each, user);
+p_result place_lane_sessions(store *s, const char *lane, bool (*each)(void *user, const session_info *info), void *user) {
+    return each_session_filtered(s, lane, each, user);
 }
 
 typedef struct { const char *project, *me; uint64_t since; bool busy; } look;

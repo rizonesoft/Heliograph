@@ -46,7 +46,7 @@ bool place_parse_session(const char *data, size_t length, session_info *out);
 s_result place_hello(store *s, const char *lane, const char *agent, const char *repository, const char *session);
 s_result place_session(store *s, const char *lane, const char *session, session_info *out);
 p_result place_each_session(store *s, bool (*each)(void *user, const session_info *info), void *user);
-p_result place_project_sessions(store *s, const char *project, bool (*each)(void *user, const session_info *info), void *user);
+p_result place_lane_sessions(store *s, const char *lane, bool (*each)(void *user, const session_info *info), void *user);
 
 /* A lane of this project, other than me, said hello within the time. */
 s_result place_busy(store *s, const char *project, const char *me, uint64_t within, bool *busy);

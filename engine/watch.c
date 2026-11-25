@@ -122,20 +122,26 @@ bool watch_classify_job(store *s, const place *here, const message *m, const job
     *overdue_out = m->due && (now->state == OPEN || now->state == TAKEN) && m->due < clock_now;
     *silent_out = false;
     if (now->state != TAKEN || !sc) return true;
-    char proj[36], taker_proj[36];
+    char proj[36];
     job_project(m->to, proj, sizeof proj);
-    job_project(now->by, taker_proj, sizeof taker_proj);
     uint64_t silent_us = 0;
     if (cached_silent_us(s, here, sc, proj, &silent_us) != P_OK) return false;
-    session_cache proj_sc = {0};
-    sess_collect col = {&proj_sc, false};
-    p_result pr = place_project_sessions(s, taker_proj, collect_session_cb, &col);
+    if (*now->session) {
+        session_info info = {0};
+        s_result sr = place_session(s, now->by, now->session, &info);
+        if (sr == S_DAMAGED) return false;
+        *silent_out = is_silent(sr == S_OK ? &info : NULL, sr == S_OK ? 1 : 0, now, clock_now, silent_us);
+        return true;
+    }
+    session_cache lane_sc = {0};
+    sess_collect col = {&lane_sc, false};
+    p_result pr = place_lane_sessions(s, now->by, collect_session_cb, &col);
     if (col.oom || (pr != P_OK && pr != P_MISSING)) {
-        sessions_cache_free(&proj_sc);
+        sessions_cache_free(&lane_sc);
         return false;
     }
-    *silent_out = is_silent(proj_sc.items, proj_sc.count, now, clock_now, silent_us);
-    sessions_cache_free(&proj_sc);
+    *silent_out = is_silent(lane_sc.items, lane_sc.count, now, clock_now, silent_us);
+    sessions_cache_free(&lane_sc);
     return true;
 }
 

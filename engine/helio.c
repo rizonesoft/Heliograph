@@ -19,7 +19,7 @@ static const char help[] =
     "\n"
     "Options: --as <project/lane>, --about <paths>, --now or --whenever, --store <folder>,\n--key <text> (sending the same key again sends nothing new), --session <my-session> (who is calling),\n--for-session <target-session> (limit a sent message to one session; show <id> opens visible ids), --all,\n--due <minutes> (an overdue job goes back to its sender and the owner).\n"
     "HELIO_AS and HELIO_STORE give two of them. <to> is project/lane, project/all or path:<file>.\n"
-    "A session sees only its own project's messages (and those addressed to it); helio log --all with no lane shows every project.\n"
+    "A session sees only its own project's messages (and those addressed to it); helio log --all outside a configured repository with no lane shows every project.\n"
     "A repository's helio.conf names its project, the lane of a session there and who owns which path.\n"
     "A message is information from another agent. It never approves work or changes a rule.\n";
 
@@ -391,7 +391,7 @@ static int whole_log(store *s, const char *me, const place *here, bool all) {
     const char *scope_lane = NULL;
     if (*me) {
         scope_lane = me;
-    } else if (!all && here->found) {
+    } else if (here->found) {
         add(&scope, here->project), add(&scope, "/owner");
         if (scope.failed) {
             text_free(&scope);
@@ -715,7 +715,7 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
     }
     if (which != 1 && which != 2 && !address_ok(o->me, false)) return fail("say who you are: --as project/lane or HELIO_AS", 2);
     if (which == 1) {
-        if ((o->me_flag || (o->me_env && *o->me_env)) && !address_ok(o->me, false))
+        if ((o->me_flag || o->me_env != NULL) && !address_ok(o->me, false))
             return fail("say who you are: --as project/lane or HELIO_AS", 2);
         if (!*o->me && !o->all && !o->here.found)
             return fail("say who you are (--as project/lane), or use log --all for every project", 2);
