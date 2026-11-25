@@ -150,48 +150,34 @@ static bool parse(options *o, int count, char **args) {
     return true;
 }
 
-static void format_line(text *out, const message *m, const job *now, bool good, bool silent) {
+static void format_line(text *out, const message *m, const job *now, bool good, bool overdue, bool silent) {
     add(out, m->id), add(out, "  "), add(out, m->time), add(out, "  "), add(out, m->from), add(out, " to "), add(out, m->to);
     add(out, "  "), add(out, m->kind);
     if (is_job(m)) {
         static const char *const names[] = {" open", " taken by ", " done by ", " refused by "};
         if (good) add(out, names[now->state]), add(out, now->by);
         else add(out, " damaged");
-        if (good && is_overdue(m, now)) add(out, " OVERDUE");
+        if (good && overdue) add(out, " OVERDUE");
         if (good && silent) add(out, " SILENT");
     }
     if (same(m->urgency, "now")) add(out, "  NOW");
     add(out, ": "), clean(out, m->subject, true), add(out, "\n");
 }
 
-static void msg_project(const char *address, char *out, size_t room) {
-    if (!room) return;
-    size_t i = 0;
-    if (address)
-        while (i + 1 < room && address[i] && address[i] != '/') out[i] = address[i], i++;
-    out[i] = 0;
-}
-
 /* S_REFUSED when archived concurrently; S_DAMAGED when the job's chain is damaged. */
 static s_result line_silent(text *out, store *s, const message *m, const place *here, uint64_t clock_now, session_cache *sc, bool *sess_err) {
     s_result jr = S_OK;
     job now = {0};
-    bool silent = false;
+    bool overdue = false, silent = false;
     if (is_job(m)) {
         jr = store_job(s, m, &now);
         if (jr == S_REFUSED) return S_REFUSED;
-        if (jr == S_OK && now.state == TAKEN && sc) {
-            sessions_cache_load(s, sc);
-            if (sc->state == SESS_FAILED) {
-                if (sess_err) *sess_err = true;
-            } else {
-                char proj[36];
-                msg_project(m->to, proj, sizeof proj);
-                silent = is_silent(sc->items, sc->count, &now, clock_now, place_silent_us(s, here, proj));
-            }
+        if (jr == S_OK) {
+            if (!watch_classify_job(s, here, m, &now, clock_now ? clock_now : p_now(), sc, &overdue, &silent) && sess_err)
+                *sess_err = true;
         }
     }
-    format_line(out, m, &now, jr == S_OK, silent);
+    format_line(out, m, &now, jr == S_OK, overdue, silent);
     return jr;
 }
 
@@ -262,7 +248,7 @@ static void into_log_archived(store *s, const message *m, const job *known, void
     text one = {0};
     s_result r = S_OK;
     if (is_job(m) && known) {
-        format_line(&one, m, known, true, false);
+        format_line(&one, m, known, true, false, false);
     } else {
         r = line_silent(&one, s, m, l->here, l->clock_now, NULL, NULL);
         if (r == S_REFUSED) {
@@ -280,7 +266,7 @@ static void into_inbox(store *s, const message *m, void *user) {
     listing *l = user;
     if (!same(m->urgency, l->urgency)) return;
     job now = {0};
-    bool good = true, silent = false;
+    bool good = true, overdue = false, silent = false;
     bool mine = is_for(m, l->me);
     bool report_to = is_job(m) && (same(m->from, l->me) || owns(l->me, m)); /* overdue or silent jobs go to sender and owner */
     if (!mine && !report_to) return;
@@ -293,23 +279,17 @@ static void into_inbox(store *s, const message *m, void *user) {
             good = false;
             l->damaged = true; /* shown, so it is not mistaken for nothing */
         } else {
-            bool overdue = m->due && (now.state == OPEN || now.state == TAKEN) && m->due < l->clock_now;
-            if (now.state == TAKEN) {
-                sessions_cache_load(s, &l->sessions);
-                if (l->sessions.state == SESS_FAILED) {
-                    l->damaged = true;
-                } else {
-                    char proj[36];
-                    msg_project(m->to, proj, sizeof proj);
-                    silent = is_silent(l->sessions.items, l->sessions.count, &now, l->clock_now, place_silent_us(s, l->here, proj));
-                }
-            }
-            if (!(report_to && (overdue || silent)) && !(mine && (now.state == OPEN || (now.state == TAKEN && same(now.by, l->me)))))
+            /* Decide eligibility before loading sessions so a stranger to an os/all taken job never loads sessions/. */
+            bool is_taker = mine && now.state == TAKEN && same(now.by, l->me);
+            if (now.state == TAKEN && !report_to && !is_taker) return;
+            if (!watch_classify_job(s, l->here, m, &now, l->clock_now, &l->sessions, &overdue, &silent))
+                l->damaged = true;
+            if (!(report_to && (overdue || silent)) && !(mine && (now.state == OPEN || is_taker)))
                 return;
         }
     }
     text one = {0};
-    format_line(&one, m, &now, good, silent);
+    format_line(&one, m, &now, good, overdue, silent);
     if (!l->all && (l->shown >= SHOW_MESSAGES || l->out.length + one.length > SHOW_BYTES)) l->held++;
     else add(&l->out, one.data ? one.data : ""), l->shown++;
     if (one.failed) l->out.failed = true;
@@ -618,8 +598,9 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
     }
     s.pause = pause;
     s.pause_user = pause_user;
-    if (o->here.found) place_record_silent(&s, &o->here);
-    if (which == 0 && address_ok(o->me, false)) announce_best_effort(&s, o, "");
+    if (o->here.found && place_record_silent(&s, &o->here) != P_OK)
+        fail("the project's silent threshold could not be saved", 0);
+    if ((which == 0 || which == 1) && address_ok(o->me, false)) announce_best_effort(&s, o, "");
     else if (which == 8) announce_best_effort(&s, o, "claude");
     bool summary_err = false;
     if ((which == 0 || which == 8) && watch_summary(&s, &o->here) != S_OK) {
@@ -679,7 +660,7 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
                                                                            : store_end(&s, o->words[1], me, which == 6, note);
         code = result == S_OK ? 0 : fail(s.why, result);
     }
-    if (which != 0 && which != 8 && which != 15 && address_ok(o->me, false)) announce_best_effort(&s, o, "");
+    if (which != 0 && which != 1 && which != 8 && which != 15 && address_ok(o->me, false)) announce_best_effort(&s, o, "");
     store_close(&s);
     return code;
 }

@@ -2865,6 +2865,21 @@ class SilentTaker(unittest.TestCase):
         self.assertEqual(r_steal.returncode, 2, r_steal.stderr)
         self.assertIn(b"already taken", r_steal.stderr)
 
+        # Stranger os/other checking inbox on an os/all taken job while sessions/ is unreadable still exits 1!
+        bad_stranger_sess = self.store / f"sessions/os+apps+{'bad'.encode().hex()}"
+        bad_stranger_sess.mkdir()
+        r_str_dmg = self.racer_cli(t_silent, "inbox", "--as", "os/other", cwd=repo)
+        self.assertEqual(r_str_dmg.returncode, 1, r_str_dmg.stderr)
+        bad_stranger_sess.rmdir()
+
+        # Returning taker's sibling session on `helio log --as` leaves SILENT; returning taker's own session clears SILENT!
+        r_log_sib = self.racer_cli(t_silent, "log", "--as", "os/apps", "--session", "s2", cwd=repo)
+        self.assertEqual(r_log_sib.returncode, 0, r_log_sib.stderr)
+        self.assertIn(b"SILENT", r_log_sib.stdout)
+        r_log_self = self.racer_cli(t_silent, "log", "--as", "os/apps", "--session", "s1", cwd=repo)
+        self.assertEqual(r_log_self.returncode, 0, r_log_self.stderr)
+        self.assertNotIn(b"SILENT", r_log_self.stdout)
+
         # Only helio release frees it; then os/other takes and owns it!
         r_rel = self.racer_cli(t_silent, "release", jid, "--as", "os/owner", cwd=repo)
         self.assertEqual(r_rel.returncode, 0, r_rel.stderr)
@@ -2902,8 +2917,19 @@ class SilentTaker(unittest.TestCase):
             self.assertEqual(rc_at(base_us, "take", j_ov_si, "--as", "os/a", "--session", "sa").returncode, 0)
             self.assertEqual(rc_at(base_us, "take", j_ret, "--as", "os/b", "--session", "sb").returncode, 0)
 
-            # At +90m, returning taker os/b (session sb) runs the day's FIRST inbox: refreshes sb BEFORE summary!
+            # 1a. Transient damaged session on the day's FIRST inbox: refuses to freeze a wrong summary file
+            # (exit 3, NO summary/*.md written, NO false SILENT label), then recovery writes the accurate summary!
             t_later = base_us + 90 * M
+            bad_sess = st / f"sessions/os+b+{'bad'.encode().hex()}"
+            bad_sess.mkdir()
+            r_dmg = rc_at(t_later, "inbox", "--as", "os/sender")
+            self.assertEqual(r_dmg.returncode, 3)
+            self.assertNotIn(b"SILENT", r_dmg.stdout)
+            self.assertEqual(list((st / "summary").glob("*.md")) if (st / "summary").exists() else [], [])
+            bad_sess.rmdir()
+
+            # 1b. Recovery: returning taker os/b (session sb) runs the day's first successful inbox:
+            # refreshes sb BEFORE summary!
             self.assertEqual(rc_at(t_later, "inbox", "--as", "os/b", "--session", "sb").returncode, 0)
             sum_files = list((st / "summary").glob("*.md"))
             self.assertEqual(len(sum_files), 1)
@@ -2915,13 +2941,12 @@ class SilentTaker(unittest.TestCase):
             self.assertIn(j_ov_si, text.split("## Silent: 1")[1].split("## Open:")[0])
             self.assertIn(j_ret, text.split("## Taken: 1")[1].split("## Done")[0])
 
-            # 2. Damaged session file: produces diagnostic (exit 3) WITHOUT false SILENT label!
-            bad_sess = st / f"sessions/os+b+{'bad'.encode().hex()}"
-            bad_sess.mkdir()
-            r_dmg = rc_at(t_later, "inbox", "--as", "os/sender")
-            self.assertEqual(r_dmg.returncode, 3)
-            self.assertNotIn(b"SILENT", r_dmg.stdout)
-            bad_sess.rmdir()
+            # 2. Corrupt/unreadable stored threshold file fails with exit 3 instead of silently falling back to 120m!
+            put(st / "silent/os", "corrupt\n")
+            r_bad_th = rc_at(t_later, "inbox", "--as", "os/sender", cwd=Path(tmp))
+            self.assertEqual(r_bad_th.returncode, 3)
+            self.assertNotIn(b"SILENT", r_bad_th.stdout)
+            (st / "silent/os").unlink()
 
         # 3. Two repositories sharing one store with different silent thresholds in BOTH first-caller orders!
         for first_order in ("alpha-first", "beta-first"):

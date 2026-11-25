@@ -60,6 +60,7 @@ void sessions_cache_load(store *s, session_cache *c) {
 
 void sessions_cache_free(session_cache *c) {
     p_free(c->items);
+    p_free(c->thresholds);
     *c = (session_cache){0};
 }
 
@@ -69,6 +70,53 @@ static void job_project(const char *address, char *out, size_t room) {
     if (address)
         while (i + 1 < room && address[i] && address[i] != '/') out[i] = address[i], i++;
     out[i] = 0;
+}
+
+static p_result cached_silent_us(const store *s, const place *here, session_cache *sc, const char *project, uint64_t *out_us) {
+    for (size_t i = 0; i < sc->thresh_count; i++) {
+        if (same(sc->thresholds[i].project, project)) {
+            if (sc->thresholds[i].failed) return P_FAILED;
+            *out_us = sc->thresholds[i].us;
+            return P_OK;
+        }
+    }
+    uint64_t us = 0;
+    p_result r = place_silent_us(s, here, project, &us);
+    if (sc->thresh_count == sc->thresh_cap) {
+        size_t next = sc->thresh_cap ? sc->thresh_cap * 2 : 8;
+        silent_cache_entry *grown = p_alloc(next * sizeof *grown);
+        if (grown) {
+            for (size_t i = 0; i < sc->thresh_count; i++) grown[i] = sc->thresholds[i];
+            p_free(sc->thresholds);
+            sc->thresholds = grown, sc->thresh_cap = next;
+        }
+    }
+    if (sc->thresh_count < sc->thresh_cap) {
+        silent_cache_entry *e = &sc->thresholds[sc->thresh_count++];
+        size_t i = 0;
+        for (; i + 1 < sizeof e->project && project[i]; i++) e->project[i] = project[i];
+        e->project[i] = 0;
+        e->us = us;
+        e->failed = (r != P_OK);
+    }
+    if (r != P_OK) return P_FAILED;
+    *out_us = us;
+    return P_OK;
+}
+
+bool watch_classify_job(store *s, const place *here, const message *m, const job *now, uint64_t clock_now,
+                        session_cache *sc, bool *overdue_out, bool *silent_out) {
+    *overdue_out = m->due && (now->state == OPEN || now->state == TAKEN) && m->due < clock_now;
+    *silent_out = false;
+    if (now->state != TAKEN || !sc) return true;
+    sessions_cache_load(s, sc);
+    if (sc->state == SESS_FAILED) return false;
+    char proj[36];
+    job_project(m->to, proj, sizeof proj);
+    uint64_t silent_us = 0;
+    if (cached_silent_us(s, here, sc, proj, &silent_us) != P_OK) return false;
+    *silent_out = is_silent(sc->items, sc->count, now, clock_now, silent_us);
+    return true;
 }
 
 static const char *word(const char *at, const char **from, size_t *n) {
@@ -207,7 +255,7 @@ s_result watch_summary(store *s, const place *here) {
         unsigned counts[6] = {0}, damaged = 0;
         uint64_t now = p_now();
         session_cache sc = {0};
-        bool sess_err_counted = false;
+        bool liveness_err = false;
         for (size_t i = 0; i < s->count; i++) {
             size_t n = len(s->names[i]);
             if (n <= 5 || !same(s->names[i] + n - 5, ".post")) continue;
@@ -227,18 +275,9 @@ s_result watch_summary(store *s, const place *here) {
             }
             if (jr != S_OK) damaged++;
             else if (is_job(&m)) {
-                bool ov = m.due && (j.state == OPEN || j.state == TAKEN) && m.due < now;
-                bool si = false;
-                if (j.state == TAKEN) {
-                    sessions_cache_load(s, &sc);
-                    if (sc.state == SESS_FAILED) {
-                        if (!sess_err_counted) damaged++, sess_err_counted = true;
-                    } else {
-                        char proj[36];
-                        job_project(m.to, proj, sizeof proj);
-                        si = is_silent(sc.items, sc.count, &j, now, place_silent_us(s, here, proj));
-                    }
-                }
+                bool ov = false, si = false;
+                if (!watch_classify_job(s, here, &m, &j, now, &sc, &ov, &si))
+                    liveness_err = true;
                 if (ov) add_summary_item(&parts[0], &counts[0], &m, &j);
                 if (si) add_summary_item(&parts[1], &counts[1], &m, &j);
                 if (!ov && !si) {
@@ -254,18 +293,25 @@ s_result watch_summary(store *s, const place *here) {
             p_free(id);
         }
         sessions_cache_free(&sc);
-        add(&out, "# Heliograph "), add(&out, day.data), add(&out, "\n\nAs it stood at "), add_time(&out, now), add(&out, ".\n");
-        for (int i = 0; i < 6; i++) {
-            add(&out, "\n## "), add(&out, titles[i]), add(&out, ": "), add_number(&out, counts[i], 0), add(&out, "\n\n");
-            if (parts[i].data) add(&out, parts[i].data);
-            if (counts[i] > 100) add(&out, "- and more: helio log\n");
-            if (parts[i].failed) out.failed = true;
-            text_free(&parts[i]);
+        if (liveness_err) {
+            /* Do not freeze an incomplete daily summary when session or threshold reads failed:
+               return S_DAMAGED so the next call retries once the transient fault clears. */
+            for (int i = 0; i < 6; i++) text_free(&parts[i]);
+            result = S_DAMAGED;
+        } else {
+            add(&out, "# Heliograph "), add(&out, day.data), add(&out, "\n\nAs it stood at "), add_time(&out, now), add(&out, ".\n");
+            for (int i = 0; i < 6; i++) {
+                add(&out, "\n## "), add(&out, titles[i]), add(&out, ": "), add_number(&out, counts[i], 0), add(&out, "\n\n");
+                if (parts[i].data) add(&out, parts[i].data);
+                if (counts[i] > 100) add(&out, "- and more: helio log\n");
+                if (parts[i].failed) out.failed = true;
+                text_free(&parts[i]);
+            }
+            if (damaged) add(&out, "\nDamaged: "), add_number(&out, damaged, 0), add(&out, ". See helio check.\n");
+            p_result wrote = out.failed || p_folder(folder.data) != P_OK ? P_FAILED : p_write(path.data, out.data, out.length, false, unique.data);
+            if (wrote != P_OK && wrote != P_EXISTS) result = S_DAMAGED;
+            text_free(&out);
         }
-        if (damaged) add(&out, "\nDamaged: "), add_number(&out, damaged, 0), add(&out, ". See helio check.\n");
-        p_result wrote = out.failed || p_folder(folder.data) != P_OK ? P_FAILED : p_write(path.data, out.data, out.length, false, unique.data);
-        if (wrote != P_OK && wrote != P_EXISTS) result = S_DAMAGED;
-        text_free(&out);
     }
     if (result != S_OK) s->why = "the summary cannot be written";
     p_free(there), text_free(&day), text_free(&folder), text_free(&path), text_free(&unique);

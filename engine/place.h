@@ -31,10 +31,13 @@ typedef struct session_info {
 s_result place_open(place *p, const char **why); /* from this folder or one above it */
 void place_close(place *p);
 
-/* Records this repository's configured silence threshold in the store (best-effort)
-   and resolves the silence threshold in microseconds for a given project. */
-void place_record_silent(store *s, const place *here);
-uint64_t place_silent_us(const store *s, const place *here, const char *project);
+/* Records this repository's configured silence threshold in the store when it differs
+   from the stored value, and resolves the silence threshold in microseconds for a project.
+   An edit to silent: in helio.conf becomes shared-store-authoritative on the next helio
+   call in that repository. place_silent_us returns P_OK on live/stored/absent-default and
+   P_FAILED on I/O error or corrupt stored threshold. */
+p_result place_record_silent(store *s, const place *here);
+p_result place_silent_us(const store *s, const place *here, const char *project, uint64_t *out_us);
 
 /* "project/lane" for a path, from the longest owner; "" when nobody owns it. */
 void place_owner(const place *p, const char *path, text *to);

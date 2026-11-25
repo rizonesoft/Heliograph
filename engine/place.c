@@ -109,40 +109,66 @@ s_result place_open(place *p, const char **why) {
     return S_OK;
 }
 
-void place_record_silent(store *s, const place *here) {
-    if (!s || !s->folder || !here || !here->found || !*here->project) return;
+p_result place_record_silent(store *s, const place *here) {
+    if (!s || !s->folder || !here || !here->found || !*here->project) return P_OK;
     text folder = {0}, path = {0}, data = {0}, unique = {0};
     add(&folder, s->folder), add(&folder, "/silent");
     add(&path, folder.data ? folder.data : ""), add(&path, "/"), add(&path, here->project);
+    if (folder.failed || path.failed) {
+        text_free(&folder), text_free(&path);
+        return P_FAILED;
+    }
+    /* Skip durable write when the stored threshold already matches helio.conf. */
+    char *existing = NULL;
+    size_t elen = 0;
+    p_result er = p_read(path.data, 64, &existing, &elen);
+    if (er == P_OK) {
+        const char *at = existing;
+        char word[32];
+        uint64_t cur = 0;
+        bool same_val = take_word(word, sizeof word, &at) && parse_silent_minutes(word, &cur) && line_end(at) && cur == here->silent_minutes;
+        p_free(existing);
+        if (same_val) {
+            text_free(&folder), text_free(&path);
+            return P_OK;
+        }
+    }
     add_number(&data, here->silent_minutes, 0), add(&data, "\n");
     add_number(&unique, p_tick(), 0);
-    if (!folder.failed && !path.failed && !data.failed && !unique.failed && p_folder(folder.data) == P_OK)
-        (void)p_write(path.data, data.data, data.length, true, unique.data);
+    p_result wr = P_FAILED;
+    if (!data.failed && !unique.failed && p_folder(folder.data) == P_OK)
+        wr = p_write(path.data, data.data, data.length, true, unique.data);
     text_free(&folder), text_free(&path), text_free(&data), text_free(&unique);
+    return wr;
 }
 
-uint64_t place_silent_us(const store *s, const place *here, const char *project) {
-    if (here && here->found && project && same(here->project, project))
-        return here->silent_minutes * 60000000ull;
-    if (s && s->folder && project && *project && pair_ok(project, "x")) {
-        text path = {0};
-        add(&path, s->folder), add(&path, "/silent/"), add(&path, project);
-        char *data = NULL;
-        size_t length = 0;
-        if (!path.failed && p_read(path.data, 64, &data, &length) == P_OK) {
-            const char *at = data;
-            char word[32];
-            uint64_t mins = 0;
-            if (take_word(word, sizeof word, &at) && parse_silent_minutes(word, &mins) && line_end(at)) {
-                p_free(data);
-                text_free(&path);
-                return mins * 60000000ull;
-            }
-            p_free(data);
-        }
-        text_free(&path);
+p_result place_silent_us(const store *s, const place *here, const char *project, uint64_t *out_us) {
+    *out_us = (uint64_t)PLACE_SILENT_DEFAULT * 60000000ull;
+    if (here && here->found && project && same(here->project, project)) {
+        *out_us = here->silent_minutes * 60000000ull;
+        return P_OK;
     }
-    return (uint64_t)PLACE_SILENT_DEFAULT * 60000000ull;
+    if (!s || !s->folder || !project || !*project || !pair_ok(project, "x")) return P_OK;
+    text path = {0};
+    add(&path, s->folder), add(&path, "/silent/"), add(&path, project);
+    if (path.failed) {
+        text_free(&path);
+        return P_FAILED;
+    }
+    char *data = NULL;
+    size_t length = 0;
+    p_result r = p_read(path.data, 64, &data, &length);
+    text_free(&path);
+    if (r == P_MISSING) return P_OK;
+    if (r != P_OK) return P_FAILED;
+    const char *at = data;
+    char word[32];
+    uint64_t mins = 0;
+    bool ok = take_word(word, sizeof word, &at) && parse_silent_minutes(word, &mins) && line_end(at);
+    p_free(data);
+    if (!ok) return P_FAILED;
+    *out_us = mins * 60000000ull;
+    return P_OK;
 }
 
 void place_close(place *p) {
