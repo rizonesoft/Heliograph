@@ -507,32 +507,32 @@ s_result store_post(store *s, const message *m, const char *key, text *id) {
     } else if (secret(subject.data) || secret(body.data) || secret(about.data ? about.data : "")) {
         s->why = "this looks like it contains a secret, so it was not sent";
     } else {
-        /* Resolve an existing keyed message (live or archived) BEFORE enforcing live admission capacity,
-           so exact repeats succeed at capacity without creating files and conflicts still refuse. */
-        if (*key) {
-            s_result fr = find_reserved(s, m, key, id);
-            if (fr == S_OK) {
-                message there = {0};
-                s_result mr = store_message(s, id->data, &there);
-                if (mr == S_OK) {
-                    bool match = same(there.from, m->from) && same(there.to, m->to) && same(there.kind, m->kind)
-                                 && same(there.subject, subject.data) && same(there.body, body.data);
-                    message_free(&there);
-                    text_free(&subject), text_free(&about), text_free(&body), text_free(&out);
-                    return match ? S_OK : say(s, S_REFUSED, "that key stands for another message");
-                }
-                message_free(&there);
-                if (mr == S_DAMAGED) {
-                    text_free(&subject), text_free(&about), text_free(&body), text_free(&out);
-                    return S_DAMAGED;
-                }
-                text_free(id);
-            } else if (fr != S_NOTHING) {
-                text_free(&subject), text_free(&about), text_free(&body), text_free(&out);
-                return fr;
-            }
-        }
+        /* At live admission capacity, still allow an exact retry of an already-reserved key (live or archived)
+           without creating files, while refusing conflicting retries and genuinely new sends. */
         if (s->count >= store_max_names / 2) {
+            if (*key) {
+                s_result fr = find_reserved(s, m, key, id);
+                if (fr == S_OK) {
+                    message there = {0};
+                    s_result mr = store_message(s, id->data, &there);
+                    if (mr == S_OK) {
+                        bool match = same(there.from, m->from) && same(there.to, m->to) && same(there.kind, m->kind)
+                                     && same(there.subject, subject.data) && same(there.body, body.data);
+                        message_free(&there);
+                        text_free(&subject), text_free(&about), text_free(&body), text_free(&out);
+                        return match ? S_OK : say(s, S_REFUSED, "that key stands for another message");
+                    }
+                    message_free(&there);
+                    if (mr == S_DAMAGED) {
+                        text_free(&subject), text_free(&about), text_free(&body), text_free(&out);
+                        return S_DAMAGED;
+                    }
+                    text_free(id);
+                } else if (fr != S_NOTHING) {
+                    text_free(&subject), text_free(&about), text_free(&body), text_free(&out);
+                    return fr;
+                }
+            }
             text_free(&subject), text_free(&about), text_free(&body), text_free(&out);
             return say(s, S_REFUSED, "the store is full: archive it first");
         }
