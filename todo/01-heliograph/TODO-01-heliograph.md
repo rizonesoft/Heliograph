@@ -37,7 +37,7 @@ title: "TODO-01 -- Heliograph"
 | ----- | ------- | ----------- | ---------- | ------ |
 | 1 | §1 | Steps that notice an archived job | -- | [x] |
 | 2 | §2 | Move a closed message to its month | §1 | [x] |
-| 3 | §3 | Read, answer and repeat archived messages | §2 | [ ] |
+| 3 | §3 | Read, answer and repeat archived messages | §2 | [x] |
 | 4 | §4 | Sessions announced by every call | -- | [ ] |
 | 5 | §5 | Report of a silent taker | §4 | [ ] |
 | 6 | §6 | Messages for one session | §5 | [ ] |
@@ -137,9 +137,12 @@ An archived message must still be found by its id. Without this a keyed send rep
 - [x] Refuse take, release, done and refuse on an archived id in `engine/store.c`. Done when: each exits 2 and says it is archived. Cheaper substitute: exit code 3.
 - [x] Show archived messages with `log --all` in `engine/helio.c`, newest month first. Done when: a test of two months lists both in order. Cheaper substitute: the live store only.
 - [x] Examine archived files in `store_check` of `engine/store.c`. Done when: a byte changed in an archived file is reported. Cheaper substitute: trusting the archive. **Corrected 2026-11-25:** validates structural and content-rule damage across archived posts, steps, seen marks, and month folders (same-length valid-payload edits require external checksums not carried by the plain-text format; see decision in `docs/phase-runs/2026-11-24-phase-1.md`).
-- [ ] Commit: `archive: still found by its id`
+- [x] Commit: `archive: still found by its id`
 
 **Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
+
+> **Verified:** 2026-11-25 | §3 | 9093c2f9aa6e806af45ebde1b1708ca5be282602
+> **Review:** `docs/reviews/d01-t01-s3.json`
 
 ## 4. Sessions announced by every call
 
