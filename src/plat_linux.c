@@ -122,9 +122,46 @@ p_result p_create_excl(const char *path, const char *data, size_t length) {
     if (plat_fail_sync) return P_FAILED;
 #endif
     if (length > 0) {
-        char unique[32];
-        snprintf(unique, sizeof unique, "ex%llu", (unsigned long long)p_tick());
-        return p_write(path, data, length, false, unique);
+        static unsigned long long excl_seq = 0;
+        char temp[4096], slot[4096];
+        unsigned long long tick = (unsigned long long)p_tick();
+        unsigned long pid = (unsigned long)getpid();
+        unsigned long long seq = ++excl_seq;
+        if ((size_t)snprintf(temp, sizeof temp, "%s.ex%lu-%llu-%llu.part", path, pid, tick, seq) >= sizeof temp) return P_FAILED;
+        if ((size_t)snprintf(slot, sizeof slot, "%s.slot", path) >= sizeof slot) return P_FAILED;
+        int tf = open(temp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (tf < 0) return errno == ENOENT ? P_MISSING : P_FAILED;
+        size_t done = 0;
+        bool good = true;
+        while (good && done < length) {
+            ssize_t wrote = write(tf, data + done, length - done);
+            if (wrote < 0 && errno == EINTR) continue;
+            good = wrote > 0;
+            if (good) done += (size_t)wrote;
+        }
+        good = good && !fsync(tf);
+        good = !close(tf) && good;
+        if (!good) {
+            unlink(temp);
+            return P_FAILED;
+        }
+        /* Atomically claim the exclusive slot so cross-host Linux and Windows writers
+           never race on the same path, then publish the complete flushed file via link. */
+        int sf = open(slot, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (sf < 0) {
+            p_result sr = why();
+            unlink(temp);
+            return sr;
+        }
+        close(sf);
+        p_result lr = link(temp, path) ? why() : P_OK;
+        unlink(temp);
+        unlink(slot);
+        if (lr != P_OK) return lr;
+#ifdef HELIO_TEST_HOOKS
+        if (plat_fail_write_flush) return P_UNFLUSHED;
+#endif
+        return settle(path) ? P_OK : P_UNFLUSHED;
     }
     int file = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (file < 0) return why();

@@ -2605,12 +2605,11 @@ class Sessions(Base):
         self.assertIn(b"cannot be read", r_trunc.stderr)
         (self.store / "sessions/os+truncated").unlink()
 
-        # Interrupted Windows publication: abandoned (>5s old) 0-byte higher generation beside intact predecessor falls
-        # back to predecessor in both C readers, and the next announcement self-heals to a new valid generation
-        # preserving agent and sweeping the 0-byte file!
+        # Interrupted publication leaving an abandoned (>5s old) .slot beside intact predecessor: readers ignore .slot
+        # and return intact predecessor, and the next announcement advances past it preserving agent and sweeping .slot!
         base_r1 = f"os+apps+{'race-1'.encode().hex()}"
         stale_t = time.time() - 60
-        empty_succ = self.store / f"sessions/{base_r1}~9999"
+        empty_succ = self.store / f"sessions/{base_r1}~9999.slot"
         put(empty_succ, "")
         os.utime(empty_succ, (stale_t, stale_t))
         rc_fb, info_fb = self.read_session("os/apps", "race-1")
@@ -2625,8 +2624,8 @@ class Sessions(Base):
         self.assertGreater(int(info_healed["when"]), int(info2["when"]))
         info2 = info_healed
 
-        # Interrupted first Windows announcement (abandoned >5s old 0-byte gen-0 with NO predecessor) self-heals on next hello!
-        empty_g0 = self.store / "sessions/os+emptygen0"
+        # Interrupted first announcement (abandoned >5s old gen-0 .slot with NO published file) self-heals on next hello!
+        empty_g0 = self.store / "sessions/os+emptygen0.slot"
         put(empty_g0, "")
         os.utime(empty_g0, (stale_t, stale_t))
         r_g0 = self.helio("hello", "codex", me="os/emptygen0", cwd=repo)
@@ -2638,9 +2637,9 @@ class Sessions(Base):
             if p.name == "os+emptygen0" or p.name.startswith("os+emptygen0~"):
                 p.unlink()
 
-        # Fresh (<5s old) 0-byte higher generation simulates an in-flight Windows hello WriteFile: an ordinary refresh
+        # Fresh (<5s old) .slot for a higher generation simulates an in-flight publish: an ordinary refresh
         # must NOT jump past it to N+2 with stale predecessor metadata!
-        inflight = self.store / f"sessions/{base_r1}~99998"
+        inflight = self.store / f"sessions/{base_r1}~99998.slot"
         put(inflight, "")
         r_inf = self.helio("inbox", "--session", "race-1", me=None, cwd=repo)
         self.assertEqual(r_inf.returncode, 1)

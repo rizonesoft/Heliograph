@@ -107,10 +107,126 @@ p_result p_remove(const char *path) {
     return settle_win(path) ? P_OK : P_FAILED;
 }
 
+static size_t format_u64_win(char *buf, uint64_t v) {
+    char rev[32];
+    size_t n = 0;
+    do rev[n++] = (char)('0' + (v % 10)), v /= 10; while (v);
+    for (size_t i = 0; i < n; i++) buf[i] = rev[n - 1 - i];
+    buf[n] = 0;
+    return n;
+}
+
 p_result p_create_excl(const char *path, const char *data, size_t length) {
 #ifdef HELIO_TEST_HOOKS
     if (plat_fail_sync) return P_FAILED;
 #endif
+    if (length > 0) {
+        static uint64_t excl_seq = 0;
+        size_t plen = im_length(path);
+        char *slot = im_alloc(plen + 6);
+        if (!slot) return P_FAILED;
+        for (size_t i = 0; i < plen; i++) slot[i] = path[i];
+        const char *ssfx = ".slot";
+        for (size_t i = 0; i <= 5; i++) slot[plen + i] = ssfx[i];
+        wchar_t *wslot = im_wide(slot);
+        wchar_t *wpath = im_wide(path);
+        im_free(slot);
+        if (!wslot || !wpath) {
+            im_free(wslot), im_free(wpath);
+            return P_FAILED;
+        }
+        /* 1. Write and flush complete payload to a unique invisible .part temp file. */
+        wchar_t *wtemp = NULL;
+        HANDLE tf = INVALID_HANDLE_VALUE;
+        for (int attempt = 0; attempt < 16; attempt++) {
+            char tick[32], salt_s[32], seq_s[32];
+            size_t tlen = format_u64_win(tick, p_tick());
+            size_t saltlen = format_u64_win(salt_s, (uint64_t)(uintptr_t)&tf ^ ((uint64_t)attempt * 2654435761u));
+            size_t slen = format_u64_win(seq_s, ++excl_seq);
+            char *temp = im_alloc(plen + tlen + saltlen + slen + 12);
+            if (!temp) {
+                im_free(wslot), im_free(wpath);
+                return P_FAILED;
+            }
+            size_t p = 0;
+            for (size_t i = 0; i < plen; i++) temp[p++] = path[i];
+            temp[p++] = '.', temp[p++] = 'e', temp[p++] = 'x';
+            for (size_t i = 0; i < saltlen; i++) temp[p++] = salt_s[i];
+            temp[p++] = '-';
+            for (size_t i = 0; i < tlen; i++) temp[p++] = tick[i];
+            temp[p++] = '-';
+            for (size_t i = 0; i < slen; i++) temp[p++] = seq_s[i];
+            const char *psfx = ".part";
+            for (size_t i = 0; i <= 5; i++) temp[p++] = psfx[i];
+            wtemp = im_wide(temp);
+            im_free(temp);
+            if (!wtemp) {
+                im_free(wslot), im_free(wpath);
+                return P_FAILED;
+            }
+            tf = CreateFileW(wtemp, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_NEW, 0, NULL);
+            if (tf != INVALID_HANDLE_VALUE) break;
+            DWORD err = GetLastError();
+            im_free(wtemp);
+            wtemp = NULL;
+            if (err == ERROR_FILE_EXISTS || err == ERROR_ALREADY_EXISTS) continue;
+            im_free(wslot), im_free(wpath);
+            return (err == ERROR_PATH_NOT_FOUND || err == ERROR_FILE_NOT_FOUND) ? P_MISSING : P_FAILED;
+        }
+        if (tf == INVALID_HANDLE_VALUE) {
+            im_free(wslot), im_free(wpath);
+            return P_FAILED;
+        }
+        const char *at = data;
+        bool good = true;
+        for (size_t left = length; good && left;) {
+            DWORD part = left > 0x100000 ? 0x100000 : (DWORD)left, wrote = 0;
+            good = WriteFile(tf, at, part, &wrote, NULL) && wrote;
+            at += wrote, left -= wrote;
+        }
+        good = good && FlushFileBuffers(tf);
+        CloseHandle(tf);
+        if (!good) {
+            DeleteFileW(wtemp);
+            im_free(wtemp), im_free(wslot), im_free(wpath);
+            return P_FAILED;
+        }
+        /* 2. Atomically claim exclusive .slot (CREATE_NEW is atomic on NTFS and \\wsl.localhost 9p). */
+        HANDLE sf = CreateFileW(wslot, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_NEW, 0, NULL);
+        if (sf == INVALID_HANDLE_VALUE) {
+            DWORD err = GetLastError();
+            DeleteFileW(wtemp);
+            im_free(wtemp), im_free(wslot), im_free(wpath);
+            if (err == ERROR_FILE_EXISTS || err == ERROR_ALREADY_EXISTS) return P_EXISTS;
+            if (err == ERROR_PATH_NOT_FOUND || err == ERROR_FILE_NOT_FOUND) return P_MISSING;
+            return P_FAILED;
+        }
+        CloseHandle(sf);
+        /* 3. Atomically publish complete flushed temp without replacing an existing destination. */
+        bool moved = false;
+        DWORD merr = 0;
+        for (int attempt = 0;; attempt++) {
+            if (MoveFileExW(wtemp, wpath, 0)) {
+                moved = true;
+                break;
+            }
+            merr = GetLastError();
+            if (!passing_win(attempt, merr)) break;
+        }
+        DeleteFileW(wslot);
+        if (!moved) {
+            DeleteFileW(wtemp);
+            im_free(wtemp), im_free(wslot), im_free(wpath);
+            if (merr == ERROR_ALREADY_EXISTS || merr == ERROR_FILE_EXISTS) return P_EXISTS;
+            if (merr == ERROR_PATH_NOT_FOUND || merr == ERROR_FILE_NOT_FOUND) return P_MISSING;
+            return P_FAILED;
+        }
+        im_free(wtemp), im_free(wslot), im_free(wpath);
+#ifdef HELIO_TEST_HOOKS
+        if (plat_fail_write_flush) return P_UNFLUSHED;
+#endif
+        return settle_win(path) ? P_OK : P_UNFLUSHED;
+    }
     wchar_t *wide = im_wide(path);
     if (!wide) return P_FAILED;
     HANDLE file = CreateFileW(wide, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_NEW, 0, NULL);
@@ -121,14 +237,7 @@ p_result p_create_excl(const char *path, const char *data, size_t length) {
         if (err == ERROR_PATH_NOT_FOUND || err == ERROR_FILE_NOT_FOUND) return P_MISSING;
         return P_FAILED;
     }
-    const char *at = data;
-    bool good = true;
-    for (size_t left = length; good && left;) {
-        DWORD part = left > 0x100000 ? 0x100000 : (DWORD)left, wrote = 0;
-        good = WriteFile(file, at, part, &wrote, NULL) && wrote;
-        at += wrote, left -= wrote;
-    }
-    good = good && FlushFileBuffers(file);
+    bool good = FlushFileBuffers(file) != 0;
     CloseHandle(file);
     if (!good) {
         DeleteFileW(wide);
