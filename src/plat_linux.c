@@ -44,15 +44,18 @@ static bool passing_linux(int attempt, int err) {
 
 p_result p_read(const char *path, size_t most, char **data, size_t *length) {
     struct stat info;
-    int file = -1;
     for (int attempt = 0;; attempt++) {
-        file = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK); /* never a pipe, a link or a device */
-        if (file >= 0 || !passing_linux(attempt, errno)) break;
+        int file = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK); /* never a pipe, a link or a device */
+        if (file < 0) {
+            if (passing_linux(attempt, errno)) continue;
+            return why();
+        }
+        p_result result = fstat(file, &info) || !S_ISREG(info.st_mode) ? P_FAILED : all(file, most, data, length);
+        int err = errno;
+        close(file);
+        if (result == P_FAILED && passing_linux(attempt, err)) continue;
+        return result;
     }
-    if (file < 0) return why();
-    p_result result = fstat(file, &info) || !S_ISREG(info.st_mode) ? P_FAILED : all(file, most, data, length);
-    close(file);
-    return result;
 }
 
 p_result p_input(size_t most, char **data, size_t *length) { return all(0, most, data, length); }

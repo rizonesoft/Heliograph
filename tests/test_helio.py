@@ -1525,20 +1525,22 @@ class Archive(Base):
             st = Path(tmp)
             put(st / "helio.conf", "project: os\n")
             self.assertEqual(run(st, "init", me=None).returncode, 0)
+            fixed_day_us = str(1795521600_000_000)  # 2026-11-24T12:00:00Z (immune to UTC midnight rollover)
             for i in range(210):
                 j = f"{feb_us + 2000 + i:016d}-e{i:05x}"
                 put(st / f"messages/{j}.post", f"id: {j}\ntime: 2025-02-15T00:00:00Z\nfrom: os/main\nto: os/userland\nkind: request\nabout: \nurgency: next\nre: \ndue: \nlength: 4\nsubject: e\n\nbody")
                 put(st / f"messages/{j}.link.0000", "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: taken\nnote: \nend: yes\n")
                 put(st / f"messages/{j}.link.0001", "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: done\nnote: ok\nend: yes\n")
             with ThreadPoolExecutor(3) as pool:
-                sim_codes = list(pool.map(lambda _: run(st, "inbox", me="os/userland").returncode, range(3)))
+                sim_codes = list(pool.map(lambda _: subprocess.run([str(RACER), "--now", fixed_day_us, "inbox", "--store", str(st), "--as", "os/userland"], stdin=subprocess.DEVNULL, capture_output=True, timeout=30).returncode, range(3)))
             for rc in sim_codes:
                 self.assertIn(rc, (0, 1))
             moved_sim = len(list((st / "archive/2025-02").glob("*.post")))
             self.assertLessEqual(moved_sim, 200, f"simultaneous inboxes exceeded 200: {moved_sim}")
             self.assertGreater(moved_sim, 0)
             # A subsequent inbox on the same date MUST NOT move any more jobs!
-            self.assertIn(run(st, "inbox", me="os/userland").returncode, (0, 1))
+            r_again = subprocess.run([str(RACER), "--now", fixed_day_us, "inbox", "--store", str(st), "--as", "os/userland"], stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
+            self.assertIn(r_again.returncode, (0, 1))
             self.assertEqual(len(list((st / "archive/2025-02").glob("*.post"))), moved_sim)
 
         # Upgrade continuity: legacy summary/<today>.claiming with 100 prior moves caps remaining budget to 100!
