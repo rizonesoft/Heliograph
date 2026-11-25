@@ -1853,6 +1853,274 @@ class Archive(Base):
             self.assertIn("state: done\n", (arch_dir / f"{oid}.link.0001").read_text(), oid)
         self.assertEqual(run(st, "check", me=None).returncode, 0)
 
+    def test_archived_show_seen_answer_and_chain_replay(self):
+        # Multi-step jobs: (1) taken -> released -> taken by another session -> done; (2) taken -> refused.
+        feb_us = 1739577600_000_000
+        j_done = f"{feb_us + 10:016d}-a00001"
+        j_ref = f"{feb_us + 20:016d}-a00002"
+        put(self.store / f"messages/{j_done}.post", f"id: {j_done}\ntime: 2025-02-15T00:00:00Z\nfrom: os/main\nto: os/all\nkind: request\nabout: engine/store.c\nurgency: next\nre: \ndue: \nlength: 10\nsubject: multi-done\n\ndone-body!")
+        put(self.store / f"messages/{j_done}.link.0000", "by: os/userland\ntime: 2025-04-10T10:00:00Z\nsession: s1\nstate: taken\nnote: \nend: yes\n")
+        put(self.store / f"messages/{j_done}.link.0001", "by: os/userland\ntime: 2025-04-10T11:00:00Z\nsession: s1\nstate: released\nnote: \nend: yes\n")
+        put(self.store / f"messages/{j_done}.link.0002", "by: os/apps\ntime: 2025-04-10T12:00:00Z\nsession: s2\nstate: taken\nnote: \nend: yes\n")
+        put(self.store / f"messages/{j_done}.link.0003", "by: os/apps\ntime: 2025-04-10T13:00:00Z\nsession: s2\nstate: done\nnote: shipped\nend: yes\n")
+        put(self.store / f"messages/{j_ref}.post", f"id: {j_ref}\ntime: 2025-02-15T00:00:00Z\nfrom: os/main\nto: os/userland\nkind: request\nabout: \nurgency: next\nre: \ndue: \nlength: 9\nsubject: multi-ref\n\nref-body!")
+        put(self.store / f"messages/{j_ref}.link.0000", "by: os/userland\ntime: 2025-04-10T12:00:00Z\nsession: s1\nstate: taken\nnote: \nend: yes\n")
+        put(self.store / f"messages/{j_ref}.link.0001", "by: os/userland\ntime: 2025-04-10T13:00:00Z\nsession: s1\nstate: refused\nnote: nope\nend: yes\n")
+        # Capture exact show text BEFORE archiving (non-recipient os/main avoids creating a live seen mark first).
+        before_done = self.helio("show", j_done, me="os/main")
+        before_ref = self.helio("show", j_ref, me="os/main")
+        self.assertEqual(before_done.returncode, 0, before_done.stderr)
+        self.assertEqual(before_ref.returncode, 0, before_ref.stderr)
+        self.assertIn(b"done by os/apps", before_done.stdout)
+        self.assertIn(b"refused by os/userland", before_ref.stdout)
+        # Archive both.
+        self.assertEqual(self.helio("archive", me=None).returncode, 0)
+        self.assertEqual(list((self.store / "messages").iterdir()), [])
+        # Exact same show text AFTER archiving, exit 0, and recipient seen mark persists in archive/<month>/ (zero live files)!
+        after_done = self.helio("show", j_done, me="os/main")
+        after_ref = self.helio("show", j_ref, me="os/main")
+        self.assertEqual(after_done.returncode, 0, after_done.stderr)
+        self.assertEqual(after_ref.returncode, 0, after_ref.stderr)
+        self.assertEqual(after_done.stdout, before_done.stdout)
+        self.assertEqual(after_ref.stdout, before_ref.stdout)
+        for _ in range(2):
+            rec_read = self.helio("show", j_ref, me="os/userland")
+            self.assertEqual(rec_read.returncode, 0, rec_read.stderr)
+            self.assertEqual(rec_read.stdout, before_ref.stdout)
+        self.assertEqual((self.store / f"archive/2025-02/{j_ref}.seen.os+userland").read_text(), "seen\n")
+        self.assertEqual(list((self.store / "messages").iterdir()), [])
+        # Invalid and unknown IDs still exit 2.
+        self.assertEqual(self.helio("show", "not an id!", me="os/main").returncode, 2)
+        self.assertEqual(self.helio("show", f"{feb_us + 99:016d}-ffffff", me="os/main").returncode, 2)
+        # Race between store_message and store_job with a real archiver: show falls back cleanly to archive!
+        j_race = self.make_aged_closed_job(created_us=feb_us + 30, closed_iso="2025-04-15T12:00:00Z", state="done", subject="race-show")
+        p_show = subprocess.Popen([str(RACER), "--pause-cli", "before-read", str(self.store), "show", j_race, "--store", str(self.store), "--as", "os/userland"],
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.store)
+        try:
+            self.wait_for(self.store / "paused.before-read")
+            self.assertEqual(self.helio("archive", me=None).returncode, 0)
+            put(self.store / "resume.before-read", "go")
+            out_s, err_s = p_show.communicate(timeout=30)
+        finally:
+            if p_show.poll() is None:
+                p_show.kill()
+        self.assertEqual(p_show.returncode, 0, err_s)
+        self.assertIn(b"done by os/userland", out_s)
+        self.assertEqual((self.store / f"archive/2025-02/{j_race}.seen.os+userland").read_text(), "seen\n")
+        for f in ("paused.before-read", "resume.before-read"):
+            if (self.store / f).exists():
+                (self.store / f).unlink()
+        self.assertEqual(list((self.store / "messages").iterdir()), [])
+        # Answering an archived job persists one live reply with exact recipient, subject, body, and re == archived ID!
+        ans = self.helio("answer", j_done, "follow-up", me="os/apps", body="checked archived work")
+        self.assertEqual(ans.returncode, 0, ans.stderr)
+        reply_id = ans.stdout.decode().strip()
+        live_posts = list((self.store / "messages").glob("*.post"))
+        self.assertEqual([p.name for p in live_posts], [f"{reply_id}.post"])
+        reply_raw = live_posts[0].read_text()
+        self.assertIn("to: os/main\n", reply_raw)
+        self.assertIn(f"re: {j_done}\n", reply_raw)
+        self.assertIn("subject: follow-up\n", reply_raw)
+        self.assertIn("\n\nchecked archived work", reply_raw)
+        read_reply = self.helio("show", reply_id, me="os/main")
+        self.assertEqual(read_reply.returncode, 0, read_reply.stderr)
+        self.assertIn(f"| answers: {j_done}\n".encode(), read_reply.stdout)
+        self.assertIn(b"| checked archived work", read_reply.stdout)
+        # Answering an unknown parent exits 2 and creates no reply; unreadable archived parent exits 3 and creates no reply.
+        before_cnt = len(list((self.store / "messages").glob("*.post")))
+        self.assertEqual(self.helio("answer", f"{feb_us + 99:016d}-ffffff", "nope", me="os/apps", body="x").returncode, 2)
+        self.assertEqual(len(list((self.store / "messages").glob("*.post"))), before_cnt)
+        if not ON_WINDOWS and os.geteuid() != 0:
+            ap = self.store / f"archive/2025-02/{j_done}.post"
+            ap.chmod(0)
+            try:
+                self.assertEqual(self.helio("show", j_done, me="os/main").returncode, 3)
+                self.assertEqual(self.helio("answer", j_done, "nope", me="os/apps", body="x").returncode, 3)
+                self.assertEqual(len(list((self.store / "messages").glob("*.post"))), before_cnt)
+            finally:
+                ap.chmod(0o600)
+
+    def test_archived_refuse_mutations_and_keyed_repeat_at_capacity(self):
+        feb_us = 1739577600_000_000
+        j = self.make_aged_closed_job(created_us=feb_us + 100, closed_iso="2025-04-15T12:00:00Z", state="done", subject="mut-refuse")
+        self.assertEqual(self.helio("archive", me=None).returncode, 0)
+        snap_live = sorted(p.name for p in (self.store / "messages").iterdir())
+        snap_arch = {p.name: p.read_bytes() for p in (self.store / "archive/2025-02").iterdir()}
+        for cmd in (("take", j), ("release", j), ("done", j, "ok"), ("refuse", j, "no")):
+            r = self.helio(*cmd, me="os/userland")
+            self.assertEqual(r.returncode, 2, (cmd, r.stderr))
+            self.assertIn(b"archived", r.stderr.lower(), (cmd, r.stderr))
+        self.assertEqual(sorted(p.name for p in (self.store / "messages").iterdir()), snap_live)
+        self.assertEqual({p.name: p.read_bytes() for p in (self.store / "archive/2025-02").iterdir()}, snap_arch)
+        # Keyed repeat at live-store admission capacity (--max-names 10 -> threshold 5):
+        with tempfile.TemporaryDirectory() as tmp:
+            st = Path(tmp)
+            put(st / "helio.conf", "project: os\n")
+            self.assertEqual(run(st, "init", me=None).returncode, 0)
+            first = run(st, "ask", "os/userland", "cap-key-subj", "--key", "cap-k", me="os/main", body="cap-body")
+            self.assertEqual(first.returncode, 0, first.stderr)
+            orig_id = first.stdout.decode().strip()
+            put(st / f"messages/{orig_id}.link.0000", "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: taken\nnote: \nend: yes\n")
+            put(st / f"messages/{orig_id}.link.0001", "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: done\nnote: ok\nend: yes\n")
+            self.assertEqual(run(st, "archive", me=None).returncode, 0)
+            # Fill live store to >= 5 names (key file + 4 live posts = 5 == 10/2).
+            for i in range(4):
+                self.assertEqual(run(st, "tell", "os/all", f"fill-{i}", me="os/main", body="b").returncode, 0)
+            live_before = sorted(p.name for p in (st / "messages").iterdir())
+            # Exact repeat at capacity returns original ID (exit 0) and creates no new file!
+            rep = subprocess.run([str(RACER), "--max-names", "10", "ask", "os/userland", "cap-key-subj", "--key", "cap-k", "--store", str(st), "--as", "os/main"],
+                                 input=b"cap-body", capture_output=True, timeout=30)
+            self.assertEqual(rep.returncode, 0, rep.stderr)
+            self.assertEqual(rep.stdout.decode().strip(), orig_id)
+            self.assertEqual(sorted(p.name for p in (st / "messages").iterdir()), live_before)
+            # Conflicting repeat at capacity refuses (exit 2) and creates no new file!
+            conf = subprocess.run([str(RACER), "--max-names", "10", "ask", "os/userland", "cap-key-subj", "--key", "cap-k", "--store", str(st), "--as", "os/main"],
+                                  input=b"different-body", capture_output=True, timeout=30)
+            self.assertEqual(conf.returncode, 2, conf.stderr)
+            self.assertEqual(sorted(p.name for p in (st / "messages").iterdir()), live_before)
+            # Genuinely new send at capacity still refuses with store-full!
+            fresh_new = subprocess.run([str(RACER), "--max-names", "10", "ask", "os/userland", "new-subj", "--key", "brand-new", "--store", str(st), "--as", "os/main"],
+                                       input=b"b", capture_output=True, timeout=30)
+            self.assertEqual(fresh_new.returncode, 2, fresh_new.stderr)
+            self.assertIn(b"full", fresh_new.stderr.lower())
+
+    def test_log_all_months_order_dedup_bounded_and_damaged_month(self):
+        # Empty new store (no archive/ yet): log --all exits 1.
+        self.assertEqual(self.helio("log", "--all", me=None).returncode, 1)
+        # Live-only store (still no archive/): log --all lists live rows and exits 0.
+        live_id = self.send("tell", to="os/all", subject="live-only")
+        r_live_only = self.helio("log", "--all", me=None)
+        self.assertEqual(r_live_only.returncode, 0, r_live_only.stderr)
+        self.assertIn(live_id.encode(), r_live_only.stdout)
+        # Create archived jobs in two months: 2025-01 and 2025-03 (5 jobs in 2025-03 to test bounded batch pagination!).
+        jan_us = 1736899200_000_000  # 2025-01-15
+        feb_us = 1739577600_000_000  # 2025-02-15
+        mar_us = 1742000000_000_000  # 2025-03-15
+        jan_id = self.make_aged_closed_job(created_us=jan_us, closed_iso="2025-04-15T12:00:00Z", state="done", subject="jan-job")
+        mar_ids = [self.make_aged_closed_job(created_us=mar_us + i, closed_iso="2025-04-15T12:00:00Z", state="done", subject=f"mar-{i}") for i in range(5)]
+        self.assertEqual(self.helio("archive", me=None).returncode, 0)
+        # Interrupted move in 2025-02: present in BOTH messages/ and archive/2025-02/ -> MUST appear ONCE in log --all!
+        dup_id = self.make_aged_closed_job(created_us=feb_us, closed_iso="2025-04-15T12:00:00Z", state="done", subject="in-flight-dup")
+        (self.store / "archive/2025-02").mkdir(parents=True, exist_ok=True)
+        for suf in ("post", "link.0000", "link.0001"):
+            put(self.store / f"archive/2025-02/{dup_id}.{suf}", (self.store / f"messages/{dup_id}.{suf}").read_text())
+        # Plain `helio log` stays live-only.
+        plain = self.helio("log", me=None)
+        self.assertEqual(plain.returncode, 0, plain.stderr)
+        plain_s = plain.stdout.decode()
+        self.assertIn(live_id, plain_s)
+        self.assertIn(dup_id, plain_s)
+        self.assertNotIn(jan_id, plain_s)
+        self.assertNotIn(mar_ids[0], plain_s)
+        # `helio log --all` with small --batch-size 2 traverses all 5 in 2025-03, newest month (2025-03) before 2025-01, dedups dup_id!
+        r_all = subprocess.run([str(RACER), "--batch-size", "2", "log", "--all", "--store", str(self.store)], capture_output=True, text=True, timeout=30)
+        self.assertEqual(r_all.returncode, 0, r_all.stderr)
+        lines = r_all.stdout.splitlines()
+        self.assertEqual(sum(1 for ln in lines if dup_id in ln), 1, lines)
+        self.assertIn(live_id, r_all.stdout)
+        for mid in mar_ids:
+            self.assertIn(mid, r_all.stdout)
+        self.assertIn(jan_id, r_all.stdout)
+        # Newest month first: every 2025-03 row precedes 2025-01 row.
+        idx_mar_last = max(i for i, ln in enumerate(lines) if any(m in ln for m in mar_ids))
+        idx_jan = next(i for i, ln in enumerate(lines) if jan_id in ln)
+        self.assertLess(idx_mar_last, idx_jan, lines)
+        # Damaged/unreadable month: healthy rows still printed, exit code 3!
+        if not ON_WINDOWS and os.geteuid() != 0:
+            jan_dir = self.store / "archive/2025-01"
+            jan_dir.chmod(0)
+            try:
+                r_dmg = self.helio("log", "--all", me=None)
+                self.assertEqual(r_dmg.returncode, 3)
+                self.assertIn(live_id.encode(), r_dmg.stdout)
+                self.assertIn(mar_ids[0].encode(), r_dmg.stdout)
+            finally:
+                jan_dir.chmod(0o700)
+
+    def test_store_check_examines_archived_files_and_in_progress_moves(self):
+        feb_us = 1739577600_000_000
+        j = self.make_aged_closed_job(created_us=feb_us + 200, closed_iso="2025-04-15T12:00:00Z", state="done", subject="check-arch")
+        self.assertEqual(self.helio("archive", me=None).returncode, 0)
+        self.assertEqual(self.helio("show", j, me="os/userland").returncode, 0)
+        self.assertEqual(self.helio("check", me=None).returncode, 0)
+        arch_dir = self.store / "archive/2025-02"
+        post_f = arch_dir / f"{j}.post"
+        l0_f = arch_dir / f"{j}.link.0000"
+        l1_f = arch_dir / f"{j}.link.0001"
+        seen_f = arch_dir / f"{j}.seen.os+userland"
+        orig_post, orig_l0, orig_l1, orig_seen = post_f.read_bytes(), l0_f.read_bytes(), l1_f.read_bytes(), seen_f.read_bytes()
+        # 1. Truncated archived post (length mismatch) -> exit 3 naming ID.
+        post_f.write_bytes(orig_post[:-1])
+        r = self.helio("check", me=None)
+        self.assertEqual(r.returncode, 3)
+        self.assertIn(j.encode(), r.stdout)
+        post_f.write_bytes(orig_post)
+        # 2. Corrupted archived post header -> exit 3.
+        post_f.write_bytes(orig_post.replace(b"kind: request", b"kind: invalid"))
+        self.assertEqual(self.helio("check", me=None).returncode, 3)
+        post_f.write_bytes(orig_post)
+        # 3. Wrong month folder -> exit 3.
+        wrong_dir = self.store / "archive/2025-03"
+        wrong_dir.mkdir(parents=True, exist_ok=True)
+        wrong_f = wrong_dir / f"{j}.post"
+        wrong_f.write_bytes(orig_post)
+        self.assertEqual(self.helio("check", me=None).returncode, 3)
+        wrong_f.unlink()
+        wrong_dir.rmdir()
+        # 4. Missing step (gap: .link.0000 deleted leaving .link.0001) -> exit 3.
+        l0_f.unlink()
+        self.assertEqual(self.helio("check", me=None).returncode, 3)
+        l0_f.write_bytes(orig_l0)
+        # 5. Corrupted step (end: no) -> exit 3.
+        l1_f.write_bytes(orig_l1.replace(b"end: yes", b"end: no "))
+        self.assertEqual(self.helio("check", me=None).returncode, 3)
+        l1_f.write_bytes(orig_l1)
+        # 6. Incomplete archive-only job (terminal link removed) -> exit 3.
+        l1_f.unlink()
+        self.assertEqual(self.helio("check", me=None).returncode, 3)
+        l1_f.write_bytes(orig_l1)
+        # 7. Orphan archived link without post -> exit 3.
+        post_f.unlink()
+        self.assertEqual(self.helio("check", me=None).returncode, 3)
+        post_f.write_bytes(orig_post)
+        # 8. Malformed archived seen mark -> exit 3.
+        seen_f.write_bytes(b"bad!\n")
+        self.assertEqual(self.helio("check", me=None).returncode, 3)
+        seen_f.write_bytes(orig_seen)
+        # 9. Unexpected file in month folder and unexpected entry in archive/ -> exit 3.
+        bogus_f = arch_dir / "bogus.txt"
+        put(bogus_f, "x")
+        self.assertEqual(self.helio("check", me=None).returncode, 3)
+        bogus_f.unlink()
+        bad_mon = self.store / "archive/not-a-month"
+        bad_mon.mkdir()
+        self.assertEqual(self.helio("check", me=None).returncode, 3)
+        bad_mon.rmdir()
+        self.assertEqual(self.helio("check", me=None).returncode, 0)
+        # 10. Interrupted move in progress: matching in-progress copy accepted (exit 0), conflicting copy rejected (exit 3)!
+        j_prog = self.make_aged_closed_job(created_us=feb_us + 210, closed_iso="2025-04-15T12:00:00Z", state="done", subject="in-prog-chk")
+        p_arch = subprocess.Popen([str(RACER), "--pause-cli", "after-copy-post", str(self.store), "archive", "--store", str(self.store)],
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.store)
+        try:
+            self.wait_for(self.store / "paused.after-copy-post")
+            # Matching partial in-progress copy (archived .post matches live .post, links not copied yet) -> check exits 0!
+            self.assertEqual(self.helio("check", me=None).returncode, 0)
+            # Conflict in in-progress archived .post -> check exits 3!
+            ap = arch_dir / f"{j_prog}.post"
+            saved = ap.read_bytes()
+            ap.write_bytes(saved.replace(b"in-prog-chk", b"CONFLICT!!!"))
+            self.assertEqual(self.helio("check", me=None).returncode, 3)
+            ap.write_bytes(saved)
+            put(self.store / "resume.after-copy-post", "go")
+            p_arch.communicate(timeout=30)
+        finally:
+            if p_arch.poll() is None:
+                p_arch.kill()
+        for f in ("paused.after-copy-post", "resume.after-copy-post"):
+            if (self.store / f).exists():
+                (self.store / f).unlink()
+        self.assertEqual(self.helio("check", me=None).returncode, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

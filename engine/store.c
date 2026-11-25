@@ -155,7 +155,7 @@ s_result store_parse_post(char *data, size_t length, const char *id, message *ou
     uint64_t body = 0;
     for (const char *d = field(data, "length"); *d >= '0' && *d <= '9' && body < MOST_FILE; d++) body = body * 10 + (uint64_t)(*d - '0');
     *out = (message){data, field(data, "id"), field(data, "time"), field(data, "from"), field(data, "to"), field(data, "kind"),
-                     field(data, "about"), field(data, "urgency"), field(data, "re"), field(data, "subject"), data + split + 2, 0};
+                     field(data, "about"), field(data, "urgency"), field(data, "re"), field(data, "subject"), data + split + 2, 0, false};
     const char *due = field(data, "due");
     for (int digits = 0; *due >= '0' && *due <= '9' && digits < 17; digits++) out->due = out->due * 10 + (uint64_t)(*due++ - '0');
     bool due_ok = !*due || *due == '\n';
@@ -170,7 +170,7 @@ s_result store_parse_post(char *data, size_t length, const char *id, message *ou
     return S_OK;
 }
 
-s_result store_message(store *s, const char *id, message *out) {
+s_result store_message_live(store *s, const char *id, message *out) {
     *out = (message){0};
     if (!id_ok(id)) return say(s, S_REFUSED, "that is not a message id");
     text at = {0};
@@ -182,6 +182,17 @@ s_result store_message(store *s, const char *id, message *out) {
     if (result == P_MISSING) return say(s, S_REFUSED, "there is no such message");
     if (result != P_OK) return say(s, S_DAMAGED, "the message cannot be read");
     return store_parse_post(data, length, id, out, &s->why);
+}
+
+s_result store_message(store *s, const char *id, message *out) {
+    s_result result = store_message_live(s, id, out);
+    if (result == S_REFUSED && same(s->why, "there is no such message")) {
+        s_result ar = archive_read_message(s, id, out);
+        if (ar == S_OK) return S_OK;
+        if (ar == S_DAMAGED) return S_DAMAGED;
+        return say(s, S_REFUSED, "there is no such message");
+    }
+    return result;
 }
 
 bool is_job(const message *m) { return same(m->kind, "request") || same(m->kind, "handoff"); }
@@ -345,6 +356,7 @@ bool store_apply_step(const message *m, job *now, char *data) {
 /* Replays the chain from the disk, because others write meanwhile. A step counts
    only if its actor was allowed to make it: the rules are those of a new step. */
 s_result store_job(store *s, const message *m, job *out) {
+    if (m->archived) return archive_read_job(s, m, out);
     *out = (job){.state = OPEN};
     if (s->pause) s->pause(s->pause_user, "before-read");
     for (; out->links < MOST_LINKS; out->links++) {
@@ -442,11 +454,39 @@ static s_result reserve(store *s, const message *m, const char *key, text *id) {
     return result;
 }
 
+/* Read-only lookup of an existing key reservation (without creating one). */
+static s_result find_reserved(store *s, const message *m, const char *key, text *id) {
+    if (len(key) > 100) return say(s, S_REFUSED, "the key is too long");
+    text whole = {0}, name = {0}, line = {0};
+    clean(&line, key, true);
+    add(&whole, m->from), add(&whole, " "), add(&whole, m->to), add(&whole, " "), add(&whole, line.data ? line.data : "");
+    uint64_t hash = 14695981039346656037ull;
+    for (const char *at = whole.data ? whole.data : ""; *at; at++) hash = (hash ^ (unsigned char)*at) * 1099511628211ull;
+    add(&name, "key."), add_number(&name, hash, 20);
+    s_result result = S_DAMAGED;
+    char *data = NULL;
+    if (whole.failed || name.failed || line.failed) result = say(s, S_DAMAGED, "out of memory");
+    else if ((result = event_of(s, "key", name.data, &data)) == S_OK) {
+        size_t n = 0;
+        while (data[n] && data[n] != '\n') n++;
+        bool mine = data[n] && n == whole.length && id_ok(data + n + 1);
+        for (size_t i = 0; mine && i < n; i++) mine = data[i] == whole.data[i];
+        if (mine) {
+            text_free(id);
+            add(id, data + n + 1);
+            result = id->failed ? say(s, S_DAMAGED, "out of memory") : S_OK;
+        } else {
+            result = say(s, S_REFUSED, "that key is in use: choose another");
+        }
+    }
+    p_free(data), text_free(&whole), text_free(&name), text_free(&line);
+    return result;
+}
+
 s_result store_post(store *s, const message *m, const char *key, text *id) {
     if (!address_ok(m->from, false)) return say(s, S_REFUSED, "say who you are: --as project/lane");
     if (!address_ok(m->to, true)) return say(s, S_REFUSED, "the reader is project/lane, or project/all");
     if (!one_of(m->kind, kinds)) return say(s, S_REFUSED, "the kind is request, handoff, answer, finding or headsup");
-    if (s->count >= store_max_names / 2) return say(s, S_REFUSED, "the store is full: archive it first");
     if (!one_of(m->urgency, urgencies)) return say(s, S_REFUSED, "the urgency is now, next or whenever");
     if (len(m->subject) > 120 || len(m->about) > 1000 || len(m->body) > MOST_BODY) return say(s, S_REFUSED, "the message is too long");
     if (*m->re) {
@@ -467,6 +507,35 @@ s_result store_post(store *s, const message *m, const char *key, text *id) {
     } else if (secret(subject.data) || secret(body.data) || secret(about.data ? about.data : "")) {
         s->why = "this looks like it contains a secret, so it was not sent";
     } else {
+        /* Resolve an existing keyed message (live or archived) BEFORE enforcing live admission capacity,
+           so exact repeats succeed at capacity without creating files and conflicts still refuse. */
+        if (*key) {
+            s_result fr = find_reserved(s, m, key, id);
+            if (fr == S_OK) {
+                message there = {0};
+                s_result mr = store_message(s, id->data, &there);
+                if (mr == S_OK) {
+                    bool match = same(there.from, m->from) && same(there.to, m->to) && same(there.kind, m->kind)
+                                 && same(there.subject, subject.data) && same(there.body, body.data);
+                    message_free(&there);
+                    text_free(&subject), text_free(&about), text_free(&body), text_free(&out);
+                    return match ? S_OK : say(s, S_REFUSED, "that key stands for another message");
+                }
+                message_free(&there);
+                if (mr == S_DAMAGED) {
+                    text_free(&subject), text_free(&about), text_free(&body), text_free(&out);
+                    return S_DAMAGED;
+                }
+                text_free(id);
+            } else if (fr != S_NOTHING) {
+                text_free(&subject), text_free(&about), text_free(&body), text_free(&out);
+                return fr;
+            }
+        }
+        if (s->count >= store_max_names / 2) {
+            text_free(&subject), text_free(&about), text_free(&body), text_free(&out);
+            return say(s, S_REFUSED, "the store is full: archive it first");
+        }
         uint64_t now = p_now();
         fresh(id, now);
         result = id->failed ? say(s, S_DAMAGED, "out of memory") : *key ? reserve(s, m, key, id) : S_OK;
@@ -592,7 +661,8 @@ static s_result change_job(store *s, const char *id, actor me, change what, cons
     message m;
     s_result result = store_message(s, id, &m);
     if (result != S_OK) return result;
-    if (!is_job(&m)) result = say(s, S_REFUSED, "only a request or a handoff can be taken");
+    if (m.archived) result = say(s, S_REFUSED, "it was archived");
+    else if (!is_job(&m)) result = say(s, S_REFUSED, "only a request or a handoff can be taken");
     if (result == S_OK) {
         /* Refuse if an archived terminal copy already exists; fail closed on archive I/O or parse errors (S_DAMAGED);
            allow ordinary in-progress archival (S_REFUSED = valid archived post without terminal links yet) to proceed. */
@@ -678,6 +748,16 @@ s_result store_seen(store *s, const char *id, const char *me) {
     return result;
 }
 
+s_result store_seen_archived(store *s, const char *id, const char *me) {
+    if (!address_ok(me, false)) return say(s, S_REFUSED, "say who you are: --as project/lane");
+    text event = {0};
+    seen_name(&event, me);
+    if (event.failed) return text_free(&event), say(s, S_DAMAGED, "out of memory");
+    s_result result = archive_write_seen(s, id, event.data);
+    text_free(&event);
+    return result;
+}
+
 s_result store_check(store *s, text *report) {
     s_result all = S_OK;
     for (size_t i = 0; i < s->count; i++) {
@@ -690,7 +770,7 @@ s_result store_check(store *s, text *report) {
         if (!id) return say(s, S_DAMAGED, "out of memory");
         if (same(id, "key")) {}
         else {
-            s_result mr = store_message(s, id, &m);
+            s_result mr = store_message_live(s, id, &m);
             if (mr == S_REFUSED && same(s->why, "there is no such message")) {
                 if (!same(dot, ".post")) {
                     char *probe = NULL;
@@ -735,5 +815,6 @@ s_result store_check(store *s, text *report) {
         message_free(&m);
         p_free(id);
     }
+    if (archive_check(s, report) != S_OK) all = say(s, S_DAMAGED, "the store has damage");
     return report->failed ? say(s, S_DAMAGED, "out of memory") : all;
 }

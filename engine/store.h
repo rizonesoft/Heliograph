@@ -12,6 +12,7 @@ typedef struct message {
     char *file; /* owns the strings below */
     const char *id, *time, *from, *to, *kind, *about, *urgency, *re, *subject, *body;
     uint64_t due; /* microseconds since 1970, or 0 */
+    bool archived;
 } message;
 
 typedef struct store {
@@ -41,6 +42,7 @@ bool address_ok(const char *address, bool may_be_all); /* project/lane, or proje
 s_result store_open(store *s, const char *folder);
 void store_close(store *s);
 s_result store_message(store *s, const char *id, message *out);
+s_result store_message_live(store *s, const char *id, message *out);
 void message_free(message *m);
 
 /* With a key, sending the same again gives the first message and no second one. */
@@ -49,6 +51,7 @@ s_result store_take(store *s, const char *id, actor me);
 s_result store_release(store *s, const char *id, actor me);
 s_result store_end(store *s, const char *id, actor me, bool done, const char *note);
 s_result store_seen(store *s, const char *id, const char *me);
+s_result store_seen_archived(store *s, const char *id, const char *me);
 bool owns(const char *lane, const message *m); /* the owner of a project on either side */
 s_result store_check(store *s, text *report); /* S_DAMAGED when anything is wrong */
 

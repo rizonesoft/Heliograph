@@ -138,7 +138,7 @@ s_result watch_summary(store *s) {
             char *id = copy(s->names[i], n - 5);
             message m = {0};
             job j;
-            s_result mr = id ? store_message(s, id, &m) : S_DAMAGED;
+            s_result mr = id ? store_message_live(s, id, &m) : S_DAMAGED;
             if (mr == S_REFUSED && same(s->why, "there is no such message")) {
                 p_free(id);
                 continue;

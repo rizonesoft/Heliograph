@@ -5,8 +5,21 @@
 /* Derives "YYYY-MM" from a message id's leading epoch-microseconds timestamp. */
 bool archive_month(const char *id, char out[8]);
 
-/* Reads and validates archive/<YYYY-MM>/<id>.post. Returns S_OK, S_NOTHING (missing), or S_DAMAGED. */
+/* Reads and validates archive/<YYYY-MM>/<id>.post. Returns S_OK (sets out->archived = true), S_NOTHING (missing), or S_DAMAGED. */
 s_result archive_read_message(store *s, const char *id, message *out);
+
+/* Replays an archived job's steps from archive/<YYYY-MM>/. Checks for step gaps and terminal state. */
+s_result archive_read_job(store *s, const message *m, job *out);
+
+/* Persists a seen mark directly to archive/<YYYY-MM>/<id>.<seen_event>. */
+s_result archive_write_seen(store *s, const char *id, const char *seen_event);
+
+/* Visits archived messages newest month first in bounded batches, skipping IDs already present in live messages/.
+   Returns count of damaged months or messages encountered. */
+size_t archive_every(store *s, void (*each)(store *s, const message *m, void *user), void *user);
+
+/* Validates all archived month folders and files structurally (and against live copies during interrupted moves). */
+s_result archive_check(store *s, text *report);
 
 /* Validates archive/<YYYY-MM>/<id>.post and its archived chain to DONE or REFUSED.
    Returns S_OK (valid terminal archived job, sets *links_out if non-NULL), S_NOTHING (no archive post), or S_DAMAGED. */
