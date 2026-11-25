@@ -67,10 +67,42 @@ static bool parse_link_index(const char *ev, unsigned *out) {
     return true;
 }
 
+/* Verifies archive/ and archive/<month>/ are real directories (never symlinks/reparse points) if present.
+   Returns S_OK (both are real dirs), S_NOTHING (either is absent), or S_DAMAGED (symlink or non-dir). */
+static s_result check_arch_dirs(const char *folder, const char *month) {
+    text a = {0}, m = {0};
+    add(&a, folder), add(&a, "/archive");
+    arch_dir(folder, month, &m);
+    if (a.failed || m.failed) {
+        text_free(&a), text_free(&m);
+        return S_DAMAGED;
+    }
+    if (!p_is_real_dir(a.data)) {
+        uint64_t mt = 0;
+        p_result mr = p_file_mtime(a.data, &mt);
+        text_free(&a), text_free(&m);
+        return mr == P_MISSING ? S_NOTHING : S_DAMAGED;
+    }
+    if (!p_is_real_dir(m.data)) {
+        uint64_t mt = 0;
+        p_result mr = p_file_mtime(m.data, &mt);
+        text_free(&a), text_free(&m);
+        return mr == P_MISSING ? S_NOTHING : S_DAMAGED;
+    }
+    text_free(&a), text_free(&m);
+    return S_OK;
+}
+
 s_result archive_read_message(store *s, const char *id, message *out) {
     *out = (message){0};
     char month[8];
     if (!valid_id(id) || !archive_month(id, month)) return S_NOTHING;
+    s_result dr = check_arch_dirs(s->folder, month);
+    if (dr == S_NOTHING) return S_NOTHING;
+    if (dr != S_OK) {
+        s->why = "the archive folder is not a real directory";
+        return S_DAMAGED;
+    }
     text at = {0};
     arch_path(s->folder, month, &at, id, "post");
     char *data = NULL;
@@ -1092,11 +1124,15 @@ static bool scan_arch_gap(void *user, const char *name) {
     return true;
 }
 
-s_result archive_read_job(store *s, const message *m, job *out) {
+static s_result archive_read_job_ex(store *s, const message *m, const str_list *known_links, job *out) {
     *out = (job){.state = OPEN};
     char month[8];
     if (!valid_id(m->id) || !archive_month(m->id, month)) {
         s->why = "that is not a message id";
+        return S_DAMAGED;
+    }
+    if (check_arch_dirs(s->folder, month) != S_OK) {
+        s->why = "the archive folder is not a real directory";
         return S_DAMAGED;
     }
     for (; out->links < MOST_LINKS; out->links++) {
@@ -1108,18 +1144,25 @@ s_result archive_read_job(store *s, const message *m, job *out) {
         p_result r = ev.failed || at.failed ? P_FAILED : p_read(at.data, MOST_FILE, &data, &length);
         text_free(&ev), text_free(&at);
         if (r == P_MISSING) {
-            text mdir = {0};
-            arch_dir(s->folder, month, &mdir);
-            arch_gap_ctx g = {.id = m->id, .id_len = len(m->id), .min_link = out->links, .has_higher = false};
-            p_result lr = mdir.failed ? P_FAILED : p_list(mdir.data, scan_arch_gap, &g);
-            text_free(&mdir);
-            if (lr != P_OK) {
-                s->why = "the archive cannot be read";
-                return S_DAMAGED;
-            }
-            if (g.has_higher) {
-                s->why = "a step of this job is missing";
-                return S_DAMAGED;
+            if (known_links) {
+                if (known_links->count != out->links) {
+                    s->why = "a step of this job is missing";
+                    return S_DAMAGED;
+                }
+            } else {
+                text mdir = {0};
+                arch_dir(s->folder, month, &mdir);
+                arch_gap_ctx g = {.id = m->id, .id_len = len(m->id), .min_link = out->links, .has_higher = false};
+                p_result lr = mdir.failed ? P_FAILED : p_list(mdir.data, scan_arch_gap, &g);
+                text_free(&mdir);
+                if (lr != P_OK) {
+                    s->why = "the archive cannot be read";
+                    return S_DAMAGED;
+                }
+                if (g.has_higher) {
+                    s->why = "a step of this job is missing";
+                    return S_DAMAGED;
+                }
             }
             if (out->state != DONE && out->state != REFUSED) {
                 s->why = "an archived job is incomplete";
@@ -1139,6 +1182,10 @@ s_result archive_read_job(store *s, const message *m, job *out) {
             return S_DAMAGED;
         }
     }
+    if (known_links && known_links->count != out->links) {
+        s->why = "a step of this job is missing";
+        return S_DAMAGED;
+    }
     if (out->state != DONE && out->state != REFUSED) {
         s->why = "an archived job is incomplete";
         return S_DAMAGED;
@@ -1146,11 +1193,19 @@ s_result archive_read_job(store *s, const message *m, job *out) {
     return S_OK;
 }
 
+s_result archive_read_job(store *s, const message *m, job *out) {
+    return archive_read_job_ex(s, m, NULL, out);
+}
+
 s_result archive_write_seen(store *s, const char *id, const char *seen_event) {
     char month[8];
     if (!valid_id(id) || !archive_month(id, month)) {
         s->why = "that is not a message id";
         return S_REFUSED;
+    }
+    if (check_arch_dirs(s->folder, month) != S_OK) {
+        s->why = "the archive folder is not a real directory";
+        return S_DAMAGED;
     }
     text at = {0}, unique = {0};
     arch_path(s->folder, month, &at, id, seen_event);
@@ -1186,19 +1241,9 @@ static bool gather_months(void *user, const char *name) {
     return true;
 }
 
-static bool has_live_post(const store *s, const char *id) {
-    size_t n = len(id), low = 0, high = s->count;
-    while (low < high) {
-        size_t mid = low + (high - low) / 2;
-        const char *name = s->names[mid];
-        int ord = 0;
-        for (size_t i = 0; i < n && !ord; i++) ord = (unsigned char)name[i] - (unsigned char)id[i];
-        if (!ord) ord = (unsigned char)name[n] - '.';
-        if (!ord) ord = compare(name + n + 1, "post");
-        if (!ord) return true;
-        if (ord < 0) low = mid + 1;
-        else high = mid;
-    }
+static bool was_emitted(char *const *emitted, size_t count, const char *id) {
+    for (size_t i = 0; i < count; i++)
+        if (same(emitted[i], id)) return true;
     return false;
 }
 
@@ -1235,7 +1280,10 @@ static bool gather_arch_post_batch(void *user, const char *name) {
     return true;
 }
 
-size_t archive_every(store *s, void (*each)(store *s, const message *m, void *user), void *user) {
+static bool attach_arch_events(void *user, const char *name);
+
+size_t archive_every(store *s, char *const *emitted, size_t emitted_count,
+                     void (*each)(store *s, const message *m, const job *known, void *user), void *user) {
     text root = {0};
     add(&root, s->folder), add(&root, "/archive");
     if (root.failed) return 1;
@@ -1257,8 +1305,9 @@ size_t archive_every(store *s, void (*each)(store *s, const message *m, void *us
         const char *month = ml.months.items[mi];
         text mdir = {0};
         arch_dir(s->folder, month, &mdir);
-        if (mdir.failed) {
+        if (mdir.failed || !p_is_real_dir(mdir.data)) {
             damaged++;
+            text_free(&mdir);
             continue;
         }
         char *cursor = NULL;
@@ -1280,14 +1329,49 @@ size_t archive_every(store *s, void (*each)(store *s, const message *m, void *us
                 break;
             }
             sort_list(&b.ids);
-            for (size_t i = 0; i < b.ids.count; i++) {
-                const char *id = b.ids.items[i];
-                if (has_live_post(s, id)) continue; /* already emitted from live messages/ */
-                message m = {0};
-                s_result mr = archive_read_message(s, id, &m);
-                if (mr == S_OK) each(s, &m, user);
-                else if (mr != S_NOTHING) damaged++;
-                message_free(&m);
+            /* Single batch scan collects all .link.* for every job in this batch (O(N), zero per-job p_list!). */
+            batch_events be = {.items = p_alloc(b.ids.count * sizeof *be.items), .count = b.ids.count};
+            if (!be.items) {
+                damaged++;
+            } else {
+                for (size_t i = 0; i < b.ids.count; i++) be.items[i].id = b.ids.items[i];
+                if (p_list(mdir.data, attach_arch_events, &be) != P_OK || be.failed) {
+                    damaged++;
+                } else {
+                    for (size_t i = 0; i < be.count; i++) {
+                        const char *id = be.items[i].id;
+                        char derived[8];
+                        if (!valid_id(id) || !archive_month(id, derived) || !same(derived, month)) {
+                            damaged++;
+                            continue;
+                        }
+                        if (was_emitted(emitted, emitted_count, id)) continue;
+                        message m = {0};
+                        s_result mr = archive_read_message(s, id, &m);
+                        if (mr == S_OK) {
+                            if (is_job(&m)) {
+                                job known = {0};
+                                s_result jr = archive_read_job_ex(s, &m, &be.items[i].links, &known);
+                                if (jr == S_OK) each(s, &m, &known, user);
+                                else {
+                                    each(s, &m, NULL, user);
+                                    damaged++;
+                                }
+                            } else {
+                                each(s, &m, NULL, user);
+                            }
+                        } else if (mr != S_NOTHING) {
+                            damaged++;
+                        }
+                        message_free(&m);
+                    }
+                }
+                for (size_t i = 0; i < be.count; i++) {
+                    list_free(&be.items[i].seen);
+                    list_free(&be.items[i].links);
+                    list_free(&be.items[i].rm_parts);
+                }
+                p_free(be.items);
             }
             if (!b.truncated) {
                 list_free(&b.ids);
@@ -1319,7 +1403,24 @@ typedef struct {
 
 static bool valid_arch_event(const char *ev) {
     if (same(ev, "post")) return true;
-    if (starts(ev, "seen.") && ev[5]) return true;
+    if (starts(ev, "seen.")) {
+        const char *who = ev + 5;
+        size_t n = len(who);
+        if (!n || n >= 72) return false;
+        char addr[72];
+        int plus = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (who[i] == '/') return false;
+            if (who[i] == '+') {
+                addr[i] = '/';
+                plus++;
+            } else {
+                addr[i] = who[i];
+            }
+        }
+        addr[n] = 0;
+        return plus == 1 && address_ok(addr, false);
+    }
     unsigned idx = 0;
     return len(ev) == 9 && starts(ev, "link.") && parse_link_index(ev, &idx);
 }
@@ -1403,15 +1504,27 @@ static bool attach_arch_events(void *user, const char *name) {
     return true;
 }
 
-static bool files_equal(const char *a, const char *b) {
+/* Returns S_OK if equal, S_NOTHING if live file b vanished concurrently, S_DAMAGED if mismatched or unreadable. */
+static s_result compare_arch_live(const char *a, const char *b) {
     char *da = NULL, *db = NULL;
     size_t la = 0, lb = 0;
     p_result ra = p_read(a, MOST_FILE, &da, &la);
     p_result rb = p_read(b, MOST_FILE, &db, &lb);
+    if (rb == P_MISSING) {
+        p_free(da), p_free(db);
+        return S_NOTHING;
+    }
     bool eq = ra == P_OK && rb == P_OK && la == lb;
     for (size_t i = 0; eq && i < la; i++) eq = da[i] == db[i];
     p_free(da), p_free(db);
-    return eq;
+    return eq ? S_OK : S_DAMAGED;
+}
+
+static void report_arch_file(text *report, const char *month, const char *id, const char *ev, const char *why) {
+    text full = {0};
+    add(&full, id), add(&full, "."), add(&full, ev);
+    report_arch(report, month, full.failed ? id : full.data, why);
+    text_free(&full);
 }
 
 s_result archive_check(store *s, text *report) {
@@ -1440,8 +1553,10 @@ s_result archive_check(store *s, text *report) {
         const char *month = ml.months.items[mi];
         text mdir = {0};
         arch_dir(s->folder, month, &mdir);
-        if (mdir.failed) {
+        if (mdir.failed || !p_is_real_dir(mdir.data)) {
+            report_arch(report, month, "", "archive month is not a real directory");
             all = S_DAMAGED;
+            text_free(&mdir);
             continue;
         }
         char *cursor = NULL;
@@ -1503,40 +1618,48 @@ s_result archive_check(store *s, text *report) {
                     p_free(lprobe);
                     text_free(&lpost);
                     if (lpr == P_OK) {
-                        /* Interrupted move in progress: every archived file must match its live counterpart byte-for-byte. */
+                        /* Interrupted move in progress: every archived file must match its live counterpart byte-for-byte.
+                           If a live file disappears concurrently as the archiver completes, fall through to archive-only check. */
+                        bool vanished = false;
                         if (it->post_removed) {
                             text ap = {0}, lp = {0};
                             arch_path(s->folder, month, &ap, it->id, "post");
                             live_path(s->folder, &lp, it->id, "post");
-                            if (ap.failed || lp.failed || !files_equal(ap.data, lp.data)) {
-                                report_arch(report, month, it->id, "archived post conflicts with live post");
+                            s_result eq = ap.failed || lp.failed ? S_DAMAGED : compare_arch_live(ap.data, lp.data);
+                            text_free(&ap), text_free(&lp);
+                            if (eq == S_NOTHING) vanished = true;
+                            else if (eq != S_OK) {
+                                report_arch_file(report, month, it->id, "post", "archived post conflicts with live post");
                                 all = S_DAMAGED;
                             }
-                            text_free(&ap), text_free(&lp);
                         }
-                        for (size_t k = 0; k < it->links.count; k++) {
+                        for (size_t k = 0; !vanished && k < it->links.count; k++) {
                             text ap = {0}, lp = {0};
                             arch_path(s->folder, month, &ap, it->id, it->links.items[k]);
                             live_path(s->folder, &lp, it->id, it->links.items[k]);
-                            if (ap.failed || lp.failed || !files_equal(ap.data, lp.data)) {
-                                report_arch(report, month, it->links.items[k], "archived step conflicts with live step");
+                            s_result eq = ap.failed || lp.failed ? S_DAMAGED : compare_arch_live(ap.data, lp.data);
+                            text_free(&ap), text_free(&lp);
+                            if (eq == S_NOTHING) vanished = true;
+                            else if (eq != S_OK) {
+                                report_arch_file(report, month, it->id, it->links.items[k], "archived step conflicts with live step");
                                 all = S_DAMAGED;
                             }
-                            text_free(&ap), text_free(&lp);
                         }
-                        for (size_t k = 0; k < it->seen.count; k++) {
+                        for (size_t k = 0; !vanished && k < it->seen.count; k++) {
                             text ap = {0}, lp = {0};
                             arch_path(s->folder, month, &ap, it->id, it->seen.items[k]);
                             live_path(s->folder, &lp, it->id, it->seen.items[k]);
-                            if (ap.failed || lp.failed || !files_equal(ap.data, lp.data)) {
-                                report_arch(report, month, it->seen.items[k], "archived seen mark conflicts with live seen mark");
+                            s_result eq = ap.failed || lp.failed ? S_DAMAGED : compare_arch_live(ap.data, lp.data);
+                            text_free(&ap), text_free(&lp);
+                            if (eq == S_NOTHING) vanished = true;
+                            else if (eq != S_OK) {
+                                report_arch_file(report, month, it->id, it->seen.items[k], "archived seen mark conflicts with live seen mark");
                                 all = S_DAMAGED;
                             }
-                            text_free(&ap), text_free(&lp);
                         }
-                        continue;
+                        if (!vanished) continue;
                     }
-                    if (lpr != P_MISSING) {
+                    if (lpr != P_MISSING && lpr != P_OK) {
                         report_arch(report, month, it->id, "the live message cannot be read");
                         all = S_DAMAGED;
                         continue;
@@ -1550,19 +1673,16 @@ s_result archive_check(store *s, text *report) {
                     message m = {0};
                     s_result mr = archive_read_message(s, it->id, &m);
                     if (mr != S_OK) {
-                        report_arch(report, month, it->id, s->why ? s->why : "archived message is damaged");
+                        report_arch_file(report, month, it->id, "post", s->why ? s->why : "archived message is damaged");
                         all = S_DAMAGED;
                         message_free(&m);
                         continue;
                     }
                     if (is_job(&m)) {
                         job now = {0};
-                        s_result jr = archive_read_job(s, &m, &now);
+                        s_result jr = archive_read_job_ex(s, &m, &it->links, &now);
                         if (jr != S_OK) {
                             report_arch(report, month, it->id, s->why ? s->why : "archived job is damaged");
-                            all = S_DAMAGED;
-                        } else if (it->links.count != now.links) {
-                            report_arch(report, month, it->id, "archived job has unexpected step files");
                             all = S_DAMAGED;
                         }
                     } else if (it->links.count > 0) {
@@ -1580,7 +1700,7 @@ s_result archive_check(store *s, text *report) {
                         bool ok_seen = sr == P_OK && sl == len(ARCHIVE_SEEN) && same(sd, ARCHIVE_SEEN);
                         p_free(sd);
                         if (!ok_seen) {
-                            report_arch(report, month, it->seen.items[k], "a seen mark is damaged");
+                            report_arch_file(report, month, it->id, it->seen.items[k], "a seen mark is damaged");
                             all = S_DAMAGED;
                         }
                     }

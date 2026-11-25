@@ -1930,6 +1930,13 @@ class Archive(Base):
         before_cnt = len(list((self.store / "messages").glob("*.post")))
         self.assertEqual(self.helio("answer", f"{feb_us + 99:016d}-ffffff", "nope", me="os/apps", body="x").returncode, 2)
         self.assertEqual(len(list((self.store / "messages").glob("*.post"))), before_cnt)
+        # Keyed answer to two different archived parents with the same key, subject, and body MUST refuse the second!
+        a1 = self.helio("answer", j_done, "same-subj", "--key", "ans-k", me="os/apps", body="same-body")
+        self.assertEqual(a1.returncode, 0, a1.stderr)
+        a2 = self.helio("answer", j_ref, "same-subj", "--key", "ans-k", me="os/apps", body="same-body")
+        self.assertEqual(a2.returncode, 2, a2.stderr)
+        self.assertIn(b"another message", a2.stderr.lower())
+        before_cnt = len(list((self.store / "messages").glob("*.post")))
         if not ON_WINDOWS and os.geteuid() != 0:
             ap = self.store / f"archive/2025-02/{j_done}.post"
             ap.chmod(0)
@@ -1939,6 +1946,23 @@ class Archive(Base):
                 self.assertEqual(len(list((self.store / "messages").glob("*.post"))), before_cnt)
             finally:
                 ap.chmod(0o600)
+            # Symlinked archive month directory MUST be refused by show, check, and log --all (never write outside store)!
+            with tempfile.TemporaryDirectory() as ext:
+                ext_p = Path(ext)
+                ext_id = f"{feb_us + 88:016d}-b00088"
+                put(ext_p / f"{ext_id}.post", f"id: {ext_id}\ntime: 2025-02-15T00:00:00Z\nfrom: os/main\nto: os/userland\nkind: request\nabout: \nurgency: next\nre: \ndue: \nlength: 4\nsubject: sym\n\nbody")
+                put(ext_p / f"{ext_id}.link.0000", "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: taken\nnote: \nend: yes\n")
+                put(ext_p / f"{ext_id}.link.0001", "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: done\nnote: ok\nend: yes\n")
+                with tempfile.TemporaryDirectory() as sym_st:
+                    ss = Path(sym_st)
+                    put(ss / "helio.conf", "project: os\n")
+                    self.assertEqual(run(ss, "init", me=None).returncode, 0)
+                    (ss / "archive").mkdir()
+                    (ss / "archive/2025-02").symlink_to(ext_p)
+                    self.assertEqual(run(ss, "show", ext_id, me="os/userland").returncode, 3)
+                    self.assertFalse((ext_p / f"{ext_id}.seen.os+userland").exists(), "show must never write seen mark through symlinked month")
+                    self.assertEqual(run(ss, "check", me=None).returncode, 3)
+                    self.assertEqual(run(ss, "log", "--all", me=None).returncode, 3)
 
     def test_archived_refuse_mutations_and_keyed_repeat_at_capacity(self):
         feb_us = 1739577600_000_000
@@ -1999,24 +2023,51 @@ class Archive(Base):
         jan_id = self.make_aged_closed_job(created_us=jan_us, closed_iso="2025-04-15T12:00:00Z", state="done", subject="jan-job")
         mar_ids = [self.make_aged_closed_job(created_us=mar_us + i, closed_iso="2025-04-15T12:00:00Z", state="done", subject=f"mar-{i}") for i in range(5)]
         self.assertEqual(self.helio("archive", me=None).returncode, 0)
-        # Interrupted move in 2025-02: present in BOTH messages/ and archive/2025-02/ -> MUST appear ONCE in log --all!
+        # Interrupted move / killed keyed retry in 2025-02: live .post WITHOUT live steps alongside completed archived
+        # job -> MUST appear ONCE in log --all with its true archived state (`done by os/userland`, NEVER `open`)!
         dup_id = self.make_aged_closed_job(created_us=feb_us, closed_iso="2025-04-15T12:00:00Z", state="done", subject="in-flight-dup")
-        (self.store / "archive/2025-02").mkdir(parents=True, exist_ok=True)
-        for suf in ("post", "link.0000", "link.0001"):
-            put(self.store / f"archive/2025-02/{dup_id}.{suf}", (self.store / f"messages/{dup_id}.{suf}").read_text())
-        # Plain `helio log` stays live-only.
+        self.assertEqual(self.helio("archive", me=None).returncode, 0)
+        put(self.store / f"messages/{dup_id}.post", (self.store / f"archive/2025-02/{dup_id}.post").read_text())
+        # Plain `helio log` stays live-only and still shows true archived state (never `open`).
         plain = self.helio("log", me=None)
         self.assertEqual(plain.returncode, 0, plain.stderr)
         plain_s = plain.stdout.decode()
         self.assertIn(live_id, plain_s)
         self.assertIn(dup_id, plain_s)
+        self.assertIn("done by os/userland", next(ln for ln in plain_s.splitlines() if dup_id in ln))
         self.assertNotIn(jan_id, plain_s)
         self.assertNotIn(mar_ids[0], plain_s)
         # `helio log --all` with small --batch-size 2 traverses all 5 in 2025-03, newest month (2025-03) before 2025-01, dedups dup_id!
         r_all = subprocess.run([str(RACER), "--batch-size", "2", "log", "--all", "--store", str(self.store)], capture_output=True, text=True, timeout=30)
         self.assertEqual(r_all.returncode, 0, r_all.stderr)
         lines = r_all.stdout.splitlines()
-        self.assertEqual(sum(1 for ln in lines if dup_id in ln), 1, lines)
+        dup_lines = [ln for ln in lines if dup_id in ln]
+        self.assertEqual(len(dup_lines), 1, lines)
+        self.assertIn("done by os/userland", dup_lines[0])
+        self.assertIn(b"done by os/userland", self.helio("show", dup_id, me="os/main").stdout)
+        (self.store / f"messages/{dup_id}.post").unlink()
+        # Concurrent archive during `log --all` (paused at before-read): job MUST still appear once, never omitted!
+        with tempfile.TemporaryDirectory() as tmp:
+            st = Path(tmp)
+            put(st / "helio.conf", "project: os\n")
+            self.assertEqual(run(st, "init", me=None).returncode, 0)
+            j_mv = f"{feb_us + 77:016d}-c00077"
+            put(st / f"messages/{j_mv}.post", f"id: {j_mv}\ntime: 2025-02-15T00:00:00Z\nfrom: os/main\nto: os/userland\nkind: request\nabout: \nurgency: next\nre: \ndue: \nlength: 4\nsubject: conc-log\n\nbody")
+            put(st / f"messages/{j_mv}.link.0000", "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: taken\nnote: \nend: yes\n")
+            put(st / f"messages/{j_mv}.link.0001", "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: done\nnote: ok\nend: yes\n")
+            p_log = subprocess.Popen([str(RACER), "--pause-cli", "before-read", str(st), "log", "--all", "--store", str(st)],
+                                     stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=st)
+            try:
+                self.wait_for(st / "paused.before-read")
+                self.assertEqual(run(st, "archive", me=None).returncode, 0)
+                put(st / "resume.before-read", "go")
+                out_l, err_l = p_log.communicate(timeout=30)
+            finally:
+                if p_log.poll() is None:
+                    p_log.kill()
+            self.assertEqual(p_log.returncode, 0, err_l)
+            self.assertIn(j_mv.encode(), out_l)
+            self.assertIn(b"done by os/userland", out_l)
         self.assertIn(live_id, r_all.stdout)
         for mid in mar_ids:
             self.assertIn(mid, r_all.stdout)
@@ -2083,10 +2134,17 @@ class Archive(Base):
         post_f.unlink()
         self.assertEqual(self.helio("check", me=None).returncode, 3)
         post_f.write_bytes(orig_post)
-        # 8. Malformed archived seen mark -> exit 3.
+        # 8. Malformed archived seen mark -> exit 3 AND names full <id>.seen.<lane> filename!
         seen_f.write_bytes(b"bad!\n")
-        self.assertEqual(self.helio("check", me=None).returncode, 3)
+        r_seen = self.helio("check", me=None)
+        self.assertEqual(r_seen.returncode, 3)
+        self.assertIn(f"{j}.seen.os+userland".encode(), r_seen.stdout)
         seen_f.write_bytes(orig_seen)
+        # 8b. Invalid seen mark suffix (<id>.seen.!) -> exit 3!
+        bad_seen = arch_dir / f"{j}.seen.!"
+        put(bad_seen, "seen\n")
+        self.assertEqual(self.helio("check", me=None).returncode, 3)
+        bad_seen.unlink()
         # 9. Unexpected file in month folder and unexpected entry in archive/ -> exit 3.
         bogus_f = arch_dir / "bogus.txt"
         put(bogus_f, "x")

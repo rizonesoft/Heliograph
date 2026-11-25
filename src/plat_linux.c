@@ -191,9 +191,21 @@ p_result p_folder(const char *path) {
     return errno == EEXIST ? P_FAILED : why();
 }
 
+bool p_is_real_dir(const char *path) {
+    struct stat info;
+    return !lstat(path, &info) && S_ISDIR(info.st_mode);
+}
+
 p_result p_list(const char *path, bool (*each)(void *user, const char *name), void *user) {
-    DIR *folder = opendir(path);
-    if (!folder) return why();
+    int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) return why();
+    DIR *folder = fdopendir(fd);
+    if (!folder) {
+        int saved = errno;
+        close(fd);
+        errno = saved;
+        return why();
+    }
     errno = 0;
     for (struct dirent *entry; (entry = readdir(folder)); errno = 0)
         if (strcmp(entry->d_name, ".") && strcmp(entry->d_name, "..") && !each(user, entry->d_name)) break;

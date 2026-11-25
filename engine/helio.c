@@ -145,8 +145,25 @@ typedef struct {
     text out;
     const char *me, *urgency;
     int shown, held;
-    bool all, damaged;
+    bool all, damaged, write_err;
+    char **emitted;
+    size_t emitted_count, emitted_cap;
 } listing;
+
+static void record_emitted(listing *l, const char *id) {
+    if (!l->all) return;
+    if (l->emitted_count == l->emitted_cap) {
+        size_t cap = l->emitted_cap ? l->emitted_cap * 2 : 64;
+        char **next = p_alloc(cap * sizeof *next);
+        if (!next) { l->damaged = true; return; }
+        if (l->emitted_count) memcpy(next, l->emitted, l->emitted_count * sizeof *next);
+        p_free(l->emitted);
+        l->emitted = next, l->emitted_cap = cap;
+    }
+    char *dup = copy(id, len(id));
+    if (!dup) { l->damaged = true; return; }
+    l->emitted[l->emitted_count++] = dup;
+}
 
 static void into_log(store *s, const message *m, void *user) {
     listing *l = user;
@@ -157,8 +174,27 @@ static void into_log(store *s, const message *m, void *user) {
         return;
     }
     if (r != S_OK) l->damaged = true;
-    add(&l->out, one.data ? one.data : "");
-    if (one.failed) l->out.failed = true;
+    if (one.failed || (one.length && !p_print(one.data))) l->write_err = true;
+    text_free(&one);
+    record_emitted(l, m->id);
+    l->shown++;
+}
+
+static void into_log_archived(store *s, const message *m, const job *known, void *user) {
+    listing *l = user;
+    text one = {0};
+    s_result r = S_OK;
+    if (is_job(m) && known) {
+        format_line(&one, m, known, true);
+    } else {
+        r = line(&one, s, m);
+        if (r == S_REFUSED) {
+            text_free(&one);
+            return;
+        }
+        if (r != S_OK) l->damaged = true;
+    }
+    if (one.failed || (one.length && !p_print(one.data))) l->write_err = true;
     text_free(&one);
     l->shown++;
 }
@@ -192,7 +228,7 @@ static void into_inbox(store *s, const message *m, void *user) {
 }
 
 static int finish(listing *l, size_t damaged) {
-    if (!print(&l->out)) return fail("the output cannot be written", 3);
+    if (!print(&l->out) || l->write_err) return fail("the output cannot be written", 3);
     if (damaged || l->damaged) return fail("something here is damaged: see helio check", 3);
     return l->shown ? 0 : 1;
 }
@@ -213,7 +249,9 @@ static int inbox(store *s, const char *me, bool all) {
 static int whole_log(store *s, bool all) {
     listing l = {.all = all};
     size_t damaged = every(s, into_log, &l);
-    if (all) damaged += archive_every(s, into_log, &l);
+    if (all) damaged += archive_every(s, l.emitted, l.emitted_count, into_log_archived, &l);
+    for (size_t i = 0; i < l.emitted_count; i++) p_free(l.emitted[i]);
+    p_free(l.emitted);
     return finish(&l, damaged);
 }
 

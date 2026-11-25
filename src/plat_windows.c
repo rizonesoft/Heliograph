@@ -227,6 +227,14 @@ p_result p_folder(const char *path) {
        (\\wsl.localhost\ and \\wsl$\), settle_win_ex and sync_dir_win allow ENOSYS on directory handles only. */
     return settle_win_ex(path, true) && sync_dir_win(path, true) ? P_OK : P_FAILED;
 }
+
+bool p_is_real_dir(const char *path) {
+    wchar_t *wide = im_wide(path);
+    if (!wide) return false;
+    DWORD attrs = GetFileAttributesW(wide);
+    im_free(wide);
+    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) && !(attrs & FILE_ATTRIBUTE_REPARSE_POINT);
+}
 p_result p_input(size_t most, char **data, size_t *length) { return from(im_read_input(most, data, length)); }
 uint64_t p_now(void) {
 #ifdef HELIO_TEST_HOOKS
