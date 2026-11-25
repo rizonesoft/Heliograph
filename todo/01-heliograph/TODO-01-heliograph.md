@@ -38,7 +38,7 @@ title: "TODO-01 -- Heliograph"
 | 1 | §1 | Steps that notice an archived job | -- | [x] |
 | 2 | §2 | Move a closed message to its month | §1 | [x] |
 | 3 | §3 | Read, answer and repeat archived messages | §2 | [x] |
-| 4 | §4 | Sessions announced by every call | -- | [ ] |
+| 4 | §4 | Sessions announced by every call | -- | [x] |
 | 5 | §5 | Report of a silent taker | §4 | [ ] |
 | 6 | §6 | Messages for one session | §5 | [ ] |
 | 7 | §7 | Projects kept apart in log and show | -- | [ ] |
@@ -159,13 +159,16 @@ Only the Claude hook announces a session, and it records a time alone. Codex and
 1. Widen the file in `engine/place.c`. Done when: an old file with a time alone is still read.
 2. Call it from `engine/helio.c`. Done when: each command changes the time.
 
-- [ ] Record time, agent, repository and session in `place_hello` of `engine/place.c` (design, "How does it find the reader?"). Done when: each is read back and an old file still counts. Cheaper substitute: the time alone.
-- [ ] Keep one file for each session of a lane in `engine/place.c`. Done when: two sessions of one lane do not overwrite each other. Cheaper substitute: one for the lane.
-- [ ] Add `hello <agent>` to the commands in `engine/helio.c`, and use it in the hook. Done when: an unknown agent exits 2 and the three known ones are stored. Cheaper substitute: the hook only.
-- [ ] Announce the lane on every other call in `engine/helio.c` without failing it. Done when: an unwritable `sessions` leaves the command's exit code unchanged and says why. Cheaper substitute: ignoring it.
-- [ ] Commit: `sessions: every call is a sign of life`
+- [x] Record time, agent, repository and session in `place_hello` of `engine/place.c` (design, "How does it find the reader?"). Done when: each is read back and an old file still counts. Cheaper substitute: the time alone.
+- [x] Keep one file for each session of a lane in `engine/place.c`. Done when: two sessions of one lane do not overwrite each other. Cheaper substitute: one for the lane.
+- [x] Add `hello <agent>` to the commands in `engine/helio.c`, and use it in the hook. Done when: an unknown agent exits 2 and the three known ones are stored. Cheaper substitute: the hook only.
+- [x] Announce the lane on every other call in `engine/helio.c` without failing it. Done when: an unwritable `sessions` leaves the command's exit code unchanged and says why. Cheaper substitute: ignoring it.
+- [x] Commit: `sessions: every call is a sign of life`
 
 **Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
+
+> **Verified:** 2026-11-25 | §4 | 5da8c72349bd58f046552c217fe829bc925152e4
+> **Review:** `docs/reviews/d01-t01-s4.json`
 
 ## 5. Report of a silent taker
 
