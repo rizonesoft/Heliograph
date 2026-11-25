@@ -124,10 +124,12 @@ p_result p_create_excl(const char *path, const char *data, size_t length) {
     if (length > 0) {
         static unsigned long long excl_seq = 0;
         char temp[4096], slot[4096];
+        const char *slash = strrchr(path, '/');
+        size_t dirlen = slash ? (size_t)(slash - path + 1) : 0;
         unsigned long long tick = (unsigned long long)p_tick();
         unsigned long pid = (unsigned long)getpid();
         unsigned long long seq = ++excl_seq;
-        if ((size_t)snprintf(temp, sizeof temp, "%s.ex%lu-%llu-%llu.part", path, pid, tick, seq) >= sizeof temp) return P_FAILED;
+        if ((size_t)snprintf(temp, sizeof temp, "%.*s.ex%lu-%llu-%llu.part", (int)dirlen, path, pid, tick, seq) >= sizeof temp) return P_FAILED;
         if ((size_t)snprintf(slot, sizeof slot, "%s.slot", path) >= sizeof slot) return P_FAILED;
         int tf = open(temp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
         if (tf < 0) return errno == ENOENT ? P_MISSING : P_FAILED;

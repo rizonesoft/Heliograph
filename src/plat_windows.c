@@ -107,15 +107,6 @@ p_result p_remove(const char *path) {
     return settle_win(path) ? P_OK : P_FAILED;
 }
 
-static size_t format_u64_win(char *buf, uint64_t v) {
-    char rev[32];
-    size_t n = 0;
-    do rev[n++] = (char)('0' + (v % 10)), v /= 10; while (v);
-    for (size_t i = 0; i < n; i++) buf[i] = rev[n - 1 - i];
-    buf[n] = 0;
-    return n;
-}
-
 p_result p_create_excl(const char *path, const char *data, size_t length) {
 #ifdef HELIO_TEST_HOOKS
     if (plat_fail_sync) return P_FAILED;
@@ -123,6 +114,8 @@ p_result p_create_excl(const char *path, const char *data, size_t length) {
     if (length > 0) {
         static uint64_t excl_seq = 0;
         size_t plen = im_length(path);
+        size_t slash = plen;
+        while (slash > 0 && path[slash - 1] != '/' && path[slash - 1] != '\\') slash--;
         char *slot = im_alloc(plen + 6);
         if (!slot) return P_FAILED;
         for (size_t i = 0; i < plen; i++) slot[i] = path[i];
@@ -135,27 +128,25 @@ p_result p_create_excl(const char *path, const char *data, size_t length) {
             im_free(wslot), im_free(wpath);
             return P_FAILED;
         }
-        /* 1. Write and flush complete payload to a unique invisible .part temp file. */
+        /* 1. Write and flush complete payload to a short same-directory .part temp file
+              (keeps temp well under MAX_PATH even for maximum-length session filenames). */
         wchar_t *wtemp = NULL;
         HANDLE tf = INVALID_HANDLE_VALUE;
-        for (int attempt = 0; attempt < 16; attempt++) {
-            char tick[32], salt_s[32], seq_s[32];
-            size_t tlen = format_u64_win(tick, p_tick());
-            size_t saltlen = format_u64_win(salt_s, (uint64_t)(uintptr_t)&tf ^ ((uint64_t)attempt * 2654435761u));
-            size_t slen = format_u64_win(seq_s, ++excl_seq);
-            char *temp = im_alloc(plen + tlen + saltlen + slen + 12);
+        for (int attempt = 0; attempt < 32; attempt++) {
+            uint64_t h = (uint64_t)(uintptr_t)&tf ^ p_tick() ^ ((++excl_seq + (uint64_t)attempt) * 2654435761u);
+            h ^= h >> 33;
+            h *= 0xff51afd7ed558ccdULL;
+            h ^= h >> 33;
+            char *temp = im_alloc(slash + 24);
             if (!temp) {
                 im_free(wslot), im_free(wpath);
                 return P_FAILED;
             }
             size_t p = 0;
-            for (size_t i = 0; i < plen; i++) temp[p++] = path[i];
+            for (size_t i = 0; i < slash; i++) temp[p++] = path[i];
             temp[p++] = '.', temp[p++] = 'e', temp[p++] = 'x';
-            for (size_t i = 0; i < saltlen; i++) temp[p++] = salt_s[i];
-            temp[p++] = '-';
-            for (size_t i = 0; i < tlen; i++) temp[p++] = tick[i];
-            temp[p++] = '-';
-            for (size_t i = 0; i < slen; i++) temp[p++] = seq_s[i];
+            static const char hx[] = "0123456789abcdef";
+            for (int k = 7; k >= 0; k--) temp[p++] = hx[(h >> (k * 4)) & 0xf];
             const char *psfx = ".part";
             for (size_t i = 0; i <= 5; i++) temp[p++] = psfx[i];
             wtemp = im_wide(temp);
