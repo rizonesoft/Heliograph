@@ -304,6 +304,25 @@ int racer(int count, char **args) {
             }
             name_vec_free(&arch);
             text_free(&adir);
+            /* Also parse and verify full readable message bytes for a rotating window of 10 eligible IDs per round
+               so every round checks both 100% membership across all 1,000 IDs and full message readability. */
+            for (size_t w = 0; w < 10 && old_n > 0; w++) {
+                const char *oid = old_ids[((size_t)i * 10 + w) % old_n];
+                message m = {0};
+                s_result mr = store_message(&s, oid, &m);
+                if (mr != S_OK) {
+                    message_free(&m);
+                    mr = archive_read_message(&s, oid, &m);
+                    if (mr != S_OK) {
+                        store_close(&s);
+                        text_free(&done);
+                        p_free(old_ids);
+                        p_free(wdata);
+                        return 7;
+                    }
+                }
+                message_free(&m);
+            }
             store_close(&s);
             if (i + 1 >= min_rounds) {
                 char *dd = NULL;

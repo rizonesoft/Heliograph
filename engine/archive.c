@@ -943,14 +943,25 @@ s_result archive_daily(const char *folder, text *report, void (*pause)(void *use
                 p_free(dd);
                 text_free(&dp);
                 if (dr == P_OK) continue;
+                if (dr != P_MISSING) {
+                    res = S_DAMAGED;
+                    all_finished = false;
+                    break;
+                }
                 text sp = {0};
                 add(&sp, sdir.data), add(&sp, "/"), add(&sp, day.data), add(&sp, ".slot."), add_number(&sp, slot, 0);
                 char *sd = NULL;
                 size_t sl = 0;
                 p_result sr = sp.failed ? P_FAILED : p_read(sp.data, 64, &sd, &sl);
                 text_free(&sp);
+                if (sr == P_MISSING) {
+                    p_free(sd);
+                    all_finished = false;
+                    break;
+                }
                 if (sr != P_OK) {
                     p_free(sd);
+                    res = S_DAMAGED;
                     all_finished = false;
                     break;
                 }

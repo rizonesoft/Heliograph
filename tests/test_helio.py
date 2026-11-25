@@ -1615,6 +1615,15 @@ class Archive(Base):
             self.assertEqual(len(list((st / "archive/2025-02").glob("*.post"))), 20)
             self.assertTrue((st / f"summary/{today_iso}.done.9").exists())
             self.assertTrue((st / f"summary/{today_iso}.archived").exists())
+            # Unreadable .done.<k> MUST surface exit 3 (never fall through to claim age or silent success)!
+            if not ON_WINDOWS and os.geteuid() != 0:
+                (st / f"summary/{today_iso}.archived").unlink()
+                d0 = st / f"summary/{today_iso}.done.0"
+                d0.chmod(0)
+                try:
+                    self.assertEqual(run(st, "inbox", me="os/userland").returncode, 3)
+                finally:
+                    d0.chmod(0o600)
 
         # Overfull-store recovery via --max-names: inbox refuses, archive drains, inbox recovers!
         with tempfile.TemporaryDirectory() as tmp:
@@ -1656,85 +1665,73 @@ class Archive(Base):
 
     @unittest.skipUnless(WSL, "needs WSL")
     def test_windows_and_linux_archive_race_1000_rounds(self):
-        # Place the shared cross-host store on Windows NTFS (accessible from WSL via DrvFs and from Windows
-        # natively) so BOTH Linux fsync(dir) AND Windows FlushFileBuffers(dir) run strictly with zero workarounds.
-        win_tmp_raw = subprocess.run(["/mnt/c/Windows/System32/cmd.exe", "/c", "echo %TEMP%"], stdin=subprocess.DEVNULL, capture_output=True, text=True, check=True, timeout=30).stdout.strip()
-        wsl_tmp_root = Path(subprocess.run(["wslpath", "-u", win_tmp_raw], capture_output=True, text=True, check=True, timeout=30).stdout.strip())
-        with tempfile.TemporaryDirectory(dir=wsl_tmp_root, prefix="helio_race_") as shared_tmp:
-            st = Path(shared_tmp)
-            put(st / "helio.conf", "project: os\n")
-            self.assertEqual(run(st, "init", me=None).returncode, 0)
-            feb_us = 1739577600_000_000
-            old_ids = []
-            for i in range(1000):
-                j = f"{feb_us + i:016d}-{i:06x}"
-                put(st / f"messages/{j}.post", f"id: {j}\ntime: 2025-02-15T00:00:00Z\nfrom: os/main\nto: os/userland\nkind: request\nabout: \nurgency: next\nre: \ndue: \nlength: 4\nsubject: arch-{i}\n\nbody")
-                put(st / f"messages/{j}.link.0000", "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: taken\nnote: \nend: yes\n")
-                put(st / f"messages/{j}.link.0001", "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: done\nnote: ok\nend: yes\n")
-                old_ids.append(j)
-            live_ids = [run(st, "ask", "os/all", f"live-{i}", me="os/main", body="body").stdout.decode().strip() for i in range(20)]
-            win_store = subprocess.run(["wslpath", "-w", str(st)], capture_output=True, text=True, check=True, timeout=30).stdout.strip()
-            win_racer = str(BUILD / "racer.exe")
-            lin_racer = str(RACER)
-            # 2 archivers (limit=1 per round: Windows 300 rounds + Linux 1000 rounds, moving all 1,000 distinct eligible jobs),
-            # 2 concurrent readers (Windows min 200 + Linux min 800 = 1,000+ rounds running until BOTH archivers finish,
-            # checking ALL 20 live controls AND 100% of ALL 1,000 eligible IDs on EVERY SINGLE ROUND),
-            # and 2 racing takers (Windows + Linux).
-            put(st / "watch_old.txt", "\n".join(old_ids) + "\n")
-            take_ids = old_ids[::25] + live_ids
-            procs = [
-                subprocess.Popen([win_racer, "--archive-loop", win_store, "300"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
-                subprocess.Popen([lin_racer, "--archive-loop", str(st), "1000"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
-                subprocess.Popen([win_racer, "--read-loop", win_store, "200", str(len(live_ids)), *live_ids], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
-                subprocess.Popen([lin_racer, "--read-loop", str(st), "800", str(len(live_ids)), *live_ids], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
-                subprocess.Popen([win_racer, win_store, "os/win-taker", *take_ids[::-1]], stdin=subprocess.DEVNULL),
-                subprocess.Popen([lin_racer, str(st), "os/lin-taker", *take_ids], stdin=subprocess.DEVNULL),
-            ]
-            try:
-                for _ in range(300):
-                    if len(list(st.glob("ready.*"))) == len(procs):
-                        break
-                    time.sleep(0.05)
-                put(st / "go", "x")
-                _, arch_win_err = procs[0].communicate(timeout=240)
-                _, arch_lin_err = procs[1].communicate(timeout=240)
-                arch_win_rc = procs[0].returncode
-                arch_lin_rc = procs[1].returncode
-                # Signal readers ONLY AFTER both archivers have finished all 1,000 moves!
-                put(st / "done", "x")
-                _, read_win_err = procs[2].communicate(timeout=240)
-                _, read_lin_err = procs[3].communicate(timeout=240)
-                read_win_rc = procs[2].returncode
-                read_lin_rc = procs[3].returncode
-                win_won = procs[4].wait(240)
-                lin_won = procs[5].wait(240)
-            finally:
-                for p in procs:
-                    if p.poll() is None:
-                        p.kill()
-                        p.wait(timeout=15)
-                    if p.stdout:
-                        p.stdout.close()
-                    if p.stderr:
-                        p.stderr.close()
-            self.assertEqual(arch_win_rc, 0, arch_win_err)
-            self.assertEqual(arch_lin_rc, 0, arch_lin_err)
-            self.assertEqual(read_win_rc, 0, read_win_err)
-            self.assertEqual(read_lin_rc, 0, read_lin_err)
-            # Every live control job taken exactly once (per-job check, not aggregate!) and zero eligible old jobs taken!
-            self.assertEqual(win_won + lin_won, len(live_ids), (win_won, lin_won))
-            for lid in live_ids:
-                self.assertTrue((st / f"messages/{lid}.post").exists(), lid)
-                links = sorted(st.glob(f"messages/{lid}.link.*"))
-                self.assertEqual([p.name for p in links], [f"{lid}.link.0000"], lid)
-            # Every one of the 1,000 eligible old jobs moved to archive/2025-02 with its complete terminal chain and gone from messages/.
-            arch_dir = st / "archive/2025-02"
-            for oid in old_ids:
-                self.assertFalse((st / f"messages/{oid}.post").exists(), oid)
-                self.assertTrue((arch_dir / f"{oid}.post").exists(), oid)
-                self.assertTrue((arch_dir / f"{oid}.link.0000").exists(), oid)
-                self.assertTrue((arch_dir / f"{oid}.link.0001").exists(), oid)
-            self.assertEqual(run(st, "check", me=None).returncode, 0)
+        # Run on the designated WSL store accessed by Windows through \\wsl.localhost (design, "Where do messages live?").
+        st = self.store
+        feb_us = 1739577600_000_000
+        old_ids = [self.make_aged_closed_job(created_us=feb_us + i, closed_iso="2025-04-15T12:00:00Z", state="done", subject=f"arch-{i}") for i in range(1000)]
+        live_ids = [self.send(to="os/all", subject=f"live-{i}") for i in range(20)]
+        win_store = subprocess.run(["wslpath", "-w", str(st)], capture_output=True, text=True, check=True, timeout=30).stdout.strip()
+        win_racer = str(BUILD / "racer.exe")
+        lin_racer = str(RACER)
+        # 2 archivers (limit=1 per round: Windows 300 rounds + Linux 1000 rounds, moving all 1,000 distinct eligible jobs),
+        # 2 concurrent readers (Windows min 200 + Linux min 800 = 1,000+ rounds running until BOTH archivers finish,
+        # checking ALL 20 live controls, 100% of ALL 1,000 eligible IDs, and full parsed readability of a rotating
+        # window of 10 eligible IDs on EVERY SINGLE ROUND), and 2 racing takers (Windows + Linux).
+        put(st / "watch_old.txt", "\n".join(old_ids) + "\n")
+        take_ids = old_ids[::25] + live_ids
+        procs = [
+            subprocess.Popen([win_racer, "--archive-loop", win_store, "300"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
+            subprocess.Popen([lin_racer, "--archive-loop", str(st), "1000"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
+            subprocess.Popen([win_racer, "--read-loop", win_store, "200", str(len(live_ids)), *live_ids], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
+            subprocess.Popen([lin_racer, "--read-loop", str(st), "800", str(len(live_ids)), *live_ids], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
+            subprocess.Popen([win_racer, win_store, "os/win-taker", *take_ids[::-1]], stdin=subprocess.DEVNULL),
+            subprocess.Popen([lin_racer, str(st), "os/lin-taker", *take_ids], stdin=subprocess.DEVNULL),
+        ]
+        try:
+            for _ in range(300):
+                if len(list(st.glob("ready.*"))) == len(procs):
+                    break
+                time.sleep(0.05)
+            put(st / "go", "x")
+            _, arch_win_err = procs[0].communicate(timeout=240)
+            _, arch_lin_err = procs[1].communicate(timeout=240)
+            arch_win_rc = procs[0].returncode
+            arch_lin_rc = procs[1].returncode
+            # Signal readers ONLY AFTER both archivers have finished all 1,000 moves!
+            put(st / "done", "x")
+            _, read_win_err = procs[2].communicate(timeout=240)
+            _, read_lin_err = procs[3].communicate(timeout=240)
+            read_win_rc = procs[2].returncode
+            read_lin_rc = procs[3].returncode
+            win_won = procs[4].wait(240)
+            lin_won = procs[5].wait(240)
+        finally:
+            for p in procs:
+                if p.poll() is None:
+                    p.kill()
+                    p.wait(timeout=15)
+                if p.stdout:
+                    p.stdout.close()
+                if p.stderr:
+                    p.stderr.close()
+        self.assertEqual(arch_win_rc, 0, arch_win_err)
+        self.assertEqual(arch_lin_rc, 0, arch_lin_err)
+        self.assertEqual(read_win_rc, 0, read_win_err)
+        self.assertEqual(read_lin_rc, 0, read_lin_err)
+        # Every live control job taken exactly once (per-job check, not aggregate!) and zero eligible old jobs taken!
+        self.assertEqual(win_won + lin_won, len(live_ids), (win_won, lin_won))
+        for lid in live_ids:
+            self.assertTrue((st / f"messages/{lid}.post").exists(), lid)
+            links = sorted(st.glob(f"messages/{lid}.link.*"))
+            self.assertEqual([p.name for p in links], [f"{lid}.link.0000"], lid)
+        # Every one of the 1,000 eligible old jobs moved to archive/2025-02 with its complete terminal chain and gone from messages/.
+        arch_dir = st / "archive/2025-02"
+        for oid in old_ids:
+            self.assertFalse((st / f"messages/{oid}.post").exists(), oid)
+            self.assertTrue((arch_dir / f"{oid}.post").exists(), oid)
+            self.assertTrue((arch_dir / f"{oid}.link.0000").exists(), oid)
+            self.assertTrue((arch_dir / f"{oid}.link.0001").exists(), oid)
+        self.assertEqual(run(st, "check", me=None).returncode, 0)
 
 
 if __name__ == "__main__":

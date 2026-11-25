@@ -52,10 +52,13 @@ static bool settle_win_ex(const char *path, bool allow_unc_enosys) {
     bool ok = FlushFileBuffers(dir) != 0;
     DWORD err = ok ? 0 : GetLastError();
     CloseHandle(dir);
+    /* WORKAROUND: Windows 9p/UNC redirectors (\\wsl.localhost) do not implement IRP_MJ_FLUSH_BUFFERS on directory
+       handles (returning ERROR_INVALID_FUNCTION/ERROR_NOT_SUPPORTED); local NTFS requires strict FlushFileBuffers,
+       and CreateFileW open + file-handle FlushFileBuffers remain strictly enforced on all paths including UNC. */
     return ok || (allow_unc_enosys && is_unc && (err == ERROR_INVALID_FUNCTION || err == ERROR_NOT_SUPPORTED));
 }
 
-static bool settle_win(const char *path) { return settle_win_ex(path, false); }
+static bool settle_win(const char *path) { return settle_win_ex(path, true); }
 
 p_result p_remove(const char *path) {
     wchar_t *wide = im_wide(path);
