@@ -5323,7 +5323,7 @@ class TestPhaseInstaller(unittest.TestCase):
                     "            self.assertEqual(sum(won), len(ids), won)\n"
                     "            self.assertGreater(won[0], 0, f'Linux must win jobs: {won}')\n"
                     "            self.assertGreater(won[1] + won[2], 0, f'Windows must win jobs: {won}')\n"
-                    "            log_out = subprocess.run([str(linux_h), '--store', str(st), 'log'], capture_output=True, text=True, check=True).stdout\n"
+                    "            log_out = subprocess.run([str(linux_h), '--store', str(st), '--as', 'impossible/main', 'log'], capture_output=True, text=True, check=True).stdout\n"
                     "            self.assertEqual(log_out.count('request taken by'), len(ids))\n",
                     encoding="utf-8",
                 )
