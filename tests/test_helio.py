@@ -2517,9 +2517,12 @@ class Sessions(Base):
             time.sleep(0.1)
             self.assertIsNone(p3.poll(), "contender must wait while p2 holds OS lock")
             put(self.store / "resume.hello-in-lock", "go")
-            p2.communicate(timeout=30)
+            _, p2_err = p2.communicate(timeout=30)
             _, p3_err = p3.communicate(timeout=30)
+            self.assertEqual(p2.returncode, 1, p2_err)
+            self.assertEqual(p2_err, b"")
             self.assertEqual(p3.returncode, 0, p3_err)
+            self.assertEqual(p3_err, b"")
         finally:
             for proc in (p2, p3):
                 if proc is not None and proc.poll() is None:
@@ -2529,10 +2532,49 @@ class Sessions(Base):
                 (self.store / f).unlink()
         rc2, info2 = self.read_session("os/apps", "race-1")
         self.assertEqual((rc2, info2["agent"], info2["repository"]), (0, "antigravity", "race-repo"))
-        self.assertGreater(int(info2["when"]), int(info["when"]))
+        # Both p2 (inbox refresh) and p3 (hello antigravity) published monotonically -> at least +2 over info["when"]!
+        self.assertGreaterEqual(int(info2["when"]), int(info["when"]) + 2)
         listed = [row for row in self.list_sessions() if row["session"] == "race-1"]
         self.assertEqual(len(listed), 1)
         self.assertEqual((listed[0]["agent"], listed[0]["repository"], listed[0]["when"]), ("antigravity", "race-repo", info2["when"]))
+
+        # Case 2b: cross-host WSL/Windows lock serialization on the same session over \\wsl.localhost!
+        if not ON_WINDOWS and (BUILD / "helio.exe").exists():
+            win_store = subprocess.run(["wslpath", "-w", str(self.store)], capture_output=True, text=True, check=True, timeout=30).stdout.strip()
+            p_lin = subprocess.Popen(
+                [str(RACER), "--pause-cli", "hello-in-lock", str(self.store), "inbox", "--store", str(self.store), "--as", "os/apps", "--session", "race-1"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=repo, env=clean,
+            )
+            p_win = None
+            try:
+                deadline = time.time() + 15
+                while not (self.store / "paused.hello-in-lock").exists():
+                    self.assertLess(time.time(), deadline)
+                    time.sleep(0.01)
+                p_win = subprocess.Popen(
+                    [str(BUILD / "helio.exe"), "hello", "codex", "--store", win_store, "--as", "os/apps", "--session", "race-1"],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=repo, env=clean,
+                )
+                time.sleep(0.15)
+                self.assertIsNone(p_win.poll(), "Windows helio.exe must wait while Linux holds the cross-host lock")
+                put(self.store / "resume.hello-in-lock", "go")
+                _, lin_err = p_lin.communicate(timeout=30)
+                _, win_err = p_win.communicate(timeout=30)
+                self.assertEqual((p_lin.returncode, lin_err), (1, b""))
+                self.assertEqual((p_win.returncode, win_err), (0, b""))
+            finally:
+                for proc in (p_lin, p_win):
+                    if proc is not None and proc.poll() is None:
+                        proc.kill()
+            for f in ("paused.hello-in-lock", "resume.hello-in-lock"):
+                if (self.store / f).exists():
+                    (self.store / f).unlink()
+            rc_xh, info_xh = self.read_session("os/apps", "race-1")
+            self.assertEqual((rc_xh, info_xh["agent"]), (0, "codex"))
+            self.assertGreaterEqual(int(info_xh["when"]), int(info2["when"]) + 2)
+            # Restore antigravity state so Case 3a/3b below stay deterministic.
+            self.assertEqual(self.helio("hello", "antigravity", "--session", "race-1", me=None, cwd=repo).returncode, 0)
+            _, info2 = self.read_session("os/apps", "race-1")
 
         # Case 3a: pre-rename failure (--fail-sync-cli) leaves existing announcement 100% untouched.
         r_sync_fail = subprocess.run(

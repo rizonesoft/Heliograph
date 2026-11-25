@@ -128,13 +128,15 @@ static bool parse(options *o, int count, char **args) {
                 }
                 static const char hex[] = "0123456789abcdef";
                 char *buf = p_alloc(24);
-                if (buf) {
-                    const char *pfx = "nested-";
-                    for (int i = 0; i < 7; i++) buf[i] = pfx[i];
-                    for (int i = 0; i < 16; i++) buf[7 + i] = hex[(h >> ((15 - i) * 4)) & 15u];
-                    buf[23] = 0;
-                    o->session_env = buf;
+                if (!buf) {
+                    for (int k = 0; k < 3; k++) p_free(vals[k]);
+                    return o->why = "out of memory", false;
                 }
+                const char *pfx = "nested-";
+                for (int i = 0; i < 7; i++) buf[i] = pfx[i];
+                for (int i = 0; i < 16; i++) buf[7 + i] = hex[(h >> ((15 - i) * 4)) & 15u];
+                buf[23] = 0;
+                o->session_env = buf;
             }
             for (int k = 0; k < 3; k++) p_free(vals[k]);
         }

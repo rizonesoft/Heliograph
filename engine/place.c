@@ -229,6 +229,12 @@ s_result place_hello(store *s, const char *lane, const char *agent, const char *
 
     if (s->pause) s->pause(s->pause_user, "hello-in-lock");
 
+    if (!p_lock_valid(lock_path.data, lock_handle)) {
+        p_unlock(lock_handle);
+        text_free(&folder), text_free(&path), text_free(&lock_path), text_free(&unique);
+        return s->why = "the session lock was lost", S_DAMAGED;
+    }
+
     uint64_t now = p_now();
     if (have_existing && now <= existing.when) now = existing.when + 1;
     const char *use_agent = *ag ? ag : (have_existing && *existing.agent ? existing.agent : "");

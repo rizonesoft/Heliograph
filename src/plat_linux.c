@@ -118,35 +118,63 @@ p_result p_write(const char *path, const char *data, size_t length, bool replace
     return result;
 }
 
+typedef struct {
+    char *path;
+    char token[32];
+} linux_lock;
+
+static bool linux_lock_matches(const char *path, const char *token) {
+    char *data = NULL;
+    size_t length = 0;
+    if (p_read(path, 64, &data, &length) != P_OK) return false;
+    bool ok = length == strlen(token) && memcmp(data, token, length) == 0;
+    p_free(data);
+    return ok;
+}
+
 p_result p_lock(const char *path, void **handle) {
     *handle = NULL;
-    int fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
-    if (fd < 0) return why();
-    struct timespec start;
-    clock_gettime(CLOCK_MONOTONIC, &start);
+    size_t plen = strlen(path);
+    linux_lock *lk = malloc(sizeof *lk);
+    if (!lk) return P_FAILED;
+    lk->path = malloc(plen + 1);
+    if (!lk->path) {
+        free(lk);
+        return P_FAILED;
+    }
+    memcpy(lk->path, path, plen + 1);
+    snprintf(lk->token, sizeof lk->token, "%llu", (unsigned long long)p_tick());
+    size_t tlen = strlen(lk->token);
+
+    struct timespec deadline;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += 2;
+
     for (;;) {
-        if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
-            int *box = malloc(sizeof *box);
-            if (!box) {
-                flock(fd, LOCK_UN);
-                close(fd);
-                return P_FAILED;
-            }
-            *box = fd;
-            *handle = box;
+        p_result r = p_create_excl(path, lk->token, tlen);
+        if (r == P_OK) {
+            *handle = lk;
             return P_OK;
         }
-        if (errno == EINTR) continue;
-        if (errno != EWOULDBLOCK) {
-            close(fd);
-            return P_FAILED;
+        if (r != P_EXISTS) {
+            free(lk->path);
+            free(lk);
+            return r;
+        }
+        uint64_t mtime = 0, wall = p_now();
+        if (p_file_mtime(path, &mtime) == P_OK && wall > mtime && wall - mtime >= 60000000ull) {
+            p_result cr = p_claim_remove(path, lk->token);
+            if (cr != P_OK && cr != P_MISSING) {
+                free(lk->path);
+                free(lk);
+                return P_FAILED;
+            }
         }
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
-        uint64_t elapsed_ms = (uint64_t)(now.tv_sec - start.tv_sec) * 1000ull
-                            + (uint64_t)(now.tv_nsec - start.tv_nsec) / 1000000ull;
-        if (elapsed_ms >= 2000ull) {
-            close(fd);
+        if (now.tv_sec > deadline.tv_sec || (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec)) {
+            free(lk->path);
+            free(lk);
             return P_FAILED;
         }
         struct timespec ts = {0, 5000000};
@@ -154,12 +182,18 @@ p_result p_lock(const char *path, void **handle) {
     }
 }
 
+bool p_lock_valid(const char *path, void *handle) {
+    if (!handle) return false;
+    linux_lock *lk = handle;
+    return linux_lock_matches(path ? path : lk->path, lk->token);
+}
+
 void p_unlock(void *handle) {
     if (!handle) return;
-    int fd = *(int *)handle;
-    free(handle);
-    flock(fd, LOCK_UN);
-    close(fd);
+    linux_lock *lk = handle;
+    if (linux_lock_matches(lk->path, lk->token)) p_remove(lk->path);
+    free(lk->path);
+    free(lk);
 }
 
 p_result p_create_excl(const char *path, const char *data, size_t length) {

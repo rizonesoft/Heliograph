@@ -19,8 +19,9 @@ p_result p_remove(const char *path);
 /* Atomically claim and remove path via a unique per-caller rename before unlink. */
 p_result p_claim_remove(const char *path, const char *unique);
 p_result p_sync(const char *path);
-/* Exclusive OS-backed lock on path; released automatically if the process exits. */
+/* Exclusive cross-host token lock on path with bounded 2s monotonic deadline. */
 p_result p_lock(const char *path, void **handle);
+bool p_lock_valid(const char *path, void *handle);
 void p_unlock(void *handle);
 p_result p_folder(const char *path);
 /* True iff path exists and is a real directory (never a symlink or reparse point). */

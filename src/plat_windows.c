@@ -29,30 +29,91 @@ p_result p_write(const char *path, const char *data, size_t length, bool replace
     return r;
 }
 
+typedef struct {
+    char *path;
+    char token[32];
+} win_lock;
+
+static size_t format_u64_win(char *buf, uint64_t v) {
+    char rev[32];
+    size_t n = 0;
+    do rev[n++] = (char)('0' + (v % 10)), v /= 10; while (v);
+    for (size_t i = 0; i < n; i++) buf[i] = rev[n - 1 - i];
+    buf[n] = 0;
+    return n;
+}
+
+static bool win_lock_matches(const char *path, const char *token) {
+    char *data = NULL;
+    size_t length = 0;
+    if (p_read(path, 64, &data, &length) != P_OK) return false;
+    size_t tlen = im_length(token);
+    bool ok = length == tlen;
+    for (size_t i = 0; ok && i < tlen; i++) ok = data[i] == token[i];
+    p_free(data);
+    return ok;
+}
+
 p_result p_lock(const char *path, void **handle) {
     *handle = NULL;
-    wchar_t *wide = im_wide(path);
-    if (!wide) return P_FAILED;
-    for (int attempt = 0; attempt < 400; attempt++) {
-        HANDLE h = CreateFileW(wide, GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (h != INVALID_HANDLE_VALUE) {
-            im_free(wide);
-            *handle = (void *)h;
+    size_t plen = im_length(path);
+    win_lock *lk = im_alloc(sizeof *lk);
+    if (!lk) return P_FAILED;
+    lk->path = im_alloc(plen + 1);
+    if (!lk->path) {
+        im_free(lk);
+        return P_FAILED;
+    }
+    for (size_t i = 0; i <= plen; i++) lk->path[i] = path[i];
+    size_t tlen = format_u64_win(lk->token, p_tick());
+
+    LARGE_INTEGER freq = {0}, start = {0}, now = {0};
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&start);
+    uint64_t limit = freq.QuadPart > 0 ? (uint64_t)freq.QuadPart * 2ull : 0;
+
+    for (;;) {
+        p_result r = p_create_excl(path, lk->token, tlen);
+        if (r == P_OK) {
+            *handle = lk;
             return P_OK;
         }
-        DWORD err = GetLastError();
-        if (err != ERROR_SHARING_VIOLATION && err != ERROR_LOCK_VIOLATION) {
-            im_free(wide);
-            return err == ERROR_PATH_NOT_FOUND || err == ERROR_FILE_NOT_FOUND ? P_MISSING : P_FAILED;
+        if (r != P_EXISTS) {
+            im_free(lk->path);
+            im_free(lk);
+            return r;
+        }
+        uint64_t mtime = 0, wall = p_now();
+        if (p_file_mtime(path, &mtime) == P_OK && wall > mtime && wall - mtime >= 60000000ull) {
+            p_result cr = p_claim_remove(path, lk->token);
+            if (cr != P_OK && cr != P_MISSING) {
+                im_free(lk->path);
+                im_free(lk);
+                return P_FAILED;
+            }
+        }
+        QueryPerformanceCounter(&now);
+        if (limit > 0 && (uint64_t)(now.QuadPart - start.QuadPart) >= limit) {
+            im_free(lk->path);
+            im_free(lk);
+            return P_FAILED;
         }
         Sleep(5);
     }
-    im_free(wide);
-    return P_FAILED;
+}
+
+bool p_lock_valid(const char *path, void *handle) {
+    if (!handle) return false;
+    win_lock *lk = handle;
+    return win_lock_matches(path ? path : lk->path, lk->token);
 }
 
 void p_unlock(void *handle) {
-    if (handle) CloseHandle((HANDLE)handle);
+    if (!handle) return;
+    win_lock *lk = handle;
+    if (win_lock_matches(lk->path, lk->token)) p_remove(lk->path);
+    im_free(lk->path);
+    im_free(lk);
 }
 
 static bool passing_win(int attempt, DWORD error) {
