@@ -36,7 +36,7 @@ title: "TODO-01 -- Heliograph"
 | Order | Section | Deliverable | Depends On | Status |
 | ----- | ------- | ----------- | ---------- | ------ |
 | 1 | §1 | Steps that notice an archived job | -- | [x] |
-| 2 | §2 | Move a closed message to its month | §1 | [ ] |
+| 2 | §2 | Move a closed message to its month | §1 | [x] |
 | 3 | §3 | Read, answer and repeat archived messages | §2 | [ ] |
 | 4 | §4 | Sessions announced by every call | -- | [ ] |
 | 5 | §5 | Report of a silent taker | §4 | [ ] |
@@ -107,9 +107,12 @@ A job done or refused for 30 days moves to `archive/<year-month>`. The month com
 - [x] Refuse to replace a copy that differs in `engine/archive.c`. Done when: a planted different copy gives exit code 3 and both stay. Cheaper substitute: replacing it.
 - [x] Add `archive` to the commands in `engine/helio.c`, and 200 messages after the daily summary. Done when: two runs at once move each message once and both exit 0. Cheaper substitute: a lock file.
 - [x] Race archivers with takers and readers from Windows and WSL in `tests/test_helio.py`. Done when: no job has two takers and no message is missing in 1000 rounds. Cheaper substitute: one system.
-- [ ] Commit: `archive: closed jobs move to their month`
+- [x] Commit: `archive: closed jobs move to their month`
 
 **Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
+
+> **Verified:** 2026-11-25 | §2 | 8f9752acd0ec10475197ed6b416d1698e43a4a40
+> **Review:** `docs/reviews/d01-t01-s2.json`
 
 ## 3. Read, answer and repeat archived messages
 
