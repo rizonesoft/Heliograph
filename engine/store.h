@@ -36,6 +36,7 @@ typedef struct job {
     unsigned links;
     char by[72], session[72]; /* the taker, or who closed it */
     uint64_t when;            /* of the last step */
+    bool from_archive;        /* true when replayed from archive/<YYYY-MM>/ */
 } job;
 
 bool address_ok(const char *address, bool may_be_all); /* project/lane, or project/all */
@@ -51,6 +52,11 @@ s_result store_post(store *s, const message *m, const char *key, text *id);
 s_result store_take(store *s, const char *id, actor me);
 s_result store_release(store *s, const char *id, actor me);
 s_result store_end(store *s, const char *id, actor me, bool done, const char *note);
+s_result store_landed(store *s, const char *id, const char *commit, actor me);
+bool store_normalize_commit(const char *in, char out[65]); /* 7..64 hex digits -> lowercase */
+bool store_valid_landed_event(const char *ev);             /* landed.<7..64 lowercase hex> */
+bool store_valid_landed_payload(const char *data, size_t length, const char *commit);
+s_result store_landed_commits(store *s, const message *m, const job *now, bool compact, text *out);
 s_result store_seen(store *s, const char *id, actor me);
 s_result store_seen_archived(store *s, const char *id, actor me);
 s_result store_seen_alert(store *s, const char *id, const char *owner_lane, unsigned alert_links);

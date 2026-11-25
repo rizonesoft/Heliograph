@@ -487,7 +487,11 @@ bool store_apply_step(const message *m, job *now, char *data) {
 /* Replays the chain from the disk, because others write meanwhile. A step counts
    only if its actor was allowed to make it: the rules are those of a new step. */
 s_result store_job(store *s, const message *m, job *out) {
-    if (m->archived) return archive_read_job(s, m, out);
+    if (m->archived) {
+        s_result ar = archive_read_job(s, m, out);
+        if (ar == S_OK) out->from_archive = true;
+        return ar;
+    }
     *out = (job){.state = OPEN};
     if (s->pause) s->pause(s->pause_user, "before-read");
     for (; out->links < MOST_LINKS; out->links++) {
@@ -505,7 +509,11 @@ s_result store_job(store *s, const message *m, job *out) {
                 /* A killed keyed retry can leave a live .post with 0 live steps alongside a completed archived job:
                    surface the true archived terminal state rather than reporting a closed job as open. */
                 s_result ar = archive_has_terminal_job(s->folder, m->id, NULL);
-                if (ar == S_OK) return archive_read_job(s, m, out);
+                if (ar == S_OK) {
+                    s_result r = archive_read_job(s, m, out);
+                    if (r == S_OK) out->from_archive = true;
+                    return r;
+                }
                 if (ar == S_DAMAGED) return say(s, S_DAMAGED, "an archived job cannot be read");
             }
             return S_OK;
@@ -890,6 +898,359 @@ s_result store_take(store *s, const char *id, actor me) { return change_job(s, i
 s_result store_release(store *s, const char *id, actor me) { return change_job(s, id, me, RELEASE, ""); }
 s_result store_end(store *s, const char *id, actor me, bool done, const char *note) { return change_job(s, id, me, done ? FINISH : REFUSE, note); }
 
+bool store_normalize_commit(const char *in, char out[65]) {
+    if (!in || !out) return false;
+    size_t n = 0;
+    for (const char *p = in; *p; p++) {
+        char c = *p;
+        if (c >= 'A' && c <= 'F') c = (char)(c - 'A' + 'a');
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+        if (n >= 64) return false;
+        out[n++] = c;
+    }
+    if (n < 7) return false;
+    out[n] = 0;
+    return true;
+}
+
+bool store_valid_landed_event(const char *ev) {
+    if (!ev || !starts(ev, "landed.")) return false;
+    const char *c = ev + 7;
+    size_t n = 0;
+    for (; *c; c++) {
+        if (!((*c >= '0' && *c <= '9') || (*c >= 'a' && *c <= 'f'))) return false;
+        if (++n > 64) return false;
+    }
+    return n >= 7;
+}
+
+bool store_valid_landed_payload(const char *data, size_t length, const char *commit) {
+    if (!data || !commit || length == 0 || length > MOST_FILE) return false;
+    for (size_t i = 0; i < length; i++)
+        if (data[i] == 0) return false;
+    char *buf = copy(data, length);
+    if (!buf) return false;
+    char by[72], when[24], session[72], cval[72], end[8];
+    uint64_t t = 0;
+    bool good = keep(by, sizeof by, buf, "by") && address_ok(by, false)
+                && keep(when, sizeof when, buf, "time") && read_time(when, &t)
+                && keep(session, sizeof session, buf, "session") && session_ok(session)
+                && keep(cval, sizeof cval, buf, "commit") && same(cval, commit)
+                && keep(end, sizeof end, buf, "end") && same(end, "yes");
+    p_free(buf);
+    if (!good) return false;
+    text expect = {0};
+    add(&expect, "by: "), add(&expect, by), add(&expect, "\ntime: "), add(&expect, when);
+    add(&expect, "\nsession: "), add(&expect, session), add(&expect, "\ncommit: "), add(&expect, commit);
+    add(&expect, "\nend: yes\n");
+    bool exact = !expect.failed && expect.length == length;
+    for (size_t i = 0; exact && i < length; i++) exact = expect.data[i] == data[i];
+    text_free(&expect);
+    return exact;
+}
+
+static const char *landed_objection(const message *m, const job *now, actor me) {
+    const char *for_s = nz(m->for_session);
+    const char *my_s = nz(me.session);
+    bool wrong_dest_session = *for_s && same(m->to, me.lane) && !same(for_s, my_s);
+    bool taker = (now->state == TAKEN || now->state == DONE) && same(now->by, me.lane)
+                 && (!*now->session || same(now->session, my_s));
+    if (now->state == REFUSED) return "a refused job cannot be marked landed";
+    if (taker) return NULL;
+    if (!wrong_dest_session && (same(m->from, me.lane) || owns(me.lane, m))) return NULL;
+    return "only the taker, sender, or owner can mark it landed";
+}
+
+static s_result settle_archived_landed(store *s, const char *id, const char *event, const char *norm,
+                                       s_result write_res, const char *write_why, s_result ar) {
+    s_result rm = remove_event(s, id, event);
+    if (write_res != S_OK) {
+        if (rm == S_OK) s->why = write_why;
+        return rm == S_OK ? write_res : rm;
+    }
+    if (rm != S_OK) return rm;
+    if (ar == S_DAMAGED) return say(s, S_DAMAGED, "an archived job cannot be read");
+    s_result al = archive_read_landed_one(s->folder, id, norm);
+    if (al == S_OK) return S_OK;
+    if (al == S_DAMAGED) return say(s, S_DAMAGED, "an archived landed mark is damaged");
+    return say(s, S_REFUSED, "it was archived");
+}
+
+s_result store_landed(store *s, const char *id, const char *commit, actor me) {
+    if (!address_ok(nz(me.lane), false)) return say(s, S_REFUSED, "say who you are: --as project/lane");
+    if (!session_ok(me.session)) return say(s, S_REFUSED, "the session name is invalid or too long");
+    char norm[65];
+    if (!store_normalize_commit(commit, norm)) return say(s, S_REFUSED, "a commit must be 7 to 64 hexadecimal digits");
+    message m = {0};
+    s_result result = store_message(s, id, &m);
+    if (result != S_OK) return result;
+    if (!may_see(&m, me.lane)) {
+        message_free(&m);
+        return say(s, S_REFUSED, "there is no such message");
+    }
+    if (m.archived) result = say(s, S_REFUSED, "it was archived");
+    else if (!is_job(&m)) result = say(s, S_REFUSED, "only a request or a handoff can be marked landed");
+    if (result == S_OK) {
+        s_result ar = archive_has_terminal_job(s->folder, id, NULL);
+        if (ar == S_OK) result = say(s, S_REFUSED, "it was archived");
+        else if (ar == S_DAMAGED) result = say(s, S_DAMAGED, "an archived job cannot be read");
+    }
+    job now = {0};
+    if (result == S_OK) {
+        result = store_job(s, &m, &now);
+        if (result == S_OK && now.from_archive) result = say(s, S_REFUSED, "it was archived");
+    }
+    if (result == S_OK) {
+        const char *why = landed_objection(&m, &now, me);
+        if (why) result = say(s, S_REFUSED, why);
+    }
+    if (result != S_OK) {
+        message_free(&m);
+        return result;
+    }
+    text event = {0}, out = {0};
+    add(&event, "landed."), add(&event, norm);
+    add(&out, "by: "), add(&out, me.lane), add(&out, "\ntime: "), add_time(&out, p_now());
+    add(&out, "\nsession: "), add(&out, nz(me.session)), add(&out, "\ncommit: "), add(&out, norm), add(&out, "\nend: yes\n");
+    if (event.failed || out.failed) {
+        text_free(&event), text_free(&out), message_free(&m);
+        return say(s, S_DAMAGED, "out of memory");
+    }
+    if (s->pause) s->pause(s->pause_user, "landed");
+    bool published = false;
+    result = make_ex(s, id, event.data, out.data, &published);
+    if (published) {
+        if (s->pause) s->pause(s->pause_user, "after-landed");
+        const char *write_why = s->why;
+        s_result live = live_post(s, id);
+        s_result ar = live == S_OK ? archive_has_terminal_job(s->folder, id, NULL) : S_NOTHING;
+        if (live == S_REFUSED || ar == S_OK || ar == S_DAMAGED) {
+            result = settle_archived_landed(s, id, event.data, norm, result, write_why, ar);
+        } else if (live != S_OK) {
+            if (result == S_OK) result = live;
+            else s->why = write_why;
+        } else {
+            job now2 = {0};
+            s_result jr2 = store_job(s, &m, &now2);
+            if (jr2 == S_REFUSED || (jr2 == S_OK && now2.from_archive)) {
+                result = settle_archived_landed(s, id, event.data, norm, result, write_why, S_OK);
+            } else if (jr2 != S_OK) {
+                if (result == S_OK) result = jr2;
+                else s->why = write_why;
+            } else {
+                const char *why2 = landed_objection(&m, &now2, me);
+                if (why2) {
+                    s_result rm = remove_event(s, id, event.data);
+                    if (result != S_OK) {
+                        if (rm == S_OK) s->why = write_why;
+                        else result = rm;
+                    } else {
+                        result = rm == S_OK ? say(s, S_REFUSED, why2) : rm;
+                    }
+                } else if (result != S_OK) {
+                    s->why = write_why;
+                }
+            }
+        }
+    } else if (result == S_NOTHING) {
+        char *existing = NULL;
+        size_t elen = 0;
+        s_result er = event_of_len(s, id, event.data, &existing, &elen);
+        if (er == S_OK) {
+            bool ok = store_valid_landed_payload(existing, elen, norm);
+            p_free(existing);
+            if (!ok) {
+                result = say(s, S_DAMAGED, "a landed mark is damaged");
+            } else {
+                s_result live = live_post(s, id);
+                s_result ar = live == S_OK ? archive_has_terminal_job(s->folder, id, NULL) : S_NOTHING;
+                if (live == S_REFUSED || ar == S_OK) {
+                    s_result al = archive_read_landed_one(s->folder, id, norm);
+                    result = al == S_OK ? S_OK : al == S_DAMAGED ? say(s, S_DAMAGED, "an archived landed mark is damaged") : say(s, S_REFUSED, "it was archived");
+                } else if (ar == S_DAMAGED) {
+                    result = say(s, S_DAMAGED, "an archived job cannot be read");
+                } else if (live != S_OK) {
+                    result = live;
+                } else {
+                    job now2 = {0};
+                    s_result jr2 = store_job(s, &m, &now2);
+                    if (jr2 == S_REFUSED || (jr2 == S_OK && now2.from_archive)) {
+                        s_result al = archive_read_landed_one(s->folder, id, norm);
+                        result = al == S_OK ? S_OK : al == S_DAMAGED ? say(s, S_DAMAGED, "an archived landed mark is damaged") : say(s, S_REFUSED, "it was archived");
+                    } else if (jr2 != S_OK) {
+                        result = jr2;
+                    } else {
+                        const char *why2 = landed_objection(&m, &now2, me);
+                        result = why2 ? say(s, S_REFUSED, why2) : S_OK;
+                    }
+                }
+            }
+        } else if (er == S_NOTHING) {
+            p_free(existing);
+            s_result al = archive_read_landed_one(s->folder, id, norm);
+            if (al == S_OK) result = S_OK;
+            else if (al == S_DAMAGED) result = say(s, S_DAMAGED, "an archived landed mark is damaged");
+            else {
+                s_result live = live_post(s, id);
+                result = live == S_REFUSED ? say(s, S_REFUSED, "it was archived")
+                       : live == S_OK ? say(s, S_REFUSED, "only the taker, sender, or owner can mark it landed")
+                       : live;
+            }
+        } else {
+            p_free(existing);
+            result = er;
+        }
+    }
+    text_free(&event), text_free(&out), message_free(&m);
+    return result;
+}
+
+typedef struct {
+    char **items;
+    size_t count, cap;
+    bool failed;
+} commit_vec;
+
+static void commit_vec_free(commit_vec *v) {
+    for (size_t i = 0; i < v->count; i++) p_free(v->items[i]);
+    p_free(v->items);
+    *v = (commit_vec){0};
+}
+
+static bool commit_vec_add(commit_vec *v, const char *commit) {
+    for (size_t i = 0; i < v->count; i++)
+        if (same(v->items[i], commit)) return true;
+    if (v->count == v->cap) {
+        size_t next = v->cap ? v->cap * 2 : 8;
+        char **grown = p_alloc(next * sizeof *grown);
+        if (!grown) return v->failed = true, false;
+        if (v->count) memcpy(grown, v->items, v->count * sizeof *grown);
+        p_free(v->items);
+        v->items = grown, v->cap = next;
+    }
+    char *dup = copy(commit, len(commit));
+    if (!dup) return v->failed = true, false;
+    size_t pos = v->count;
+    while (pos > 0 && compare(v->items[pos - 1], dup) > 0) {
+        v->items[pos] = v->items[pos - 1];
+        pos--;
+    }
+    v->items[pos] = dup;
+    v->count++;
+    return true;
+}
+
+static void format_commit_vec(const commit_vec *v, bool compact, text *out) {
+    size_t show = (compact && v->count > 2) ? 2 : v->count;
+    for (size_t i = 0; i < show; i++) {
+        if (i) add(out, ",");
+        add(out, v->items[i]);
+    }
+    if (compact && v->count > 2) {
+        add(out, " (+"), add_number(out, (uint64_t)(v->count - 2), 0), add(out, " more)");
+    }
+}
+
+s_result store_landed_commits(store *s, const message *m, const job *now, bool compact, text *out) {
+    if (!m || !is_job(m)) return S_OK;
+    commit_vec v = {0};
+    s_result res = S_OK;
+    bool read_arch = m->archived || (now && now->from_archive);
+    if (read_arch) {
+        text arch_list = {0};
+        const char *why = NULL;
+        s_result ar = archive_read_landed_commits(s->folder, m->id, false, &arch_list, &why);
+        if (ar == S_DAMAGED) {
+            text_free(&arch_list), commit_vec_free(&v);
+            return say(s, S_DAMAGED, why ? why : "a landed mark is damaged");
+        }
+        if (arch_list.data && *arch_list.data) {
+            for (const char *at = arch_list.data; *at;) {
+                const char *end = at;
+                while (*end && *end != ',') end++;
+                char *one = copy(at, (size_t)(end - at));
+                if (!one || !commit_vec_add(&v, one)) v.failed = true;
+                p_free(one);
+                at = *end ? end + 1 : end;
+            }
+        }
+        text_free(&arch_list);
+    }
+    if (!m->archived && !v.failed) {
+        text prefix = {0};
+        add(&prefix, m->id), add(&prefix, ".landed.");
+        if (prefix.failed) {
+            text_free(&prefix), commit_vec_free(&v);
+            return say(s, S_DAMAGED, "out of memory");
+        }
+        size_t plen = prefix.length;
+        size_t low = 0, high = s->count;
+        while (low < high) {
+            size_t mid = low + (high - low) / 2;
+            if (compare(s->names[mid], prefix.data) < 0) low = mid + 1;
+            else high = mid;
+        }
+        for (size_t i = low; i < s->count && starts(s->names[i], prefix.data); i++) {
+            const char *ev = s->names[i] + len(m->id) + 1;
+            if (!store_valid_landed_event(ev)) {
+                res = say(s, S_DAMAGED, "a landed mark is damaged");
+                break;
+            }
+            const char *c = s->names[i] + plen;
+            char *data = NULL;
+            size_t dlen = 0;
+            s_result er = event_of_len(s, m->id, ev, &data, &dlen);
+            if (er == S_OK) {
+                bool ok = store_valid_landed_payload(data, dlen, c);
+                p_free(data);
+                if (!ok) {
+                    res = say(s, S_DAMAGED, "a landed mark is damaged");
+                    break;
+                }
+                if (!commit_vec_add(&v, c)) break;
+            } else if (er == S_NOTHING) {
+                p_free(data);
+                s_result lp = live_post(s, m->id);
+                if (lp == S_REFUSED) {
+                    if (!read_arch) res = S_REFUSED;
+                    break;
+                }
+                if (lp != S_OK) {
+                    res = lp;
+                    break;
+                }
+            } else {
+                p_free(data);
+                res = er;
+                break;
+            }
+        }
+        /* Also catch a stray <id>.landed with no commit suffix. */
+        if (res == S_OK && !v.failed) {
+            text bare = {0};
+            add(&bare, m->id), add(&bare, ".landed");
+            if (!bare.failed) {
+                size_t bl = 0, bh = s->count;
+                while (bl < bh) {
+                    size_t mid = bl + (bh - bl) / 2;
+                    if (compare(s->names[mid], bare.data) < 0) bl = mid + 1;
+                    else bh = mid;
+                }
+                if (bl < s->count && same(s->names[bl], bare.data))
+                    res = say(s, S_DAMAGED, "a landed mark is damaged");
+            } else {
+                v.failed = true;
+            }
+            text_free(&bare);
+        }
+        text_free(&prefix);
+    }
+    if (v.failed) res = say(s, S_DAMAGED, "out of memory");
+    if (res == S_OK && v.count > 0) format_commit_vec(&v, compact, out);
+    commit_vec_free(&v);
+    return res;
+}
+
 static s_result write_seen_ex(store *s, const char *id, actor me, bool alert, unsigned alert_links) {
     if (!address_ok(nz(me.lane), false)) return say(s, S_REFUSED, "say who you are: --as project/lane");
     if (alert) {
@@ -1001,6 +1362,22 @@ s_result store_check(store *s, text *report) {
                         else if (lp != S_REFUSED) why = s->why;
                     } else if (er != S_OK || !valid_seen_payload(data, dlen)) {
                         why = "a seen mark is damaged";
+                    }
+                    p_free(data);
+                }
+            } else if (same(dot, ".landed") || starts(dot, ".landed.")) {
+                if (!is_job(&m) || !store_valid_landed_event(dot + 1)) {
+                    why = "a landed mark is damaged";
+                } else {
+                    char *data = NULL;
+                    size_t dlen = 0;
+                    s_result er = event_of_len(s, id, dot + 1, &data, &dlen);
+                    if (er == S_NOTHING) {
+                        s_result lp = live_post(s, id);
+                        if (lp == S_OK) why = "a landed mark is damaged";
+                        else if (lp != S_REFUSED) why = s->why;
+                    } else if (er != S_OK || !store_valid_landed_payload(data, dlen, dot + 8)) {
+                        why = "a landed mark is damaged";
                     }
                     p_free(data);
                 }

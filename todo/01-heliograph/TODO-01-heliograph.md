@@ -250,7 +250,7 @@ The design says a session sees only its own project's messages and those sent to
 
 ## 8. Mark for landed work
 
-A linked commit marks a job landed and closes nothing. The engine starts no program, so the caller gives the commit.
+A linked commit marks a job landed and closes nothing. The engine starts no program, so the caller gives the commit. **Corrected 2026-11-25:** Plan review (`docs/reviews/01-heliograph/D01-T01-s8.md`) clarified: dispatch `landed` explicitly to `store_landed` (never falling through to `store_end`); validate commit syntax (7 to 64 hex digits, normalized to lowercase) and session syntax in CLI before `store_open` as well as in `store_landed`; enforce `wrong_dest_session` precedence before sender/owner overrides so session-targeted jobs cannot be marked by a wrong/empty sibling session; re-check job state, authority, and archival after publication (`remove_event` then `archive_read_landed_one`) and copy valid late live landed marks in `sweep_item_tail` so an acknowledged mark always survives and an exit-2 refusal never leaves an archived mark; read landed commits from the authoritative archive copy when `store_job` recovers terminal state for a duplicate live post (unioning any un-swept live mark); load landed marks after visibility/eligibility checks, propagate read/flush/rollback errors as exit 3, bound inbox/hook commit display so one heavily marked job never overflows the 2,000-byte budget, and include landed marks in all archive orphan, sweep, and check paths.
 
 **Phase:** 2
 **Needs:** none
@@ -261,11 +261,11 @@ A linked commit marks a job landed and closes nothing. The engine starts no prog
 1. Write the mark in `engine/store.c`. Done when: it is made once and read back.
 2. Show it in `engine/helio.c`. Done when: the state of the job is unchanged.
 
-- [ ] Make `<id>.landed.<commit>` in `engine/store.c` for 7 to 64 hexadecimal digits (design, "Not goals"). Done when: a repeat changes nothing and other text exits 2. Cheaper substitute: a note on the job.
-- [ ] Add `landed <id> <commit>` to the commands in `engine/helio.c` for the taker, the sender and the owner. Done when: a stranger is refused and the job stays open or taken. Cheaper substitute: closing the job.
-- [ ] Show the commit in `line` of `engine/helio.c`, and examine the mark in `store_check` of `engine/store.c`. Done when: a damaged mark is reported. Cheaper substitute: `show` alone.
-- [ ] Move the mark with its message in `engine/archive.c`. Done when: an archived job still names its commit. Cheaper substitute: dropping it.
-- [ ] Commit: `jobs: a commit marks them landed`
+- [x] Make `<id>.landed.<commit>` in `engine/store.c` for 7 to 64 hexadecimal digits (design, "Not goals"). Done when: a repeat changes nothing and other text exits 2. Cheaper substitute: a note on the job.
+- [x] Add `landed <id> <commit>` to the commands in `engine/helio.c` for the taker, the sender and the owner. Done when: a stranger is refused and the job stays open or taken. Cheaper substitute: closing the job.
+- [x] Show the commit in `line` of `engine/helio.c`, and examine the mark in `store_check` of `engine/store.c`. Done when: a damaged mark is reported. Cheaper substitute: `show` alone.
+- [x] Move the mark with its message in `engine/archive.c`. Done when: an archived job still names its commit. Cheaper substitute: dropping it.
+- [x] Commit: `jobs: a commit marks them landed`
 
 **Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
 

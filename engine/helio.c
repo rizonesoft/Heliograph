@@ -13,6 +13,7 @@ static const char help[] =
     "  helio answer <id> <subject> < body               a reply to its sender\n"
     "  helio show <id>      helio take <id>     helio release <id>\n"
     "  helio done <id> [note]                   helio refuse <id> [note]\n"
+    "  helio landed <id> <commit>               mark a job landed with a commit (7..64 hex)\n"
     "  helio working <paths>                            what I touch, for the overlap warning\n"
     "  helio hello <agent>                              announce this session (claude, codex, antigravity)\n"
     "  helio log            helio check         helio archive       helio init\n"
@@ -171,7 +172,7 @@ static uint64_t message_time_us(const message *m) {
     return us;
 }
 
-static void format_line(text *out, const message *m, const job *now, bool good, bool overdue, bool silent) {
+static void format_line(text *out, const message *m, const job *now, bool good, bool overdue, bool silent, const char *landed) {
     add(out, m->id), add(out, "  "), add(out, m->time), add(out, "  "), add(out, m->from), add(out, " to "), add(out, m->to);
     if (m->for_session && *m->for_session) add(out, " (for "), add(out, m->for_session), add(out, ")");
     add(out, "  "), add(out, m->kind);
@@ -182,14 +183,16 @@ static void format_line(text *out, const message *m, const job *now, bool good, 
         if (good && overdue) add(out, " OVERDUE");
     }
     if (good && silent) add(out, " SILENT");
+    if (good && landed && *landed) add(out, " landed "), add(out, landed);
     if (same(m->urgency, "now")) add(out, "  NOW");
     add(out, ": "), clean(out, m->subject, true), add(out, "\n");
 }
 
-/* S_REFUSED when archived concurrently; S_DAMAGED when the job's chain is damaged. */
+/* S_REFUSED when archived concurrently; S_DAMAGED when the job's chain or landed mark is damaged. */
 static s_result line_silent_ex(text *out, store *s, const message *m, const place *here, uint64_t clock_now, session_cache *sc, bool *sess_err, job *job_out) {
     s_result jr = S_OK;
     job now = {0};
+    text landed = {0};
     bool overdue = false, silent = false;
     if (is_job(m)) {
         jr = store_job(s, m, &now);
@@ -197,10 +200,20 @@ static s_result line_silent_ex(text *out, store *s, const message *m, const plac
         if (jr == S_OK) {
             if (!watch_classify_job(s, here, m, &now, clock_now ? clock_now : p_now(), sc, &overdue, &silent) && sess_err)
                 *sess_err = true;
+            s_result lr = store_landed_commits(s, m, &now, false, &landed);
+            if (lr == S_REFUSED) {
+                text_free(&landed);
+                return S_REFUSED;
+            }
+            if (lr != S_OK) {
+                if (sess_err) *sess_err = true;
+                else jr = lr;
+            }
         }
     }
     if (job_out) *job_out = now;
-    format_line(out, m, &now, jr == S_OK, overdue, silent);
+    format_line(out, m, &now, jr == S_OK, overdue, silent, landed.data);
+    text_free(&landed);
     return jr;
 }
 
@@ -277,12 +290,12 @@ static void into_log(store *s, const message *m, void *user) {
     l->shown++;
 }
 
-static void into_log_archived(store *s, const message *m, const job *known, void *user) {
+static void into_log_archived(store *s, const message *m, const job *known, const char *landed, void *user) {
     listing *l = user;
     text one = {0};
     s_result r = S_OK;
     if (is_job(m) && known) {
-        format_line(&one, m, known, true, false, false);
+        format_line(&one, m, known, true, false, false, landed);
     } else {
         r = line_silent(&one, s, m, l->here, l->clock_now, NULL, NULL);
         if (r == S_REFUSED) {
@@ -358,8 +371,18 @@ static void into_inbox(store *s, const message *m, void *user) {
                 return;
         }
     }
+    text landed = {0};
+    if (is_job(m) && good) {
+        s_result lr = store_landed_commits(s, m, &now, !l->all, &landed);
+        if (lr == S_REFUSED) {
+            text_free(&landed);
+            return;
+        }
+        if (lr != S_OK) l->damaged = true;
+    }
     text one = {0};
-    format_line(&one, m, &now, good, overdue, silent);
+    format_line(&one, m, &now, good, overdue, silent, landed.data);
+    text_free(&landed);
     if (!l->all && (l->shown >= SHOW_MESSAGES || l->out.length + one.length > SHOW_BYTES)) l->held++;
     else add(&l->out, one.data ? one.data : ""), l->shown++;
     if (one.failed) l->out.failed = true;
@@ -703,7 +726,7 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
     static const struct { const char *name; int least, most; } commands[] = {
         {"inbox", 0, 1}, {"log", 1, 1}, {"check", 1, 1}, {"show", 2, 2}, {"take", 2, 2}, {"release", 2, 2}, {"done", 2, 3},
         {"refuse", 2, 3}, {"hook", 2, 2}, {"answer", 3, 3}, {"working", 2, 2}, {"ask", 3, 3}, {"hand", 3, 3}, {"tell", 3, 3}, {"find", 3, 3},
-        {"hello", 2, 2}};
+        {"hello", 2, 2}, {"landed", 3, 3}};
     int which = -1;
     for (int i = 0; i < (int)(sizeof commands / sizeof *commands); i++)
         if (same(command, commands[i].name)) which = i;
@@ -724,6 +747,11 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
     if (which == 8 && !same(o->words[1], "claude")) return fail("there is a hook for claude only: other agents run helio between sections", 2);
     if (which == 15) {
         if (!agent_ok(o->words[1])) return fail("unknown agent: use claude, codex or antigravity", 2);
+        if (!session_ok(o->session)) return fail("the session name is invalid or too long", 2);
+    }
+    if (which == 16) {
+        char norm[65];
+        if (!store_normalize_commit(o->words[2], norm)) return fail("a commit must be 7 to 64 hexadecimal digits", 2);
         if (!session_ok(o->session)) return fail("the session name is invalid or too long", 2);
     }
 
@@ -798,6 +826,10 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
     }
     case 15:
         result = announce_session(&s, o, o->words[1]);
+        code = result == S_OK ? 0 : fail(s.why, result);
+        break;
+    case 16:
+        result = store_landed(&s, o->words[1], o->words[2], me);
         code = result == S_OK ? 0 : fail(s.why, result);
         break;
     default:

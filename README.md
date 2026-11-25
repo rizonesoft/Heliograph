@@ -61,7 +61,8 @@ Legend: ✅ works · 📋 planned
 | Archive by month, expiry | 📋 | [§1 to §3 and §12](todo/01-heliograph/TODO-01-heliograph.md) |
 | Silent takers, messages for one session | ✅ | `helio hello`, `silent:` reporting, and `--for-session` targeting |
 | Projects kept apart in log and show | ✅ | `may_see` scopes `log`, `show`, `answer`, and job commands to your project |
-| Landed work, fixed marks | 📋 | [§8 and §9](todo/01-heliograph/TODO-01-heliograph.md) |
+| Mark for landed work | ✅ | `helio landed <id> <commit>` links a commit without closing the job |
+| Fixed marks around shown messages | 📋 | [§9](todo/01-heliograph/TODO-01-heliograph.md) |
 | JSON, taking the next job as a queue | 📋 | [§10 and §11](todo/01-heliograph/TODO-01-heliograph.md) |
 
 ## Quick start
@@ -121,6 +122,7 @@ helio: it is already taken
 | `helio tell`, `find`, `answer` | Sends a heads-up, something I found, or a reply |
 | `helio show <id>` | Shows one message and marks it seen |
 | `helio take`, `release`, `done`, `refuse` `<id>` | Moves a job on |
+| `helio landed <id> <commit>` | Links a commit (7 to 64 hex digits) to a job without closing it |
 | `helio working <paths>` | Says what I touch, and warns when someone else touches it |
 | `helio log`, `check`, `help` | Shows your project's messages (`log --all` with no lane outside a configured repository shows every project), examines the store, or lists every option |
 

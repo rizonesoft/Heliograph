@@ -14,11 +14,17 @@ s_result archive_read_job(store *s, const message *m, job *out);
 /* Persists a seen mark directly to archive/<YYYY-MM>/<id>.<seen_event>. */
 s_result archive_write_seen(store *s, const char *id, const char *seen_event);
 
+/* Checks archive/<YYYY-MM>/<id>.landed.<commit>. Returns S_OK (valid), S_NOTHING (missing), or S_DAMAGED. */
+s_result archive_read_landed_one(const char *folder, const char *id, const char *commit);
+
+/* Reads and validates all archived landed marks for id into sorted comma-separated commits (or compact form). */
+s_result archive_read_landed_commits(const char *folder, const char *id, bool compact, text *out, const char **why);
+
 /* Visits archived messages newest month first in bounded batches, skipping IDs already emitted by the live pass.
    Returns count of damaged months or messages encountered. */
 size_t archive_every(store *s, char *const *emitted, size_t emitted_count,
                      bool (*visible)(const message *m, void *user),
-                     void (*each)(store *s, const message *m, const job *known, void *user), void *user);
+                     void (*each)(store *s, const message *m, const job *known, const char *landed, void *user), void *user);
 
 /* Validates all archived month folders and files structurally (and against live copies during interrupted moves). */
 s_result archive_check(store *s, text *report);

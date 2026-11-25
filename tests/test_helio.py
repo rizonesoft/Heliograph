@@ -3585,5 +3585,312 @@ class ProjectIsolation(Base):
         self.assertEqual(self.helio("check", me=None).returncode, 0)
 
 
+class Landed(Base):
+    def test_landed_commit_validation_payload_idempotency_and_cli_dispatch(self):
+        # 1. Malformed commits exit 2 BEFORE store_open (missing store and configured checkout leave no silent/ cache).
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            missing_store = root / "does-not-exist"
+            cfg_repo = root / "cfg_repo"
+            cfg_repo.mkdir()
+            put(cfg_repo / "helio.conf", "project: os\nlane: main\nsilent: 45\n")
+            for bad in ("123456", "a" * 65, "123456g", "", "../abcd123", "abcd123\n"):
+                r_miss = run(missing_store, "landed", "1700000000000000-000001", bad, me="os/main", cwd=root)
+                self.assertEqual(r_miss.returncode, 2, bad)
+                r_cfg = run(self.store, "landed", "1700000000000000-000001", bad, me=None, cwd=cfg_repo)
+                self.assertEqual(r_cfg.returncode, 2, bad)
+            self.assertFalse((self.store / "silent/os").exists())
+
+        # 2. Open request and handoff: public CLI creates canonical lowercase file, adds zero links, keeps state open.
+        req_id = self.send("ask", "os/apps", "os/main", "Land open req", "body")
+        hand_id = self.send("hand", "os/apps", "os/main", "Land handoff", "body")
+        r_req = self.helio("landed", req_id, "AbCd123", "--session", "s-main", me="os/main")
+        self.assertEqual(r_req.returncode, 0, r_req.stderr)
+        r_hand = self.helio("landed", hand_id, "0123456789abcdef" * 4, me="os/main")
+        self.assertEqual(r_hand.returncode, 0, r_hand.stderr)
+
+        mark = self.store / f"messages/{req_id}.landed.abcd123"
+        self.assertTrue(mark.exists())
+        self.assertEqual(list((self.store / "messages").glob(f"{req_id}.link.*")), [])
+        raw = mark.read_bytes()
+        text_val = raw.decode("ascii")
+        lines = text_val.splitlines(keepends=True)
+        self.assertEqual(len(lines), 5, text_val)
+        self.assertEqual(lines[0], "by: os/main\n")
+        self.assertRegex(lines[1], r"^time: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\n$")
+        self.assertEqual(lines[2], "session: s-main\n")
+        self.assertEqual(lines[3], "commit: abcd123\n")
+        self.assertEqual(lines[4], "end: yes\n")
+
+        # Idempotent repeat by a DIFFERENT authorized actor with different hex casing leaves payload bytes untouched.
+        r_rep = self.helio("landed", req_id, "ABCD123", "--session", "s-owner", me="os/owner")
+        self.assertEqual(r_rep.returncode, 0, r_rep.stderr)
+        self.assertEqual(mark.read_bytes(), raw)
+        self.assertEqual(list((self.store / "messages").glob(f"{req_id}.link.*")), [])
+
+        # Job stays open and can still be taken, then marked with a second 64-char commit and shown everywhere.
+        self.assertEqual(self.helio("take", req_id, "--session", "s-apps", me="os/apps").returncode, 0)
+        c64 = "fedcba9876543210" * 4
+        self.assertEqual(self.helio("landed", req_id, c64, "--session", "s-apps", me="os/apps").returncode, 0)
+        expect = f"taken by os/apps landed abcd123,{c64}"
+        for out in (
+            self.helio("--session", "s-apps", me="os/apps").stdout.decode(),
+            self.helio("log", me="os/apps").stdout.decode(),
+            self.helio("log", "--all", me="os/apps").stdout.decode(),
+            self.helio("show", req_id, me="os/ui").stdout.decode(),
+            self.helio("hook", "claude", "--session", "s-apps", me="os/apps").stdout.decode(),
+        ):
+            self.assertIn(expect, out)
+        self.assertEqual(self.helio("check", me=None).returncode, 0)
+
+    def test_landed_permissions_session_targeting_and_project_isolation(self):
+        # Cross-project request: both project owners, sender, and taker succeed; stranger and wrong session fail.
+        cross = self.send("ask", "beta/dev", "alpha/main", "Cross work", "do it")
+        self.assertEqual(self.helio("landed", cross, "1111111", me="alpha/ui").returncode, 2)
+        self.assertEqual(self.helio("landed", cross, "1111111", me="beta/ui").returncode, 2)
+        self.assertEqual(self.helio("landed", cross, "1111111", me="alpha/owner").returncode, 0)
+        self.assertEqual(self.helio("landed", cross, "2222222", me="beta/owner").returncode, 0)
+        # Sessionless take allows taker without session.
+        self.assertEqual(self.helio("take", cross, "--session", "", me="beta/dev").returncode, 0)
+        self.assertEqual(self.helio("landed", cross, "3333333", "--session", "", me="beta/dev").returncode, 0)
+        # Foreign project ID matches missing ID byte-for-byte (live and archived) with zero side effects.
+        absent = "1700000000000000-ffffff"
+        r_abs = self.helio("landed", absent, "4444444", me="gamma/dev")
+        r_for = self.helio("landed", cross, "4444444", me="gamma/dev")
+        self.assertEqual((r_for.returncode, r_for.stdout, r_for.stderr), (r_abs.returncode, r_abs.stdout, r_abs.stderr))
+        self.assertFalse((self.store / f"messages/{cross}.landed.4444444").exists())
+
+        # Named take refuses wrong taker session; non-jobs refused.
+        job_s = self.send("ask", "os/apps", "os/main", "Session take", "work")
+        self.assertEqual(self.helio("take", job_s, "--session", "s1", me="os/apps").returncode, 0)
+        self.assertEqual(self.helio("landed", job_s, "5555555", "--session", "s2", me="os/apps").returncode, 2)
+        self.assertEqual(self.helio("landed", job_s, "5555555", "--session", "", me="os/apps").returncode, 2)
+        self.assertEqual(self.helio("landed", job_s, "5555555", "--session", "s1", me="os/apps").returncode, 0)
+        for kind_cmd in ("tell", "find"):
+            nj = self.send(kind_cmd, "os/apps", "os/main", "Non job", "note")
+            self.assertEqual(self.helio("landed", nj, "6666666", me="os/main").returncode, 2)
+            self.assertFalse((self.store / f"messages/{nj}.landed.6666666").exists())
+        ans = self.helio("answer", job_s, "Re", me="os/apps", body="reply").stdout.decode().strip()
+        self.assertEqual(self.helio("landed", ans, "6666666", me="os/apps").returncode, 2)
+
+        # Overlapping roles with --for-session: wrong or empty sibling session cannot bypass via sender or owner role.
+        self_targ = self.send("ask", "os/apps", "os/apps", "Self targ", "work", "--for-session", "s1")
+        self.assertEqual(self.helio("landed", self_targ, "7777777", "--session", "s2", me="os/apps").returncode, 2)
+        self.assertEqual(self.helio("landed", self_targ, "7777777", "--session", "", me="os/apps").returncode, 2)
+        self.assertEqual(self.helio("landed", self_targ, "7777777", "--session", "s1", me="os/owner").returncode, 0)
+        own_targ = self.send("ask", "beta/owner", "alpha/main", "Owner targ", "work", "--for-session", "s1")
+        self.assertEqual(self.helio("landed", own_targ, "8888888", "--session", "s2", me="beta/owner").returncode, 2)
+        self.assertEqual(self.helio("landed", own_targ, "8888888", "--session", "", me="beta/owner").returncode, 2)
+        self.assertEqual(self.helio("landed", own_targ, "8888888", me="alpha/main").returncode, 0)
+        self.assertEqual(self.helio("landed", own_targ, "9999999", me="alpha/owner").returncode, 0)
+
+        # Marked while open then refused: earlier mark stays readable and check passes, while new landed on refused exits 2.
+        ref_job = self.send("ask", "os/apps", "os/main", "Later refused", "work")
+        self.assertEqual(self.helio("landed", ref_job, "aaaaaaa", me="os/main").returncode, 0)
+        self.assertEqual(self.helio("refuse", ref_job, "no", me="os/apps").returncode, 0)
+        self.assertEqual(self.helio("landed", ref_job, "bbbbbbb", me="os/main").returncode, 2)
+        self.assertIn("refused by os/apps landed aaaaaaa", self.helio("show", ref_job, me="os/main").stdout.decode())
+        self.assertEqual(self.helio("check", me=None).returncode, 0)
+
+    def test_landed_damage_check_inbox_budget_and_foreign_damage_isolation(self):
+        a_job = self.send("ask", "alpha/apps", "alpha/main", "Alpha job", "work")
+        b_job = self.send("ask", "beta/apps", "beta/main", "Beta job", "work")
+        # 1. Corrupt foreign landed mark does NOT fail alpha's log or inbox, but check and beta's log report exit 3.
+        bad_b = self.store / f"messages/{b_job}.landed.1234567"
+        put(bad_b, "corrupt payload\n")
+        self.assertEqual(self.helio("log", me="alpha/apps").returncode, 0)
+        self.assertEqual(self.helio("log", me="beta/apps").returncode, 3)
+        self.assertEqual(self.helio("show", b_job, me="beta/apps").returncode, 3)
+        self.assertEqual(self.helio(me="beta/apps").returncode, 3)
+        self.assertEqual(self.helio("check", me=None).returncode, 3)
+        bad_b.unlink()
+
+        # 2. Various malformed live landed files caught by check.
+        note_id = self.send("tell", "alpha/apps", "alpha/main", "Heads up", "info")
+        bad_cases = [
+            (f"{a_job}.landed", "by: alpha/main\ntime: 2026-01-01T00:00:00Z\nsession: \ncommit: 1234567\nend: yes\n"),
+            (f"{a_job}.landed.123", "by: alpha/main\ntime: 2026-01-01T00:00:00Z\nsession: \ncommit: 123\nend: yes\n"),
+            (f"{a_job}.landed.1234567", "by: alpha/main\ntime: 2026-01-01T00:00:00Z\nsession: \ncommit: 7654321\nend: yes\n"),
+            (f"{note_id}.landed.1234567", "by: alpha/main\ntime: 2026-01-01T00:00:00Z\nsession: \ncommit: 1234567\nend: yes\n"),
+            ("1700000000000000-000009.landed.1234567", "by: alpha/main\ntime: 2026-01-01T00:00:00Z\nsession: \ncommit: 1234567\nend: yes\n"),
+        ]
+        for fname, content in bad_cases:
+            p = self.store / "messages" / fname
+            put(p, content)
+            rc_chk = self.helio("check", me=None)
+            self.assertEqual(rc_chk.returncode, 3, fname)
+            p.unlink()
+
+        # 3. Single heavily marked job (40 x 64-char commits > 2,500 bytes) stays bounded in inbox/hook while full in show/log.
+        for i in range(40):
+            c = f"{i:064x}"
+            self.assertEqual(self.helio("landed", a_job, c, me="alpha/main").returncode, 0)
+        r_inb = self.helio(me="alpha/apps")
+        self.assertEqual(r_inb.returncode, 0, r_inb.stderr)
+        inb_out = r_inb.stdout.decode()
+        self.assertIn(a_job, inb_out)
+        self.assertIn("(+38 more)", inb_out)
+        self.assertLessEqual(len(r_inb.stdout), 2000)
+        r_hook = self.helio("hook", "claude", me="alpha/apps")
+        self.assertEqual(r_hook.returncode, 0)
+        self.assertIn(a_job, r_hook.stdout.decode())
+        self.assertIn("(+38 more)", r_hook.stdout.decode())
+        self.assertIn(f"{39:064x}", self.helio("show", a_job, me="alpha/ui").stdout.decode())
+        self.assertIn(f"{39:064x}", self.helio("log", me="alpha/ui").stdout.decode())
+
+    def test_landed_archive_recovery_duplicate_post_and_concurrency_races(self):
+        old_us = 1739577600_000_000  # 2025-02-15
+        clean_env = {k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "ANTIGRAVITY_CONVERSATION_ID")}
+        def rc_at(us, *args, body=b""):
+            return subprocess.run(
+                [str(RACER), "--now", str(us), *args, "--store", str(self.store)],
+                input=body, capture_output=True, timeout=30, cwd=self.store, env=clean_env,
+            )
+
+        # 1. Archiving moves landed marks to archive/2025-02, preserves display, refuses post-archive landed, and passes check.
+        jid = rc_at(old_us + 100, "ask", "os/apps", "Arch landed", "--as", "os/main", body=b"work").stdout.decode().strip()
+        self.assertEqual(rc_at(old_us + 200, "take", jid, "--as", "os/apps").returncode, 0)
+        self.assertEqual(rc_at(old_us + 300, "landed", jid, "1111111", "--as", "os/apps").returncode, 0)
+        self.assertEqual(rc_at(old_us + 350, "landed", jid, "2222222", "--as", "os/main").returncode, 0)
+        self.assertEqual(rc_at(old_us + 400, "done", jid, "ok", "--as", "os/apps").returncode, 0)
+        self.assertEqual(self.helio("archive", me=None).returncode, 0)
+        self.assertFalse((self.store / f"messages/{jid}.landed.1111111").exists())
+        self.assertTrue((self.store / f"archive/2025-02/{jid}.landed.1111111").exists())
+        self.assertTrue((self.store / f"archive/2025-02/{jid}.landed.2222222").exists())
+        self.assertIn("done by os/apps landed 1111111,2222222", self.helio("show", jid, me="os/ui").stdout.decode())
+        self.assertIn("done by os/apps landed 1111111,2222222", self.helio("log", "--all", me="os/ui").stdout.decode())
+        self.assertEqual(self.helio("landed", jid, "3333333", me="os/main").returncode, 2)
+        # Foreign archived ID still matches missing ID exactly.
+        r_abs = self.helio("landed", "1700000000000000-ffffff", "3333333", me="other/ui")
+        r_for = self.helio("landed", jid, "3333333", me="other/ui")
+        self.assertEqual((r_for.returncode, r_for.stdout, r_for.stderr), (r_abs.returncode, r_abs.stdout, r_abs.stderr))
+        self.assertEqual(self.helio("check", me=None).returncode, 0)
+
+        # 2. Duplicate live .post recovery: show, log, and log --all still name both archived commits exactly once.
+        arch_post = (self.store / f"archive/2025-02/{jid}.post").read_bytes()
+        live_post_copy = self.store / f"messages/{jid}.post"
+        live_post_copy.write_bytes(arch_post)
+        for cmd in (("show", jid), ("log",), ("log", "--all")):
+            out = self.helio(*cmd, me="os/ui").stdout.decode()
+            self.assertEqual(out.count("landed 1111111,2222222"), 1, (cmd, out))
+        self.assertEqual(self.helio("archive", me=None).returncode, 0)
+        self.assertFalse(live_post_copy.exists())
+
+        # 3. Landed-only orphan tail: identical remnant swept cleanly; conflicting remnant fails and preserves evidence; lone orphan fails.
+        arch_l1 = (self.store / f"archive/2025-02/{jid}.landed.1111111").read_bytes()
+        live_l1 = self.store / f"messages/{jid}.landed.1111111"
+        live_l1.write_bytes(arch_l1)
+        self.assertEqual(self.helio("check", me=None).returncode, 0)
+        self.assertEqual(self.helio("archive", me=None).returncode, 0)
+        self.assertFalse(live_l1.exists())
+
+        conflict_bytes = arch_l1.replace(b"os/apps", b"os/main")
+        live_l1.write_bytes(conflict_bytes)
+        self.assertEqual(self.helio("check", me=None).returncode, 3)
+        self.assertEqual(self.helio("archive", me=None).returncode, 3)
+        self.assertEqual(live_l1.read_bytes(), conflict_bytes)
+        self.assertEqual((self.store / f"archive/2025-02/{jid}.landed.1111111").read_bytes(), arch_l1)
+        live_l1.unlink()
+
+        lone = self.store / "messages/1739577600009999-abcdef.landed.1111111"
+        lone.write_bytes(arch_l1)
+        self.assertEqual(self.helio("check", me=None).returncode, 3)
+        self.assertEqual(self.helio("archive", me=None).returncode, 3)
+        lone.unlink()
+
+        # 4. Concurrency via pause harness:
+        #    (a) Taker A loses authority (owner releases, B takes) between authorization and publication -> exits 2, zero mark left!
+        race_a = self.send("ask", "os/all", "os/main", "Race auth", "work")
+        self.assertEqual(self.helio("take", race_a, "--session", "sA", me="os/apps").returncode, 0)
+        p_a = subprocess.Popen(
+            [str(RACER), "--pause-cli", "landed", str(self.store), "landed", race_a, "aaaa111", "--as", "os/apps", "--session", "sA", "--store", str(self.store)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        try:
+            for _ in range(200):
+                if (self.store / "paused.landed").exists():
+                    break
+                time.sleep(0.02)
+            self.assertTrue((self.store / "paused.landed").exists())
+            self.assertEqual(self.helio("release", race_a, me="os/owner").returncode, 0)
+            self.assertEqual(self.helio("take", race_a, "--session", "sB", me="os/ui").returncode, 0)
+            put(self.store / "resume.landed", "x")
+            _, err_a = p_a.communicate(timeout=30)
+            self.assertEqual(p_a.returncode, 2, err_a)
+            self.assertFalse((self.store / f"messages/{race_a}.landed.aaaa111").exists())
+        finally:
+            if p_a.poll() is None:
+                p_a.kill()
+                p_a.wait(timeout=10)
+            for f in ("paused.landed", "resume.landed"):
+                if (self.store / f).exists():
+                    (self.store / f).unlink()
+
+        #    (b) Publication before archive scan (paused at after-landed): archiver captures mark -> writer exits 0 and mark survives!
+        race_b = rc_at(old_us + 500, "ask", "os/apps", "Race arch capture", "--as", "os/main", body=b"w").stdout.decode().strip()
+        self.assertEqual(rc_at(old_us + 600, "take", race_b, "--as", "os/apps").returncode, 0)
+        self.assertEqual(rc_at(old_us + 700, "done", race_b, "ok", "--as", "os/apps").returncode, 0)
+        p_b = subprocess.Popen(
+            [str(RACER), "--pause-cli", "after-landed", str(self.store), "landed", race_b, "bbbb222", "--as", "os/main", "--store", str(self.store)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        try:
+            for _ in range(200):
+                if (self.store / "paused.after-landed").exists():
+                    break
+                time.sleep(0.02)
+            self.assertTrue((self.store / "paused.after-landed").exists())
+            self.assertEqual(self.helio("archive", me=None).returncode, 0)
+            put(self.store / "resume.after-landed", "x")
+            _, err_b = p_b.communicate(timeout=30)
+            self.assertEqual(p_b.returncode, 0, err_b)
+            self.assertTrue((self.store / f"archive/2025-02/{race_b}.landed.bbbb222").exists())
+            self.assertFalse((self.store / f"messages/{race_b}.landed.bbbb222").exists())
+        finally:
+            if p_b.poll() is None:
+                p_b.kill()
+                p_b.wait(timeout=10)
+            for f in ("paused.after-landed", "resume.after-landed"):
+                if (self.store / f).exists():
+                    (self.store / f).unlink()
+
+        #    (c) Publication after archive unlink (paused at landed): writer removes orphan mark -> exits 2, zero archived mark!
+        race_c = rc_at(old_us + 800, "ask", "os/apps", "Race arch refuse", "--as", "os/main", body=b"w").stdout.decode().strip()
+        self.assertEqual(rc_at(old_us + 900, "take", race_c, "--as", "os/apps").returncode, 0)
+        self.assertEqual(rc_at(old_us + 950, "done", race_c, "ok", "--as", "os/apps").returncode, 0)
+        p_c = subprocess.Popen(
+            [str(RACER), "--pause-cli", "landed", str(self.store), "landed", race_c, "cccc333", "--as", "os/main", "--store", str(self.store)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        try:
+            for _ in range(200):
+                if (self.store / "paused.landed").exists():
+                    break
+                time.sleep(0.02)
+            self.assertTrue((self.store / "paused.landed").exists())
+            self.assertEqual(self.helio("archive", me=None).returncode, 0)
+            put(self.store / "resume.landed", "x")
+            _, err_c = p_c.communicate(timeout=30)
+            self.assertEqual(p_c.returncode, 2, err_c)
+            self.assertFalse((self.store / f"archive/2025-02/{race_c}.landed.cccc333").exists())
+            self.assertFalse((self.store / f"messages/{race_c}.landed.cccc333").exists())
+        finally:
+            if p_c.poll() is None:
+                p_c.kill()
+                p_c.wait(timeout=10)
+            for f in ("paused.landed", "resume.landed"):
+                if (self.store / f).exists():
+                    (self.store / f).unlink()
+
+        # 5. Flush failure on landed publication preserves exit 3.
+        flush_job = self.send("ask", "os/apps", "os/main", "Flush fault", "work")
+        r_fl = subprocess.run(
+            [str(RACER), "--fail-write-flush-cli", "landed", flush_job, "dddd444", "--as", "os/main", "--store", str(self.store)],
+            capture_output=True, timeout=30, env=clean_env,
+        )
+        self.assertEqual(r_fl.returncode, 3, r_fl.stderr)
+        self.assertEqual(self.helio("check", me=None).returncode, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

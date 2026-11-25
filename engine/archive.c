@@ -168,6 +168,21 @@ bool archive_is_clean_remnant(const char *folder, const char *id, const char *ev
     unsigned arch_links = 0;
     if (archive_has_terminal_job(folder, id, &arch_links) != S_OK) return false;
     if (starts(event, "seen.")) return store_valid_seen_event(event) && length == len(ARCHIVE_SEEN) && same(data, ARCHIVE_SEEN);
+    if (starts(event, "landed.")) {
+        if (!store_valid_landed_event(event) || !store_valid_landed_payload(data, length, event + 7)) return false;
+        char month[8];
+        if (!archive_month(id, month)) return false;
+        text dst = {0};
+        arch_path(folder, month, &dst, id, event);
+        char *adata = NULL;
+        size_t alen = 0;
+        p_result r = dst.failed ? P_FAILED : p_read(dst.data, MOST_FILE, &adata, &alen);
+        text_free(&dst);
+        bool equal = r == P_OK && alen == length;
+        for (size_t i = 0; equal && i < length; i++) equal = adata[i] == data[i];
+        p_free(adata);
+        return equal;
+    }
     unsigned idx = 0;
     if (!parse_link_index(event, &idx)) return false;
     if (idx >= arch_links) return true; /* late step from a writer that raced post removal */
@@ -293,6 +308,7 @@ typedef struct {
     char *id;
     char month[8];
     str_list seen;
+    str_list landed;
     str_list links;
     str_list rm_parts;
     unsigned arch_links;
@@ -351,15 +367,17 @@ static bool attach_events(void *user, const char *name) {
     const char *ev = dot + 1;
     if (same(ev, "post")) return true;
     if (starts(ev, "seen.")) list_push(&be->items[idx].seen, ev, len(ev));
+    else if (same(ev, "landed") || starts(ev, "landed.")) list_push(&be->items[idx].landed, ev, len(ev));
     else if (starts(ev, "link.")) list_push(&be->items[idx].links, ev, len(ev));
     else if (is_post_part_ev(ev, len(ev))) list_push(&be->items[idx].rm_parts, ev, len(ev));
-    if (be->items[idx].seen.failed || be->items[idx].links.failed || be->items[idx].rm_parts.failed) return be->failed = true, false;
+    if (be->items[idx].seen.failed || be->items[idx].landed.failed || be->items[idx].links.failed || be->items[idx].rm_parts.failed) return be->failed = true, false;
     return true;
 }
 
 static bool populate_batch_events(const char *folder, batch_events *be) {
     for (size_t i = 0; i < be->count; i++) {
         list_free(&be->items[i].seen);
+        list_free(&be->items[i].landed);
         list_free(&be->items[i].links);
         list_free(&be->items[i].rm_parts);
     }
@@ -371,6 +389,7 @@ static bool populate_batch_events(const char *folder, batch_events *be) {
     if (r != P_OK || be->failed) return false;
     for (size_t i = 0; i < be->count; i++) {
         sort_list(&be->items[i].seen);
+        sort_list(&be->items[i].landed);
         sort_list(&be->items[i].links);
     }
     return true;
@@ -427,6 +446,35 @@ static s_result sweep_item_tail(const char *folder, const batch_item *it,
         text_free(&src), text_free(&dst);
     }
     if (res == S_OK && pause) pause(pause_user, "after-remove-seen");
+    for (size_t i = 0; res == S_OK && i < it->landed.count; i++) {
+        const char *ev = it->landed.items[i];
+        text src = {0}, dst = {0};
+        live_path(folder, &src, it->id, ev);
+        arch_path(folder, it->month, &dst, it->id, ev);
+        char *data = NULL;
+        size_t length = 0;
+        p_result sr = src.failed || dst.failed ? P_FAILED : p_read(src.data, MOST_FILE, &data, &length);
+        if (sr == P_OK) {
+            bool valid_landed = store_valid_landed_event(ev) && store_valid_landed_payload(data, length, ev + 7);
+            p_free(data);
+            if (!valid_landed) {
+                *why = "a landed mark is damaged";
+                res = S_DAMAGED;
+            } else {
+                s_result cr = copy_durable(src.data, dst.data, why);
+                if (cr == S_DAMAGED) res = S_DAMAGED;
+                else {
+                    if (pause) pause(pause_user, "before-remove-landed");
+                    p_result rm = p_remove(src.data);
+                    if (rm != P_OK && rm != P_MISSING) *why = "a landed mark could not be removed", res = S_DAMAGED;
+                }
+            }
+        } else if (sr != P_MISSING) {
+            *why = "a landed mark cannot be read";
+            res = S_DAMAGED;
+        }
+        text_free(&src), text_free(&dst);
+    }
     for (size_t i = it->links.count; res == S_OK && i-- > 0;) {
         const char *ev = it->links.items[i];
         text src = {0}, dst = {0};
@@ -576,7 +624,7 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
             bool has_rm_part = false;
             for (size_t i = 0; i < it->rm_parts.count; i++)
                 if (is_rm_part(it->rm_parts.items[i], len(it->rm_parts.items[i]))) has_rm_part = true;
-            if (tr == S_DAMAGED || it->links.count > 0 || it->seen.count > 0 || has_rm_part) {
+            if (tr == S_DAMAGED || it->links.count > 0 || it->seen.count > 0 || it->landed.count > 0 || has_rm_part) {
                 add_report(report, it->id, tr == S_DAMAGED ? "archived terminal chain is damaged or incomplete" : "orphan event without post");
                 return S_DAMAGED;
             }
@@ -667,6 +715,34 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
                 return S_DAMAGED;
             }
         }
+        /* Validate, copy, and flush every remaining live landed mark BEFORE unlinking the live post. */
+        for (size_t i = 0; i < it->landed.count; i++) {
+            const char *ev = it->landed.items[i];
+            text src = {0}, dst = {0};
+            live_path(folder, &src, it->id, ev);
+            char *ld = NULL;
+            size_t ll = 0;
+            p_result lr = src.failed ? P_FAILED : p_read(src.data, MOST_FILE, &ld, &ll);
+            if (lr == P_MISSING) {
+                text_free(&src);
+                continue;
+            }
+            bool ok_landed = lr == P_OK && store_valid_landed_event(ev) && store_valid_landed_payload(ld, ll, ev + 7);
+            p_free(ld);
+            if (!ok_landed) {
+                text_free(&src), text_free(&post_p);
+                add_report(report, it->id, "a landed mark is damaged");
+                return S_DAMAGED;
+            }
+            arch_path(folder, it->month, &dst, it->id, ev);
+            s_result cr = dst.failed ? S_DAMAGED : copy_durable(src.data, dst.data, &why);
+            text_free(&src), text_free(&dst);
+            if (cr == S_DAMAGED) {
+                text_free(&post_p);
+                add_report(report, it->id, why ? why : "a landed mark cannot be preserved");
+                return S_DAMAGED;
+            }
+        }
         p_result rm_post = remove_post_exclusive(post_p.data);
         text_free(&post_p);
         if (rm_post != P_OK && rm_post != P_MISSING) {
@@ -747,6 +823,25 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
             return S_DAMAGED;
         }
     }
+    /* Validate all live landed marks before copying anything. */
+    for (size_t i = 0; i < it->landed.count; i++) {
+        const char *ev = it->landed.items[i];
+        text lp = {0};
+        live_path(folder, &lp, it->id, ev);
+        char *ld = NULL;
+        size_t ll = 0;
+        p_result lr = lp.failed ? P_FAILED : p_read(lp.data, MOST_FILE, &ld, &ll);
+        text_free(&lp);
+        if (lr == P_MISSING) continue;
+        bool ok_landed = lr == P_OK && store_valid_landed_event(ev) && store_valid_landed_payload(ld, ll, ev + 7);
+        p_free(ld);
+        if (!ok_landed) {
+            message_free(&m);
+            text_free(&post_p);
+            add_report(report, it->id, "a landed mark is damaged");
+            return S_DAMAGED;
+        }
+    }
 
     if (!ensure_archive_month(folder, it->month)) {
         message_free(&m);
@@ -796,6 +891,20 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
         s_result sr = ssrc.failed || sdst.failed ? (why = "out of memory", S_DAMAGED) : copy_durable(ssrc.data, sdst.data, &why);
         text_free(&ssrc), text_free(&sdst);
         if (sr == S_DAMAGED) {
+            message_free(&m);
+            text_free(&post_p);
+            add_report(report, it->id, why);
+            return S_DAMAGED;
+        }
+    }
+    for (size_t i = 0; i < it->landed.count; i++) {
+        text lsrc = {0}, ldst = {0};
+        live_path(folder, &lsrc, it->id, it->landed.items[i]);
+        arch_path(folder, it->month, &ldst, it->id, it->landed.items[i]);
+        if (pause) pause(pause_user, "before-copy-landed");
+        s_result lr = lsrc.failed || ldst.failed ? (why = "out of memory", S_DAMAGED) : copy_durable(lsrc.data, ldst.data, &why);
+        text_free(&lsrc), text_free(&ldst);
+        if (lr == S_DAMAGED) {
             message_free(&m);
             text_free(&post_p);
             add_report(report, it->id, why);
@@ -909,6 +1018,7 @@ s_result archive_store(const char *folder, size_t limit, size_t *moved, text *re
         }
         for (size_t i = 0; i < be.count; i++) {
             list_free(&be.items[i].seen);
+            list_free(&be.items[i].landed);
             list_free(&be.items[i].links);
             list_free(&be.items[i].rm_parts);
         }
@@ -1297,9 +1407,124 @@ static bool gather_arch_post_batch(void *user, const char *name) {
 
 static bool attach_arch_events(void *user, const char *name);
 
+s_result archive_read_landed_one(const char *folder, const char *id, const char *commit) {
+    char month[8];
+    if (!valid_id(id) || !archive_month(id, month)) return S_NOTHING;
+    text ev = {0}, ap = {0};
+    add(&ev, "landed."), add(&ev, commit);
+    if (ev.failed || !store_valid_landed_event(ev.data)) {
+        text_free(&ev);
+        return S_DAMAGED;
+    }
+    arch_path(folder, month, &ap, id, ev.data);
+    text_free(&ev);
+    char *data = NULL;
+    size_t length = 0;
+    p_result r = ap.failed ? P_FAILED : p_read(ap.data, MOST_FILE, &data, &length);
+    text_free(&ap);
+    if (r == P_MISSING) return S_NOTHING;
+    if (r != P_OK) return S_DAMAGED;
+    bool ok = store_valid_landed_payload(data, length, commit);
+    p_free(data);
+    return ok ? S_OK : S_DAMAGED;
+}
+
+typedef struct {
+    const char *prefix;
+    size_t prefix_len;
+    const char *bare;
+    str_list events;
+    bool bad;
+} arch_landed_ctx;
+
+static bool gather_arch_landed(void *user, const char *name) {
+    arch_landed_ctx *c = user;
+    if (same(name, c->bare)) {
+        c->bad = true;
+        return true;
+    }
+    if (!starts(name, c->prefix)) return true;
+    size_t n = len(name);
+    if (n > 5 && same(name + n - 5, ".part")) return true;
+    const char *ev = name + (c->prefix_len - 7); /* "landed.<commit>" */
+    if (!store_valid_landed_event(ev)) {
+        c->bad = true;
+        return true;
+    }
+    return list_push(&c->events, ev, len(ev));
+}
+
+static s_result format_arch_landed_events(const char *folder, const char *month, const char *id,
+                                          str_list *events, bool compact, text *out, const char **why) {
+    sort_list(events);
+    size_t shown = 0;
+    for (size_t i = 0; i < events->count; i++) {
+        const char *ev = events->items[i];
+        if (!store_valid_landed_event(ev)) {
+            if (why) *why = "a landed mark is damaged";
+            return S_DAMAGED;
+        }
+        const char *commit = ev + 7;
+        text ap = {0};
+        arch_path(folder, month, &ap, id, ev);
+        char *data = NULL;
+        size_t length = 0;
+        p_result r = ap.failed ? P_FAILED : p_read(ap.data, MOST_FILE, &data, &length);
+        text_free(&ap);
+        bool ok = r == P_OK && store_valid_landed_payload(data, length, commit);
+        p_free(data);
+        if (!ok) {
+            if (why) *why = "a landed mark is damaged";
+            return S_DAMAGED;
+        }
+        if (!compact || shown < 2) {
+            if (shown) add(out, ",");
+            add(out, commit);
+        }
+        shown++;
+    }
+    if (compact && shown > 2) {
+        add(out, " (+"), add_number(out, (uint64_t)(shown - 2), 0), add(out, " more)");
+    }
+    if (out->failed) {
+        if (why) *why = "out of memory";
+        return S_DAMAGED;
+    }
+    return S_OK;
+}
+
+s_result archive_read_landed_commits(const char *folder, const char *id, bool compact, text *out, const char **why) {
+    char month[8];
+    if (!valid_id(id) || !archive_month(id, month)) return S_OK;
+    text mdir = {0}, prefix = {0}, bare = {0};
+    arch_dir(folder, month, &mdir);
+    add(&prefix, id), add(&prefix, ".landed.");
+    add(&bare, id), add(&bare, ".landed");
+    if (mdir.failed || prefix.failed || bare.failed) {
+        text_free(&mdir), text_free(&prefix), text_free(&bare);
+        if (why) *why = "out of memory";
+        return S_DAMAGED;
+    }
+    arch_landed_ctx ctx = {.prefix = prefix.data, .prefix_len = prefix.length, .bare = bare.data};
+    p_result lr = p_list(mdir.data, gather_arch_landed, &ctx);
+    text_free(&mdir), text_free(&prefix), text_free(&bare);
+    if (lr == P_MISSING) {
+        list_free(&ctx.events);
+        return S_OK;
+    }
+    if (lr != P_OK || ctx.events.failed || ctx.bad) {
+        list_free(&ctx.events);
+        if (why) *why = ctx.bad ? "a landed mark is damaged" : "the archive month cannot be read";
+        return S_DAMAGED;
+    }
+    s_result res = format_arch_landed_events(folder, month, id, &ctx.events, compact, out, why);
+    list_free(&ctx.events);
+    return res;
+}
+
 size_t archive_every(store *s, char *const *emitted, size_t emitted_count,
                      bool (*visible)(const message *m, void *user),
-                     void (*each)(store *s, const message *m, const job *known, void *user), void *user) {
+                     void (*each)(store *s, const message *m, const job *known, const char *landed, void *user), void *user) {
     text root = {0};
     add(&root, s->folder), add(&root, "/archive");
     if (root.failed) return 1;
@@ -1372,13 +1597,19 @@ size_t archive_every(store *s, char *const *emitted, size_t emitted_count,
                             if (is_job(&m)) {
                                 job known = {0};
                                 s_result jr = archive_read_job_ex(s, &m, &be.items[i].links, &known);
-                                if (jr == S_OK) each(s, &m, &known, user);
-                                else {
-                                    each(s, &m, NULL, user);
+                                text landed_t = {0};
+                                const char *lwhy = NULL;
+                                s_result lr2 = jr == S_OK ? format_arch_landed_events(s->folder, month, id, &be.items[i].landed, false, &landed_t, &lwhy) : S_OK;
+                                if (jr == S_OK) {
+                                    if (lr2 != S_OK) damaged++;
+                                    each(s, &m, &known, lr2 == S_OK ? landed_t.data : NULL, user);
+                                } else {
+                                    each(s, &m, NULL, NULL, user);
                                     damaged++;
                                 }
+                                text_free(&landed_t);
                             } else {
-                                each(s, &m, NULL, user);
+                                each(s, &m, NULL, NULL, user);
                             }
                         } else if (mr != S_NOTHING) {
                             damaged++;
@@ -1388,6 +1619,7 @@ size_t archive_every(store *s, char *const *emitted, size_t emitted_count,
                 }
                 for (size_t i = 0; i < be.count; i++) {
                     list_free(&be.items[i].seen);
+                    list_free(&be.items[i].landed);
                     list_free(&be.items[i].links);
                     list_free(&be.items[i].rm_parts);
                 }
@@ -1424,6 +1656,7 @@ typedef struct {
 static bool valid_arch_event(const char *ev) {
     if (same(ev, "post")) return true;
     if (starts(ev, "seen.")) return store_valid_seen_event(ev);
+    if (starts(ev, "landed.")) return store_valid_landed_event(ev);
     unsigned idx = 0;
     return len(ev) == 9 && starts(ev, "link.") && parse_link_index(ev, &idx);
 }
@@ -1502,8 +1735,9 @@ static bool attach_arch_events(void *user, const char *name) {
     const char *ev = dot + 1;
     if (same(ev, "post")) be->items[idx].post_removed = true; /* reuse flag to record archived .post presence */
     else if (starts(ev, "seen.")) list_push(&be->items[idx].seen, ev, len(ev));
+    else if (same(ev, "landed") || starts(ev, "landed.")) list_push(&be->items[idx].landed, ev, len(ev));
     else if (starts(ev, "link.")) list_push(&be->items[idx].links, ev, len(ev));
-    if (be->items[idx].seen.failed || be->items[idx].links.failed) return be->failed = true, false;
+    if (be->items[idx].seen.failed || be->items[idx].landed.failed || be->items[idx].links.failed) return be->failed = true, false;
     return true;
 }
 
@@ -1606,6 +1840,7 @@ s_result archive_check(store *s, text *report) {
                     batch_item *it = &be.items[i];
                     sort_list(&it->links);
                     sort_list(&it->seen);
+                    sort_list(&it->landed);
                     char derived[8];
                     bool month_ok = archive_month(it->id, derived) && same(derived, month);
                     if (!month_ok) {
@@ -1660,6 +1895,18 @@ s_result archive_check(store *s, text *report) {
                                 all = S_DAMAGED;
                             }
                         }
+                        for (size_t k = 0; !vanished && k < it->landed.count; k++) {
+                            text ap = {0}, lp = {0};
+                            arch_path(s->folder, month, &ap, it->id, it->landed.items[k]);
+                            live_path(s->folder, &lp, it->id, it->landed.items[k]);
+                            s_result eq = ap.failed || lp.failed ? S_DAMAGED : compare_arch_live(ap.data, lp.data);
+                            text_free(&ap), text_free(&lp);
+                            if (eq == S_NOTHING) vanished = true;
+                            else if (eq != S_OK) {
+                                report_arch_file(report, month, it->id, it->landed.items[k], "archived landed mark conflicts with live landed mark");
+                                all = S_DAMAGED;
+                            }
+                        }
                         if (!vanished) continue;
                     }
                     if (lpr != P_MISSING && lpr != P_OK) {
@@ -1688,10 +1935,11 @@ s_result archive_check(store *s, text *report) {
                             report_arch(report, month, it->id, s->why ? s->why : "archived job is damaged");
                             all = S_DAMAGED;
                         }
-                    } else if (it->links.count > 0) {
-                        report_arch(report, month, it->id, "non-job archived message has step files");
+                    } else if (it->links.count > 0 || it->landed.count > 0) {
+                        report_arch(report, month, it->id, it->links.count > 0 ? "non-job archived message has step files" : "non-job archived message has landed marks");
                         all = S_DAMAGED;
                     }
+                    bool was_job = is_job(&m);
                     message_free(&m);
                     for (size_t k = 0; k < it->seen.count; k++) {
                         text ap = {0};
@@ -1707,10 +1955,28 @@ s_result archive_check(store *s, text *report) {
                             all = S_DAMAGED;
                         }
                     }
+                    if (was_job) {
+                        for (size_t k = 0; k < it->landed.count; k++) {
+                            const char *ev = it->landed.items[k];
+                            text ap = {0};
+                            arch_path(s->folder, month, &ap, it->id, ev);
+                            char *ld = NULL;
+                            size_t ll = 0;
+                            p_result lr = ap.failed ? P_FAILED : p_read(ap.data, MOST_FILE, &ld, &ll);
+                            text_free(&ap);
+                            bool ok_landed = lr == P_OK && store_valid_landed_event(ev) && store_valid_landed_payload(ld, ll, ev + 7);
+                            p_free(ld);
+                            if (!ok_landed) {
+                                report_arch_file(report, month, it->id, ev, "a landed mark is damaged");
+                                all = S_DAMAGED;
+                            }
+                        }
+                    }
                 }
             }
             for (size_t i = 0; i < be.count; i++) {
                 list_free(&be.items[i].seen);
+                list_free(&be.items[i].landed);
                 list_free(&be.items[i].links);
                 list_free(&be.items[i].rm_parts);
             }
