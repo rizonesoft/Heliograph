@@ -1,0 +1,89 @@
+{
+  "ref": "D01 T01 \u00a76",
+  "title": "Messages for one session",
+  "implementation_sha": "761a76efa0ac63be8ed968b3f1db6b6a707e5424",
+  "date": "2026-11-25",
+  "reviews": [
+    {
+      "round": 1,
+      "report": "docs/reviews/01-heliograph/D01-T01-s6.md",
+      "verdict": "fixed"
+    }
+  ],
+  "checks": [
+    "python3 ../ImpossibleSDK/tools/prove.py . -> Ran 107 tests OK",
+    "python3 ../ImpossibleSDK/tools/app_build.py . -> Ran 107 tests OK (skipped=4)",
+    "build.yml: green at 62f4f3dc0a02 https://github.com/rizonesoft/Heliograph/actions/runs/45624932917"
+  ],
+  "completion": {
+    "report": "docs/reviews/01-heliograph/D01-T01-s6.md",
+    "verdict": "reconciled",
+    "candidate": "761a76efa0ac63be8ed968b3f1db6b6a707e5424",
+    "reviewer": "astra",
+    "model": "gpt-6.2-astra",
+    "filed": []
+  },
+  "rounds_spent": 1,
+  "round_cap": 33,
+  "plan": {
+    "report": "docs/reviews/01-heliograph/D01-T01-s6.md",
+    "candidate": "84ce433f688bc63e2d28638d3bedcb173b56e399",
+    "reviewer": "astra",
+    "model": "gpt-6.2-astra",
+    "effort": "medium",
+    "lenses": [
+      "plan"
+    ]
+  },
+  "schedule_sha": "84ce433f688bc63e2d28638d3bedcb173b56e399",
+  "schedule": {
+    "policy": "three-pass",
+    "pass_cap": 33,
+    "blocking": [
+      "P1",
+      "P2"
+    ],
+    "plan": {
+      "effort": "medium",
+      "lenses": [
+        "plan"
+      ]
+    },
+    "rounds": [
+      {
+        "effort": "medium",
+        "lenses": [
+          "adversarial",
+          "integration",
+          "source-defect",
+          "consistency",
+          "quality",
+          "optimization",
+          "design"
+        ]
+      }
+    ],
+    "completion": {
+      "effort": "low",
+      "lenses": [
+        "plan-delivery",
+        "record"
+      ]
+    },
+    "reconciliation": {
+      "effort": "low",
+      "lenses": [
+        "adversarial",
+        "integration",
+        "plan-delivery",
+        "record"
+      ]
+    },
+    "lenses": {
+      "thread-safety": "Which state is reached from two threads (UI, worker, callback, timer) without one lock or atomic owning it, and which lock order, wait, cancellation or teardown can deadlock or run after its owner is gone?",
+      "memory-safety": "Which pointer, reference, view, handle or iterator can outlive what it refers to, and which size, index or cast is trusted unchecked?"
+    }
+  },
+  "passes_spent": 4,
+  "pass_cap": 33
+}

@@ -40,7 +40,7 @@ title: "TODO-01 -- Heliograph"
 | 3 | §3 | Read, answer and repeat archived messages | §2 | [x] |
 | 4 | §4 | Sessions announced by every call | -- | [x] |
 | 5 | §5 | Report of a silent taker | §4 | [x] |
-| 6 | §6 | Messages for one session | §5 | [ ] |
+| 6 | §6 | Messages for one session | §5 | [x] |
 | 7 | §7 | Projects kept apart in log and show | -- | [ ] |
 | 8 | §8 | Mark for landed work | §2 | [ ] |
 | 9 | §9 | Fixed marks around every shown message | §7 | [ ] |
@@ -219,6 +219,9 @@ The design lets a message be for a session, not only a lane. `--for-session <nam
 - [x] Commit: `messages: for one session`
 
 **Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
+
+> **Verified:** 2026-11-25 | §6 | 761a76efa0ac63be8ed968b3f1db6b6a707e5424
+> **Review:** `docs/reviews/d01-t01-s6.json`
 
 ## 7. Projects kept apart in log and show
 
