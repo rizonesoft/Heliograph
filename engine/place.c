@@ -1,6 +1,8 @@
 #include "place.h"
 
 enum { MOST_SESSION_FILE = 512 };
+static const uint64_t SESSION_LOCK_STALE_US = 5000000ull; /* 5 seconds */
+static const uint64_t SESSION_LOCK_WAIT_US = 2000000ull;  /* 2 seconds */
 
 static bool take_word(char *to, size_t room, const char **at) {
     while (**at == ' ') ++*at;
@@ -11,6 +13,11 @@ static bool take_word(char *to, size_t room, const char **at) {
     }
     to[n] = 0;
     return n > 0;
+}
+
+static bool line_end(const char *at) {
+    while (*at == ' ' || *at == '\r') at++;
+    return !*at || *at == '\n';
 }
 
 static const char *next_line(const char *at) {
@@ -55,10 +62,10 @@ s_result place_open(place *p, const char **why) {
         const char *value = line;
         bool good = true;
         char path[512], lane[36];
-        if (starts(line, "project:")) value += 8, good = take_word(p->project, sizeof p->project, &value);
-        else if (starts(line, "lane:")) value += 5, good = take_word(p->lane, sizeof p->lane, &value);
-        else if (starts(line, "repository:")) value += 11, good = take_word(p->repository, sizeof p->repository, &value) && pair_ok("x", p->repository);
-        else if (starts(line, "path:")) value += 5, good = take_word(path, sizeof path, &value) && take_word(lane, sizeof lane, &value) && pair_ok("x", lane);
+        if (starts(line, "project:")) value += 8, good = take_word(p->project, sizeof p->project, &value) && line_end(value);
+        else if (starts(line, "lane:")) value += 5, good = take_word(p->lane, sizeof p->lane, &value) && line_end(value);
+        else if (starts(line, "repository:")) value += 11, good = take_word(p->repository, sizeof p->repository, &value) && pair_ok("x", p->repository) && line_end(value);
+        else if (starts(line, "path:")) value += 5, good = take_word(path, sizeof path, &value) && take_word(lane, sizeof lane, &value) && pair_ok("x", lane) && line_end(value);
         else if (*line != '\n' && *line != '\r' && *line != '#') good = false;
         if (!good) return *why = "helio.conf has a line that is not project, lane, repository or path", S_DAMAGED;
     }
@@ -180,16 +187,18 @@ static p_result read_session_file(const char *path, session_info *out, bool *par
     return r;
 }
 
-static void merge_meta(session_info *info, const session_info *meta, bool has_meta) {
-    if (!has_meta || info->legacy) return;
-    if (meta->when > info->when) {
-        info->when = meta->when;
-        if (*meta->agent) copy_str(info->agent, sizeof info->agent, meta->agent);
-        copy_str(info->repository, sizeof info->repository, meta->repository);
-    } else if (!*info->agent && *meta->agent) {
-        copy_str(info->agent, sizeof info->agent, meta->agent);
-        if (meta->when >= info->when && !*info->repository && *meta->repository)
-            copy_str(info->repository, sizeof info->repository, meta->repository);
+static p_result acquire_session_lock(const char *lock_path, const char *unique) {
+    uint64_t start = p_now();
+    for (;;) {
+        p_result r = p_create_excl(lock_path, "", 0);
+        if (r == P_OK) return P_OK;
+        if (r != P_EXISTS) return r;
+        uint64_t mtime = 0, now = p_now();
+        if (p_file_mtime(lock_path, &mtime) == P_OK && now > mtime && now - mtime >= SESSION_LOCK_STALE_US) {
+            p_claim_remove(lock_path, unique);
+            continue;
+        }
+        if (now >= start && now - start >= SESSION_LOCK_WAIT_US) return P_FAILED;
     }
 }
 
@@ -200,80 +209,48 @@ s_result place_hello(store *s, const char *lane, const char *agent, const char *
     const char *ag = agent ? agent : "";
     const char *rp = repository ? repository : "";
     const char *ss = session ? session : "";
-    uint64_t now = p_now();
 
-    text folder = {0}, path = {0}, meta_path = {0}, data = {0}, unique = {0};
+    text folder = {0}, path = {0}, lock_path = {0}, data = {0}, unique = {0};
     add(&folder, s->folder), add(&folder, "/sessions");
     hello_path(s, &path, lane, ss);
-    add(&meta_path, path.data ? path.data : ""), add(&meta_path, ".meta");
+    add(&lock_path, path.data ? path.data : ""), add(&lock_path, ".lock");
     add_number(&unique, p_tick(), 0);
-    if (folder.failed || path.failed || meta_path.failed || unique.failed) {
-        text_free(&folder), text_free(&path), text_free(&meta_path), text_free(&unique);
+    if (folder.failed || path.failed || lock_path.failed || unique.failed) {
+        text_free(&folder), text_free(&path), text_free(&lock_path), text_free(&unique);
         return s->why = "out of memory", S_DAMAGED;
     }
 
     p_result result = p_folder(folder.data);
     if (result != P_OK) {
-        text_free(&folder), text_free(&path), text_free(&meta_path), text_free(&unique);
+        text_free(&folder), text_free(&path), text_free(&lock_path), text_free(&unique);
         return s->why = "the session cannot be announced", S_DAMAGED;
     }
 
-    if (*ag) {
-        format_session(&data, now, ag, rp, ss);
-        if (data.failed) result = P_FAILED;
-        else {
-            result = p_write(meta_path.data, data.data, data.length, true, unique.data);
-            if (result == P_OK) result = p_write(path.data, data.data, data.length, true, unique.data);
-        }
-    } else {
-        session_info existing = {0}, meta = {0};
-        bool have_existing = false, have_meta = false;
-        p_result er = read_session_file(path.data, &existing, &have_existing);
-        if (er != P_OK && er != P_MISSING) {
-            text_free(&folder), text_free(&path), text_free(&meta_path), text_free(&unique);
-            return s->why = "the existing session cannot be read", S_DAMAGED;
-        }
-        p_result mr = read_session_file(meta_path.data, &meta, &have_meta);
-        if (mr != P_OK && mr != P_MISSING) {
-            text_free(&folder), text_free(&path), text_free(&meta_path), text_free(&unique);
-            return s->why = "the existing session metadata cannot be read", S_DAMAGED;
-        }
-        const char *use_agent = (have_meta && *meta.agent) ? meta.agent : (have_existing && *existing.agent) ? existing.agent : "";
-        const char *use_repo = rp;
-        if (s->pause) s->pause(s->pause_user, "hello-write");
+    if (s->pause) s->pause(s->pause_user, "hello-write");
 
-        format_session(&data, now, use_agent, use_repo, ss);
-        if (data.failed) result = P_FAILED;
-        else if (er == P_MISSING) {
-            result = p_write(path.data, data.data, data.length, false, unique.data);
-            if (result == P_EXISTS) {
-                /* A concurrent hello or refresh created the file while we were preparing. */
-                session_info raced = {0}, raced_meta = {0};
-                bool have_raced = false, have_raced_meta = false;
-                p_result rr = read_session_file(path.data, &raced, &have_raced);
-                p_result rmr = read_session_file(meta_path.data, &raced_meta, &have_raced_meta);
-                if ((rr != P_OK && rr != P_MISSING) || (rmr != P_OK && rmr != P_MISSING)) {
-                    result = P_FAILED;
-                } else {
-                    const char *ra = (have_raced_meta && *raced_meta.agent) ? raced_meta.agent : (have_raced && *raced.agent) ? raced.agent : use_agent;
-                    const char *rrp = use_repo;
-                    uint64_t rwhen = now;
-                    if (have_raced_meta && raced_meta.when >= rwhen) {
-                        rwhen = raced_meta.when;
-                        if (!*rrp && *raced_meta.repository) rrp = raced_meta.repository;
-                    }
-                    if (have_raced && raced.when > rwhen) rwhen = raced.when;
-                    text_free(&data);
-                    format_session(&data, rwhen, ra, rrp, ss);
-                    result = data.failed ? P_FAILED : p_write(path.data, data.data, data.length, true, unique.data);
-                }
-            }
-        } else {
-            result = p_write(path.data, data.data, data.length, true, unique.data);
-        }
+    result = acquire_session_lock(lock_path.data, unique.data);
+    if (result != P_OK) {
+        text_free(&folder), text_free(&path), text_free(&lock_path), text_free(&unique);
+        return s->why = "the session cannot be announced", S_DAMAGED;
     }
 
-    text_free(&folder), text_free(&path), text_free(&meta_path), text_free(&data), text_free(&unique);
+    session_info existing = {0};
+    bool have_existing = false;
+    p_result er = read_session_file(path.data, &existing, &have_existing);
+    if (er != P_OK && er != P_MISSING) {
+        p_remove(lock_path.data);
+        text_free(&folder), text_free(&path), text_free(&lock_path), text_free(&unique);
+        return s->why = "the existing session cannot be read", S_DAMAGED;
+    }
+
+    uint64_t now = p_now();
+    if (have_existing && now <= existing.when) now = existing.when + 1;
+    const char *use_agent = *ag ? ag : (have_existing && *existing.agent ? existing.agent : "");
+    format_session(&data, now, use_agent, rp, ss);
+    result = data.failed ? P_FAILED : p_write(path.data, data.data, data.length, true, unique.data);
+    p_remove(lock_path.data);
+
+    text_free(&folder), text_free(&path), text_free(&lock_path), text_free(&data), text_free(&unique);
     if (result != P_OK) s->why = "the session cannot be announced";
     return result == P_OK ? S_OK : S_DAMAGED;
 }
@@ -281,27 +258,17 @@ s_result place_hello(store *s, const char *lane, const char *agent, const char *
 s_result place_session(store *s, const char *lane, const char *session, session_info *out) {
     *out = (session_info){0};
     if (!lane || !address_ok(lane, false) || !session_ok(session)) return s->why = "invalid lane or session", S_REFUSED;
-    text path = {0}, meta_path = {0};
+    text path = {0};
     hello_path(s, &path, lane, session ? session : "");
-    add(&meta_path, path.data ? path.data : ""), add(&meta_path, ".meta");
-    if (path.failed || meta_path.failed) {
-        text_free(&path), text_free(&meta_path);
+    if (path.failed) {
+        text_free(&path);
         return s->why = "out of memory", S_DAMAGED;
     }
-    bool parsed = false, has_meta = false;
-    session_info meta = {0};
+    bool parsed = false;
     p_result r = read_session_file(path.data, out, &parsed);
-    if (r == P_MISSING) {
-        text_free(&path), text_free(&meta_path);
-        return S_NOTHING;
-    }
-    if (r != P_OK || !parsed) {
-        text_free(&path), text_free(&meta_path);
-        return s->why = "the session cannot be read", S_DAMAGED;
-    }
-    p_result mr = read_session_file(meta_path.data, &meta, &has_meta);
-    text_free(&path), text_free(&meta_path);
-    if (mr == P_OK && has_meta) merge_meta(out, &meta, true);
+    text_free(&path);
+    if (r == P_MISSING) return S_NOTHING;
+    if (r != P_OK || !parsed) return s->why = "the session cannot be read", S_DAMAGED;
     copy_str(out->lane, sizeof out->lane, lane);
     return S_OK;
 }
@@ -310,6 +277,7 @@ typedef struct {
     store *s;
     bool (*each)(void *user, const session_info *info);
     void *user;
+    bool had_error;
 } session_scan;
 
 static bool decode_lane_from_name(const char *name, char *lane, size_t room) {
@@ -328,23 +296,26 @@ static bool scan_one_session(void *user, const char *name) {
     session_scan *sc = user;
     size_t n = len(name);
     if (n > 5 && same(name + n - 5, ".part")) return true;
-    if (n > 5 && same(name + n - 5, ".meta")) return true;
+    if (n > 5 && same(name + n - 5, ".lock")) return true;
     char lane[72];
     if (!decode_lane_from_name(name, lane, sizeof lane)) return true;
-    text path = {0}, meta_path = {0};
+    text path = {0};
     add(&path, sc->s->folder), add(&path, "/sessions/"), add(&path, name);
-    add(&meta_path, path.data ? path.data : ""), add(&meta_path, ".meta");
     bool keep = true;
-    if (!path.failed && !meta_path.failed) {
-        session_info info = {0}, meta = {0};
-        bool parsed = false, has_meta = false;
-        if (read_session_file(path.data, &info, &parsed) == P_OK && parsed) {
-            if (read_session_file(meta_path.data, &meta, &has_meta) == P_OK && has_meta) merge_meta(&info, &meta, true);
+    if (path.failed) {
+        sc->had_error = true;
+    } else {
+        session_info info = {0};
+        bool parsed = false;
+        p_result r = read_session_file(path.data, &info, &parsed);
+        if (r == P_OK && parsed) {
             copy_str(info.lane, sizeof info.lane, lane);
             keep = sc->each(sc->user, &info);
+        } else if (r != P_MISSING) {
+            sc->had_error = true;
         }
     }
-    text_free(&path), text_free(&meta_path);
+    text_free(&path);
     return keep;
 }
 
@@ -355,10 +326,11 @@ p_result place_each_session(store *s, bool (*each)(void *user, const session_inf
         text_free(&folder);
         return P_FAILED;
     }
-    session_scan sc = {s, each, user};
+    session_scan sc = {s, each, user, false};
     p_result r = p_list(folder.data, scan_one_session, &sc);
     text_free(&folder);
-    return r;
+    if (r != P_OK) return r;
+    return sc.had_error ? P_FAILED : P_OK;
 }
 
 typedef struct { const char *project, *me; uint64_t since; bool busy; } look;

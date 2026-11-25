@@ -2238,19 +2238,19 @@ class Sessions(Base):
             self.assertGreater(int(info["when"]), 0)
             self.assertEqual(info["legacy"], "0")
 
-        # Unknown agent exits 2 both on an uninitialized store (before store_open!) and on an initialized store without mutation.
+        # Unknown agent exits 2 both on an uninitialized store (before store_open!) and on an initialized store without ANY mutation.
         missing_store = self.store / "not-initialized"
         r_missing = run(missing_store, "hello", "unknown", me="os/apps", cwd=self.store)
         self.assertEqual(r_missing.returncode, 2, r_missing.stderr)
-        before_files = sorted(p.name for p in (self.store / "sessions").iterdir())
+        before_snapshot = {p.name: p.read_bytes() for p in (self.store / "sessions").iterdir()}
         r_bad = self.helio("hello", "unknown", "--session", "s-codex", me=None, cwd=repo)
         self.assertEqual(r_bad.returncode, 2, r_bad.stderr)
-        self.assertEqual(sorted(p.name for p in (self.store / "sessions").iterdir()), before_files)
-        rc, after = self.read_session("os/apps", "s-codex")
-        self.assertEqual((rc, after["agent"]), (0, "codex"))
+        after_snapshot = {p.name: p.read_bytes() for p in (self.store / "sessions").iterdir()}
+        self.assertEqual(after_snapshot, before_snapshot)
 
         # Maximum-length record (32-char project, 32-char lane, antigravity, 32-char repo, 64-byte session),
-        # fresh legacy single-line file, and ignored .part file all verified through C place_session + place_each_session.
+        # fresh legacy single-line file, and named-session .part file (which would decode to valid lane os/apps if not filtered)
+        # all verified through C place_session + place_each_session with exact row count.
         max_proj = "p" * 32
         max_lane = "l" * 32
         max_repo = "r" * 32
@@ -2268,15 +2268,17 @@ class Sessions(Base):
 
         fresh_now = str(int(time.time() * 1_000_000))
         put(self.store / "sessions/os+legacy-lane", f"{fresh_now}\n")
-        put(self.store / "sessions/os+ghost.123.part", "time: 9999999999999999\nagent: codex\n")
+        named_part = self.store / f"sessions/os+apps+{'ghost'.encode().hex()}.123.part"
+        put(named_part, "time: 9999999999999999\nagent: codex\nrepository: x\nsession: ghost\n")
         listed = self.list_sessions()
+        self.assertEqual(len(listed), 5, listed)
         by_key = {(row["lane"], row["session"]): row for row in listed}
         self.assertIn((f"{max_proj}/{max_lane}", max_sess), by_key)
         self.assertEqual(by_key[(f"{max_proj}/{max_lane}", max_sess)]["repository"], max_repo)
         self.assertIn(("os/legacy-lane", ""), by_key)
         self.assertEqual(by_key[("os/legacy-lane", "")]["legacy"], "1")
         self.assertEqual(by_key[("os/legacy-lane", "")]["when"], fresh_now)
-        self.assertNotIn(("os/ghost", ""), by_key)
+        self.assertNotIn(("os/apps", "ghost"), by_key)
         # Legacy fresh file still counts as busy for unowned path routing!
         sent = self.send("ask", "path:docs/x.md", me=None, cwd=repo)
         post_txt = (self.store / f"messages/{sent}.post").read_text()
@@ -2297,29 +2299,51 @@ class Sessions(Base):
         self.assertIn("to: os/owner\n", (self.store / f"messages/{sent}.post").read_text())
 
         # Integration-supplied session env vars on documented `helio inbox` calls (Codex + Antigravity + Claude).
-        r1 = self.helio("inbox", me=None, cwd=repo, extra_env={"CODEX_THREAD_ID": "codex-thread-1"})
-        r2 = self.helio("inbox", me=None, cwd=repo, extra_env={"ANTIGRAVITY_CONVERSATION_ID": "agy-conv-2"})
-        self.assertIn(r1.returncode, (0, 1))
-        self.assertIn(r2.returncode, (0, 1))
-        rc1, i1 = self.read_session("os/apps", "codex-thread-1")
-        rc2, i2 = self.read_session("os/apps", "agy-conv-2")
-        self.assertEqual((rc1, rc2), (0, 0))
-        self.assertEqual(i1["session"], "codex-thread-1")
-        self.assertEqual(i2["session"], "agy-conv-2")
-        # Repeat call from codex-thread-1 updates its time without touching agy-conv-2!
-        time.sleep(0.01)
-        self.helio("inbox", me=None, cwd=repo, extra_env={"CODEX_THREAD_ID": "codex-thread-1"})
-        _, i1_after = self.read_session("os/apps", "codex-thread-1")
-        _, i2_after = self.read_session("os/apps", "agy-conv-2")
-        self.assertGreaterEqual(int(i1_after["when"]), int(i1["when"]))
-        self.assertEqual(i2_after["when"], i2["when"])
+        integrations = (
+            ("CODEX_THREAD_ID", "codex-thread-1"),
+            ("ANTIGRAVITY_CONVERSATION_ID", "agy-conv-2"),
+            ("CLAUDE_CODE_SESSION_ID", "claude-sess-3"),
+        )
+        for var, sid in integrations:
+            r = self.helio("inbox", me=None, cwd=repo, extra_env={var: sid})
+            self.assertIn(r.returncode, (0, 1))
+            rc, info = self.read_session("os/apps", sid)
+            self.assertEqual((rc, info["session"]), (0, sid))
+
+        # Each integration's repeat call strictly advances its own timestamp from a backdated record without touching siblings.
+        for var, sid in integrations:
+            sfile = self.store / f"sessions/os+apps+{sid.encode().hex()}"
+            put(sfile, f"time: 1000\nagent: \nrepository: repo-s\nsession: {sid}\n")
+            others_before = {
+                osid: self.read_session("os/apps", osid)[1]["when"]
+                for _, osid in integrations if osid != sid
+            }
+            self.helio("inbox", me=None, cwd=repo, extra_env={var: sid})
+            _, after = self.read_session("os/apps", sid)
+            self.assertGreater(int(after["when"]), 1000, var)
+            for osid, prev_when in others_before.items():
+                self.assertEqual(self.read_session("os/apps", osid)[1]["when"], prev_when)
+
+        # Single stable identity when both CODEX_THREAD_ID and CLAUDE_CODE_SESSION_ID are present:
+        # hook, inbox, and take all resolve to the same session ID!
+        j = self.send("ask", to="os/apps", me="os/main", subject="Unified session")
+        both_env = {"CODEX_THREAD_ID": "shared-codex-id", "CLAUDE_CODE_SESSION_ID": "other-claude-id"}
+        self.assertEqual(self.helio("hook", "claude", me=None, cwd=repo, extra_env=both_env).returncode, 0)
+        self.assertEqual(self.helio("inbox", me=None, cwd=repo, extra_env=both_env).returncode, 0)
+        self.assertEqual(self.helio("take", j, me=None, cwd=repo, extra_env=both_env).returncode, 0)
+        rc_shared, info_shared = self.read_session("os/apps", "shared-codex-id")
+        self.assertEqual((rc_shared, info_shared["agent"]), (0, "claude"))
+        self.assertEqual(self.read_session("os/apps", "other-claude-id")[0], 1)
+        link0 = (self.store / f"messages/{j}.link.0000").read_text()
+        self.assertIn("session: shared-codex-id\n", link0)
 
     def test_two_repositories_and_unconfigured_dir_refresh(self):
         repo_a = self.store / "repo-a"
         repo_b = self.store / "repo-b"
         repo_a.mkdir()
         repo_b.mkdir()
-        put(repo_a / "helio.conf", "project: os\nlane: apps\nrepository: alpha\n")
+        # Trailing whitespace on repository: is accepted; trailing second token is refused.
+        put(repo_a / "helio.conf", "project: os\nlane: apps\nrepository: alpha   \n")
         put(repo_b / "helio.conf", "project: os\nlane: apps\nrepository: beta\n")
         self.assertEqual(self.helio("hello", "codex", "--session", "s1", me=None, cwd=repo_a).returncode, 0)
         self.assertEqual(self.helio("hello", "codex", "--session", "s2", me=None, cwd=repo_b).returncode, 0)
@@ -2327,51 +2351,66 @@ class Sessions(Base):
         _, ib = self.read_session("os/apps", "s2")
         self.assertEqual((ia["repository"], ib["repository"]), ("alpha", "beta"))
 
-        # Invalid repository path in helio.conf is refused with exit 2.
-        bad_repo = self.store / "repo-bad"
-        bad_repo.mkdir()
-        put(bad_repo / "helio.conf", "project: os\nrepository: a/b\n")
-        self.assertEqual(self.helio("inbox", me="os/apps", cwd=bad_repo).returncode, 2)
+        # Invalid repository path AND trailing second token in helio.conf are refused with exit 2.
+        for bad_conf in (
+            "project: os\nrepository: a/b\n",
+            "project: os\nrepository: core tools\n",
+            "project: os extra\n",
+            "project: os\nlane: apps extra\n",
+        ):
+            bad_repo = self.store / "repo-bad"
+            bad_repo.mkdir(exist_ok=True)
+            put(bad_repo / "helio.conf", bad_conf)
+            self.assertEqual(self.helio("inbox", me="os/apps", cwd=bad_repo).returncode, 2, bad_conf)
 
         # Refresh from a separate unconfigured temp directory (no ancestor helio.conf) clears repository while preserving agent.
         with tempfile.TemporaryDirectory() as unconf:
-            time.sleep(0.01)
+            sfile = self.store / f"sessions/os+apps+{'s1'.encode().hex()}"
+            put(sfile, "time: 1000\nagent: codex\nrepository: alpha\nsession: s1\n")
             r = self.helio("inbox", "--session", "s1", me="os/apps", cwd=unconf)
             self.assertEqual(r.returncode, 1)
             _, ia_after = self.read_session("os/apps", "s1")
             self.assertEqual(ia_after["agent"], "codex")
             self.assertEqual(ia_after["repository"], "")
-            self.assertGreaterEqual(int(ia_after["when"]), int(ia["when"]))
+            self.assertGreater(int(ia_after["when"]), 1000)
 
     def test_every_other_command_announces_and_unwritable_sessions_never_fails_command(self):
         repo = self.store / "repo-cmd"
         repo.mkdir()
         put(repo / "helio.conf", "project: os\nlane: apps\nrepository: cmd-repo\n")
-        j = self.send("ask", to="os/apps", me="os/main", subject="Work item")
+        j_done = self.send("ask", to="os/apps", me="os/main", subject="Work done")
+        j_ref = self.send("ask", to="os/apps", me="os/main", subject="Work refuse")
 
-        # Every command announces when lane is named and preserves hello agent.
+        # Every command strictly advances time from a known older record (1000) and preserves hello agent.
         self.assertEqual(self.helio("hello", "antigravity", "--session", "cmd-s", me=None, cwd=repo).returncode, 0)
-        _, prev = self.read_session("os/apps", "cmd-s")
-        for args in (
-            (),  # default no-command inbox
-            ("inbox",),
-            ("log",),
-            ("check",),
-            ("show", j),
-            ("take", j),
-            ("release", j),
-            ("take", j),
-            ("done", j, "finished"),
-            ("working", "src/a.c"),
-            ("archive",),
-            ("help",),
+        sfile = self.store / f"sessions/os+apps+{'cmd-s'.encode().hex()}"
+        for args, body in (
+            ((), ""),  # default no-command inbox
+            (("inbox",), ""),
+            (("log",), ""),
+            (("check",), ""),
+            (("show", j_done), ""),
+            (("take", j_done), ""),
+            (("release", j_done), ""),
+            (("take", j_done), ""),
+            (("done", j_done, "finished"), ""),
+            (("take", j_ref), ""),
+            (("refuse", j_ref, "nope"), ""),
+            (("ask", "os/main", "Subj ask"), "body"),
+            (("hand", "os/main", "Subj hand"), "body"),
+            (("tell", "os/main", "Subj tell"), "body"),
+            (("find", "os/main", "Subj find"), "body"),
+            (("answer", j_done, "Subj ans"), "body"),
+            (("working", "src/a.c"), ""),
+            (("archive",), ""),
+            (("help",), ""),
         ):
-            r = self.helio(*args, "--session", "cmd-s", me="os/apps", cwd=repo)
+            put(sfile, "time: 1000\nagent: antigravity\nrepository: cmd-repo\nsession: cmd-s\n")
+            r = self.helio(*args, "--session", "cmd-s", me="os/apps", cwd=repo, body=body)
             self.assertIn(r.returncode, (0, 1), (args, r.stderr))
             _, cur = self.read_session("os/apps", "cmd-s")
             self.assertEqual(cur["agent"], "antigravity", args)
-            self.assertGreaterEqual(int(cur["when"]), int(prev["when"]), args)
-            prev = cur
+            self.assertGreater(int(cur["when"]), 1000, args)
 
         # Store-free help still exits 0 quietly without error.
         clean_env = {k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_DEFAULT_STORE", "HELIO_DEFAULT_STORE_HEX", "HELIO_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "ANTIGRAVITY_CONVERSATION_ID")}
@@ -2407,9 +2446,7 @@ class Sessions(Base):
                 rb = run(s_blk, *args, me=me)
                 self.assertEqual(rb.returncode, ro.returncode, (args, ro.stderr, rb.stderr))
                 self.assertIn(b"cannot be announced", rb.stderr, args)
-                if args == ("hook", "claude"):
-                    self.assertIn(b"Wait", rb.stdout)
-                elif args == ("inbox",):
+                if args in (("hook", "claude"), ("inbox",)):
                     self.assertIn(b"Wait", rb.stdout)
 
     def test_concurrent_ordinary_refresh_never_erases_hello_metadata(self):
@@ -2421,7 +2458,7 @@ class Sessions(Base):
         # Case 1: ordinary inbox starts when session file is missing, pauses at hello-write, hello codex runs, inbox resumes.
         p1 = subprocess.Popen(
             [str(RACER), "--pause-cli", "hello-write", str(self.store), "inbox", "--store", str(self.store), "--as", "os/apps", "--session", "race-1"],
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.store, env=clean,
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=repo, env=clean,
         )
         try:
             deadline = time.time() + 15
@@ -2429,6 +2466,7 @@ class Sessions(Base):
                 self.assertLess(time.time(), deadline)
                 time.sleep(0.01)
             self.assertEqual(self.helio("hello", "codex", "--session", "race-1", me=None, cwd=repo).returncode, 0)
+            _, mid = self.read_session("os/apps", "race-1")
             put(self.store / "resume.hello-write", "go")
             p1.communicate(timeout=30)
         finally:
@@ -2439,8 +2477,46 @@ class Sessions(Base):
                 (self.store / f).unlink()
         rc, info = self.read_session("os/apps", "race-1")
         self.assertEqual((rc, info["agent"], info["repository"]), (0, "codex", "race-repo"))
+        self.assertGreater(int(info["when"]), int(mid["when"]))
 
-        # Case 2: ordinary refresh when existing session path is unreadable (a directory) leaves it intact and warns.
+        # Case 2: established session, two overlapping ordinary refreshes never move time backward or lose agent/repository.
+        p2 = subprocess.Popen(
+            [str(RACER), "--pause-cli", "hello-write", str(self.store), "inbox", "--store", str(self.store), "--as", "os/apps", "--session", "race-1"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=repo, env=clean,
+        )
+        try:
+            deadline = time.time() + 15
+            while not (self.store / "paused.hello-write").exists():
+                self.assertLess(time.time(), deadline)
+                time.sleep(0.01)
+            self.helio("inbox", "--session", "race-1", me=None, cwd=repo)
+            _, mid2 = self.read_session("os/apps", "race-1")
+            put(self.store / "resume.hello-write", "go")
+            p2.communicate(timeout=30)
+        finally:
+            if p2.poll() is None:
+                p2.kill()
+        for f in ("paused.hello-write", "resume.hello-write"):
+            if (self.store / f).exists():
+                (self.store / f).unlink()
+        rc2, info2 = self.read_session("os/apps", "race-1")
+        self.assertEqual((rc2, info2["agent"], info2["repository"]), (0, "codex", "race-repo"))
+        self.assertGreater(int(info2["when"]), int(mid2["when"]))
+        listed = [row for row in self.list_sessions() if row["session"] == "race-1"]
+        self.assertEqual(len(listed), 1)
+        self.assertEqual((listed[0]["agent"], listed[0]["repository"], listed[0]["when"]), ("codex", "race-repo", info2["when"]))
+
+        # Case 3: failed hello (flush failure) leaves existing announcement completely untouched (one publication point).
+        r_fail = subprocess.run(
+            [str(RACER), "--fail-flush-cli", "hello", "claude", "--store", str(self.store), "--as", "os/apps", "--session", "race-1"],
+            capture_output=True, timeout=30, cwd=repo, env=clean,
+        )
+        self.assertEqual(r_fail.returncode, 3)
+        rc3, info3 = self.read_session("os/apps", "race-1")
+        self.assertEqual((rc3, info3["agent"], info3["repository"], info3["when"]), (0, "codex", "race-repo", info2["when"]))
+
+        # Case 4: ordinary refresh when existing session path is unreadable (a directory) leaves it intact and warns,
+        # and place_each_session reports the I/O error rather than silently ignoring it.
         (self.store / "sessions").mkdir(exist_ok=True)
         bad_entry = self.store / "sessions/os+unreadable"
         bad_entry.mkdir()
@@ -2448,6 +2524,8 @@ class Sessions(Base):
         self.assertEqual(r_unr.returncode, 1)
         self.assertTrue(bad_entry.is_dir())
         self.assertIn(b"cannot be read", r_unr.stderr)
+        r_list_err = subprocess.run([str(RACER), "--list-sessions", str(self.store)], capture_output=True, timeout=30)
+        self.assertNotEqual(r_list_err.returncode, 0)
 
     def test_session_name_validation_blocks_collisions_and_length_overflow(self):
         # team<TAB>A is refused while team A is accepted; control-only is refused and never aliases anonymous "".

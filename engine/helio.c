@@ -101,13 +101,9 @@ static bool parse(options *o, int count, char **args) {
         else o->words[o->count++] = args[i];
     }
     if (!o->session_flag) {
+        /* One uniform precedence across every command so a process never splits its
+           session identity between hook/hello and inbox/take. */
         o->session_env = env_nonempty("HELIO_SESSION");
-        if (!o->session_env && o->count >= 2 && (same(o->words[0], "hello") || same(o->words[0], "hook"))) {
-            const char *preferred = same(o->words[1], "claude") ? "CLAUDE_CODE_SESSION_ID"
-                                  : same(o->words[1], "codex") ? "CODEX_THREAD_ID"
-                                  : same(o->words[1], "antigravity") ? "ANTIGRAVITY_CONVERSATION_ID" : NULL;
-            if (preferred) o->session_env = env_nonempty(preferred);
-        }
         if (!o->session_env) o->session_env = env_nonempty("CODEX_THREAD_ID");
         if (!o->session_env) o->session_env = env_nonempty("ANTIGRAVITY_CONVERSATION_ID");
         if (!o->session_env) o->session_env = env_nonempty("CLAUDE_CODE_SESSION_ID");
