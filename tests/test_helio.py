@@ -2917,11 +2917,21 @@ class SilentTaker(unittest.TestCase):
             self.assertEqual(rc_at(base_us, "take", j_ov_si, "--as", "os/a", "--session", "sa").returncode, 0)
             self.assertEqual(rc_at(base_us, "take", j_ret, "--as", "os/b", "--session", "sb").returncode, 0)
 
-            # 1a. Transient damaged session on the day's FIRST inbox: refuses to freeze a wrong summary file
-            # (exit 3, NO summary/*.md written, NO false SILENT label), then recovery writes the accurate summary!
+            # 1a. Transient damaged session on the day's FIRST inbox:
+            # - Stranger (os/other) on an unrelated project-wide taken job exits 1 (NOT 3!), gets summary diagnostic,
+            #   and NO summary/*.md is written so the summary stays retryable!
+            # - Sender (os/sender) whose taken job needs liveness exits 3 without false SILENT and NO summary/*.md!
+            r_pw = rc_at(base_us, "ask", "os/all", "Project-wide task", "--as", "os/sender", body=b"pw")
+            self.assertEqual(r_pw.returncode, 0, r_pw.stderr)
+            j_pw = r_pw.stdout.decode().strip()
+            self.assertEqual(rc_at(base_us, "take", j_pw, "--as", "os/a", "--session", "sa").returncode, 0)
             t_later = base_us + 90 * M
             bad_sess = st / f"sessions/os+b+{'bad'.encode().hex()}"
             bad_sess.mkdir()
+            r_str_first = rc_at(t_later, "inbox", "--as", "os/other")
+            self.assertEqual(r_str_first.returncode, 1, r_str_first.stderr)
+            self.assertIn(b"summary was deferred", r_str_first.stderr)
+            self.assertEqual(list((st / "summary").glob("*.md")) if (st / "summary").exists() else [], [])
             r_dmg = rc_at(t_later, "inbox", "--as", "os/sender")
             self.assertEqual(r_dmg.returncode, 3)
             self.assertNotIn(b"SILENT", r_dmg.stdout)
@@ -2929,16 +2939,17 @@ class SilentTaker(unittest.TestCase):
             bad_sess.rmdir()
 
             # 1b. Recovery: returning taker os/b (session sb) runs the day's first successful inbox:
-            # refreshes sb BEFORE summary!
+            # refreshes sb BEFORE summary! (j_ov_si is overdue+silent; j_pw is silent; j_ret is taken/alive.)
             self.assertEqual(rc_at(t_later, "inbox", "--as", "os/b", "--session", "sb").returncode, 0)
             sum_files = list((st / "summary").glob("*.md"))
             self.assertEqual(len(sum_files), 1)
             text = sum_files[0].read_text()
             self.assertIn("## Overdue: 1\n", text)
-            self.assertIn("## Silent: 1\n", text)
+            self.assertIn("## Silent: 2\n", text)
             self.assertIn("## Taken: 1\n", text)
             self.assertIn(j_ov_si, text.split("## Overdue: 1")[1].split("## Silent:")[0])
-            self.assertIn(j_ov_si, text.split("## Silent: 1")[1].split("## Open:")[0])
+            self.assertIn(j_ov_si, text.split("## Silent: 2")[1].split("## Open:")[0])
+            self.assertIn(j_pw, text.split("## Silent: 2")[1].split("## Open:")[0])
             self.assertIn(j_ret, text.split("## Taken: 1")[1].split("## Done")[0])
 
             # 2. Corrupt/unreadable stored threshold file fails with exit 3 instead of silently falling back to 120m!

@@ -295,9 +295,12 @@ s_result watch_summary(store *s, const place *here) {
         sessions_cache_free(&sc);
         if (liveness_err) {
             /* Do not freeze an incomplete daily summary when session or threshold reads failed:
-               return S_DAMAGED so the next call retries once the transient fault clears. */
+               return S_NOTHING (deferred) so the caller prints a diagnostic, retries on the next
+               call once the transient fault clears, and lets the caller's own inbox decide its exit code. */
             for (int i = 0; i < 6; i++) text_free(&parts[i]);
-            result = S_DAMAGED;
+            s->why = "the summary was deferred: session or threshold could not be read";
+            p_free(there), text_free(&day), text_free(&folder), text_free(&path), text_free(&unique);
+            return S_NOTHING;
         } else {
             add(&out, "# Heliograph "), add(&out, day.data), add(&out, "\n\nAs it stood at "), add_time(&out, now), add(&out, ".\n");
             for (int i = 0; i < 6; i++) {

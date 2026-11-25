@@ -603,9 +603,13 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
     if ((which == 0 || which == 1) && address_ok(o->me, false)) announce_best_effort(&s, o, "");
     else if (which == 8) announce_best_effort(&s, o, "claude");
     bool summary_err = false;
-    if ((which == 0 || which == 8) && watch_summary(&s, &o->here) != S_OK) {
-        fail(s.why, 3); /* the inbox is shown all the same */
-        summary_err = true;
+    if (which == 0 || which == 8) {
+        s_result sr = watch_summary(&s, &o->here);
+        if (sr == S_NOTHING) fail(s.why, 0); /* deferred on transient liveness error; caller's own inbox decides exit code */
+        else if (sr != S_OK) {
+            fail(s.why, 3); /* the inbox is shown all the same */
+            summary_err = true;
+        }
     }
     bool daily_err = false;
     if (which == 0 && !summary_err) {
