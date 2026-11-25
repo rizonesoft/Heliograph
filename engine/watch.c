@@ -6,21 +6,32 @@ bool is_overdue(const message *m, const job *now) {
     return m->due && (now->state == OPEN || now->state == TAKEN) && m->due < p_now();
 }
 
+static uint64_t session_repo_when(const session_info *s, const char *repository) {
+    if (!repository || !*repository) return s->when;
+    uint64_t best = same(s->repository, repository) ? s->when : 0;
+    for (size_t k = 0; k < s->repo_count; k++) {
+        if (same(s->repos[k].name, repository) && s->repos[k].when > best)
+            best = s->repos[k].when;
+    }
+    return best;
+}
+
 bool is_silent(const session_info *sessions, size_t session_count, const job *now, uint64_t clock_now, uint64_t silent_us) {
     if (!now || now->state != TAKEN || !*now->by || !silent_us) return false;
     uint64_t last = now->when;
     if (*now->session) {
         for (size_t i = 0; i < session_count; i++) {
-            if (*now->repository && !same(sessions[i].repository, now->repository)) continue;
             if (same(sessions[i].lane, now->by) && same(sessions[i].session, now->session)) {
-                if (sessions[i].when > last) last = sessions[i].when;
+                uint64_t t = session_repo_when(&sessions[i], now->repository);
+                if (t > last) last = t;
             }
         }
     } else {
         for (size_t i = 0; i < session_count; i++) {
-            if (*now->repository && !same(sessions[i].repository, now->repository)) continue;
-            if (same(sessions[i].lane, now->by) && sessions[i].when > last)
-                last = sessions[i].when;
+            if (same(sessions[i].lane, now->by)) {
+                uint64_t t = session_repo_when(&sessions[i], now->repository);
+                if (t > last) last = t;
+            }
         }
     }
     return clock_now > last && (clock_now - last) >= silent_us;

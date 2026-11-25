@@ -1184,7 +1184,7 @@ def win_install(
                             create_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
                             init_r = subprocess.run(
                                 [str(stage_exe), "init", "--store", store_path],
-                                cwd=os.environ.get("TEMP", str(stage_exe.parent)),
+                                cwd=tempfile.gettempdir(),
                                 stdin=subprocess.DEVNULL,
                                 capture_output=True,
                                 text=True,

@@ -4400,6 +4400,19 @@ class RepositoryRouting(Base):
         watch_ok = rc_at(t_late + 300, "inbox", "--as", "os/main", cwd=repo_a).stdout.decode()
         self.assertNotIn(scoped, watch_ok)
 
+        # Reverse order: active named taker refreshes in repo-a at +119m, then runs in repo-b at +121m -> NOT silent!
+        M = 60 * 1_000_000
+        self.assertEqual(rc_at(t0, "hello", "claude", "--session", "s2", "--as", "os/dev", cwd=repo_a).returncode, 0)
+        scoped2 = rc_at(t0 + 100, "ask", "path:docs/s2.md", "Active then foreign", "--as", "os/main", cwd=repo_a, body=b"work").stdout.decode().strip()
+        self.assertEqual(rc_at(t0 + 200, "take", scoped2, "--session", "s2", "--as", "os/dev", cwd=repo_a).returncode, 0)
+        self.assertEqual(rc_at(t0 + 119 * M, "hello", "claude", "--session", "s2", "--as", "os/dev", cwd=repo_a).returncode, 0)
+        self.assertEqual(rc_at(t0 + 121 * M, "hello", "claude", "--session", "s2", "--as", "os/dev", cwd=repo_b).returncode, 0)
+        self.assertNotIn(scoped2, rc_at(t0 + 121 * M + 100, "inbox", "--as", "os/main", cwd=repo_a).stdout.decode())
+        # Once 120m elapses after the +119m repo-a heartbeat (at +240m), SILENT fires!
+        watch2_late = rc_at(t0 + 240 * M, "inbox", "--as", "os/main", cwd=repo_a).stdout.decode()
+        self.assertIn(scoped2, watch2_late)
+        self.assertIn("SILENT", watch2_late)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -9,7 +9,7 @@
 #pragma once
 #include "store.h"
 
-enum { PLACE_SILENT_DEFAULT = 120 };
+enum { PLACE_SILENT_DEFAULT = 120, PLACE_MAX_REPOS = 16 };
 
 typedef struct place {
     char *file;
@@ -19,12 +19,19 @@ typedef struct place {
     char why[128];
 } place;
 
+typedef struct repo_time {
+    char name[36];
+    uint64_t when;
+} repo_time;
+
 typedef struct session_info {
     uint64_t when;
     char lane[72];
     char agent[16];
     char repository[36];
     char session[72];
+    repo_time repos[PLACE_MAX_REPOS];
+    size_t repo_count;
     bool legacy;
 } session_info;
 

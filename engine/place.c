@@ -1,6 +1,6 @@
 #include "place.h"
 
-enum { MOST_SESSION_FILE = 512, MOST_CAS_ATTEMPTS = 64 };
+enum { MOST_SESSION_FILE = 2048, MOST_CAS_ATTEMPTS = 64 };
 
 static bool take_word(char *to, size_t room, const char **at) {
     while (**at == ' ') ++*at;
@@ -300,6 +300,29 @@ static void copy_slice(char *to, size_t room, const char *from, size_t n) {
     to[take] = 0;
 }
 
+static void repo_time_upsert(session_info *info, const char *repo, uint64_t when) {
+    if (!repo || !*repo || !repo_ok(repo)) return;
+    for (size_t i = 0; i < info->repo_count; i++) {
+        if (same(info->repos[i].name, repo)) {
+            if (when > info->repos[i].when) info->repos[i].when = when;
+            return;
+        }
+    }
+    if (info->repo_count < PLACE_MAX_REPOS) {
+        size_t i = info->repo_count++;
+        copy_str(info->repos[i].name, sizeof info->repos[i].name, repo);
+        info->repos[i].when = when;
+        return;
+    }
+    size_t oldest = 0;
+    for (size_t i = 1; i < PLACE_MAX_REPOS; i++)
+        if (info->repos[i].when < info->repos[oldest].when) oldest = i;
+    if (when > info->repos[oldest].when) {
+        copy_str(info->repos[oldest].name, sizeof info->repos[oldest].name, repo);
+        info->repos[oldest].when = when;
+    }
+}
+
 bool place_parse_session(const char *data, size_t length, session_info *out) {
     *out = (session_info){0};
     if (!data || !length) return false;
@@ -331,6 +354,17 @@ bool place_parse_session(const char *data, size_t length, session_info *out) {
         } else if (line_len >= 9 && starts(line, "session: ")) {
             copy_slice(out->session, sizeof out->session, line + 9, line_len - 9);
             have_session = true;
+        } else if (line_len >= 11 && starts(line, "repo-time: ")) {
+            size_t sep = 11;
+            while (sep < line_len && line[sep] != ' ') sep++;
+            if (sep == 11 || sep + 1 >= line_len) return false;
+            char rname[36];
+            size_t rlen = sep - 11;
+            if (rlen >= sizeof rname) return false;
+            copy_slice(rname, sizeof rname, line + 11, rlen);
+            uint64_t rt = 0;
+            if (!repo_ok(rname) || !parse_u64(line + sep + 1, line_len - sep - 1, &rt)) return false;
+            repo_time_upsert(out, rname, rt);
         } else if (line_len == 8 && starts(line, "end: yes")) {
             have_end = true;
         }
@@ -339,11 +373,18 @@ bool place_parse_session(const char *data, size_t length, session_info *out) {
     return have_time && (have_end || (have_agent && have_repo && have_session && data[length - 1] == '\n'));
 }
 
-static void format_session(text *out, uint64_t when, const char *agent, const char *repository, const char *session) {
+static void format_session(text *out, uint64_t when, const char *agent, const char *repository, const char *session,
+                           const session_info *repos_src) {
     add(out, "time: "), add_number(out, when, 0), add(out, "\n");
     add(out, "agent: "), add(out, agent ? agent : ""), add(out, "\n");
     add(out, "repository: "), add(out, repository ? repository : ""), add(out, "\n");
     add(out, "session: "), add(out, session ? session : ""), add(out, "\n");
+    if (repos_src) {
+        for (size_t i = 0; i < repos_src->repo_count; i++) {
+            add(out, "repo-time: "), add(out, repos_src->repos[i].name), add(out, " ");
+            add_number(out, repos_src->repos[i].when, 0), add(out, "\n");
+        }
+    }
     add(out, "end: yes\n");
 }
 
@@ -566,7 +607,16 @@ s_result place_hello(store *s, const char *lane, const char *agent, const char *
 
         text next_path = {0}, data = {0};
         session_seq_path(s, &next_path, base.data, next_seq);
-        format_session(&data, now, use_agent, rp, ss);
+        session_info merged = {0};
+        if (*ss) {
+            if (have_existing) {
+                for (size_t i = 0; i < existing.repo_count; i++)
+                    repo_time_upsert(&merged, existing.repos[i].name, existing.repos[i].when);
+                if (*existing.repository) repo_time_upsert(&merged, existing.repository, existing.when);
+            }
+            if (*rp) repo_time_upsert(&merged, rp, now);
+        }
+        format_session(&data, now, use_agent, rp, ss, *ss ? &merged : NULL);
         if (next_path.failed || data.failed) {
             text_free(&next_path), text_free(&data), text_free(&base);
             return s->why = "out of memory", S_DAMAGED;
