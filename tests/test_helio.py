@@ -2622,6 +2622,52 @@ class Sessions(Base):
         info2 = info_healed
         abandoned_part.unlink()
 
+        # Legacy 0-byte generation from an interrupted older Windows writer (both successor beside intact predecessor
+        # and gen-0 with no predecessor) recovers cleanly and sweeps the dead 0-byte file!
+        empty_succ = self.store / f"sessions/{base_r1}~9999"
+        put(empty_succ, "")
+        rc_es, info_es = self.read_session("os/apps", "race-1")
+        self.assertEqual((rc_es, info_es["agent"], info_es["repository"], info_es["when"]), (0, "antigravity", "race-repo", info2["when"]))
+        r_es = self.helio("inbox", "--session", "race-1", me=None, cwd=repo)
+        self.assertEqual((r_es.returncode, r_es.stderr), (1, b""))
+        self.assertFalse(empty_succ.exists())
+        rc_es2, info_es2 = self.read_session("os/apps", "race-1")
+        self.assertEqual((rc_es2, info_es2["agent"], info_es2["repository"]), (0, "antigravity", "race-repo"))
+        info2 = info_es2
+
+        empty_g0 = self.store / "sessions/os+emptygen0"
+        put(empty_g0, "")
+        r_g0 = self.helio("hello", "codex", me="os/emptygen0", cwd=repo)
+        self.assertEqual((r_g0.returncode, r_g0.stderr), (0, b""))
+        self.assertFalse(empty_g0.exists())
+        rc_g0, info_g0 = self.read_session("os/emptygen0", "")
+        self.assertEqual((rc_g0, info_g0["agent"]), (0, "codex"))
+        for p in list((self.store / "sessions").iterdir()):
+            if p.name == "os+emptygen0" or p.name.startswith("os+emptygen0~"):
+                p.unlink()
+
+        # Concurrent refresh sweeps hello's newly published N+1 before hello verifies: hello retries cleanly and succeeds!
+        p_ver = subprocess.Popen(
+            [str(RACER), "--pause-cli", "hello-verify", str(self.store), "hello", "antigravity", "--store", str(self.store), "--as", "os/apps", "--session", "race-1"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=repo, env=clean,
+        )
+        try:
+            deadline = time.time() + 15
+            while not (self.store / "paused.hello-verify").exists():
+                self.assertLess(time.time(), deadline)
+                time.sleep(0.01)
+            r_sweep = self.helio("inbox", "--session", "race-1", me=None, cwd=repo)
+            self.assertEqual((r_sweep.returncode, r_sweep.stderr), (1, b""))
+            put(self.store / "resume.hello-verify", "go")
+            _, ver_err = p_ver.communicate(timeout=30)
+            self.assertEqual((p_ver.returncode, ver_err), (0, b""))
+        finally:
+            if p_ver.poll() is None:
+                p_ver.kill()
+        rc_ver, info_ver = self.read_session("os/apps", "race-1")
+        self.assertEqual((rc_ver, info_ver["agent"], info_ver["repository"]), (0, "antigravity", "race-repo"))
+        info2 = info_ver
+
         # I/O read error on a newer generation (e.g. unreadable directory at ~99999 beside intact predecessor)
         # MUST fail with S_DAMAGED rather than silently falling back to the older predecessor!
         bad_newer = self.store / f"sessions/{base_r1}~99999"

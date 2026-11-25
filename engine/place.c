@@ -235,29 +235,43 @@ static bool parse_session_filename(const char *name, size_t *base_len, char *lan
 typedef struct {
     const char *base;
     size_t base_len;
-    bool found;
-    uint64_t max_seq;
-} latest_scan;
+    uint64_t *seqs;
+    size_t count, cap;
+    bool failed;
+} seq_list;
 
-static bool collect_base_latest_cb(void *user, const char *name) {
-    latest_scan *ls = user;
+static bool collect_base_seqs_cb(void *user, const char *name) {
+    seq_list *sl = user;
     size_t blen = 0;
     char lane[72];
     uint64_t seq = 0;
     if (!parse_session_filename(name, &blen, lane, sizeof lane, &seq)) return true;
-    if (blen != ls->base_len) return true;
+    if (blen != sl->base_len) return true;
     for (size_t i = 0; i < blen; i++)
-        if (name[i] != ls->base[i]) return true;
-    if (!ls->found || seq > ls->max_seq) ls->found = true, ls->max_seq = seq;
+        if (name[i] != sl->base[i]) return true;
+    if (sl->count == sl->cap) {
+        size_t next = sl->cap ? sl->cap * 2 : 8;
+        uint64_t *grown = p_alloc(next * sizeof *grown);
+        if (!grown) { sl->failed = true; return false; }
+        for (size_t i = 0; i < sl->count; i++) grown[i] = sl->seqs[i];
+        p_free(sl->seqs);
+        sl->seqs = grown, sl->cap = next;
+    }
+    sl->seqs[sl->count++] = seq;
     return true;
 }
 
 /* Reads the highest published generation for base. Because p_create_excl publishes
    complete flushed payloads atomically via temp + link (Linux) or MoveFileExW without
-   replace (Windows), a published generation is never empty or partially written. */
+   replace (Windows), no current writer ever creates a 0-byte visible generation.
+   A 0-byte generation file can therefore only be a dead leftover from an interrupted
+   older Windows writer; we skip past 0-byte leftovers to recover an intact predecessor
+   (or report only_empty so place_hello can self-heal), while NEVER falling back past
+   an I/O read error or a non-empty corrupt/truncated file. */
 static p_result read_best_generation(const store *s, const char *base, bool *any_found, uint64_t *max_seq,
-                                     bool *valid_found, uint64_t *valid_seq, session_info *out) {
+                                     bool *valid_found, uint64_t *valid_seq, bool *only_empty, session_info *out) {
     *any_found = false, *max_seq = 0, *valid_found = false, *valid_seq = 0;
+    if (only_empty) *only_empty = false;
     *out = (session_info){0};
     text folder = {0};
     add(&folder, s->folder), add(&folder, "/sessions");
@@ -265,27 +279,69 @@ static p_result read_best_generation(const store *s, const char *base, bool *any
         text_free(&folder);
         return P_FAILED;
     }
-    latest_scan ls = {base, len(base), false, 0};
-    p_result lr = p_list(folder.data, collect_base_latest_cb, &ls);
+    seq_list sl = {base, len(base), NULL, 0, 0, false};
+    p_result lr = p_list(folder.data, collect_base_seqs_cb, &sl);
     text_free(&folder);
-    if (lr == P_MISSING) return P_OK;
-    if (lr != P_OK) return lr;
-    if (!ls.found) return P_OK;
-    *any_found = true;
-    *max_seq = ls.max_seq;
-    text path = {0};
-    session_seq_path(s, &path, base, ls.max_seq);
-    if (path.failed) {
-        text_free(&path);
-        return P_FAILED;
+    if (lr == P_MISSING) {
+        p_free(sl.seqs);
+        return P_OK;
     }
-    bool parsed = false;
-    p_result rr = read_session_file(path.data, out, &parsed, NULL);
-    text_free(&path);
-    if (rr == P_MISSING) return P_MISSING;
-    if (rr != P_OK) return P_FAILED;
-    if (parsed) *valid_found = true, *valid_seq = ls.max_seq;
-    return P_OK;
+    if (lr != P_OK || sl.failed) {
+        p_free(sl.seqs);
+        return lr != P_OK ? lr : P_FAILED;
+    }
+    if (!sl.count) {
+        p_free(sl.seqs);
+        return P_OK;
+    }
+    for (size_t i = 0; i < sl.count; i++)
+        for (size_t j = i + 1; j < sl.count; j++)
+            if (sl.seqs[j] > sl.seqs[i]) {
+                uint64_t tmp = sl.seqs[i];
+                sl.seqs[i] = sl.seqs[j], sl.seqs[j] = tmp;
+            }
+    *any_found = true;
+    *max_seq = sl.seqs[0];
+    bool any_missing = false, saw_empty = false;
+    for (size_t i = 0; i < sl.count; i++) {
+        text path = {0};
+        session_seq_path(s, &path, base, sl.seqs[i]);
+        if (path.failed) {
+            text_free(&path);
+            p_free(sl.seqs);
+            return P_FAILED;
+        }
+        bool parsed = false, is_empty = false;
+        p_result rr = read_session_file(path.data, out, &parsed, &is_empty);
+        text_free(&path);
+        if (rr == P_MISSING) {
+            any_missing = true;
+            continue;
+        }
+        if (rr != P_OK) {
+            p_free(sl.seqs);
+            return P_FAILED;
+        }
+        if (parsed) {
+            *valid_found = true;
+            *valid_seq = sl.seqs[i];
+            p_free(sl.seqs);
+            return P_OK;
+        }
+        if (is_empty) {
+            saw_empty = true;
+            continue;
+        }
+        /* Non-empty corrupt/truncated file: refuse without falling back. */
+        p_free(sl.seqs);
+        return P_OK;
+    }
+    p_free(sl.seqs);
+    if (saw_empty) {
+        if (only_empty) *only_empty = true;
+        return P_OK;
+    }
+    return any_missing ? P_MISSING : P_OK;
 }
 
 /* Lock-free monotonic CAS: each update atomically creates `<base>` (seq 0) or
@@ -316,12 +372,12 @@ s_result place_hello(store *s, const char *lane, const char *agent, const char *
     if (s->pause) s->pause(s->pause_user, "hello-write");
 
     for (int attempt = 0; attempt < MOST_CAS_ATTEMPTS; attempt++) {
-        bool any_found = false, have_existing = false;
+        bool any_found = false, have_existing = false, only_empty = false;
         uint64_t max_seq = 0, valid_seq = 0;
         session_info existing = {0};
-        p_result br = read_best_generation(s, base.data, &any_found, &max_seq, &have_existing, &valid_seq, &existing);
+        p_result br = read_best_generation(s, base.data, &any_found, &max_seq, &have_existing, &valid_seq, &only_empty, &existing);
         if (br == P_MISSING) continue; /* Concurrent writer swept all seen generations; retry. */
-        if (br != P_OK || (any_found && !have_existing)) {
+        if (br != P_OK || (any_found && !have_existing && !only_empty)) {
             text_free(&base);
             return s->why = "the existing session cannot be read", S_DAMAGED;
         }
@@ -349,11 +405,17 @@ s_result place_hello(store *s, const char *lane, const char *agent, const char *
             continue;
         }
         if (cr == P_OK || cr == P_UNFLUSHED) {
-            /* Verify our newly written generation next_seq itself is readable and not superseded. */
+            /* Verify our newly written generation next_seq itself is readable and not superseded.
+               Retry P_MISSING if a concurrent peer swept next_seq while publishing next_seq+1. */
+            if (s->pause) s->pause(s->pause_user, "hello-verify");
             bool chk_any = false, chk_valid = false;
             uint64_t chk_max = 0, chk_vseq = 0;
             session_info chk_info = {0};
-            p_result chkr = read_best_generation(s, base.data, &chk_any, &chk_max, &chk_valid, &chk_vseq, &chk_info);
+            p_result chkr = P_MISSING;
+            for (int v = 0; v < 8; v++) {
+                chkr = read_best_generation(s, base.data, &chk_any, &chk_max, &chk_valid, &chk_vseq, NULL, &chk_info);
+                if (chkr != P_MISSING) break;
+            }
             if (chkr != P_OK || !chk_any || !chk_valid || chk_vseq < next_seq) {
                 text_free(&next_path), text_free(&base);
                 return s->why = "the session was written, but could not be verified", S_DAMAGED;
@@ -369,6 +431,12 @@ s_result place_hello(store *s, const char *lane, const char *agent, const char *
                 session_seq_path(s, &sweep, base.data, valid_seq);
                 if (!sweep.failed) p_remove(sweep.data);
                 text_free(&sweep);
+            }
+            if (any_found && (!have_existing || max_seq != valid_seq)) {
+                text empty_sweep = {0};
+                session_seq_path(s, &empty_sweep, base.data, max_seq);
+                if (!empty_sweep.failed) p_remove(empty_sweep.data);
+                text_free(&empty_sweep);
             }
             text_free(&next_path), text_free(&base);
             if (cr == P_UNFLUSHED) return s->why = "the session was written, but its folder could not be flushed", S_DAMAGED;
@@ -394,7 +462,7 @@ s_result place_session(store *s, const char *lane, const char *session, session_
     for (int attempt = 0; attempt < 8; attempt++) {
         bool any_found = false, valid_found = false;
         uint64_t max_seq = 0, valid_seq = 0;
-        p_result br = read_best_generation(s, base.data, &any_found, &max_seq, &valid_found, &valid_seq, out);
+        p_result br = read_best_generation(s, base.data, &any_found, &max_seq, &valid_found, &valid_seq, NULL, out);
         if (br == P_MISSING) continue;
         text_free(&base);
         if (br == P_OK && !any_found) return S_NOTHING;
@@ -473,7 +541,7 @@ p_result place_each_session(store *s, bool (*each)(void *user, const session_inf
         for (int attempt = 0; attempt < 8; attempt++) {
             bool any_found = false, valid_found = false;
             uint64_t max_seq = 0, valid_seq = 0;
-            p_result br = read_best_generation(s, map.items[i].base, &any_found, &max_seq, &valid_found, &valid_seq, &info);
+            p_result br = read_best_generation(s, map.items[i].base, &any_found, &max_seq, &valid_found, &valid_seq, NULL, &info);
             if (br == P_MISSING) continue;
             if (br == P_OK && !any_found) {
                 gone = true;
