@@ -48,7 +48,7 @@ title: "TODO-01 -- Heliograph"
 | 11 | §11 | Take the next job as a queue | §10 | [ ] |
 | 12 | §12 | Expiry of seen heads-ups and findings | §3, §4 | [ ] |
 | 13 | §13 | Design and help that match the program | §11, §12, §14 | [ ] |
-| 14 | §14 | Unowned paths kept to their repository | §4, §6 | [ ] |
+| 14 | §14 | Unowned paths kept to their repository | §4, §6 | [x] |
 | 15 | §15 | Quick installer | -- | [x] |
 | 16 | §16 | Installer for Windows sessions | §15 | [x] |
 | 17 | §17 | Installed program replaced after a tested phase | §15, §16 | [x] |
@@ -408,6 +408,9 @@ A path that no lane owns goes to whoever works in that repository, and to the ow
 - [x] Commit: `routing: an unowned path stays in its repository`
 
 **Test checkpoint:** `python3 ../ImpossibleSDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted. **Corrected 2026-11-26:** Impossible SDK's folder is now `SDK` (051e1c9), so the command is `python3 ../SDK/tools/app_build.py .`.
+
+> **Verified:** 2026-11-26 | §14 | 5f18e62b045e2a163d4579daecd1c281cf94a615
+> **Review:** `docs/reviews/d01-t01-s14.json`
 
 ## 15. Quick installer
 
