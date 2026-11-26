@@ -29,6 +29,7 @@ typedef struct session_info {
     uint64_t order;       /* one past the session's highest order when written; older records have 0 */
     uint64_t agent_order; /* the order of the write that last named the agent */
     uint64_t agent_when;  /* when the agent was last named; a record without the line counts its own time */
+    uint64_t newest;      /* from place_session: the newest time of any of the session's keys; `when` stays this record's own */
     char lane[72];
     char agent[16];
     char repository[36];
@@ -56,6 +57,7 @@ bool place_parse_session(const char *data, size_t length, session_info *out);
 s_result place_hello(store *s, const char *lane, const char *agent, const char *repository, const char *session);
 s_result place_session(store *s, const char *lane, const char *session, session_info *out);
 s_result place_session_repo(store *s, const char *lane, const char *session, const char *repository, session_info *out);
+/* The session's last sign of life in one repository, or in any when repository is empty. */
 uint64_t place_session_repo_when(const session_info *info, const char *repository);
 p_result place_each_session(store *s, bool (*each)(void *user, const session_info *info), void *user);
 p_result place_lane_sessions(store *s, const char *lane, bool (*each)(void *user, const session_info *info), void *user);

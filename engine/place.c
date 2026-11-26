@@ -791,24 +791,36 @@ static bool collect_repo_keys_cb(void *user, const char *name) {
 typedef struct {
     session_info latest; /* the record with the highest (order, time) */
     uint64_t newest;     /* the newest time of any record */
-    char agent[16];
+    char agent[16], agent_repo[36];
     uint64_t agent_order, agent_when;
     bool have;
 } session_merge;
 
+/* Orders two names byte by byte: the last tie-break, so no choice ever depends on listing order. */
+static int name_order(const char *a, const char *b) {
+    for (; *a && *a == *b; a++, b++) {}
+    return (unsigned char)*a - (unsigned char)*b;
+}
+
 static void merge_record(session_merge *m, const session_info *r) {
-    if (!m->have || r->order > m->latest.order || (r->order == m->latest.order && r->when > m->latest.when)) m->latest = *r;
+    if (!m->have || r->order > m->latest.order ||
+        (r->order == m->latest.order && (r->when > m->latest.when ||
+                                          (r->when == m->latest.when && name_order(r->repository, m->latest.repository) > 0))))
+        m->latest = *r;
     if (!m->have || r->when > m->newest) m->newest = r->when;
-    if (*r->agent && (!*m->agent || r->agent_order > m->agent_order || (r->agent_order == m->agent_order && r->agent_when > m->agent_when))) {
+    if (*r->agent && (!*m->agent || r->agent_order > m->agent_order ||
+                      (r->agent_order == m->agent_order && (r->agent_when > m->agent_when ||
+                                                            (r->agent_when == m->agent_when && name_order(r->repository, m->agent_repo) > 0))))) {
         copy_str(m->agent, sizeof m->agent, r->agent);
+        copy_str(m->agent_repo, sizeof m->agent_repo, r->repository);
         m->agent_order = r->agent_order, m->agent_when = r->agent_when;
     }
     m->have = true;
 }
 
 /* A session across its keys (outside a repository, the record an older build wrote under its name,
-   and each repository): the repository it wrote last by order, the agent it named last by agent
-   order, its highest order, and as its time the newest time of any key, which is what liveness reads. */
+   and each repository): the record it wrote last by order (with that record's own time), the agent
+   it named last by agent order, and in `newest` the newest time of any key for unscoped liveness. */
 s_result place_session(store *s, const char *lane, const char *session, session_info *out) {
     *out = (session_info){0};
     if (!lane || !address_ok(lane, false) || !session_ok(session)) return s->why = "invalid lane or session", S_REFUSED;
@@ -856,8 +868,10 @@ s_result place_session(store *s, const char *lane, const char *session, session_
     text_free(&prefix);
     if (result == S_DAMAGED) return S_DAMAGED;
     if (!m.have) return S_NOTHING;
+    /* The latest record keeps its own time, so a repository is never paired with another key's time;
+       the newest time of any key is `newest`, read by unscoped liveness alone. */
     *out = m.latest;
-    out->when = m.newest;
+    out->newest = m.newest;
     copy_str(out->agent, sizeof out->agent, m.agent);
     out->agent_order = m.agent_order, out->agent_when = m.agent_when;
     return S_OK;
@@ -865,7 +879,7 @@ s_result place_session(store *s, const char *lane, const char *session, session_
 
 uint64_t place_session_repo_when(const session_info *info, const char *repository) {
     if (!info) return 0;
-    if (!repository || !*repository) return info->when;
+    if (!repository || !*repository) return info->newest > info->when ? info->newest : info->when;
     uint64_t best = same(info->repository, repository) ? info->when : 0;
     for (size_t i = 0; i < info->legacy_repo_count; i++) {
         if (same(info->legacy_repos[i].name, repository) && info->legacy_repos[i].when > best)
@@ -1046,8 +1060,62 @@ static p_result each_session_filtered(store *s, const char *only_lane, const cha
     return had_error ? P_FAILED : P_OK;
 }
 
+typedef struct {
+    store *s;
+    bool (*each)(void *user, const session_info *info);
+    void *user;
+    char **seen;
+    size_t count, cap;
+    bool failed;
+} one_row;
+
+/* A named session has a key in each repository it worked in; the full listing gives it once, merged. */
+static bool one_row_cb(void *user, const session_info *info) {
+    one_row *o = user;
+    if (!*info->session) return o->each(o->user, info);
+    text id = {0};
+    add(&id, info->lane), add(&id, "\n"), add(&id, info->session);
+    if (id.failed) {
+        text_free(&id);
+        o->failed = true;
+        return false;
+    }
+    for (size_t i = 0; i < o->count; i++)
+        if (same(o->seen[i], id.data)) {
+            text_free(&id);
+            return true;
+        }
+    if (o->count == o->cap) {
+        size_t next = o->cap ? o->cap * 2 : 16;
+        char **grown = p_alloc(next * sizeof *grown);
+        if (!grown) {
+            text_free(&id);
+            o->failed = true;
+            return false;
+        }
+        for (size_t i = 0; i < o->count; i++) grown[i] = o->seen[i];
+        p_free(o->seen);
+        o->seen = grown, o->cap = next;
+    }
+    o->seen[o->count] = copy(id.data, id.length);
+    text_free(&id);
+    if (!o->seen[o->count]) {
+        o->failed = true;
+        return false;
+    }
+    o->count++;
+    session_info merged = {0};
+    s_result r = place_session(o->s, info->lane, info->session, &merged);
+    if (r == S_DAMAGED) o->failed = true;
+    return r == S_OK ? o->each(o->user, &merged) : true;
+}
+
 p_result place_each_session(store *s, bool (*each)(void *user, const session_info *info), void *user) {
-    return each_session_filtered(s, NULL, NULL, each, user);
+    one_row o = {s, each, user, NULL, 0, 0, false};
+    p_result r = each_session_filtered(s, NULL, NULL, one_row_cb, &o);
+    for (size_t i = 0; i < o.count; i++) p_free(o.seen[i]);
+    p_free(o.seen);
+    return r == P_OK && o.failed ? P_FAILED : r;
 }
 
 p_result place_lane_sessions(store *s, const char *lane, bool (*each)(void *user, const session_info *info), void *user) {

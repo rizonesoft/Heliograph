@@ -4616,7 +4616,9 @@ class RepositoryRouting(Base):
         put(self.store / f"sessions/os+dev+r{digest}+repo-c~99", f"time: {ahead}\norder: 1\nagent: claude\nagent-order: 1\nrepository: repo-c\nsession: w\nend: yes\n")
         self.assertEqual(self.helio("hello", "codex", "--session", "w", me="os/dev", cwd=repos["repo-d"]).returncode, 0)
         rc_k, info_k = self.read_session("os/dev", "w")
-        self.assertEqual((rc_k, info_k["agent"], info_k["repository"], int(info_k["when"])), (0, "codex", "repo-d", ahead))
+        self.assertEqual((rc_k, info_k["agent"], info_k["repository"], int(info_k["newest"])), (0, "codex", "repo-d", ahead))
+        # The record keeps repo-d's own time: a repository is never paired with another key's time.
+        self.assertLess(int(info_k["when"]), ahead)
         # Naming an agent while one of the session's keys cannot be read refuses and writes nothing.
         d_key = f"os+dev+r{digest}+repo-d"
         unreadable = self.store / f"sessions/os+dev+r{digest}+repo-c~99999"
@@ -4721,6 +4723,41 @@ class RepositoryRouting(Base):
         self.assertFalse(empty.exists())
         rc_h, healed = self.read_session("os/dev", "t")
         self.assertEqual((rc_h, healed["agent"], healed["repository"]), (0, "claude", "repo-a"))
+
+    def test_a_merged_session_never_lends_another_keys_time_to_a_repository(self):
+        """An owner inbox loads a session unscoped for a session-addressed heads-up, then checks a take in
+        repo-d by the same session. A key of repo-c with a clock an hour ahead must not keep it from SILENT."""
+        repos = {}
+        for name in ("repo-c", "repo-d"):
+            repos[name] = self.store / name
+            repos[name].mkdir()
+            put(repos[name] / "helio.conf", f"project: os\nrepository: {name}\n")
+        clean = {k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "ANTIGRAVITY_CONVERSATION_ID")}
+
+        def rc_at(us, *args, cwd, body=b""):
+            return subprocess.run([str(RACER), "--now", str(us), *args, "--store", str(self.store)],
+                                  input=body, capture_output=True, timeout=30, cwd=cwd, env=clean)
+        now = int(time.time() * 1_000_000)
+        t0 = now - 200 * 60 * 1_000_000
+        self.assertEqual(rc_at(t0, "hello", "claude", "--as", "os/dev", "--session", "w", cwd=repos["repo-d"]).returncode, 0)
+        r_tell = rc_at(t0 + 10, "tell", "os/dev", "Ping", "--for-session", "w", "--as", "os/main", cwd=repos["repo-d"], body=b"hi")
+        self.assertEqual(r_tell.returncode, 0, r_tell.stderr)
+        r_ask = rc_at(t0 + 20, "ask", "path:docs/x.md", "Work in d", "--as", "os/main", cwd=repos["repo-d"], body=b"work")
+        self.assertEqual(r_ask.returncode, 0, r_ask.stderr)
+        job = r_ask.stdout.decode().strip()
+        self.assertIn("repository: repo-d\n", (self.store / f"messages/{job}.post").read_text())
+        self.assertEqual(rc_at(t0 + 30, "take", job, "--as", "os/dev", "--session", "w", cwd=repos["repo-d"]).returncode, 0)
+        digest = hashlib.sha256(b"w").hexdigest()[:32]
+        ahead = now + 3600 * 1_000_000
+        put(self.store / f"sessions/os+dev+r{digest}+repo-c", f"time: {ahead}\nagent: claude\nrepository: repo-c\nsession: w\nend: yes\n")
+        owner = self.helio(me="os/owner", cwd=repos["repo-d"])
+        lines = [ln for ln in owner.stdout.decode().splitlines() if job in ln]
+        self.assertEqual(len(lines), 1, owner.stdout.decode())
+        self.assertIn("SILENT", lines[0])
+        # The full listing gives the session once although it has a key in two repositories.
+        rows = [row for row in Sessions.parse_racer_sessions(self, subprocess.run([str(RACER), "--list-sessions", str(self.store)], capture_output=True, timeout=30).stdout.decode()) if row.get("session") == "w"]
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual((rows[0]["repository"], rows[0]["agent"]), ("repo-d", "claude"))
 
 if __name__ == "__main__":
     unittest.main()

@@ -161,6 +161,7 @@ static bool print_one_session(void *user, const session_info *info) {
     text out = {0};
     add(&out, "lane="), add(&out, info->lane);
     add(&out, "\twhen="), add_number(&out, info->when, 0);
+    add(&out, "\tnewest="), add_number(&out, info->newest > info->when ? info->newest : info->when, 0);
     add(&out, "\tagent="), add(&out, info->agent);
     add(&out, "\trepository="), add(&out, info->repository);
     add(&out, "\tsession="), add(&out, info->session);

@@ -32,8 +32,8 @@ bool is_session_silent(const session_info *sessions, size_t session_count, const
     if (!lane || !*lane || !session || !*session || !silent_us) return false;
     uint64_t last = since_us;
     for (size_t i = 0; i < session_count; i++) {
-        if (same(sessions[i].lane, lane) && same(sessions[i].session, session) && sessions[i].when > last)
-            last = sessions[i].when;
+        if (same(sessions[i].lane, lane) && same(sessions[i].session, session) && place_session_repo_when(&sessions[i], "") > last)
+            last = place_session_repo_when(&sessions[i], "");
     }
     return clock_now > last && (clock_now - last) >= silent_us;
 }
