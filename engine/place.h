@@ -28,6 +28,7 @@ typedef struct session_info {
     uint64_t when;
     uint64_t order;       /* one past the session's highest order when written; older records have 0 */
     uint64_t agent_order; /* the order of the write that last named the agent */
+    uint64_t agent_when;  /* when the agent was last named; a record without the line counts its own time */
     char lane[72];
     char agent[16];
     char repository[36];

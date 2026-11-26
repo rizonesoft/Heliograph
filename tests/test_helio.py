@@ -4658,5 +4658,69 @@ class RepositoryRouting(Base):
             self.assertIn("to: os/all\n", post, mid)
             self.assertIn("repository: repo-a\n", post, mid)
 
+    def test_the_agent_named_last_survives_ties_upgrades_and_empty_leftovers(self):
+        repos = {}
+        for name in ("repo-a", "repo-b"):
+            repos[name] = self.store / name
+            repos[name].mkdir()
+            put(repos[name] / "helio.conf", f"project: os\nrepository: {name}\n")
+        digest = hashlib.sha256(b"t").hexdigest()[:32]
+        clean = {k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "ANTIGRAVITY_CONVERSATION_ID")}
+
+        # Two explicit names racing in two repositories read the same highest order and tie on agent
+        # order. Whichever reads as the agent stays it through refreshes that name none, in either repository.
+        self.assertEqual(self.helio("hello", "claude", "--session", "t", me="os/dev", cwd=repos["repo-a"]).returncode, 0)
+        racing = subprocess.Popen(
+            [str(RACER), "--pause-cli", "hello-write", str(self.store), "hello", "antigravity", "--store", str(self.store), "--as", "os/dev", "--session", "t"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=repos["repo-a"], env=clean,
+        )
+        try:
+            deadline = time.time() + 15
+            while not (self.store / "paused.hello-write").exists():
+                self.assertLess(time.time(), deadline)
+                time.sleep(0.01)
+            self.assertEqual(self.helio("hello", "codex", "--session", "t", me="os/dev", cwd=repos["repo-b"]).returncode, 0)
+        finally:
+            put(self.store / "resume.hello-write", "go")
+            _, racing_err = racing.communicate(timeout=30)
+        self.assertEqual((racing.returncode, racing_err), (0, b""))
+        for f in ("paused.hello-write", "resume.hello-write"):
+            if (self.store / f).exists():
+                (self.store / f).unlink()
+        orders = {}
+        for name in ("repo-a", "repo-b"):
+            files = sorted(p for p in (self.store / "sessions").iterdir() if p.name.startswith(f"os+dev+r{digest}+{name}"))
+            body = files[-1].read_text()
+            orders[name] = [ln for ln in body.splitlines() if ln.startswith("agent-order: ")]
+        self.assertEqual(orders["repo-a"], orders["repo-b"], "the two names did not tie on agent order")
+        rc0, first = self.read_session("os/dev", "t")
+        self.assertEqual(rc0, 0)
+        for where in ("repo-a", "repo-b", "repo-a", "repo-b"):
+            r = self.helio("inbox", "--session", "t", me="os/dev", cwd=repos[where])
+            self.assertEqual((r.returncode in (0, 1), r.stderr), (True, b""))
+            rc, now_info = self.read_session("os/dev", "t")
+            self.assertEqual((rc, now_info["agent"]), (0, first["agent"]), f"a refresh in {where} changed the agent")
+
+        # Records from the build that wrote `agent-time:` and no order: claude was named in repo-a, codex
+        # later in repo-b, then repo-a was refreshed without a name. codex is still the agent.
+        for p in list((self.store / "sessions").iterdir()):
+            p.unlink()
+        t1 = int(time.time() * 1_000_000) - 3000
+        put(self.store / f"sessions/os+dev+r{digest}+repo-a", f"time: {t1 + 2000}\nagent: claude\nagent-time: {t1}\nrepository: repo-a\nsession: t\nend: yes\n")
+        put(self.store / f"sessions/os+dev+r{digest}+repo-b", f"time: {t1 + 1000}\nagent: codex\nagent-time: {t1 + 1000}\nrepository: repo-b\nsession: t\nend: yes\n")
+        rc_u, upgraded = self.read_session("os/dev", "t")
+        self.assertEqual((rc_u, upgraded["agent"], upgraded["repository"]), (0, "codex", "repo-a"))
+
+        # A named hello retried after its first write was cut short (an empty first generation) heals it.
+        for p in list((self.store / "sessions").iterdir()):
+            p.unlink()
+        empty = self.store / f"sessions/os+dev+r{digest}+repo-a"
+        put(empty, "")
+        r_heal = self.helio("hello", "claude", "--session", "t", me="os/dev", cwd=repos["repo-a"])
+        self.assertEqual((r_heal.returncode, r_heal.stderr), (0, b""))
+        self.assertFalse(empty.exists())
+        rc_h, healed = self.read_session("os/dev", "t")
+        self.assertEqual((rc_h, healed["agent"], healed["repository"]), (0, "claude", "repo-a"))
+
 if __name__ == "__main__":
     unittest.main()

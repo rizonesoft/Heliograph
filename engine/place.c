@@ -345,6 +345,8 @@ bool place_parse_session(const char *data, size_t length, session_info *out) {
             have_time = true;
         } else if (line_len >= 7 && starts(line, "order: ")) {
             if (!parse_u64(line + 7, line_len - 7, &out->order)) return false;
+        } else if (line_len >= 12 && starts(line, "agent-time: ")) {
+            if (!parse_u64(line + 12, line_len - 12, &out->agent_when)) return false;
         } else if (line_len >= 13 && starts(line, "agent-order: ")) {
             if (!parse_u64(line + 13, line_len - 13, &out->agent_order)) return false;
         } else if (line_len >= 7 && starts(line, "agent: ")) {
@@ -377,14 +379,19 @@ bool place_parse_session(const char *data, size_t length, session_info *out) {
         }
         pos = end < length ? end + 1 : length;
     }
-    return have_time && (have_end || (have_agent && have_repo && have_session && data[length - 1] == '\n'));
+    bool whole = have_time && (have_end || (have_agent && have_repo && have_session && data[length - 1] == '\n'));
+    if (whole && *out->agent && !out->agent_when) out->agent_when = out->when;
+    return whole;
 }
 
-static void format_session(text *out, uint64_t when, uint64_t order, const char *agent, uint64_t agent_order, const char *repository, const char *session) {
+static void format_session(text *out, uint64_t when, uint64_t order, const char *agent, uint64_t agent_order, uint64_t agent_when, const char *repository, const char *session) {
     add(out, "time: "), add_number(out, when, 0), add(out, "\n");
     add(out, "order: "), add_number(out, order, 0), add(out, "\n");
     add(out, "agent: "), add(out, agent ? agent : ""), add(out, "\n");
-    if (agent && *agent) add(out, "agent-order: "), add_number(out, agent_order, 0), add(out, "\n");
+    if (agent && *agent) {
+        add(out, "agent-order: "), add_number(out, agent_order, 0), add(out, "\n");
+        add(out, "agent-time: "), add_number(out, agent_when, 0), add(out, "\n");
+    }
     add(out, "repository: "), add(out, repository ? repository : ""), add(out, "\n");
     add(out, "session: "), add(out, session ? session : ""), add(out, "\n");
     add(out, "end: yes\n");
@@ -593,10 +600,11 @@ static p_result read_best_generation(const store *s, const char *base, bool *any
 
    Which record is the session's latest is a logical order, never the clock, which can step back:
    a named session's write reads only the order of its other keys and records `order:` one past the
-   highest, and a call that names the agent records `agent-order:` as that order, while a call that
-   names none keeps its key's agent and agent order. The clock's `time:` says only when the session
-   was last alive. Readers take the latest repository by order, the agent by agent order, and the
-   liveness time as the newest time of any key.
+   highest, and a call that names the agent records `agent-order:` as that order and `agent-time:` as
+   when it was named, while a call that names none keeps its key's agent, agent order and agent time.
+   The clock's `time:` says only when the session was last alive. Readers take the latest repository
+   by order, the agent by agent order then agent time (which only naming an agent changes, so a
+   refresh that names none never decides it), and the liveness time as the newest time of any key.
 
    Within one key, each update atomically creates `<base>` (seq 0) or `<base>~<seq+1>` via
    p_create_excl. On P_EXISTS another writer won that slot, so we re-read the latest generation,
@@ -621,10 +629,11 @@ static s_result publish_session_key(store *s, const char *base, const char *ag, 
         uint64_t own = have_existing ? existing.order : 0;
         uint64_t order = (own > order_floor ? own : order_floor) + 1;
         uint64_t agent_order = *ag ? order : (have_existing ? existing.agent_order : 0);
+        uint64_t agent_when = *ag ? now : (have_existing ? existing.agent_when : 0);
 
         text next_path = {0}, data = {0};
         session_seq_path(s, &next_path, base, next_seq);
-        format_session(&data, now, order, use_agent, agent_order, rp, ss);
+        format_session(&data, now, order, use_agent, agent_order, agent_when, rp, ss);
         if (next_path.failed || data.failed) {
             text_free(&next_path), text_free(&data);
             return s->why = "out of memory", S_DAMAGED;
@@ -719,18 +728,25 @@ s_result place_hello(store *s, const char *lane, const char *agent, const char *
     return r;
 }
 
-static s_result read_session_by_base(store *s, const char *lane, const char *base, session_info *out) {
+/* empty_is_nothing: a key whose only generations are 0-byte leftovers of an interrupted older writer
+   counts as absent, as publish_session_key heals it, so the session-wide read does not refuse it. */
+static s_result read_session_key(store *s, const char *lane, const char *base, session_info *out, bool empty_is_nothing) {
     for (int attempt = 0; attempt < 8; attempt++) {
-        bool any_found = false, valid_found = false;
+        bool any_found = false, valid_found = false, only_empty = false;
         uint64_t max_seq = 0, valid_seq = 0;
-        p_result br = read_best_generation(s, base, &any_found, &max_seq, &valid_found, &valid_seq, NULL, false, out);
+        p_result br = read_best_generation(s, base, &any_found, &max_seq, &valid_found, &valid_seq, &only_empty, false, out);
         if (br == P_MISSING) continue;
         if (br == P_OK && !any_found) return S_NOTHING;
+        if (br == P_OK && !valid_found && only_empty && empty_is_nothing) return *out = (session_info){0}, S_NOTHING;
         if (br != P_OK || !valid_found) return s->why = "the session cannot be read", S_DAMAGED;
         copy_str(out->lane, sizeof out->lane, lane);
         return S_OK;
     }
     return s->why = "the session cannot be read", S_DAMAGED;
+}
+
+static s_result read_session_by_base(store *s, const char *lane, const char *base, session_info *out) {
+    return read_session_key(s, lane, base, out, false);
 }
 
 typedef struct {
@@ -783,9 +799,9 @@ typedef struct {
 static void merge_record(session_merge *m, const session_info *r) {
     if (!m->have || r->order > m->latest.order || (r->order == m->latest.order && r->when > m->latest.when)) m->latest = *r;
     if (!m->have || r->when > m->newest) m->newest = r->when;
-    if (*r->agent && (!*m->agent || r->agent_order > m->agent_order || (r->agent_order == m->agent_order && r->when > m->agent_when))) {
+    if (*r->agent && (!*m->agent || r->agent_order > m->agent_order || (r->agent_order == m->agent_order && r->agent_when > m->agent_when))) {
         copy_str(m->agent, sizeof m->agent, r->agent);
-        m->agent_order = r->agent_order, m->agent_when = r->when;
+        m->agent_order = r->agent_order, m->agent_when = r->agent_when;
     }
     m->have = true;
 }
@@ -803,7 +819,7 @@ s_result place_session(store *s, const char *lane, const char *session, session_
         text_free(&base);
         return s->why = "out of memory", S_DAMAGED;
     }
-    s_result r = read_session_by_base(s, lane, base.data, out);
+    s_result r = read_session_key(s, lane, base.data, out, true);
     text_free(&base);
     if (r == S_DAMAGED || !*ss) return r;
     session_merge m = {0};
@@ -812,7 +828,7 @@ s_result place_session(store *s, const char *lane, const char *session, session_
     text old = {0};
     legacy_session_base(&old, lane, ss);
     session_info oi = {0};
-    s_result orr = old.failed ? (s->why = "out of memory", S_DAMAGED) : read_session_by_base(s, lane, old.data, &oi);
+    s_result orr = old.failed ? (s->why = "out of memory", S_DAMAGED) : read_session_key(s, lane, old.data, &oi, true);
     text_free(&old);
     if (orr == S_DAMAGED) return S_DAMAGED;
     if (orr == S_OK) merge_record(&m, &oi);
@@ -831,7 +847,7 @@ s_result place_session(store *s, const char *lane, const char *session, session_
     if ((lr != P_OK && lr != P_MISSING) || bl.failed) result = (s->why = "the sessions folder cannot be read", S_DAMAGED);
     for (size_t i = 0; i < bl.count && result != S_DAMAGED; i++) {
         session_info ri = {0};
-        s_result rr = read_session_by_base(s, lane, bl.bases[i], &ri);
+        s_result rr = read_session_key(s, lane, bl.bases[i], &ri, true);
         if (rr == S_DAMAGED) result = S_DAMAGED;
         else if (rr == S_OK) merge_record(&m, &ri);
     }
@@ -843,7 +859,7 @@ s_result place_session(store *s, const char *lane, const char *session, session_
     *out = m.latest;
     out->when = m.newest;
     copy_str(out->agent, sizeof out->agent, m.agent);
-    out->agent_order = m.agent_order;
+    out->agent_order = m.agent_order, out->agent_when = m.agent_when;
     return S_OK;
 }
 
