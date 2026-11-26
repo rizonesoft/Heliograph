@@ -343,6 +343,8 @@ bool place_parse_session(const char *data, size_t length, session_info *out) {
         if (line_len >= 6 && starts(line, "time: ")) {
             if (!parse_u64(line + 6, line_len - 6, &out->when)) return false;
             have_time = true;
+        } else if (line_len >= 12 && starts(line, "agent-time: ")) {
+            if (!parse_u64(line + 12, line_len - 12, &out->agent_when)) return false;
         } else if (line_len >= 7 && starts(line, "agent: ")) {
             copy_slice(out->agent, sizeof out->agent, line + 7, line_len - 7);
             have_agent = true;
@@ -373,12 +375,15 @@ bool place_parse_session(const char *data, size_t length, session_info *out) {
         }
         pos = end < length ? end + 1 : length;
     }
-    return have_time && (have_end || (have_agent && have_repo && have_session && data[length - 1] == '\n'));
+    bool whole = have_time && (have_end || (have_agent && have_repo && have_session && data[length - 1] == '\n'));
+    if (whole && !out->agent_when && *out->agent) out->agent_when = out->when;
+    return whole;
 }
 
-static void format_session(text *out, uint64_t when, const char *agent, const char *repository, const char *session) {
+static void format_session(text *out, uint64_t when, const char *agent, uint64_t agent_when, const char *repository, const char *session) {
     add(out, "time: "), add_number(out, when, 0), add(out, "\n");
     add(out, "agent: "), add(out, agent ? agent : ""), add(out, "\n");
+    if (agent && *agent) add(out, "agent-time: "), add_number(out, agent_when, 0), add(out, "\n");
     add(out, "repository: "), add(out, repository ? repository : ""), add(out, "\n");
     add(out, "session: "), add(out, session ? session : ""), add(out, "\n");
     add(out, "end: yes\n");
@@ -578,18 +583,24 @@ static p_result read_best_generation(const store *s, const char *base, bool *any
 }
 
 /* One key holds one heartbeat: a lane, its session name and the one repository it ran in
-   (`<lane>+r<32-hex>+<repo>`), a named session outside a repository (`<lane>+<hex>`), or a
+   (`<lane>+r<32-hex>+<repo>`), a named session outside any repository (`<lane>+o<32-hex>`), or a
    sessionless lane with or without a repository (`<lane>++<repo>`, `<lane>`). A refresh writes
-   only its own key and never copies, moves or supersedes another key, so a heartbeat that is on
-   disk when a reader starts looking stays under its own name: there is no hand-over between keys
-   for a reader to fall into. Records written by older builds under the named key (`<lane>+<hex>`,
-   with `repository:` and legacy `repo-time:` lines) are read where they lie and never rewritten.
+   only its own key and never reads, copies, moves or supersedes another key, so a heartbeat that
+   is on disk when a reader starts looking stays under its own name: there is no hand-over between
+   keys for a reader to fall into. Records older builds wrote under the session's name
+   (`<lane>+<hex>`, with `repository:` and legacy `repo-time:` lines) are read where they lie and
+   never written.
+
+   The agent is a fact with its own time (`agent-time:`): a call that names one records it with the
+   refresh's time, and a call that names none keeps its key's agent and that agent's time. Readers
+   take the agent with the newest agent time across the session's keys, so an implicit refresh,
+   however late it lands, never outranks an agent named elsewhere after it.
 
    Within one key, each update atomically creates `<base>` (seq 0) or `<base>~<seq+1>` via
    p_create_excl. On P_EXISTS another writer won that slot, so we re-read the latest generation,
    merge monotonically, and retry. After publishing, the superseded generation is removed
    best-effort. */
-static s_result publish_session_key(store *s, const char *base, const char *ag, const session_info *newest, const char *rp, const char *ss) {
+static s_result publish_session_key(store *s, const char *base, const char *ag, const char *rp, const char *ss) {
     if (s->pause) s->pause(s->pause_user, "hello-write");
 
     for (int attempt = 0; attempt < MOST_CAS_ATTEMPTS; attempt++) {
@@ -601,19 +612,15 @@ static s_result publish_session_key(store *s, const char *base, const char *ag, 
         if (br != P_OK || (any_found && !have_existing && !only_empty))
             return s->why = "the existing session cannot be read", S_DAMAGED;
 
-        /* No agent named: the newer of this key's record and the session's newest record says it. */
-        const char *use_agent = ag;
-        if (!*use_agent) {
-            bool newest_wins = newest && *newest->agent && (!have_existing || newest->when > existing.when);
-            use_agent = newest_wins ? newest->agent : (have_existing ? existing.agent : "");
-        }
         uint64_t next_seq = any_found ? max_seq + 1 : 0;
         uint64_t now = p_now();
         if (have_existing && now <= existing.when) now = existing.when + 1;
+        const char *use_agent = *ag ? ag : (have_existing ? existing.agent : "");
+        uint64_t agent_when = *ag ? now : (have_existing ? existing.agent_when : 0);
 
         text next_path = {0}, data = {0};
         session_seq_path(s, &next_path, base, next_seq);
-        format_session(&data, now, use_agent, rp, ss);
+        format_session(&data, now, use_agent, agent_when, rp, ss);
         if (next_path.failed || data.failed) {
             text_free(&next_path), text_free(&data);
             return s->why = "out of memory", S_DAMAGED;
@@ -690,11 +697,7 @@ s_result place_hello(store *s, const char *lane, const char *agent, const char *
         return s->why = "the session cannot be announced", S_DAMAGED;
     }
     text_free(&folder);
-    /* A call that names no agent keeps the one the session last gave: its newest record in any
-       repository, unless this key's own record is newer. Only the name is read; no heartbeat moves. */
-    session_info newest = {0};
-    if (!*ag && *ss && place_session(s, lane, ss, &newest) != S_OK) newest = (session_info){0};
-    s_result r = publish_session_key(s, base.data, ag, &newest, rp, ss);
+    s_result r = publish_session_key(s, base.data, ag, rp, ss);
     text_free(&base);
     return r;
 }
@@ -752,8 +755,8 @@ static bool collect_repo_keys_cb(void *user, const char *name) {
     return true;
 }
 
-/* The session's newest heartbeat in any repository: its key outside a repository, the record an older
-   build wrote under the session's name, and each of its repository keys. */
+/* The session's newest heartbeat in any repository (its key outside a repository, the record an older
+   build wrote under the session's name, and each of its repository keys), with the agent it named last. */
 s_result place_session(store *s, const char *lane, const char *session, session_info *out) {
     *out = (session_info){0};
     if (!lane || !address_ok(lane, false) || !session_ok(session)) return s->why = "invalid lane or session", S_REFUSED;
@@ -768,12 +771,16 @@ s_result place_session(store *s, const char *lane, const char *session, session_
     text_free(&base);
     if (r == S_DAMAGED || !*ss) return r;
     bool have = r == S_OK;
+    char agent[sizeof out->agent] = {0};
+    uint64_t agent_when = 0;
+    if (have && *out->agent) copy_str(agent, sizeof agent, out->agent), agent_when = out->agent_when;
     text old = {0};
     legacy_session_base(&old, lane, ss);
     session_info oi = {0};
     s_result orr = old.failed ? (s->why = "out of memory", S_DAMAGED) : read_session_by_base(s, lane, old.data, &oi);
     text_free(&old);
     if (orr == S_DAMAGED) return S_DAMAGED;
+    if (orr == S_OK && *oi.agent && oi.agent_when > agent_when) copy_str(agent, sizeof agent, oi.agent), agent_when = oi.agent_when;
     if (orr == S_OK && (!have || oi.when > out->when)) *out = oi, have = true;
 
     text prefix = {0}, folder = {0};
@@ -791,9 +798,16 @@ s_result place_session(store *s, const char *lane, const char *session, session_
     for (size_t i = 0; i < bl.count && result != S_DAMAGED; i++) {
         session_info ri = {0};
         s_result rr = read_session_by_base(s, lane, bl.bases[i], &ri);
-        if (rr == S_DAMAGED) result = S_DAMAGED;
-        else if (rr == S_OK && (!have || ri.when > out->when)) *out = ri, have = true, result = S_OK;
+        if (rr == S_DAMAGED) {
+            result = S_DAMAGED;
+            continue;
+        }
+        if (rr != S_OK) continue;
+        if (*ri.agent && ri.agent_when > agent_when) copy_str(agent, sizeof agent, ri.agent), agent_when = ri.agent_when;
+        if (!have || ri.when > out->when) *out = ri, have = true, result = S_OK;
     }
+    /* The heartbeat is the newest record's; the agent is the one named most recently in any key. */
+    if (have && agent_when) copy_str(out->agent, sizeof out->agent, agent), out->agent_when = agent_when;
     for (size_t i = 0; i < bl.count; i++) p_free(bl.bases[i]);
     p_free(bl.bases);
     text_free(&prefix);

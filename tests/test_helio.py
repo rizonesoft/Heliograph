@@ -4527,9 +4527,11 @@ class RepositoryRouting(Base):
         self.assertEqual(self.helio("hello", "claude", "--session", "w", me="os/dev", cwd=repos["repo-a"]).returncode, 0)
         # A record an older build wrote under the session's key outside a repository, with inline times.
         now_us = int(time.time() * 1_000_000)
-        put(self.store / f"sessions/os+dev+{'w'.encode().hex()}",
-            f"time: {now_us}\nagent: claude\nrepository: repo-c\nsession: w\nrepo-time: repo-d {now_us - 5}\nend: yes\n")
-        self.assertEqual(self.helio("hello", "codex", me="os/other", cwd=repos["repo-a"]).returncode, 0)
+        legacy = self.store / f"sessions/os+dev+{'w'.encode().hex()}"
+        legacy_body = f"time: {now_us}\nagent: claude\nrepository: repo-c\nsession: w\nrepo-time: repo-d {now_us - 5}\nend: yes\n"
+        put(legacy, legacy_body)
+        # Another lane's key, kept out of repo-a so it never makes repo-a busy for the routing check below.
+        self.assertEqual(self.helio("hello", "codex", me="os/other", cwd=repos["repo-b"]).returncode, 0)
 
         def snapshot():
             return {p.name: p.read_bytes() for p in (self.store / "sessions").iterdir()}
@@ -4553,11 +4555,8 @@ class RepositoryRouting(Base):
             rc, info = self.read_session("os/dev", "w")
             self.assertEqual((rc, info["agent"]), (0, "claude"))
 
-        # The older build's record still gives repo-d's inline time after every refresh above.
-        rc_d, info_d = self.read_session("os/dev", "w")
-        self.assertEqual(rc_d, 0)
-        r_live = subprocess.run([str(RACER), "--list-sessions", str(self.store)], capture_output=True, timeout=30)
-        self.assertIn(f"repository=repo-c".encode(), r_live.stdout)
+        # The older build's record is still on disk, byte for byte, with its inline repo-d time.
+        self.assertEqual(legacy.read_text(), legacy_body)
 
         # Returning to a repository keeps the agent the session gave last, not the one that key held.
         self.assertEqual(self.helio("hello", "codex", "--session", "w", me="os/dev", cwd=repos["repo-b"]).returncode, 0)
@@ -4566,6 +4565,31 @@ class RepositoryRouting(Base):
         rc_a, info_a = self.read_session("os/dev", "w")
         self.assertEqual((rc_a, info_a["agent"], info_a["repository"]), (0, "codex", "repo-a"))
 
+        # The same while racing: a refresh in repo-a that names no agent starts and pauses before it writes,
+        # the session names antigravity in repo-b, then repo-a lands later with a newer time. The agent
+        # named last still wins.
+        clean = {k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "ANTIGRAVITY_CONVERSATION_ID")}
+        late = subprocess.Popen(
+            [str(RACER), "--pause-cli", "hello-write", str(self.store), "inbox", "--store", str(self.store), "--as", "os/dev", "--session", "w"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=repos["repo-a"], env=clean,
+        )
+        try:
+            deadline = time.time() + 15
+            while not (self.store / "paused.hello-write").exists():
+                self.assertLess(time.time(), deadline)
+                time.sleep(0.01)
+            self.assertEqual(self.helio("hello", "antigravity", "--session", "w", me="os/dev", cwd=repos["repo-b"]).returncode, 0)
+            self.assertIsNone(late.poll(), "the paused refresh exited before resume")
+        finally:
+            put(self.store / "resume.hello-write", "go")
+            _, late_err = late.communicate(timeout=30)
+        self.assertIn(late.returncode, (0, 1), late_err)
+        for f in ("paused.hello-write", "resume.hello-write"):
+            if (self.store / f).exists():
+                (self.store / f).unlink()
+        rc_l, info_l = self.read_session("os/dev", "w")
+        self.assertEqual((rc_l, info_l["agent"]), (0, "antigravity"))
+
         # End to end: while the session refreshes in b, c and d over and over, every unowned path sent
         # in repo-a still finds the worker there and stays in repo-a.
         stop = time.time() + 6
@@ -4573,7 +4597,7 @@ class RepositoryRouting(Base):
         def churn():
             i = 0
             while time.time() < stop:
-                refreshes.append(self.helio("inbox", "--session", "w", me="os/dev", cwd=repos[("repo-b", "repo-c", "repo-d")[i % 3]]).returncode)
+                refreshes.append(self.helio("hello", "claude", "--session", "w", me="os/dev", cwd=repos[("repo-b", "repo-c", "repo-d")[i % 3]]).returncode)
                 i += 1
         import threading
         worker = threading.Thread(target=churn)
@@ -4586,7 +4610,7 @@ class RepositoryRouting(Base):
             worker.join()
         self.assertGreater(len(sent), 5)
         self.assertGreater(len(refreshes), 5)
-        self.assertTrue(all(code in (0, 1) for code in refreshes), refreshes)
+        self.assertTrue(all(code == 0 for code in refreshes), refreshes)
         for mid in sent:
             post = (self.store / f"messages/{mid}.post").read_text()
             self.assertIn("to: os/all\n", post, mid)
