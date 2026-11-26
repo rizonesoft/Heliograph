@@ -28,17 +28,18 @@ Sections: 3 | Checklist items: 19
 
 ### Phase 2: The right reader
 
-Sections: 7 | Checklist items: 37
+Sections: 8 | Checklist items: 41
 
-| Status | Reference   | Deliverable                            | Needs | Items |
-| ------ | ----------- | -------------------------------------- | ----- | ----- |
-| [x]    | D01 T01 §4  | Sessions announced by every call       | none  | 5     |
-| [x]    | D01 T01 §5  | Report of a silent taker               | none  | 6     |
-| [x]    | D01 T01 §6  | Messages for one session               | none  | 5     |
-| [x]    | D01 T01 §7  | Projects kept apart in log and show    | none  | 4     |
-| [x]    | D01 T01 §8  | Mark for landed work                   | none  | 5     |
-| [x]    | D01 T01 §9  | Fixed marks around every shown message | none  | 4     |
-| [ ]    | D01 T01 §14 | Unowned paths kept to their repository | none  | 8     |
+| Status | Reference   | Deliverable                                        | Needs | Items |
+| ------ | ----------- | -------------------------------------------------- | ----- | ----- |
+| [x]    | D01 T01 §4  | Sessions announced by every call                   | none  | 5     |
+| [x]    | D01 T01 §5  | Report of a silent taker                           | none  | 6     |
+| [x]    | D01 T01 §6  | Messages for one session                           | none  | 5     |
+| [x]    | D01 T01 §7  | Projects kept apart in log and show                | none  | 4     |
+| [x]    | D01 T01 §8  | Mark for landed work                               | none  | 5     |
+| [x]    | D01 T01 §9  | Fixed marks around every shown message             | none  | 4     |
+| [ ]    | D01 T01 §14 | Unowned paths kept to their repository             | none  | 8     |
+| [ ]    | D01 T01 §18 | Session tie and listing tests held to their result | none  | 4     |
 
 ### Phase 3: Scripts and queues
 
@@ -51,6 +52,6 @@ Sections: 4 | Checklist items: 19
 | [ ]    | D01 T01 §12 | Expiry of seen heads-ups and findings  | none  | 4     |
 | [ ]    | D01 T01 §13 | Design and help that match the program | none  | 4     |
 
-Progress: 12/17 verified sections, 3 ready to run now.
+Progress: 12/18 verified sections, 3 ready to run now.
 
-Checklist: 80/99 items completed (includes Commit items).
+Checklist: 80/103 items completed (includes Commit items).

@@ -52,6 +52,7 @@ title: "TODO-01 -- Heliograph"
 | 15 | §15 | Quick installer | -- | [x] |
 | 16 | §16 | Installer for Windows sessions | §15 | [x] |
 | 17 | §17 | Installed program replaced after a tested phase | §15, §16 | [x] |
+| 18 | §18 | Session tie and listing tests held to their result | §14 | [ ] |
 
 ## 1. Steps that notice an archived job
 
@@ -506,6 +507,26 @@ When a phase is closed and everything is tested, the program that the sessions u
 
 > **Verified:** 2026-11-24 | §17 | bad7ff6ca4483ebfa1f78a397b98fef5a9729cd8
 > **Review:** `docs/reviews/d01-t01-s17.json`
+
+## 18. Session tie and listing tests held to their result
+
+Filed 2026-11-26 from the last reconciliation of `D01 T01 §14` (`docs/reviews/01-heliograph/D01-T01-s14.md`, gaps 25 and 40, both P3). §14 breaks an exact tie between two named agents (same agent order, same agent time) on the repository name, but its regression forces only equal agent orders, so removing that last tie-break leaves the test passing whenever the two naming times differ. The one-row listing assertion parses the racer's output without checking its exit code, so a listing that prints the expected row and then fails would pass.
+
+**Phase:** 2
+**Needs:** none
+**Surface:** no
+
+**Build order:**
+
+1. Force an exact tie in `tests/test_helio.py` and assert its winner. Done when: removing the repository-name tie-break in `merge_record` of `engine/place.c` makes it fail.
+2. Check the listing's exit code. Done when: a listing that fails after printing is refused by the test.
+
+- [ ] Write two records for one named session in `tests/test_helio.py` (`RepositoryRouting`), one per repository, with equal `order:`, `agent-order:` and `agent-time:` and different agents, then read the session with `--read-session`. Done when: the agent and repository of the repository name that sorts last are read, the same after the two keys are written in the other order, and the same after a refresh that names no agent in each repository. Cheaper substitute: equal agent orders alone.
+- [ ] Prove the case is held by the tie-break: build with the repository-name comparison removed from `merge_record` and `name_order` of `engine/place.c` and run the case. Done when: it fails there and passes on the section's commit, both results in the commit body.
+- [ ] Check the exit code of `--list-sessions` before its rows are parsed in `test_a_merged_session_never_lends_another_keys_time_to_a_repository` of `tests/test_helio.py`. Done when: the test asserts exit 0 and fails when the racer is made to return 3 after printing.
+- [ ] Commit: `tests: an exact agent tie and the session listing are held to their result`
+
+**Test checkpoint:** `python3 ../SDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
 
 ## Verification
 
