@@ -592,7 +592,8 @@ static p_result read_best_generation(const store *s, const char *base, bool *any
    never written.
 
    The agent is a fact with its own time (`agent-time:`): a call that names one records it with the
-   refresh's time, and a call that names none keeps its key's agent and that agent's time. Readers
+   refresh's time, or one past the session's newest agent time when the clock is behind it, and a call
+   that names none keeps its key's agent and that agent's time without reading any other key. Readers
    take the agent with the newest agent time across the session's keys, so an implicit refresh,
    however late it lands, never outranks an agent named elsewhere after it.
 
@@ -600,7 +601,7 @@ static p_result read_best_generation(const store *s, const char *base, bool *any
    p_create_excl. On P_EXISTS another writer won that slot, so we re-read the latest generation,
    merge monotonically, and retry. After publishing, the superseded generation is removed
    best-effort. */
-static s_result publish_session_key(store *s, const char *base, const char *ag, const char *rp, const char *ss) {
+static s_result publish_session_key(store *s, const char *base, const char *ag, uint64_t agent_floor, const char *rp, const char *ss) {
     if (s->pause) s->pause(s->pause_user, "hello-write");
 
     for (int attempt = 0; attempt < MOST_CAS_ATTEMPTS; attempt++) {
@@ -616,7 +617,7 @@ static s_result publish_session_key(store *s, const char *base, const char *ag, 
         uint64_t now = p_now();
         if (have_existing && now <= existing.when) now = existing.when + 1;
         const char *use_agent = *ag ? ag : (have_existing ? existing.agent : "");
-        uint64_t agent_when = *ag ? now : (have_existing ? existing.agent_when : 0);
+        uint64_t agent_when = *ag ? (now > agent_floor ? now : agent_floor + 1) : (have_existing ? existing.agent_when : 0);
 
         text next_path = {0}, data = {0};
         session_seq_path(s, &next_path, base, next_seq);
@@ -697,7 +698,12 @@ s_result place_hello(store *s, const char *lane, const char *agent, const char *
         return s->why = "the session cannot be announced", S_DAMAGED;
     }
     text_free(&folder);
-    s_result r = publish_session_key(s, base.data, ag, rp, ss);
+    /* A call that names its agent dates it past every agent time the session already has, so a clock
+       that stepped back cannot hide it; only times are read, and a failed read leaves the clock's time. */
+    uint64_t agent_floor = 0;
+    session_info named = {0};
+    if (*ag && *ss && place_session(s, lane, ss, &named) == S_OK) agent_floor = named.agent_when;
+    s_result r = publish_session_key(s, base.data, ag, agent_floor, rp, ss);
     text_free(&base);
     return r;
 }

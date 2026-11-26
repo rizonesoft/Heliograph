@@ -4474,7 +4474,7 @@ class RepositoryRouting(Base):
         s4_lines = [ln for ln in r_log4.stdout.decode().splitlines() if scoped4 in ln]
         self.assertEqual(len(s4_lines), 1, r_log4.stdout.decode())
         self.assertNotIn("SILENT", s4_lines[0])
-        # (b) refreshing s4 in repo-b migrates repo-a's legacy timestamp BEFORE superseding canonical, keeping repo-a busy!
+        # (b) refreshing s4 in repo-b writes only its repo-b key and leaves the older record with repo-a's inline time, keeping repo-a busy!
         # Send as `os/main4` so os/main4's own heartbeat from inbox/log is excluded by busy_each!
         self.assertEqual(rc_at(t0 + 122 * M, "hello", "claude", "--session", "s4", "--as", "os/dev", cwd=repo_b).returncode, 0)
         mig_job = rc_at(t0 + 122 * M + 100, "ask", "path:docs/mig.md", "Migrated", "--as", "os/main4", cwd=repo_a, body=b"work").stdout.decode().strip()
@@ -4482,9 +4482,9 @@ class RepositoryRouting(Base):
         self.assertIn("to: os/all\n", mig_post)
         self.assertIn("repository: repo-a\n", mig_post)
 
-        # Paused mid-enumeration migration handoff: sender lists sessions while s5 only has canonical repo-a,
-        # pauses at sessions-after-list while s5 refreshes in repo-b (creating per-repo A and sweeping canonical A),
-        # then resumes -> place_busy rescans and STILL routes to os/all (in repo-a), NOT os/owner!
+        # Paused mid-enumeration refresh: sender lists sessions while s5 has only an older build's record for repo-a,
+        # pauses at sessions-after-list while s5 refreshes in repo-b (writing only its repo-b key, leaving that record),
+        # then resumes -> place_busy STILL routes to os/all (in repo-a), NOT os/owner!
         s5_hex = "s5".encode().hex()
         for sf in list((self.store / "sessions").iterdir()):
             sf.unlink()
@@ -4557,6 +4557,22 @@ class RepositoryRouting(Base):
 
         # The older build's record is still on disk, byte for byte, with its inline repo-d time.
         self.assertEqual(legacy.read_text(), legacy_body)
+        # And a reader still finds an inline time after foreign refreshes: session v of os/dev2 has only an
+        # older record whose inline time is for repo-e, which nobody else visits. After v refreshes in repo-b
+        # and outside any repository, an unowned path sent in repo-e still finds v there.
+        repos["repo-e"] = self.store / "repo-e"
+        repos["repo-e"].mkdir()
+        put(repos["repo-e"] / "helio.conf", "project: os\nrepository: repo-e\n")
+        v_now = int(time.time() * 1_000_000)
+        put(self.store / f"sessions/os+dev2+{'v'.encode().hex()}",
+            f"time: {v_now}\nagent: codex\nrepository: repo-b\nsession: v\nrepo-time: repo-e {v_now - 5}\nend: yes\n")
+        for where in (repos["repo-b"], nowhere):
+            r_v = self.helio("hello", "codex", "--session", "v", me="os/dev2", cwd=where)
+            self.assertEqual(r_v.returncode, 0, r_v.stderr)
+        mid_e = self.send("ask", "path:docs/inline.md", me="os/main", cwd=repos["repo-e"])
+        post_e = (self.store / f"messages/{mid_e}.post").read_text()
+        self.assertIn("to: os/all\n", post_e)
+        self.assertIn("repository: repo-e\n", post_e)
 
         # Returning to a repository keeps the agent the session gave last, not the one that key held.
         self.assertEqual(self.helio("hello", "codex", "--session", "w", me="os/dev", cwd=repos["repo-b"]).returncode, 0)
@@ -4579,16 +4595,32 @@ class RepositoryRouting(Base):
                 self.assertLess(time.time(), deadline)
                 time.sleep(0.01)
             self.assertEqual(self.helio("hello", "antigravity", "--session", "w", me="os/dev", cwd=repos["repo-b"]).returncode, 0)
+            _, at_b = self.read_session("os/dev", "w")
+            self.assertEqual(at_b["repository"], "repo-b")
             self.assertIsNone(late.poll(), "the paused refresh exited before resume")
         finally:
             put(self.store / "resume.hello-write", "go")
             _, late_err = late.communicate(timeout=30)
-        self.assertIn(late.returncode, (0, 1), late_err)
+        self.assertEqual((late.returncode in (0, 1), late_err), (True, b""))
         for f in ("paused.hello-write", "resume.hello-write"):
             if (self.store / f).exists():
                 (self.store / f).unlink()
         rc_l, info_l = self.read_session("os/dev", "w")
-        self.assertEqual((rc_l, info_l["agent"]), (0, "antigravity"))
+        # repo-a's implicit refresh published, later than repo-b's, and still did not take the agent back.
+        self.assertEqual((rc_l, info_l["agent"], info_l["repository"]), (0, "antigravity", "repo-a"))
+        self.assertGreater(int(info_l["when"]), int(at_b["when"]))
+
+        # A clock that stepped back: repo-c's record names claude with times an hour ahead. Naming codex in
+        # repo-d afterwards still makes codex the session's agent.
+        ahead = int(time.time() * 1_000_000) + 3600 * 1_000_000
+        put(self.store / f"sessions/os+dev+r{digest}+repo-c~99", f"time: {ahead}\nagent: claude\nagent-time: {ahead}\nrepository: repo-c\nsession: w\nend: yes\n")
+        self.assertEqual(self.helio("hello", "codex", "--session", "w", me="os/dev", cwd=repos["repo-d"]).returncode, 0)
+        rc_k, info_k = self.read_session("os/dev", "w")
+        self.assertEqual((rc_k, info_k["agent"]), (0, "codex"))
+        for p in list((self.store / "sessions").iterdir()):
+            if p.name.startswith(f"os+dev+r{digest}+repo-c"):
+                p.unlink()
+        self.assertEqual(self.helio("hello", "claude", "--session", "w", me="os/dev", cwd=repos["repo-c"]).returncode, 0)
 
         # End to end: while the session refreshes in b, c and d over and over, every unowned path sent
         # in repo-a still finds the worker there and stays in repo-a.
