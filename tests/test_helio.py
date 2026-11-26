@@ -4610,13 +4610,23 @@ class RepositoryRouting(Base):
         self.assertEqual((rc_l, info_l["agent"], info_l["repository"]), (0, "antigravity", "repo-a"))
         self.assertGreater(int(info_l["when"]), int(at_b["when"]))
 
-        # A clock that stepped back: repo-c's record names claude with times an hour ahead. Naming codex in
-        # repo-d afterwards still makes codex the session's agent.
+        # A clock that stepped back: repo-c's record names claude with a time an hour ahead. Naming codex in
+        # repo-d afterwards makes codex the agent and repo-d the latest repository; the time stays the newest.
         ahead = int(time.time() * 1_000_000) + 3600 * 1_000_000
-        put(self.store / f"sessions/os+dev+r{digest}+repo-c~99", f"time: {ahead}\nagent: claude\nagent-time: {ahead}\nrepository: repo-c\nsession: w\nend: yes\n")
+        put(self.store / f"sessions/os+dev+r{digest}+repo-c~99", f"time: {ahead}\norder: 1\nagent: claude\nagent-order: 1\nrepository: repo-c\nsession: w\nend: yes\n")
         self.assertEqual(self.helio("hello", "codex", "--session", "w", me="os/dev", cwd=repos["repo-d"]).returncode, 0)
         rc_k, info_k = self.read_session("os/dev", "w")
-        self.assertEqual((rc_k, info_k["agent"]), (0, "codex"))
+        self.assertEqual((rc_k, info_k["agent"], info_k["repository"], int(info_k["when"])), (0, "codex", "repo-d", ahead))
+        # Naming an agent while one of the session's keys cannot be read refuses and writes nothing.
+        d_key = f"os+dev+r{digest}+repo-d"
+        unreadable = self.store / f"sessions/os+dev+r{digest}+repo-c~99999"
+        unreadable.mkdir()
+        d_before = {p.name: p.read_bytes() for p in (self.store / "sessions").iterdir() if p.name.startswith(d_key)}
+        r_refused = self.helio("hello", "antigravity", "--session", "w", me="os/dev", cwd=repos["repo-d"])
+        self.assertEqual(r_refused.returncode, 3, r_refused.stderr)
+        self.assertIn(b"agent is not changed", r_refused.stderr)
+        self.assertEqual({p.name: p.read_bytes() for p in (self.store / "sessions").iterdir() if p.name.startswith(d_key)}, d_before)
+        unreadable.rmdir()
         for p in list((self.store / "sessions").iterdir()):
             if p.name.startswith(f"os+dev+r{digest}+repo-c"):
                 p.unlink()
