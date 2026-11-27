@@ -54,7 +54,7 @@ title: "TODO-01 -- Heliograph"
 | 17 | §17 | Installed program replaced after a tested phase | §15, §16 | [x] |
 | 18 | §18 | Session tie and listing tests held to their result | §14 | [x] |
 | 19 | §19 | Archive paths opened without following a swapped folder | §3 | [x] |
-| 20 | §20 | Windows launches from WSL that survive an interop timeout | §17 | [ ] |
+| 20 | §20 | Windows launches from WSL that survive an interop timeout | §17 | [x] |
 
 ## 1. Steps that notice an archived job
 
@@ -610,9 +610,12 @@ Filed 2026-11-27 from the `D01 T01 §18` and `§19` gate runs: 3 of 6 `python3 .
 - [x] Ship the module with the installer: every fixture that copies `tools/install.py` into a standalone checkout copies `tools/win_launch.py` too. Done when: the standalone installer tests pass and a fixture without the module fails with a message that names it.
   **Corrected 2026-11-27 (build):** the repeat policy lives in the launching functions, not at their call sites: `_run_clean_win_helio` repeats `check` and `show` only, `_run_win_cli` `--status` only, and the snapshot unittest run is `_run_snapshot_proof`, started once, so each policy is one place a test can reach. The two Windows temporary folders the tests made with `mkdtemp` now take a name made in WSL and `exist_ok`, so they are repeatable.
   **Corrected 2026-11-27 (plan review, `docs/reviews/01-heliograph/D01-T01-s20.md`):** findings 1 to 9 folded in: forwarding for `--status` (1), `check` applied after the repeats and bytes or text kept (2), one-shot test fixtures single-start unless given a stable identity (3), the SDK decision and the snapshot proof classified (4), coverage defined at the WSL-to-Windows boundary with `Popen` named (5), policy tested through the real call paths (6), the exact predicate tested (7), loading by file path and shipping with fixtures (8), delays recorded (9).
-- [ ] Commit: `install: a Windows launch the WSL relay timed out is started again`
+- [x] Commit: `install: a Windows launch the WSL relay timed out is started again`
 
 **Test checkpoint:** `python3 ../SDK/tools/app_build.py .` exits 0; the predicate, timing and policy tests fail with the repeat removed and with any one call's `repeatable` reversed.
+
+> **Verified:** 2026-11-27 | §20 | 12e35c188b362c11a192602b8895bb447eacad13
+> **Review:** `docs/reviews/d01-t01-s20.json`
 
 ## Verification
 
