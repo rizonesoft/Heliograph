@@ -1917,7 +1917,10 @@ class Archive(Base):
     def test_archive_folder_created_meanwhile_is_never_damage(self):
         # The first archive creates archive/, and the first archive of a new month creates archive/<month>/, while a
         # taker asks whether a live job was archived. A folder that appeared between two looks once read as "not a
-        # real directory", so the take failed as damaged. Each folder is made to come and go on its own.
+        # real directory", so the take failed as damaged. Each folder is made to come and go on its own. Nothing in
+        # Heliograph removes these folders, so the folder leaves by a rename away (one step on both systems) and the
+        # renamed copy is removed: removing it in place leaves it "delete pending" on NTFS, refused to every look,
+        # a state the real case never has.
         import threading
 
         st = self.store
@@ -1931,10 +1934,14 @@ class Archive(Base):
                 errors = []
 
                 def flip():
+                    n = 0
                     try:
                         while not stop.is_set():
+                            gone = st / f"gone-{folder.name}-{n}"
+                            n += 1
                             folder.mkdir()
-                            folder.rmdir()
+                            folder.rename(gone)
+                            gone.rmdir()
                     except OSError as e:
                         errors.append(e)
 
