@@ -619,6 +619,7 @@ static int show(store *s, const char *id, actor me, const place *here) {
     message_free(&m);
     if (!print(&out)) return fail("the output cannot be written", 3);
     int known = lr != S_OK ? fail("a step of this job is damaged", 3) : 0; /* known before the reply: inside it */
+    if (alert_err && reply.on) fail("the alert state cannot be read", 3); /* known too; the seen mark still follows */
     /* The reply goes before the seen mark, so a message is never marked seen when its reply was not written; a seen
        mark that then fails shows in the exit code alone. */
     if (!reply_send()) return 3;
@@ -881,7 +882,9 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
     s.pause_user = pause_user;
     if (o->here.found && place_record_silent(&s, &o->here) != P_OK)
         fail("the project's silent threshold could not be saved", 0);
-    if ((which == 0 || which == 1) && address_ok(o->me, false)) announce_best_effort(&s, o, "");
+    /* With --json, show announces first too: its reply goes before its seen mark, so a warning after it would be lost. */
+    bool announce_first = which == 0 || which == 1 || (which == 3 && reply.on);
+    if (announce_first && address_ok(o->me, false)) announce_best_effort(&s, o, "");
     else if (which == 8) announce_best_effort(&s, o, "claude");
     bool summary_err = false;
     if (which == 0 || which == 8) {
@@ -953,7 +956,7 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
                                                                            : store_end(&s, o->words[1], me, which == 6, note);
         code = result == S_OK ? 0 : fail(s.why, result);
     }
-    if (which != 0 && which != 1 && which != 8 && which != 15 && address_ok(o->me, false)) announce_best_effort(&s, o, "");
+    if (!announce_first && which != 8 && which != 15 && address_ok(o->me, false)) announce_best_effort(&s, o, "");
     store_close(&s);
     return code;
 }
