@@ -120,3 +120,26 @@ COMPLETION: gaps
 - Implemented: repaired the returning lane losing its broadcast after the last read before the removal (gap 1) in 9427c06
 - Implemented: repaired the unread broadcast skipping the heartbeat read (gap 2) in 9427c06
 - Implemented: repaired the race test to compare the archived post bytes (gap 3) in 9427c06
+
+## Reconciliation review: astra (`gpt-6.2-astra` via `codex`)
+
+- Writer: claude
+- Run: 2026-11-27T19:27:06Z
+- Candidate: ed484581b8eff130f261640da183f183b4422d1d
+- Effort: low
+- Lenses: adversarial, integration, plan-delivery, record
+- Lines: 12
+- Digest: 1cce7cdde2806482
+
+1. **open, P1. A lane that returns before removal can still lose its unread broadcast.** Path: The lane completes `hello` while the post is live. The archiver removes the post and is interrupted before it can restore it. Evidence: traced. Removal happens at `engine/archive.c:960`, and the `after-remove-post` pause at `engine/archive.c:966` precedes both the audience check and restoration at `engine/archive.c:970`. On restart, recovery accepts the archived copy at `engine/archive.c:1008` and marks the post removed at `engine/archive.c:1028` without checking the returning lane. The regression waits for the mover to finish at `tests/test_helio.py:2859` before checking delivery. It proves restoration by a surviving mover. The implementation claim at `docs/reviews/01-heliograph/D01-T01-s12.md:120` therefore remains partial.
+2. **closed. An unread broadcast now defers the summary when its audience cannot be read.** Audience enumeration runs with zero qualifying marks at `engine/archive.c:844`, and a failed listing returns damage at `engine/archive.c:852`. The regression at `tests/test_helio.py:2872` checks summary deferral, archive exit 3 with the message ID, and the saved held count after heartbeat repair. This supports the implementation record at `docs/reviews/01-heliograph/D01-T01-s12.md:121`.
+3. **closed. The concurrent read and keyed-retry test now compares the post bytes.** It captures the live bytes before the race at `tests/test_helio.py:2916` and compares the archived post directly against them at `tests/test_helio.py:2939`. The mark and log checks remain in place. This supports the implementation record at `docs/reviews/01-heliograph/D01-T01-s12.md:122`.
+
+**New finding, P2. A lane that first returns after removal can resurrect a completed broadcast.** Path: An eligible broadcast is removed, then another lane completes `hello` before the archiver’s next audience check. Evidence: traced. The interval starts at `engine/archive.c:966`. The read at `engine/archive.c:967` includes that new heartbeat, and `engine/archive.c:970` restores the post to the live store. This moves the decision past removal, contrary to the unchanged contract at `todo/01-heliograph/TODO-01-heliograph.md:371`. Both findings arise because the post-removal check cannot distinguish which side of removal the heartbeat was published on.
+
+LENS adversarial: findings  
+LENS integration: findings  
+LENS plan-delivery: findings  
+LENS record: findings  
+HIGHEST: P1  
+RECONCILIATION: gaps
