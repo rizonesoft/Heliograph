@@ -32,8 +32,12 @@ def relay_timed_out(result: subprocess.CompletedProcess) -> bool:
     """True only for a start the relay timed out: exit 1, nothing on stdout, and stderr that one relay line."""
     if result.returncode != 1 or _text(result.stdout):
         return False
-    lines = _text(result.stderr).strip("\r\n").splitlines()
-    return len(lines) == 1 and bool(RELAY_LINE.match(lines[0]))
+    err = _text(result.stderr)
+    for end in ("\r\n", "\n"):  # one line ending at most; any other line, blank ones too, is not the relay alone
+        if err.endswith(end):
+            err = err[: -len(end)]
+            break
+    return "\n" not in err and "\r" not in err and bool(RELAY_LINE.match(err))
 
 
 def run_windows(
@@ -62,7 +66,13 @@ def run_windows(
         result = run(list(argv), **run_args)
     if forward:
         for stream, data in ((sys.stdout, result.stdout), (sys.stderr, result.stderr)):
-            if data:
+            if not data:
+                continue
+            if isinstance(data, bytes) and hasattr(stream, "buffer"):
+                stream.flush()
+                stream.buffer.write(data)  # the bytes as the program wrote them, whatever its code page
+                stream.buffer.flush()
+            else:
                 stream.write(_text(data))
                 stream.flush()
     if check and result.returncode != 0:

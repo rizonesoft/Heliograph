@@ -682,6 +682,7 @@ def _run_clean_win_helio(
     reg_key: str,
     helio_args: list[str],
     *,
+    command: str,
     input_text: str | None = None,
     timeout: int = 60,
 ) -> subprocess.CompletedProcess[str]:
@@ -714,7 +715,9 @@ def _run_clean_win_helio(
     )
     # `check` and `show` only read (a seen mark written twice is the same mark); anything else, such as the smoke
     # `ask`, is started once, since a second start would send a second message.
-    command = next((a for i, a in enumerate(helio_args) if not a.startswith("-") and (i == 0 or helio_args[i - 1] not in ("--store", "--as"))), "")
+    # The caller names the command, so an option's value can never be taken for it.
+    if command not in helio_args:
+        raise ValueError(f"helio command {command!r} is not in {helio_args!r}")
     return _run([python_exe, "-B", "-c", helper, reg_key, *helio_args], input_text=input_text, timeout=timeout,
                 repeatable=command in ("check", "show"))
 
@@ -848,7 +851,7 @@ def _verify_live_installations(
             f"installed WSL `helio check` failed on real store (exit {wsl_real.returncode}): {(wsl_real.stderr or wsl_real.stdout).strip()}",
             code=3,
         )
-    win_real = _run_clean_win_helio(python_exe, reg_key, ["check"])
+    win_real = _run_clean_win_helio(python_exe, reg_key, ["check"], command="check")
     if win_real.returncode != 0:
         raise install_mod.InstallError(
             f"installed Windows `helio check` failed on real store (exit {win_real.returncode}): {(win_real.stderr or win_real.stdout).strip()}",
@@ -875,6 +878,7 @@ def _verify_live_installations(
             python_exe,
             reg_key,
             ["--store", smoke_win, "ask", "impossible/all", "phase verification job", "--as", "impossible/win-smoke"],
+            command="ask",
             input_text="cross-os smoke body\n",
         )
         if ask_res.returncode != 0:
@@ -908,7 +912,7 @@ def _verify_live_installations(
 
         for label, show_res in (
             ("WSL", _run_clean_wsl_helio(wrapper_path, ["--store", str(smoke_wsl), "show", job_id, "--as", "impossible/wsl-smoke"])),
-            ("Windows", _run_clean_win_helio(python_exe, reg_key, ["--store", smoke_win, "show", job_id, "--as", "impossible/win-smoke"])),
+            ("Windows", _run_clean_win_helio(python_exe, reg_key, ["--store", smoke_win, "show", job_id, "--as", "impossible/win-smoke"], command="show")),
         ):
             if show_res.returncode != 0:
                 raise install_mod.InstallError(
@@ -924,7 +928,7 @@ def _verify_live_installations(
 
         for label, chk_res in (
             ("WSL", _run_clean_wsl_helio(wrapper_path, ["--store", str(smoke_wsl), "check"])),
-            ("Windows", _run_clean_win_helio(python_exe, reg_key, ["--store", smoke_win, "check"])),
+            ("Windows", _run_clean_win_helio(python_exe, reg_key, ["--store", smoke_win, "check"], command="check")),
         ):
             if chk_res.returncode != 0:
                 raise install_mod.InstallError(
