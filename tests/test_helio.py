@@ -1942,7 +1942,7 @@ class Archive(Base):
                     stop.set()
                     flipper.join(timeout=30)
                 self.assertEqual(errors, [])
-                self.assertEqual(r.returncode, 0, "a folder created meanwhile was reported as damage")
+                self.assertEqual(r.returncode, 0, "9: a folder created meanwhile was reported as damage; 8: a job never archived was found")
                 present, absent = map(int, r.stdout.split())
                 self.assertGreater(min(present, absent), 100, "the folder must really come and go while the racer looks")
 

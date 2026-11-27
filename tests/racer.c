@@ -175,7 +175,8 @@ static bool print_one_session(void *user, const session_info *info) {
 int racer(int count, char **args) {
     if (count >= 3 && same(args[1], "--remove")) return (int)p_remove(args[2]);
     /* --terminal-loop <store> <id> <rounds> <folder>: asks whether <id> has an archived terminal copy <rounds>
-       times; exit 9 the first time the answer is damage, 0 when it never is, printing how many times it found
+       times; exit 9 the first time the answer is damage, 8 the first time it is anything but nothing (the
+       fixture archives nothing), 0 when it is always nothing, printing how many times it found
        <folder> present and absent, so a test knows the folder really came and went while it looked. */
     if (count >= 6 && same(args[1], "--terminal-loop")) {
         unsigned long rounds = 0;
@@ -184,7 +185,9 @@ int racer(int count, char **args) {
         for (unsigned long i = 0; i < rounds; i++) {
             p_result seen = p_real_dir(args[5]);
             present += seen == P_OK, absent += seen == P_MISSING;
-            if (archive_has_terminal_job(args[2], args[3], NULL) == S_DAMAGED) return 9;
+            s_result got = archive_has_terminal_job(args[2], args[3], NULL);
+            if (got == S_DAMAGED) return 9;
+            if (got != S_NOTHING) return 8;
         }
         text out = {0};
         add_number(&out, present, 0), add(&out, " "), add_number(&out, absent, 0), add(&out, "\n");
