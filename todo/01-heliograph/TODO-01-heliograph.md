@@ -690,6 +690,8 @@ Filed 2026-11-27 from the `D01 T01 §10` plan review (findings 2, 3, 4 for `chec
 
 ## 22. JSON for sending, job changes, archive and working
 
+> **Started:** 2026-11-27T22:45:48Z
+
 Filed 2026-11-27 from the `D01 T01 §10` plan review (findings 4 for `archive`, 5 for `working`, 8). Every change a script makes is answered with what the store now holds, not an echo of its words.
 
 **Phase:** 3
