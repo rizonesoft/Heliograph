@@ -45,15 +45,18 @@ Sections: 10 | Checklist items: 60
 
 ### Phase 3: Scripts and queues
 
-Sections: 4 | Checklist items: 19
+Sections: 7 | Checklist items: 38
 
-| Status | Reference   | Deliverable                            | Needs | Items |
-| ------ | ----------- | -------------------------------------- | ----- | ----- |
-| [ ]    | D01 T01 §10 | JSON output on every command           | none  | 6     |
-| [ ]    | D01 T01 §11 | Take the next job as a queue           | none  | 5     |
-| [ ]    | D01 T01 §12 | Expiry of seen heads-ups and findings  | none  | 4     |
-| [ ]    | D01 T01 §13 | Design and help that match the program | none  | 4     |
+| Status | Reference   | Deliverable                                        | Needs | Items |
+| ------ | ----------- | -------------------------------------------------- | ----- | ----- |
+| [ ]    | D01 T01 §10 | JSON writer and one reply per call                 | none  | 7     |
+| [ ]    | D01 T01 §12 | Expiry of seen heads-ups and findings              | none  | 4     |
+| [ ]    | D01 T01 §21 | JSON for the inbox, log, show and check            | none  | 6     |
+| [ ]    | D01 T01 §22 | JSON for sending, job changes, archive and working | none  | 7     |
+| [ ]    | D01 T01 §11 | Take the next job as a queue                       | none  | 5     |
+| [ ]    | D01 T01 §23 | Summary command read from the day's snapshot       | none  | 5     |
+| [ ]    | D01 T01 §13 | Design and help that match the program             | none  | 4     |
 
-Progress: 16/20 verified sections, 2 ready to run now.
+Progress: 16/23 verified sections, 2 ready to run now.
 
-Checklist: 103/122 items completed (includes Commit items).
+Checklist: 103/141 items completed (includes Commit items).

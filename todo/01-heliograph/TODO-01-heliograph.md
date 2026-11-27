@@ -44,10 +44,10 @@ title: "TODO-01 -- Heliograph"
 | 7 | §7 | Projects kept apart in log and show | -- | [x] |
 | 8 | §8 | Mark for landed work | §2 | [x] |
 | 9 | §9 | Fixed marks around every shown message | §7 | [x] |
-| 10 | §10 | JSON output on every command | §3, §5, §6, §8, §9 | [ ] |
-| 11 | §11 | Take the next job as a queue | §10 | [ ] |
+| 10 | §10 | JSON writer and one reply per call | §3, §5, §6, §8, §9 | [ ] |
+| 11 | §11 | Take the next job as a queue | §10, §22 | [ ] |
 | 12 | §12 | Expiry of seen heads-ups and findings | §3, §4 | [ ] |
-| 13 | §13 | Design and help that match the program | §11, §12, §14 | [ ] |
+| 13 | §13 | Design and help that match the program | §11, §12, §14, §21, §23 | [ ] |
 | 14 | §14 | Unowned paths kept to their repository | §4, §6 | [x] |
 | 15 | §15 | Quick installer | -- | [x] |
 | 16 | §16 | Installer for Windows sessions | §15 | [x] |
@@ -55,6 +55,9 @@ title: "TODO-01 -- Heliograph"
 | 18 | §18 | Session tie and listing tests held to their result | §14 | [x] |
 | 19 | §19 | Archive paths opened without following a swapped folder | §3 | [x] |
 | 20 | §20 | Windows launches from WSL that survive an interop timeout | §17 | [x] |
+| 21 | §21 | JSON for the inbox, log, show and check | §10 | [ ] |
+| 22 | §22 | JSON for sending, job changes, archive and working | §10 | [ ] |
+| 23 | §23 | Summary command read from the day's snapshot | §10 | [ ] |
 
 ## 1. Steps that notice an archived job
 
@@ -302,36 +305,34 @@ A linked commit marks a job landed and closes nothing. The engine starts no prog
 > **Verified:** 2026-11-25 | §9 | 124fad2bfbaebd3f02eab670f55a37c5e0ab5334
 > **Review:** `docs/reviews/d01-t01-s9.json`
 
-## 10. JSON output on every command
+## 10. JSON writer and one reply per call
 
 > **Started:** 2026-11-27T13:40:00Z
 
-A script must not parse lines meant for people. `--json` prints one JSON value, and an error is one too. `summary` becomes a command that prints the day's counts.
+A script must not parse lines meant for people. This section builds the writer and the one rule every command keeps: with `--json` a call gives exactly one JSON value. The commands' own shapes are `D01 T01 §21` (reading), `D01 T01 §22` (sending and changing) and `D01 T01 §23` (summary).
+
+**Corrected 2026-11-27 (plan review, `docs/reviews/01-heliograph/D01-T01-s10.md`):** the section was "JSON output on every command" with the reading, changing and summary commands in it. The plan review found twelve gaps that make each of those its own feature (bounded inbox, visibility, read-back of each change, the summary snapshot and overlap count), so they moved to `§21`, `§22` and `§23` and this section keeps the writer, the one-reply rule, the flag, errors, `help` and `hook`.
+
+**Contract:** with `--json` anywhere among a call's words (before or after the command, never as the value of an option that takes one, such as `--about --json`) the call prints exactly one JSON value and a newline on stdout and nothing on stderr, also when it is refused while its words are read or its `helio.conf` is bad. Exit codes stay 0 done, 1 nothing, 2 refused, 3 damaged (design, "Commands"). A call that did part of its work and then failed gives one value holding both: its result fields and `"error": <text>, "code": <exit code>` (and `"problems": [<text>...]` where it found several), never a result followed by a second value. A failed write of the reply exits 3 and does not acknowledge what it did not print (no seen mark for an unread message). Text is UTF-8; a byte sequence that is not UTF-8 becomes U+FFFD; the engine still uses no floating point or system call (`AGENTS.md`). `helio help --json` gives `{"help": <text>}`; `helio hook claude --json` gives `{"context": <text or null>}`, and without the flag the hook's installed output is unchanged.
 
 **Phase:** 3
 **Needs:** none
 **Surface:** no
 
-**Contract (Corrected 2026-11-27):** the section named no JSON shape and listed `send`, which the program spells `ask`, `hand`, `tell`, `find` and `answer` (`engine/helio.c` command table). With `--json` a command prints exactly one JSON value and a newline on stdout, and nothing on stderr; exit codes stay 0 done, 1 nothing, 2 refused, 3 damaged (design, "Commands"). Text is UTF-8, a byte sequence that is not UTF-8 becomes U+FFFD, and the engine still uses no floating point or system call (`AGENTS.md`). The shapes:
-- a message: `{"id", "time", "from", "to", "for_session", "repository", "kind", "about", "urgency", "re", "due", "subject", "body", "archived"}` with the stored values (`due` as the stored time text, or `null`), plus, for a request or handoff, `"state"` (`"open"`, `"taken"`, `"done"`, `"refused"`), `"taker"`, `"session"` and `"landed"` (a list of commits), and in the inbox `"overdue"` and `"silent"` (booleans);
-- `helio` (inbox) and `log`: `{"messages": [<message>...]}`; `show`: `<message>`; `check`: `{"ok": <bool>, "problems": [<text>...]}`;
-- `ask`, `hand`, `tell`, `find`, `answer`: `{"id": <id>}`; `take`, `release`, `done`, `refuse`: `{"id": <id>, "state": <state>}`; `landed`: `{"id": <id>, "commit": <commit>}`; `hello`: `{"agent": <agent>, "session": <session>}`; `working`: `{"lane": <lane>, "paths": [<path>...]}`; `archive`: `{"archived": <count>, "problems": [<text>...]}`; `init`: `{"store": <folder>}`; `summary`: `{"day", "at", "overdue", "silent", "open", "taken", "done", "refused", "damaged"}` with the counts of `summary/<day>.md`;
-- an error: `{"error": <text>, "code": <exit code>}`.
-`hook` keeps the Claude hook's own output and `help` stays text: neither is a script's interface.
-
 **Build order:**
 
-1. Write `engine/json.c`. Done when: Python reads every output.
-2. Use it in `engine/helio.c`. Done when: every command in the table has a JSON test.
+1. Write `engine/json.c` and wire it into the build. Done when: the encoder's output parses in Python to the exact strings given.
+2. One reply per call in `engine/helio.c`. Done when: every error and partial result path gives one value.
 
-- [ ] Escape text in `engine/json.c` and replace bytes that are not UTF-8. Done when: Python's `json` reads random bytes of 10000 messages. Cheaper substitute: copying bytes.
-- [ ] Print inbox, log, show and check in `engine/helio.c` with every field of the message, its state and its taker, in the shapes above (design, "Commands"). Done when: each field equals the stored one. Cheaper substitute: the line as a string.
-- [ ] Print the id or the new state for ask, hand, tell, find, answer, take, release, done, refuse, landed, hello, working, archive and init in `engine/helio.c`, in the shapes above. Done when: each is read in `tests/test_helio.py`. Cheaper substitute: no output.
-- [ ] Add `summary` to the commands in `engine/helio.c`, as text and as JSON from `engine/watch.c`. Done when: its counts equal the file's. Cheaper substitute: the path of the file.
-- [ ] Print an error as `{"error": ..., "code": ...}` in `fail` of `engine/helio.c`. Done when: exit codes are unchanged for 0, 1, 2 and 3. Cheaper substitute: text on an error.
-- [ ] Commit: `output: JSON on every command`
+- [ ] Write `engine/json.h` and `engine/json.c` (object, array, string, number, boolean, null into a `text`) and add `engine/json.c` to `CORE` in `CMakeLists.txt`. Done when: both hosts build it with `-Werror`.
+- [ ] Escape strings in `engine/json.c`: `"`, `\`, control characters as `\u00XX`, and any byte sequence that is not UTF-8 (truncated, overlong, a surrogate, past U+10FFFF) as U+FFFD. Done when: a racer entry point in `tests/racer.c` encodes given bytes and a test in `tests/test_helio.py` decodes stdout strictly as UTF-8 and finds the exact expected strings for ASCII, quotes, backslashes, newlines, valid two- to four-byte text, each invalid kind, and 10000 random byte strings (each compared with Python's own decoding with `errors="replace"`). Cheaper substitute: checking only that the output parses.
+- [ ] Recognize `--json` for the whole call in the word reader of `engine/helio.c`, before any refusal, without taking it from an option's value. Done when: `helio show --bad --json`, `helio --json show`, a missing option value and a bad `helio.conf` each give one error value, and `--about --json` keeps `--json` as the paths. Cheaper substitute: the flag only after the command.
+- [ ] Route every reply through one writer in `engine/helio.c`: `fail` and every partial-result path add `"error"` and `"code"` to the call's one value. Done when: a test runs each path that today prints and then fails (an inbox with a damaged job beside readable messages, a session announcement failing after a send, `show` failing to write its seen mark after printing) and the whole stdout is one JSON value, stderr is empty, and the exit code is the old one. Cheaper substitute: checking only the exit code.
+- [ ] Refuse to acknowledge what was not printed: a failed write of the JSON reply exits 3 and writes no seen mark. Done when: a test with stdout closed early (`SIGPIPE` ignored, as `eebea74` does) leaves the message unseen for the next inbox.
+- [ ] Give `help` and `hook` their JSON forms in `engine/helio.c`. Done when: `helio help --json` parses to the help text, `helio hook claude --json` gives `{"context": ...}` for messages, `null` for none and an error value for a damaged store, and the hook without `--json` prints what it printed before (byte-compared).
+- [ ] Commit: `output: one JSON reply per call`
 
-**Test checkpoint:** `python3 ../SDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
+**Test checkpoint:** `python3 ../SDK/tools/app_build.py .` exits 0, and the tests fail with the escaping, the whole-call flag or the one-writer rule removed.
 
 ## 11. Take the next job as a queue
 
@@ -625,6 +626,72 @@ Filed 2026-11-27 from the `D01 T01 §18` and `§19` gate runs: 3 of 6 `python3 .
 
 > **Verified:** 2026-11-27 | §20 | 12e35c188b362c11a192602b8895bb447eacad13
 > **Review:** `docs/reviews/d01-t01-s20.json`
+
+## 21. JSON for the inbox, log, show and check
+
+Filed 2026-11-27 from the `D01 T01 §10` plan review (findings 2, 3, 4 for `check`, 8 for the job fields, 11). A script reading the inbox must see what a person sees, no more and no less, and learn what it did not get.
+
+**Phase:** 3
+**Needs:** none
+**Surface:** no
+
+**Build order:**
+
+1. A message object. Done when: every stored field and the job fields read back as stored.
+2. The four reading commands. Done when: each returns exactly the rows a person would see and acknowledges the same way.
+
+- [ ] Write a message as `{"id", "time", "from", "to", "for_session", "repository", "kind", "about", "urgency", "re", "due", "subject", "body", "archived"}` in `engine/helio.c` (`due` the stored time text or `null`), and for a request or handoff add `"state"`, `"taker"` (the lane that took it, `null` when open or refused without a take), `"closed_by"` (the lane that ended it, or `null`), `"session"` and `"landed"` (every commit, normalized). Done when: a test reads each field equal to the stored post and steps, for open, taken, released, done, refused-without-take and archived jobs with three landed commits. Cheaper substitute: the inbox line as a string.
+- [ ] Give the reader's state of a message that is not a job: `"seen"` (whether this reader marked it) in the inbox, `show` and `log`, and in the inbox `"overdue"` for a job and `"silent"` for a job whose taker stopped or a session-addressed heads-up whose target went silent (`"silent_target"` naming it). Done when: a target and an owner each see their own `seen` and `silent` before and after the target reads it.
+- [ ] Print the inbox as `{"messages": [...], "held": <count>, "more": <bool>}` under the same display budget and urgent-first order as the text inbox, a body over the budget cut with `"body_cut": true` and read whole with `show`, and `--all` without the budget. Done when: six waiting messages give the budgeted ones and `held` for the rest, one 16 KiB body comes back cut and whole through `show`, and an inbox with messages never exits 1.
+- [ ] Print `log` as `{"messages": [...]}` and `show` as one message through the same visibility and seen-mark paths as the text forms. Done when: with two projects in one store and two sessions in one lane, the exact ids returned match the text forms, a message outside the reader's view is refused the same as a missing one, an id live and archived at once appears once, and `show` marks it seen for the next inbox.
+- [ ] Print `check` as `{"ok": <bool>, "problems": [<text>...]}`: exit 0 and an empty list for a clean store, 3 with every problem for a damaged one. Done when: a test damages two files and gets both problems and exit 3, with stderr empty.
+- [ ] Commit: `output: JSON for reading`
+
+**Test checkpoint:** `python3 ../SDK/tools/app_build.py .` exits 0 and the tests fail with any field, the budget or the visibility path removed.
+
+## 22. JSON for sending, job changes, archive and working
+
+Filed 2026-11-27 from the `D01 T01 §10` plan review (findings 4 for `archive`, 5 for `working`, 8). Every change a script makes is answered with what the store now holds, not an echo of its words.
+
+**Phase:** 3
+**Needs:** none
+**Surface:** no
+
+**Build order:**
+
+1. The send and job-change replies. Done when: each value is read back from the store after the change.
+2. `archive` and `working`. Done when: their partial and overlap results are one value.
+
+- [ ] Reply `{"id": <id>}` for `ask`, `hand`, `tell`, `find` and `answer` in `engine/helio.c`, the id of the stored message. Done when: a keyed retry returns the first id and stores nothing new, and an answer's stored `re` is the asked id.
+- [ ] Reply `{"id", "state", "taker", "closed_by"}` for `take`, `release`, `done` and `refuse`, read from the job after the change. Done when: release reads back `open` with `taker` `null`, a refused transition exits 2 with the earlier state left and shown in the error value, and each reply equals a following `show --json`.
+- [ ] Reply `{"id", "commit", "landed"}` for `landed`, the normalized commit and every commit now on the job. Done when: an uppercase commit comes back lowercase and a third commit returns all three, live and archived.
+- [ ] Reply `{"agent", "session"}` for `hello` and `{"store"}` for `init`, from what was stored. Done when: each equals the stored session record and the store folder.
+- [ ] Reply `{"lane", "paths", "overlaps": [{"lane", "path"}...]}` for `working`, keeping the note written to the other lane. Done when: two lanes declaring the same path both learn of it, and the second's reply names the first.
+- [ ] Reply `{"archived": <count>, "problems": [<text>...]}` for `archive`: exit 0 with moves, 1 with none, 3 with any problem and the count of what did move. Done when: a batch with one damaged job reports the others' count equal to the files moved on disk, the problem, exit 3 and empty stderr.
+- [ ] Commit: `output: JSON for changes`
+
+**Test checkpoint:** `python3 ../SDK/tools/app_build.py .` exits 0 and the tests fail with any reply replaced by an echo of the call's words.
+
+## 23. Summary command read from the day's snapshot
+
+Filed 2026-11-27 from the `D01 T01 §10` plan review (findings 5 for the overlap count, 6). The design lists `helio summary` and a daily overlap count (design, "How does it watch?"); `summary/<day>.md` is written by the first inbox of the day and has no overlap count.
+
+**Phase:** 3
+**Needs:** none
+**Surface:** no
+
+**Build order:**
+
+1. The overlap count in the daily file. Done when: a known overlap is counted.
+2. The command. Done when: it prints the day's saved snapshot, never a recount.
+
+- [ ] Add an "Overlaps" part to `watch_summary` in `engine/watch.c`, from the `working` records live that day. Done when: two lanes on one path give an overlap count of 1 in `summary/<day>.md`.
+- [ ] Add `summary` to the commands in `engine/helio.c`: it writes the day's file when it is the first call of the day, as the inbox does, then prints the saved file as text, or with `--json` `{"day", "at", "overdue", "silent", "open", "taken", "done", "refused", "overlaps", "damaged"}` parsed from it. Done when: after a job closes later in the day, `summary` still prints the morning's counts; two first calls racing leave one file and both print it.
+- [ ] Refuse a snapshot that cannot be read or is cut short with exit 3 and the error value, and report a day whose file was deferred (a liveness read failed) as exit 1 `{"day", "deferred": true}`. Done when: a truncated file gives exit 3 and a deferred day exit 1.
+- [ ] List `summary` and `--json` in the help of `engine/helio.c` and the command reference in `README.md`. Done when: both name them.
+- [ ] Commit: `summary: the day's snapshot as a command`
+
+**Test checkpoint:** `python3 ../SDK/tools/app_build.py .` exits 0 and the tests fail when `summary` recounts the store instead of reading the file.
 
 ## Verification
 
