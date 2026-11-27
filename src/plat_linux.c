@@ -68,6 +68,7 @@ bool plat_fail_flush = false;
 bool plat_fail_write_flush = false;
 bool plat_fail_sync = false;
 uint64_t plat_now_override = 0;
+void (*plat_pause)(const char *stage) = NULL; /* called between steps of a platform call, for a test to act */
 #endif
 /* Flushes the folder that holds path: the held folder itself when dir is one, else path's parent. */
 static bool settle_at(int dir, const char *path) {
@@ -217,7 +218,7 @@ static p_result sync_at(int dir, const char *path) {
 #endif
     int file = -1;
     for (int attempt = 0;; attempt++) {
-        file = openat(dir, path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        file = openat(dir, path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK); /* never waits on a pipe put in its place */
         if (file >= 0 || !passing_linux(attempt, errno)) break;
     }
     if (file < 0) return why();

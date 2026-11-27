@@ -13,6 +13,7 @@ bool plat_fail_flush = false;
 bool plat_fail_write_flush = false;
 bool plat_fail_sync = false;
 uint64_t plat_now_override = 0;
+void (*plat_pause)(const char *stage) = NULL; /* called between steps of a platform call, for a test to act */
 #endif
 
 void *p_alloc(size_t bytes) { return im_alloc(bytes); }
@@ -611,10 +612,41 @@ p_result p_dir_sync(p_dir *dir, const char *name) {
     return r;
 }
 
+/* Makes a folder inside a held one and flushes it through its own handle, opened as itself and without
+   FILE_SHARE_DELETE, so a junction put in its place after it was made is refused, never flushed through. */
 p_result p_dir_folder(p_dir *dir, const char *name) {
     char *path = inside(dir, name);
     if (!path) return P_FAILED;
-    p_result r = p_folder(path); /* refuses a reparse point in its place */
+    p_result r = from(im_make_folder(path));
+#ifdef HELIO_TEST_HOOKS
+    if (r == P_OK && plat_pause) plat_pause("after-make-folder");
+#endif
+    wchar_t *wide = r == P_OK ? im_wide(path) : NULL;
+    if (r == P_OK && !wide) r = P_FAILED;
+    HANDLE h = INVALID_HANDLE_VALUE;
+    DWORD err = 0;
+    for (int attempt = 0; r == P_OK; attempt++) {
+        h = CreateFileW(wide, GENERIC_WRITE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+        if (h != INVALID_HANDLE_VALUE) break;
+        err = GetLastError();
+        if (!passing_win(attempt, err)) r = P_FAILED;
+    }
+    if (r == P_OK) {
+        DWORD attrs = GetFileAttributesW(wide); /* the folder h holds: its name cannot change while h is open */
+        if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY) || (attrs & FILE_ATTRIBUTE_REPARSE_POINT)) r = P_FAILED;
+    }
+#ifdef HELIO_TEST_HOOKS
+    if (r == P_OK && plat_fail_flush) r = P_FAILED;
+#endif
+    if (r == P_OK && !FlushFileBuffers(h)) {
+        DWORD ferr = GetLastError();
+        /* WORKAROUND: as in settle_win_ex, the 9p redirector has no flush for a folder handle. */
+        if (!(is_wsl_unc(path) && (ferr == ERROR_INVALID_FUNCTION || ferr == ERROR_NOT_SUPPORTED))) r = P_FAILED;
+    }
+    if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+    im_free(wide);
+    if (r == P_OK && !settle_win(path)) r = P_FAILED; /* the parent: held, so its name cannot change */
     im_free(path);
     return r;
 }

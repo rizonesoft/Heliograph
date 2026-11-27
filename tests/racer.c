@@ -16,6 +16,7 @@ extern bool plat_fail_flush;
 extern bool plat_fail_write_flush;
 extern bool plat_fail_sync;
 extern uint64_t plat_now_override;
+extern void (*plat_pause)(const char *stage);
 extern size_t store_max_names;
 #endif
 
@@ -66,6 +67,51 @@ static void on_pause(void *user, const char *stage) {
     text_free(&paused);
     text_free(&resume);
 }
+
+#ifdef HELIO_TEST_HOOKS
+static pause_ctx *plat_ctx;
+static void plat_on_pause(const char *stage) { on_pause(plat_ctx, stage); }
+
+/* --dir <folder|sync|read> <root> <rel> <name> <stages>: one held-folder call on <name> inside <root>/<rel>,
+   pausing at <stages> inside the platform (paused.<stage> and resume.<stage> in <root>); exits with its p_result. */
+static int run_dir(int count, char **args) {
+    if (count < 7) return 104;
+    const char *op = args[2], *root = args[3], *rel = args[4], *name = args[5];
+    pause_ctx ctx = {root, count > 6 ? args[6] : "", false};
+    plat_ctx = &ctx, plat_pause = plat_on_pause;
+    p_dir *d = NULL;
+    p_result r = p_dir_open(root, rel, &d);
+    if (r == P_OK) {
+        char *data = NULL;
+        size_t length = 0;
+        if (same(op, "folder")) r = p_dir_folder(d, name);
+        else if (same(op, "sync")) r = p_dir_sync(d, name);
+        else if (same(op, "read")) r = p_dir_read(d, name, 1 << 20, &data, &length), p_free(data);
+        else r = P_FAILED;
+    }
+    p_dir_close(d);
+    plat_pause = NULL;
+    return ctx.timed_out ? PAUSE_TIMED_OUT : (int)r;
+}
+
+/* --pause-lifetime <store> <id> <reader>: shows <id> as <reader> through helio_paused with a counting pause, then
+   reads it from the archive directly; exits 0 when the pause was never called after helio_paused returned. */
+static int lifetime_calls;
+static void count_pause(void *user, const char *stage) { (void)user, (void)stage, lifetime_calls++; }
+static int run_pause_lifetime(int count, char **args) {
+    if (count < 5) return 104;
+    char *show[] = {"helio", "show", args[3], "--store", args[2], "--as", args[4]};
+    int code = helio_paused(7, show, count_pause, NULL);
+    if (code != 0) return 100 + code;
+    int during = lifetime_calls;
+    store s = {.folder = args[2]};
+    message m = {0};
+    s_result r = archive_read_message(&s, args[3], &m);
+    message_free(&m);
+    if (r != S_OK) return 90;
+    return during > 0 && lifetime_calls == during ? 0 : 91;
+}
+#endif
 
 static int run_pause(int count, char **args) {
     if (count < 7) return 104;
@@ -213,6 +259,8 @@ int racer(int count, char **args) {
         return r == P_OK ? 0 : (int)r;
     }
 #ifdef HELIO_TEST_HOOKS
+    if (count >= 7 && same(args[1], "--dir")) return run_dir(count, args);
+    if (count >= 5 && same(args[1], "--pause-lifetime")) return run_pause_lifetime(count, args);
     if (count >= 3 && same(args[1], "--remove-fail-flush")) {
         plat_fail_flush = true;
         return (int)p_remove(args[2]);

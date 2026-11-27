@@ -1940,15 +1940,18 @@ class Archive(Base):
                             gone = st / f"gone-{folder.name}-{n}"
                             n += 1
                             folder.mkdir()
-                            while True:
+                            for _ in range(5000):
                                 try:
                                     folder.rename(gone)
                                     break
-                                except PermissionError:
-                                    if not ON_WINDOWS:
+                                except PermissionError as e:
+                                    # Windows: the racer holds the folder (no FILE_SHARE_DELETE) while it looks,
+                                    # a sharing violation (32) that ends when the look does; anything else is real.
+                                    if not ON_WINDOWS or getattr(e, "winerror", None) != 32:
                                         raise
-                                    # Windows: the racer holds the folder (no FILE_SHARE_DELETE) while it looks.
                                     time.sleep(0.001)
+                            else:
+                                raise TimeoutError(f"{folder} stayed held for 5 s")
                             gone.rmdir()
                     except OSError as e:
                         errors.append(e)
@@ -2408,12 +2411,13 @@ class ArchiveSwap(Base):
         command = [str(RACER), "--pause-cli", stages or stage, str(self.store), *arguments, "--store", str(self.store), *(["--as", me] if me else [])]
         clean = {k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "ANTIGRAVITY_CONVERSATION_ID")}
         proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.store, env=clean)
-        try:
-            self.wait_for(self.store / f"paused.{stage}")
-        except BaseException:
-            proc.kill()
+
+        def reap():
+            if proc.poll() is None:
+                proc.kill()
             proc.communicate()
-            raise
+        self.addCleanup(reap)
+        self.wait_for(self.store / f"paused.{stage}")
         return proc
 
     def resume(self, proc, stage):
@@ -2486,6 +2490,7 @@ class ArchiveSwapLinux(ArchiveSwap):
                 finally:
                     self.unswap("archive")
                 self.assertEqual(w.events(), [], "the listing followed the link out of the store")
+                self.assertIn(rc, (0, 3), err)  # a crash or signal is never a pass
                 self.assertNotIn(planted.encode(), out + err)
                 self.assertNotIn(b"2025-03", out + err)
 
@@ -2526,7 +2531,9 @@ class ArchiveSwapLinux(ArchiveSwap):
                 self.assertEqual(w.events(), [], "a write followed the link out of the store")
                 self.assertEqual(list(self.outside.joinpath("m").iterdir()), [])
                 self.assertIn(rc, (0, 3), err)
-                if rc == 3:
+                if rc == 0:
+                    self.assertTrue(done(), f"{stage} reported success without its file in the archive")
+                else:
                     self.assertTrue(live_kept(), "the live source was removed although its write was refused")
                 # A refused promotion leaves the job archived with its landed mark live, which the next archive run
                 # carries across; every other command is retried as it was.
@@ -2534,6 +2541,17 @@ class ArchiveSwapLinux(ArchiveSwap):
                 self.assertIn(retry.returncode, (0, 1), retry.stderr)
                 self.assertTrue(done(), f"the retry of {stage} did not finish")
                 self.assertEqual(self.helio("check", me=None).returncode, 0)
+
+    def test_a_flush_never_waits_on_a_pipe_put_in_a_files_place(self):
+        (self.store / "a").mkdir()
+        os.mkfifo(self.store / "a/x.post")
+        r = subprocess.run([str(RACER), "--dir", "sync", str(self.store), "a", "x.post", ""], stdin=subprocess.DEVNULL, capture_output=True, timeout=20)
+        self.assertEqual(r.returncode, 4, "a pipe is refused (P_FAILED), never waited on")
+
+    def test_a_pause_belongs_to_its_call_only(self):
+        job = self.archived_job()
+        r = subprocess.run([str(RACER), "--pause-lifetime", str(self.store), job, "os/userland"], stdin=subprocess.DEVNULL, capture_output=True, timeout=30)
+        self.assertEqual(r.returncode, 0, "91: an archive call after helio_paused returned still called its pause")
 
     def test_the_first_archive_of_a_month_never_makes_its_folder_outside(self):
         self.archived_job()
@@ -2598,6 +2616,8 @@ class ArchiveJunction(ArchiveSwap):
             os.symlink(self.outside / "planted.post", post)
         except OSError as e:
             post.with_name(post.name + ".real").rename(post)
+            if getattr(e, "winerror", None) != 1314:  # ERROR_PRIVILEGE_NOT_HELD: the only reason to skip
+                raise
             self.skipTest(f"no file symlink privilege here: {e}")
         try:
             shown = self.helio("show", job, me="os/userland")
@@ -2606,6 +2626,18 @@ class ArchiveJunction(ArchiveSwap):
             post.with_name(post.name + ".real").rename(post)
         self.assertEqual(shown.returncode, 3, shown.stdout + shown.stderr)
         self.assertNotIn(b"planted", shown.stdout + shown.stderr)
+
+    def test_a_junction_put_in_a_new_folders_place_is_never_flushed_through(self):
+        (self.store / "a").mkdir()
+        proc = subprocess.Popen([str(RACER), "--dir", "folder", str(self.store), "a", "m", "after-make-folder"],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.addCleanup(lambda: (proc.poll() is None and proc.kill(), proc.communicate()))
+        self.wait_for(self.store / "paused.after-make-folder")
+        self.junction("a/m", self.outside)
+        put(self.store / "resume.after-make-folder", "go")
+        proc.communicate(timeout=60)
+        self.unjunction("a/m")
+        self.assertEqual(proc.returncode, 4, "a junction put in place of the new folder was opened and flushed")
 
     def test_a_held_folder_cannot_be_renamed_until_the_command_ends(self):
         job = self.archived_job()

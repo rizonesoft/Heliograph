@@ -897,6 +897,7 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
 int helio_paused(int count, char **args, void (*pause)(void *user, const char *stage), void *user) {
     options o;
     int code = parse(&o, count, args) ? run(&o, pause, user) : fail(o.why, 2);
+    archive_pauses(NULL, NULL); /* the pause belongs to this call only */
     p_free(o.me_env), p_free(o.folder_env), p_free(o.default_env), p_free(o.session_env);
     text_free(&o.lane), text_free(&o.to), place_close(&o.here);
     return code;

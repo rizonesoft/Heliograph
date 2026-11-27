@@ -150,18 +150,21 @@ s_result archive_read_message(store *s, const char *id, message *out) {
     *out = (message){0};
     char month[8];
     if (!valid_id(id) || !archive_month(id, month)) return S_NOTHING;
-    s_result dr = check_arch_dirs(s->folder, month);
-    if (dr == S_NOTHING) return S_NOTHING;
-    if (dr != S_OK) {
+    p_dir *d = NULL;
+    p_result hr = arch_hold(s->folder, month, &d);
+    if (hr == P_MISSING) return S_NOTHING;
+    if (hr != P_OK) {
         s->why = "the archive folder is not a real directory";
         return S_DAMAGED;
     }
-    arch_at at = {0};
-    arch_at_of(&at, s->folder, month, id, "post");
+    text name = {0};
+    add(&name, id), add(&name, ".post");
     char *data = NULL;
     size_t length = 0;
-    p_result r = at.name.failed ? P_FAILED : arch_read_at(&at, MOST_FILE, &data, &length, "arch-held");
-    arch_at_free(&at);
+    arch_pause("arch-held");
+    p_result r = name.failed ? P_FAILED : p_dir_read(d, name.data, MOST_FILE, &data, &length);
+    text_free(&name);
+    p_dir_close(d);
     if (r == P_MISSING) return S_NOTHING;
     if (r != P_OK) {
         s->why = "an archived message cannot be read";
@@ -468,13 +471,11 @@ static void add_report(text *report, const char *id, const char *why) {
 /* Makes archive/ in the store folder, then the month folder inside the held archive/, so a swap of archive/ for a
    link between the two is refused rather than followed. */
 static bool ensure_archive_month(const char *folder, const char *month) {
-    text a = {0};
-    add(&a, folder), add(&a, "/archive");
-    bool ok = !a.failed && p_folder(a.data) == P_OK;
-    text_free(&a);
+    p_dir *store_dir = NULL, *d = NULL;
+    bool ok = p_dir_open(folder, "", &store_dir) == P_OK && p_dir_folder(store_dir, "archive") == P_OK;
+    p_dir_close(store_dir);
     if (!ok) return false;
     arch_pause("before-make-month");
-    p_dir *d = NULL;
     ok = arch_hold(folder, NULL, &d) == P_OK && p_dir_folder(d, month) == P_OK;
     p_dir_close(d);
     return ok;
