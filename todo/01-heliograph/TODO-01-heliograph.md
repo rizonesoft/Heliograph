@@ -54,6 +54,7 @@ title: "TODO-01 -- Heliograph"
 | 17 | §17 | Installed program replaced after a tested phase | §15, §16 | [x] |
 | 18 | §18 | Session tie and listing tests held to their result | §14 | [x] |
 | 19 | §19 | Archive paths opened without following a swapped folder | §3 | [ ] |
+| 20 | §20 | Windows launches from WSL that survive an interop timeout | §17 | [ ] |
 
 ## 1. Steps that notice an archived job
 
@@ -578,6 +579,28 @@ Filed 2026-11-27 from the Astra review round 2 of `b9388b0` (P2, pre-existing, r
 - [ ] Commit: `archive: a folder swapped after its check is never followed`
 
 **Test checkpoint:** `python3 ../SDK/tools/app_build.py .` exits 0 on the section's commit; each swap test fails with the held opens replaced by path opens; `python3 ../SDK/tools/prove.py .` prints `proved on Windows` for that commit and its `Build` run is green on both hosts.
+
+## 20. Windows launches from WSL that survive an interop timeout
+
+Filed 2026-11-27 from the `D01 T01 §18` and `§19` gate runs: 3 of 6 `python3 ../SDK/tools/app_build.py .` runs that day failed only because a Windows program started from WSL never ran, its stderr `<3>WSL (<pid> - ) ERROR: UtilAcceptVsock:281: accept4 failed 110` (WSL's interop relay timing out, `ETIMEDOUT`, under host load with several agent runs). The launches are `_run` and `_run_win_cli` in `tools/phase_install.py`, `run_windows_from_wsl` in `tools/install.py`, and the `python.exe` calls in `tests/test_install.py`. The same failure hits `tools/install.py --phase` on the operator's machine, where it rolls a phase back for a reason that is not the build. The fix owns one launcher that recognizes exactly that failure and starts the program again, and only for a call that is safe to repeat.
+
+**Phase:** 2
+**Needs:** wsl-windows-interop
+**Surface:** no
+
+**Build order:**
+
+1. One launcher for Windows programs from WSL. Done when: every launch in `tools/` goes through it.
+2. Repeat only the interop failure. Done when: a launch whose stderr is the relay timeout and nothing else is started again, at most 3 times, and any other failure is returned at once.
+3. The tests use it too. Done when: no `python.exe` launch in `tests/test_install.py` bypasses it.
+
+- [ ] Add `run_windows(argv, *, repeatable, ...)` to `tools/install.py` (beside `run_windows_from_wsl`), wrapping `subprocess.run` with the arguments `_run` uses. Done when: it returns the `CompletedProcess`, and with `repeatable=True` starts the program again, up to 3 times with 0.5 s, 1 s and 2 s between, only when the exit code is 1, stdout is empty and stderr matches `^<3>WSL \(\d+ - \S*\) ERROR: UtilAcceptVsock:\d+: accept4 failed 110\s*$`. Cheaper substitute: repeating every failed launch.
+- [ ] Mark each launch in `tools/phase_install.py` and `tools/install.py` as repeatable or not: repeatable for reads (`--status`, path lookups, `helio check`, `mkdtemp` probes) and for journaled phase steps that resume from `phase.journal.json`; not repeatable for anything else. Done when: every launch of `python.exe`, `cmd.exe` or a `.exe` passes `repeatable` explicitly (`grep -n "subprocess.run(\[python_exe\|cmd.exe" tools/` shows only `run_windows`).
+- [ ] Route the `python.exe` launches of `tests/test_install.py` through `run_windows` with `repeatable=True` where the test only reads or probes. Done when: `grep -n "subprocess.*python_exe" tests/test_install.py` shows none outside it.
+- [ ] Test the launcher in `tests/test_install.py` with a fake program on `PATH` that prints the relay line and exits 1 a set number of times, then succeeds (bounded output, stopped with its process group on timeout). Done when: two failures then success returns success after 3 starts, four failures returns the failure after 4 starts, a different stderr returns after 1 start, and `repeatable=False` returns after 1 start.
+- [ ] Commit: `install: a Windows launch the WSL relay timed out is started again`
+
+**Test checkpoint:** `python3 ../SDK/tools/app_build.py .` exits 0 and the launcher tests fail when the repeat is removed.
 
 ## Verification
 
