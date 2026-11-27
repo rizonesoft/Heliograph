@@ -1841,17 +1841,17 @@ class Archive(Base):
         # 2 archivers (limit=1 per round: Windows 100 rounds + Linux 900 rounds, moving all 1,000 distinct eligible jobs).
         # Both walk the same sorted ids and the local Linux one is far faster, so with more than 900 rounds it can archive
         # everything before the Windows walk over \\wsl.localhost reaches a job; capped at 900 it always leaves exactly 100
-        # for Windows, so every round of each side moves one job. Each side writes a mark after its first move and holds
-        # partway (Windows at 50, Linux at 450) until the other's mark is there, so neither can run all its moves before
-        # the other starts: both archivers are proven to move jobs while the other is still running.
+        # for Windows, so every round of each side moves one job. This is load, not proof of overlap: no schedule is forced,
+        # so the two may happen to run one after the other. Two moves meeting inside one archive is proven deterministically,
+        # in both directions, by test_windows_and_linux_archivers_meet_inside_one_move.
         # 2 concurrent readers (Windows min 100 + Linux min 900 = 1,000+ rounds running until BOTH archivers finish,
         # checking ALL 20 live controls, 100% of ALL 1,000 eligible IDs, and full parsed readability of a rotating
         # window of 10 eligible IDs on EVERY SINGLE ROUND), and 2 racing takers (Windows + Linux).
         put(st / "watch_old.txt", "\n".join(old_ids) + "\n")
         take_ids = old_ids[::25] + live_ids
         procs = [
-            subprocess.Popen([win_racer, "--archive-loop", win_store, "100", win_store + "\\win-moved", "50", win_store + "\\lin-moved"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
-            subprocess.Popen([lin_racer, "--archive-loop", str(st), "900", str(st / "lin-moved"), "450", str(st / "win-moved")], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
+            subprocess.Popen([win_racer, "--archive-loop", win_store, "100"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
+            subprocess.Popen([lin_racer, "--archive-loop", str(st), "900"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
             subprocess.Popen([win_racer, "--read-loop", win_store, "100", str(len(live_ids)), *live_ids], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
             subprocess.Popen([lin_racer, "--read-loop", str(st), "900", str(len(live_ids)), *live_ids], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
             subprocess.Popen([win_racer, win_store, "os/win-taker", *take_ids[::-1]], stdin=subprocess.DEVNULL),
@@ -1911,35 +1911,79 @@ class Archive(Base):
         self.assertEqual(run(st, "check", me=None).returncode, 0)
 
     def test_archive_folder_created_meanwhile_is_never_damage(self):
-        # The first archiver creates archive/ while a taker asks whether a live job was archived. A folder that
-        # appears between two looks once read as "not a real directory", so the take failed as damaged.
+        # The first archive creates archive/, and the first archive of a new month creates archive/<month>/, while a
+        # taker asks whether a live job was archived. A folder that appeared between two looks once read as "not a
+        # real directory", so the take failed as damaged. Each folder is made to come and go on its own.
         import threading
 
         st = self.store
         live = self.send(to="os/all", subject="live")
-        arch = st / "archive"
-        stop = threading.Event()
-        errors = []
+        month = time.strftime("%Y-%m", time.gmtime(int(live.split("-")[0]) / 1_000_000))
+        for folder, keep in ((st / "archive", None), (st / "archive" / month, st / "archive")):
+            with self.subTest(folder=folder.name):
+                if keep:
+                    keep.mkdir(exist_ok=True)
+                stop = threading.Event()
+                errors = []
 
-        def flip():
-            try:
-                while not stop.is_set():
-                    arch.mkdir()
-                    arch.rmdir()
-            except OSError as e:
-                errors.append(e)
+                def flip():
+                    try:
+                        while not stop.is_set():
+                            folder.mkdir()
+                            folder.rmdir()
+                    except OSError as e:
+                        errors.append(e)
 
-        flipper = threading.Thread(target=flip)
-        flipper.start()
-        try:
-            r = subprocess.run([str(RACER), "--terminal-loop", str(st), live, "300000"], stdin=subprocess.DEVNULL, capture_output=True, timeout=120)
-        finally:
-            stop.set()
-            flipper.join(timeout=30)
-        self.assertEqual(errors, [])
-        self.assertEqual(r.returncode, 0, "a folder created meanwhile was reported as damage")
-        present, absent = map(int, r.stdout.split())
-        self.assertGreater(min(present, absent), 100, "the folder must really come and go while the racer looks")
+                flipper = threading.Thread(target=flip)
+                flipper.start()
+                try:
+                    r = subprocess.run([str(RACER), "--terminal-loop", str(st), live, "300000", str(folder)], stdin=subprocess.DEVNULL, capture_output=True, timeout=120)
+                finally:
+                    stop.set()
+                    flipper.join(timeout=30)
+                self.assertEqual(errors, [])
+                self.assertEqual(r.returncode, 0, "a folder created meanwhile was reported as damage")
+                present, absent = map(int, r.stdout.split())
+                self.assertGreater(min(present, absent), 100, "the folder must really come and go while the racer looks")
+
+    @unittest.skipUnless(WSL, "needs WSL")
+    def test_windows_and_linux_archivers_meet_inside_one_move(self):
+        # One archiver is paused inside its move of a job, after it saw the job eligible and before it copies it, while
+        # the other host archives the same job; then it resumes. Exactly one of them moves it, both exit 0, and the job
+        # is archived once, in each direction (Windows paused through \\wsl.localhost, then Linux paused).
+        st = self.store
+        win_store = subprocess.run(["wslpath", "-w", str(st)], capture_output=True, text=True, check=True, timeout=30).stdout.strip()
+        win_racer = str(BUILD / "racer.exe")
+        clean = {k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "ANTIGRAVITY_CONVERSATION_ID")}
+        feb_us = 1739577600_000_000
+        for n, paused_on_windows in enumerate((True, False)):
+            with self.subTest(paused="windows" if paused_on_windows else "linux"):
+                j = self.make_aged_closed_job(created_us=feb_us + 900 + n, subject=f"meet-{n}")
+                if paused_on_windows:
+                    held = [win_racer, "--pause-cli", "before-copy-post", win_store, "archive", "--store", win_store]
+                    other = [str(PROGRAM), "archive", "--store", str(st)]
+                else:
+                    held = [str(RACER), "--pause-cli", "before-copy-post", str(st), "archive", "--store", str(st)]
+                    other = [str(BUILD / "helio.exe"), "archive", "--store", win_store]
+                p_a = subprocess.Popen(held, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=st, env=clean)
+                try:
+                    self.wait_for(st / "paused.before-copy-post", timeout=60)
+                    r_b = subprocess.run(other, stdin=subprocess.DEVNULL, capture_output=True, timeout=120, cwd=st, env=clean)
+                    self.assertEqual(r_b.returncode, 0, r_b.stderr)
+                    put(st / "resume.before-copy-post", "go")
+                    out_a, err_a = p_a.communicate(timeout=120)
+                finally:
+                    if p_a.poll() is None:
+                        p_a.kill()
+                        p_a.wait(timeout=15)
+                (st / "paused.before-copy-post").unlink(missing_ok=True)
+                (st / "resume.before-copy-post").unlink(missing_ok=True)
+                self.assertEqual(p_a.returncode, 0, err_a)
+                counts = (int(out_a.decode().split()[0]), int(r_b.stdout.decode().split()[0]))
+                self.assertEqual(sorted(counts), [0, 1], counts)
+                self.assertTrue((st / f"archive/2025-02/{j}.post").exists())
+                self.assertEqual([p.name for p in (st / "messages").iterdir() if p.name.startswith(j)], [])
+        self.assertEqual(run(st, "check", me=None).returncode, 0)
 
     def test_archived_show_seen_answer_and_chain_replay(self):
         # Multi-step jobs: (1) taken -> released -> taken by another session -> done; (2) taken -> refused.

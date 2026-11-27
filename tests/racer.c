@@ -174,22 +174,18 @@ static bool print_one_session(void *user, const session_info *info) {
 
 int racer(int count, char **args) {
     if (count >= 3 && same(args[1], "--remove")) return (int)p_remove(args[2]);
-    /* --terminal-loop <store> <id> <rounds>: asks whether <id> has an archived terminal copy <rounds> times;
-       exit 9 the first time the answer is damage, 0 when it never is, printing how many times it found
-       archive/ present and absent, so a test knows the folder really came and went while it looked. */
-    if (count >= 5 && same(args[1], "--terminal-loop")) {
+    /* --terminal-loop <store> <id> <rounds> <folder>: asks whether <id> has an archived terminal copy <rounds>
+       times; exit 9 the first time the answer is damage, 0 when it never is, printing how many times it found
+       <folder> present and absent, so a test knows the folder really came and went while it looked. */
+    if (count >= 6 && same(args[1], "--terminal-loop")) {
         unsigned long rounds = 0;
         for (const char *p = args[4]; *p >= '0' && *p <= '9'; p++) rounds = rounds * 10 + (unsigned long)(*p - '0');
-        text arch = {0};
-        add(&arch, args[2]), add(&arch, "/archive");
-        if (arch.failed) return 100;
         uint64_t present = 0, absent = 0;
         for (unsigned long i = 0; i < rounds; i++) {
-            p_result seen = p_real_dir(arch.data);
+            p_result seen = p_real_dir(args[5]);
             present += seen == P_OK, absent += seen == P_MISSING;
-            if (archive_has_terminal_job(args[2], args[3], NULL) == S_DAMAGED) return text_free(&arch), 9;
+            if (archive_has_terminal_job(args[2], args[3], NULL) == S_DAMAGED) return 9;
         }
-        text_free(&arch);
         text out = {0};
         add_number(&out, present, 0), add(&out, " "), add_number(&out, absent, 0), add(&out, "\n");
         if (!out.failed) p_print(out.data);
@@ -261,28 +257,11 @@ int racer(int count, char **args) {
             if (p_now() > until) return 101;
         p_free(gdata);
         text_free(&ready), text_free(&go);
-        /* Optional [<mark> [<hold-at> <wait-for>]]: write <mark> after the first own move ("-" for none);
-           after <hold-at> own moves wait up to 120 s for <wait-for> (exit 105 if it never comes), so two
-           archivers are proven to have moved jobs while both were running. */
-        const char *mark = count >= 5 && !same(args[4], "-") ? args[4] : NULL;
-        size_t hold_at = 0;
-        if (count >= 7)
-            for (const char *p = args[5]; *p >= '0' && *p <= '9'; p++) hold_at = hold_at * 10 + (size_t)(*p - '0');
-        const char *wait_for = count >= 7 ? args[6] : NULL;
         size_t total_moved = 0;
         for (int i = 0; i < rounds; i++) {
-            if (wait_for && total_moved == hold_at) {
-                char *wdata = NULL;
-                size_t wlen = 0;
-                for (uint64_t until = p_now() + 120000000; p_read(wait_for, 9, &wdata, &wlen) != P_OK;)
-                    if (p_now() > until) return 105;
-                p_free(wdata);
-                wait_for = NULL;
-            }
             size_t moved = 0;
             text rep = {0};
             s_result r = archive_store(folder, 1, &moved, &rep, NULL, NULL);
-            if (mark && moved && !total_moved && p_write(mark, "x", 1, false, "m") != P_OK) return 100;
             total_moved += moved;
             if (r == S_DAMAGED) {
                 if (rep.length) p_error(rep.data);
