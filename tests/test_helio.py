@@ -2661,6 +2661,11 @@ class JsonReading(Base):
         self.ok(t + 1, "take", ids["done"], "--as", "os/userland"), self.ok(t + 2, "done", ids["done"], "ok", "--as", "os/userland")
         ids["refused"] = self.sent(t, "ask", "os/userland", "refused", "--as", "os/main")
         self.ok(t + 1, "refuse", ids["refused"], "no", "--as", "os/userland")
+        ids["other_refuser"] = self.sent(t, "ask", "os/all", "other refuser", "--as", "os/main")
+        self.ok(t + 1, "take", ids["other_refuser"], "--as", "os/apps", "--session", "s9"), self.ok(t + 2, "release", ids["other_refuser"], "--as", "os/apps", "--session", "s9")
+        self.ok(t + 3, "refuse", ids["other_refuser"], "no", "--as", "os/userland")
+        ids["unnamed_taker"] = self.sent(t, "ask", "os/userland", "unnamed taker", "--as", "os/main")
+        self.ok(t + 1, "take", ids["unnamed_taker"], "--as", "os/userland"), self.ok(t + 2, "done", ids["unnamed_taker"], "ok", "--as", "os/userland", "--session", "s2")
         ids["repository"] = self.sent(t + 1, "ask", "path:docs/x.md", "in repo-a", "--as", "os/main", cwd=repo)
         self.assertEqual(self.post_fields(ids["repository"])["repository"], "repo-a")
         for name, mid in ids.items():
@@ -2668,9 +2673,16 @@ class JsonReading(Base):
             self.assert_row_is_the_post(v, mid)
             self.assertEqual(v["archived"], False, name)
         self.assertEqual(self.shown(t + 10, ids["repository"])["repository"], "repo-a")
+        # The list commands carry it too: the inbox of a lane working in repo-a, and log --all.
+        inbox = self.value(self.at(t + 10, "--json", "--as", "os/dev1", cwd=repo), 0)
+        log = self.rows(t + 10, "log", "--all")
+        for listing in (inbox, log):
+            row = next(m for m in listing["messages"] if m["id"] == ids["repository"])
+            self.assert_row_is_the_post(row, ids["repository"])
+            self.assertEqual(row["repository"], "repo-a")
         # Archived, the closed ones (open, taken and released jobs are never archived, D01 T01 §2) read the same.
         self.assertEqual(run(self.store, "archive", me=None).returncode, 0)
-        for name in ("done", "refused"):
+        for name in ("done", "refused", "other_refuser", "unnamed_taker"):
             mid = ids[name]
             month = next((self.store / "archive").glob(f"*/{mid}.post")).parent
             v = self.shown(t + 10, mid)
