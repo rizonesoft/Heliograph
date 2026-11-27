@@ -25,7 +25,9 @@ def win_start(argv, *, repeatable, **run_args):
     """Starts a Windows program from WSL through tools/win_launch.py, again after a WSL relay timeout when the step is
     safe to run twice (a probe, a read, a cleanup, or a fixture step with a stable name). The Popen launches that keep
     a Windows program or file held for a test (`holder`, `proc` and `p` in test_held_windows_exe_concurrent_caller_during_publication,
-    and `holder`/`holder_a` in the busy-exe tests) keep their own lifetime and readiness checks and start once."""
+    and `holder`/`holder_a` in the busy-exe tests) keep their own lifetime and readiness checks and start once, as do the two
+    Windows racers (`win1`, `win2`) the generated real-SDK checkout test starts from WSL beside the Linux one: they meet
+    at a readiness barrier (one `ready.*` file each) and compete to take jobs, so a second start would change the race."""
     if not _WIN_LAUNCH:
         spec = importlib.util.spec_from_file_location("helio_win_launch_tests", REPO / "tools" / "win_launch.py")
         assert spec and spec.loader
