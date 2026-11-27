@@ -10,6 +10,7 @@
 #include "place.h"
 #include "store.h"
 #include "watch.h"
+#include "json.h"
 
 #ifdef HELIO_TEST_HOOKS
 extern bool plat_fail_flush;
@@ -250,6 +251,39 @@ int racer(int count, char **args) {
         if (!out.failed) p_print(out.data);
         text_free(&out);
         return 0;
+    }
+    /* --json-escape-many: stdin holds records of a 4-byte big-endian length and that many bytes; prints the JSON string
+       of each on its own line. */
+    if (count >= 2 && same(args[1], "--json-escape-many")) {
+        char *in = NULL;
+        size_t n = 0;
+        if (p_input(64u << 20, &in, &n) != P_OK) return 100;
+        text out = {0};
+        for (size_t at = 0; at + 4 <= n;) {
+            const unsigned char *h = (const unsigned char *)in + at;
+            size_t k = ((size_t)h[0] << 24) | ((size_t)h[1] << 16) | ((size_t)h[2] << 8) | h[3];
+            at += 4;
+            if (k > n - at) break;
+            json_string(&out, in + at, k), add(&out, "\n");
+            at += k;
+        }
+        p_free(in);
+        bool good = !out.failed && (!out.data || p_print(out.data));
+        text_free(&out);
+        return good ? 0 : 3;
+    }
+    /* --json-escape: the JSON string of the bytes on stdin, and a newline. */
+    if (count >= 2 && same(args[1], "--json-escape")) {
+        char *in = NULL;
+        size_t n = 0;
+        if (p_input(1 << 20, &in, &n) != P_OK) return 100;
+        text out = {0};
+        json_string(&out, in, n);
+        add(&out, "\n");
+        p_free(in);
+        bool good = !out.failed && p_print(out.data);
+        text_free(&out);
+        return good ? 0 : 3;
     }
     if (count >= 4 && same(args[1], "--read-session")) {
         store s = {.folder = args[2]};

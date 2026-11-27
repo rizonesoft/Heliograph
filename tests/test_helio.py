@@ -2352,6 +2352,139 @@ class Archive(Base):
         self.assertEqual(self.helio("check", me=None).returncode, 0)
 
 
+class JsonWriter(unittest.TestCase):
+    """engine/json.c writes JSON in UTF-8 whatever bytes it is given: escaped, and a byte sequence that is not UTF-8
+    replaced by U+FFFD the way Python's errors="replace" does."""
+
+    def escape_many(self, items):
+        import json, struct
+        data = b"".join(struct.pack(">I", len(b)) + b for b in items)
+        r = subprocess.run([str(RACER), "--json-escape-many"], input=data, capture_output=True, timeout=120)
+        self.assertEqual((r.returncode, r.stderr), (0, b""))
+        lines = r.stdout.decode("utf-8").split("\n")  # strict: the writer's output is always UTF-8
+        self.assertEqual(lines[-1], "")
+        return [json.loads(line) for line in lines[:-1]]
+
+    def test_each_kind_of_text_reads_back_exactly(self):
+        cases = {
+            b"plain": "plain",
+            b'say "hi"': 'say "hi"',
+            b"back\\slash": "back\\slash",
+            b"two\nlines\r\tand tab": "two\nlines\r\tand tab",
+            b"\x00\x01\x1f\x7f": "\x00\x01\x1f\x7f",
+            "café ж 中 🚀".encode(): "café ж 中 🚀",
+            b"cut \xe2\x82": "cut �",
+            b"lone \x80 byte": "lone � byte",
+            b"overlong \xc0\xaf": "overlong ��",
+            b"surrogate \xed\xa0\x80": "surrogate ���",
+            b"too big \xf4\x90\x80\x80": "too big ����",
+            b"\xf0\x9f\x9a": "�",
+            b"": "",
+        }
+        got = self.escape_many(list(cases))
+        for (raw, want), have in zip(cases.items(), got):
+            with self.subTest(raw=raw):
+                self.assertEqual(have, want)
+                self.assertEqual(have, raw.decode("utf-8", errors="replace"))
+
+    def test_random_bytes_read_back_as_python_reads_them(self):
+        import random
+        rng = random.Random(10)
+        items = [bytes(rng.randrange(256) for _ in range(rng.randrange(40))) for _ in range(10000)]
+        got = self.escape_many(items)
+        self.assertEqual(len(got), len(items))
+        for raw, have in zip(items, got):
+            self.assertEqual(have, raw.decode("utf-8", errors="replace"), raw)
+
+
+class JsonReply(Base):
+    """With --json a call gives exactly one JSON value and a newline on stdout and nothing on stderr, also when it is
+    refused while its words are read or did part of its work and then failed; exit codes are those of text mode."""
+
+    def one(self, r, code):
+        import json
+        self.assertEqual((r.returncode, r.stderr), (code, b""), r.stdout)
+        out = r.stdout.decode("utf-8")
+        self.assertTrue(out.endswith("\n") and out.count("\n") == 1 + out[:-1].count("\n"), out)
+        return json.loads(out)  # one value: json.loads refuses a second
+
+    def test_the_flag_is_found_anywhere_but_never_as_an_options_value(self):
+        sent = self.send("tell", to="os/all", subject="flagged")
+        for words in (("show", "--bad", "--json"), ("--json", "show", "--bad"), ("--json", "show", sent, "--as")):
+            with self.subTest(words=words):
+                v = self.one(self.helio(*words, me="os/userland"), 2)
+                self.assertEqual(v["code"], 2)
+                self.assertIsInstance(v["error"], str)
+        v = self.one(self.helio("--json", "show", sent, me="os/userland"), 0)
+        self.assertIn("flagged", v["text"])
+        # --about takes a value, so a literal --json there is the paths and the reply is text.
+        r = self.helio("tell", "os/all", "about-json", "--about", "--json", me="os/main", body="b")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        mid = r.stdout.decode().strip()
+        self.assertIn("about: --json\n", (self.store / f"messages/{mid}.post").read_text())
+        bad = self.store / "badconf"
+        bad.mkdir()
+        put(bad / "helio.conf", "project: os\nowns nonsense\n")
+        v = self.one(self.helio("--json", me="os/userland", cwd=bad), 2)
+        self.assertEqual(v["code"], 2)
+
+    def test_work_done_before_a_failure_comes_in_the_same_value(self):
+        good = self.send("tell", to="os/userland", subject="readable")
+        bad_job = self.send(subject="damaged-job")
+        put(self.store / f"messages/{bad_job}.link.0000", "corrupt\n")
+        v = self.one(self.helio("--json", me="os/userland"), 3)
+        self.assertIn("readable", v["text"])
+        self.assertEqual(v["code"], 3)
+        # A send whose session announcement fails afterwards: the id, and the failure as a warning.
+        sessions = self.store / "sessions"
+        sessions.mkdir(exist_ok=True)
+        os.chmod(sessions, 0o500)
+        try:
+            v = self.one(self.helio("tell", "os/all", "warned", "--json", "--session", "s1", me="os/main", body="b"), 0)
+        finally:
+            os.chmod(sessions, 0o700)
+        self.assertRegex(v["text"], r"^\d+-[0-9a-f]+\n$")
+        self.assertTrue(v["warnings"], v)
+        # show writes its reply, then the seen mark: a seen mark that fails shows in the exit code alone.
+        os.chmod(self.store / "messages", 0o500)
+        try:
+            r = self.helio("show", good, "--json", me="os/userland")
+        finally:
+            os.chmod(self.store / "messages", 0o700)
+        self.assertNotEqual(r.returncode, 0)
+        v = self.one(r, r.returncode)
+        self.assertIn("readable", v["text"])
+
+    def test_a_reply_that_cannot_be_written_acknowledges_nothing(self):
+        sent = self.send("tell", to="os/userland", subject="unread")
+        read_end, write_end = os.pipe()
+        os.close(read_end)  # the reader is gone before anything is written
+        try:
+            r = subprocess.run([str(PROGRAM), "show", sent, "--json", "--store", str(self.store), "--as", "os/userland"],
+                               stdin=subprocess.DEVNULL, stdout=write_end, stderr=subprocess.PIPE, timeout=30)
+        finally:
+            os.close(write_end)
+        self.assertEqual(r.returncode, 3)
+        self.assertEqual([p.name for p in (self.store / "messages").iterdir() if ".seen." in p.name], [])
+        self.assertIn("unread", self.helio(me="os/userland").stdout.decode())
+
+    def test_help_and_the_hook_have_their_own_values(self):
+        import json
+        v = self.one(self.helio("help", "--json", me=None), 0)
+        self.assertIn("helio ask", v["help"])
+        v = self.one(self.helio("hook", "claude", "--json", me="os/userland"), 0)
+        self.assertEqual(v, {"context": None})
+        self.send("tell", to="os/userland", subject="for the hook")
+        text_hook = self.helio("hook", "claude", me="os/userland")
+        v = self.one(self.helio("hook", "claude", "--json", me="os/userland"), 0)
+        self.assertEqual(v["context"].encode(), text_hook.stdout)
+        bad = self.send(subject="hook-damage")
+        put(self.store / f"messages/{bad}.link.0000", "corrupt\n")
+        v = self.one(self.helio("hook", "claude", "--json", me="os/userland"), 0)
+        self.assertTrue(v["damaged"])
+        self.assertIn(b"damaged", self.helio("hook", "claude", me="os/userland").stdout)
+
+
 class OutsideWatch:
     """Every open, listing, read, write and creation inside the watched folders, through Linux inotify: a store
     operation that followed a link out of the store shows here, whatever it then did with what it found."""

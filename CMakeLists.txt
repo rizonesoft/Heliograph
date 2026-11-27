@@ -3,7 +3,7 @@ project(Heliograph LANGUAGES C)
 include("${IMPOSSIBLE_SDK_DIR}/cmake/ImpossibleSDK.cmake")
 include_directories(engine)
 set(STORE engine/base.c engine/store.c engine/archive.c)
-set(CORE ${STORE} engine/place.c engine/watch.c engine/helio.c)
+set(CORE ${STORE} engine/json.c engine/place.c engine/watch.c engine/helio.c)
 
 impossible_add_program(helio CONSOLE TIER 0 SOURCES src/main.c src/plat_windows.c src/helio.rc ${CORE})
 set_source_files_properties(src/helio.rc PROPERTIES OBJECT_DEPENDS "${CMAKE_SOURCE_DIR}/brand/icon.ico")
