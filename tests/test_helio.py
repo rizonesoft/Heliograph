@@ -4810,6 +4810,54 @@ class RepositoryRouting(Base):
         rc_h, healed = self.read_session("os/dev", "t")
         self.assertEqual((rc_h, healed["agent"], healed["repository"]), (0, "claude", "repo-a"))
 
+    def test_an_exact_tie_goes_to_the_repository_name_that_sorts_last(self):
+        """Keys of one session that tie on time, order, agent order and agent time are told apart by the
+        repository name alone, so the session reads the same whatever order the folder lists them in."""
+        digest = hashlib.sha256(b"x").hexdigest()[:32]
+        prefix = f"os+dev+r{digest}+"
+        agents = ("claude", "codex", "antigravity")
+        sdir = self.store / "sessions"
+        sdir.mkdir(exist_ok=True)
+        t = int(time.time() * 1_000_000) - 5_000_000
+        name_sets = [("repo-a", "repo-b"), ("zeta", "alpha"), ("m3", "m1", "m2")] + [(f"p{i}a", f"p{i}b") for i in range(20)]
+        seen = set()
+        for names in name_sets:
+            winner = max(names)
+            for written in (names, tuple(reversed(names))):
+                for p in list(sdir.iterdir()):
+                    p.unlink()
+                for name in written:
+                    put(sdir / f"{prefix}{name}",
+                        f"time: {t}\norder: 5\nagent: {agents[names.index(name)]}\nagent-order: 4\nagent-time: {t - 10}\nrepository: {name}\nsession: x\nend: yes\n")
+                listed = [n[len(prefix):] for n in os.listdir(sdir) if n.startswith(prefix)]
+                seen.add("first" if listed[0] == winner else "later")
+                rc, info = self.read_session("os/dev", "x")
+                self.assertEqual((rc, info and info["agent"], info and info["repository"]), (0, agents[names.index(winner)], winner), (names, listed))
+        self.assertEqual(seen, {"first", "later"}, "the winning key was never listed in both positions")
+
+        # A refresh that names no agent moves the repository by design and never the agent.
+        names = ("repo-a", "repo-b")
+        for p in list(sdir.iterdir()):
+            p.unlink()
+        for name in names:
+            put(sdir / f"{prefix}{name}",
+                f"time: {t}\norder: 5\nagent: {agents[names.index(name)]}\nagent-order: 4\nagent-time: {t - 10}\nrepository: {name}\nsession: x\nend: yes\n")
+        for where in ("repo-b", "repo-a", "repo-b"):
+            folder = self.store / f"w-{where}"
+            folder.mkdir(exist_ok=True)
+            put(folder / "helio.conf", f"project: os\nrepository: {where}\n")
+
+            def stored_order():
+                files = sorted((p for p in sdir.iterdir() if p.name == prefix + where or p.name.startswith(prefix + where + "~")),
+                               key=lambda p: int(p.name.partition("~")[2] or 0))
+                return int(next(ln for ln in files[-1].read_text().splitlines() if ln.startswith("order: "))[7:])
+            before = stored_order()
+            r = self.helio("inbox", "--session", "x", me="os/dev", cwd=folder)
+            self.assertEqual((r.returncode in (0, 1), r.stderr), (True, b""))
+            self.assertGreater(stored_order(), before, f"the refresh in {where} wrote nothing")
+            rc, info = self.read_session("os/dev", "x")
+            self.assertEqual((rc, info["agent"], info["repository"]), (0, "codex", where), where)
+
     def test_a_merged_session_never_lends_another_keys_time_to_a_repository(self):
         """An owner inbox loads a session unscoped for a session-addressed heads-up, then checks a take in
         repo-d by the same session. A key of repo-c with a clock an hour ahead must not keep it from SILENT."""
@@ -4841,7 +4889,7 @@ class RepositoryRouting(Base):
         self.assertEqual(len(lines), 1, owner.stdout.decode())
         self.assertIn("SILENT", lines[0])
         # The full listing gives the session once although it has a key in two repositories.
-        rows = [row for row in Sessions.parse_racer_sessions(self, subprocess.run([str(RACER), "--list-sessions", str(self.store)], capture_output=True, timeout=30).stdout.decode()) if row.get("session") == "w"]
+        rows = [row for row in Sessions.list_sessions(self) if row.get("session") == "w"]
         self.assertEqual(len(rows), 1, rows)
         self.assertEqual((rows[0]["repository"], rows[0]["agent"]), ("repo-d", "claude"))
 
