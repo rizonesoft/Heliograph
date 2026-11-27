@@ -55,7 +55,7 @@ title: "TODO-01 -- Heliograph"
 | 18 | §18 | Session tie and listing tests held to their result | §14 | [x] |
 | 19 | §19 | Archive paths opened without following a swapped folder | §3 | [x] |
 | 20 | §20 | Windows launches from WSL that survive an interop timeout | §17 | [x] |
-| 21 | §21 | JSON for the inbox, log, show and check | §10 | [ ] |
+| 21 | §21 | JSON for the inbox, log, show and check | §10 | [x] |
 | 22 | §22 | JSON for sending, job changes, archive and working | §10 | [ ] |
 | 23 | §23 | Summary command read from the day's snapshot | §10 | [ ] |
 | 24 | §24 | Folder holds that outlast a busy Windows host | -- | [ ] |
@@ -681,9 +681,12 @@ Filed 2026-11-27 from the `D01 T01 §10` plan review (findings 2, 3, 4 for `chec
 - [x] Print `log` as `{"messages": [...]}` and `show` as one message object, through the same visibility and seen-mark paths as the text forms. Done when: with two projects in one store and two sessions in one lane, the exact ids returned match the text forms, a message outside the reader's view is refused the same as a missing one, an id live and archived at once appears once, and `show` marks it seen for the next inbox.
 - [x] Print `check` as `{"ok": <bool>, "problems": [<text>...]}` with one `problems` array holding every live and archive problem (the reply writer adds no second one): exit 0 with `{"ok": true, "problems": []}` exactly for a clean store, exit 3 with `ok` `false`, every problem, `error` and `code` for a damaged one. Done when: a clean store reads exactly so; one live and one archive damage give both problems, `error`, `code` 3 and empty stderr, and decoding with a duplicate-key check finds none.
 - [x] Move the tests that read `v["text"]` for the inbox, `show` and `log` in `tests/test_helio.py` (from `D01 T01 §10`) to the structured fields, keeping their checks of partial results, warnings, exit codes and acknowledgment. Done when: no test reads `text` for those commands and each still fails with its own production change reverted.
-- [ ] Commit: `output: JSON for reading`
+- [x] Commit: `output: JSON for reading`
 
 **Test checkpoint:** `python3 ../SDK/tools/app_build.py .` exits 0 and the tests fail with any field, the budget or the visibility path removed.
+
+> **Verified:** 2026-11-28 | §21 | c73623edc8461688e1714e42b62dc22f75a388c4
+> **Review:** `docs/reviews/d01-t01-s21.json`
 
 ## 22. JSON for sending, job changes, archive and working
 
