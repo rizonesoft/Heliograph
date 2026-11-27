@@ -46,7 +46,7 @@ title: "TODO-01 -- Heliograph"
 | 9 | §9 | Fixed marks around every shown message | §7 | [x] |
 | 10 | §10 | JSON writer and one reply per call | §3, §5, §6, §8, §9 | [x] |
 | 11 | §11 | Take the next job as a queue | §10, §22 | [ ] |
-| 12 | §12 | Expiry of seen heads-ups and findings | §3, §4 | [ ] |
+| 12 | §12 | Expiry of seen heads-ups and findings | §3, §4 | [x] |
 | 13 | §13 | Design and help that match the program | §11, §12, §14, §21, §23 | [ ] |
 | 14 | §14 | Unowned paths kept to their repository | §4, §6 | [x] |
 | 15 | §15 | Quick installer | -- | [x] |
@@ -393,9 +393,12 @@ Seen heads-ups, findings and answers stay in the working store for ever. They le
 - [x] Move a ready message in `copy_and_unlink_post` of `engine/archive.c`: validate its seen marks, copy the post and every seen mark durably, remove the post, then sweep late seen marks, as a closed job is moved. The decision is made again on every attempt from the live and archived marks and the heartbeats, the last time just before the post is removed, and is final at the removal: nothing is put back after it. An archived copy beside a live post is an unfinished move, never proof, and stays while the message is held. Done when: at the boundary a read message is in `archive/<year-month>/` byte for byte and gone from `messages`; `show`, `answer` and a keyed repeat still find it under its id; a lane that announces itself after the post was copied and before the last listing keeps the post live and in its inbox, also when the archiver was cut at `before-unlink-post` and retried; both `helio archive` and the first inbox of the day move it. Cheaper substitute: deleting it.
 - [x] Recognize a finished move of a non-job in `engine/archive.c` (`archive_has_closed`: a terminal job, or an archived non-job post with its live post gone, used by the recovery branch of `copy_and_unlink_post`, `sweep_item_tail` and `archive_is_clean_remnant`), keeping `archive_has_terminal_job` for jobs. A late seen mark is swept to the archive; a step or landed mark of a non-job is damage, named and kept. Done when: a kill at each pause of the move, `before-unlink-post` included, leaves `helio check` exit 0 and the next `helio archive` finishes it; a failed flush of an archive copy exits 3 naming the message with its live files unchanged, and the next run without the failure finishes the move; a reader writing a second seen mark and a keyed sender retrying while the post moves end with the post and every acknowledged mark in the archive byte for byte, no live copy, the original keyed id and one `log --all` row; a live seen mark with no post and no archived copy, and a `.link.0000` or a `.landed.<commit>` beside an archived heads-up, are named damage by `check` and `archive` and kept. Cheaper substitute: treating any orphan mark as clean.
 - [x] Keep an unseen message and count it in `watch_summary` of `engine/watch.c` with `archive_expiry`: a `Held unseen` part lists the ids of messages at or over 30 days that are held, with their count. Done when: with held, ready and young messages together the day's summary lists exactly the held ids and their count (zero and two cases), the held one is still in the inbox of the lane that has not seen it, and the saved summary reads back unchanged after that lane then reads it. Cheaper substitute: deleting it.
-- [ ] Commit: `archive: seen messages expire`
+- [x] Commit: `archive: seen messages expire`
 
 **Test checkpoint:** `python3 ../SDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
+
+> **Verified:** 2026-11-27 | §12 | 9cf12fe584ef2a4011c212f45bb7d958c68c4c95
+> **Review:** `docs/reviews/d01-t01-s12.json`
 
 ## 13. Design and help that match the program
 

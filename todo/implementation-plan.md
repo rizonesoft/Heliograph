@@ -50,13 +50,13 @@ Sections: 7 | Checklist items: 42
 | Status | Reference   | Deliverable                                        | Needs | Items |
 | ------ | ----------- | -------------------------------------------------- | ----- | ----- |
 | [x]    | D01 T01 §10 | JSON writer and one reply per call                 | none  | 7     |
-| [ ]    | D01 T01 §12 | Expiry of seen heads-ups and findings              | none  | 8     |
+| [x]    | D01 T01 §12 | Expiry of seen heads-ups and findings              | none  | 8     |
 | [ ]    | D01 T01 §21 | JSON for the inbox, log, show and check            | none  | 6     |
 | [ ]    | D01 T01 §22 | JSON for sending, job changes, archive and working | none  | 7     |
 | [ ]    | D01 T01 §11 | Take the next job as a queue                       | none  | 5     |
 | [ ]    | D01 T01 §23 | Summary command read from the day's snapshot       | none  | 5     |
 | [ ]    | D01 T01 §13 | Design and help that match the program             | none  | 4     |
 
-Progress: 17/23 verified sections, 4 ready to run now.
+Progress: 18/23 verified sections, 3 ready to run now.
 
-Checklist: 117/145 items completed (includes Commit items).
+Checklist: 118/145 items completed (includes Commit items).
