@@ -2558,13 +2558,13 @@ class JsonReading(Base):
         return subprocess.run([str(RACER), "--now", str(us), *args, "--store", str(self.store)], input=body, capture_output=True,
                               timeout=30, cwd=cwd or self.store, env=env)
 
-    def sent(self, us, *args, body=b"b"):
-        r = self.at(us, *args, body=body)
+    def sent(self, us, *args, body=b"b", cwd=None):
+        r = self.at(us, *args, body=body, cwd=cwd)
         self.assertEqual(r.returncode, 0, r.stderr)
         return r.stdout.decode().strip()
 
-    def ok(self, us, *args):
-        r = self.at(us, *args)
+    def ok(self, us, *args, cwd=None):
+        r = self.at(us, *args, cwd=cwd)
         self.assertEqual(r.returncode, 0, (args, r.stderr, r.stdout))
 
     def value(self, r, code, pairs=False):
@@ -2633,6 +2633,49 @@ class JsonReading(Base):
         for row in self.rows(t + 10, "log", "--all")["messages"]:
             name = row["subject"]
             self.assertEqual((row["state"], row["taker"], row["session"], row["closed_by"]), want[name], name)
+
+    def assert_row_is_the_post(self, v, mid, root="messages"):
+        post = self.post_fields(mid, root)
+        body = (self.store / f"{root}/{mid}.post").read_bytes().split(b"\n\n", 1)[1].decode()
+        due = int(post["due"]) if post.get("due") else 0
+        want_due = None if not due else "%s.%06dZ" % (time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(due // 1_000_000)), due % 1_000_000)
+        want = {"id": post["id"], "time": post["time"], "from": post["from"], "to": post["to"], "for_session": post.get("for", ""),
+                "repository": post.get("repository", ""), "kind": post["kind"], "about": post["about"], "urgency": post["urgency"],
+                "re": post["re"], "due": want_due, "subject": post["subject"], "body": body}
+        self.assertEqual({k: v[k] for k in want}, want, mid)
+
+    # completion gap 1: every stored field reads back for every job history, and a repository is carried
+    def test_every_job_history_reads_back_every_stored_field(self):
+        t = self.OLD
+        repo = self.store / "repo-a"
+        repo.mkdir()
+        put(repo / "helio.conf", "project: os\nrepository: repo-a\n")
+        self.ok(t, "hello", "codex", "--as", "os/dev1", cwd=repo)
+        ids = {}
+        ids["open"] = self.sent(t, "ask", "os/userland", "open", "--as", "os/main", "--about", "a.c", "--due", "7")
+        ids["taken"] = self.sent(t, "ask", "os/userland", "taken", "--as", "os/main", "--for-session", "s1")
+        self.ok(t + 1, "take", ids["taken"], "--as", "os/userland", "--session", "s1")
+        ids["released"] = self.sent(t, "hand", "os/userland", "released", "--as", "os/main")
+        self.ok(t + 1, "take", ids["released"], "--as", "os/userland"), self.ok(t + 2, "release", ids["released"], "--as", "os/userland")
+        ids["done"] = self.sent(t, "ask", "os/userland", "done", "--as", "os/main")
+        self.ok(t + 1, "take", ids["done"], "--as", "os/userland"), self.ok(t + 2, "done", ids["done"], "ok", "--as", "os/userland")
+        ids["refused"] = self.sent(t, "ask", "os/userland", "refused", "--as", "os/main")
+        self.ok(t + 1, "refuse", ids["refused"], "no", "--as", "os/userland")
+        ids["repository"] = self.sent(t + 1, "ask", "path:docs/x.md", "in repo-a", "--as", "os/main", cwd=repo)
+        self.assertEqual(self.post_fields(ids["repository"])["repository"], "repo-a")
+        for name, mid in ids.items():
+            v = self.shown(t + 10, mid)
+            self.assert_row_is_the_post(v, mid)
+            self.assertEqual(v["archived"], False, name)
+        self.assertEqual(self.shown(t + 10, ids["repository"])["repository"], "repo-a")
+        # Archived, the closed ones (open, taken and released jobs are never archived, D01 T01 §2) read the same.
+        self.assertEqual(run(self.store, "archive", me=None).returncode, 0)
+        for name in ("done", "refused"):
+            mid = ids[name]
+            month = next((self.store / "archive").glob(f"*/{mid}.post")).parent
+            v = self.shown(t + 10, mid)
+            self.assert_row_is_the_post(v, mid, root=f"archive/{month.name}")
+            self.assertEqual(v["archived"], True, name)
 
     # item 2: a message reads back as stored
     def test_a_message_reads_back_every_stored_field(self):
