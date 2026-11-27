@@ -35,9 +35,30 @@ size_t archive_every(store *s, char *const *emitted, size_t emitted_count,
 /* Validates all archived month folders and files structurally (and against live copies during interrupted moves). */
 s_result archive_check(store *s, text *report);
 
+/* Whether a heads-up, finding or answer leaves the working store: not yet (under 30 days since it was sent, or sent
+   in the future), held (someone it is for has not seen it) or ready. A lane has seen it when any of its seen marks
+   exists; a message for one session needs that session's mark; an owner's alert mark never counts. A message for
+   project/all waits for every other lane of the project with a heartbeat at or after its sending (`life`, which
+   the caller reads in the message's repository when it names one), and for at least one reader. It reads nothing:
+   seen holds the names of the message's seen marks ("seen.<proj>+<lane>..."), and the caller has validated them. */
+typedef enum { EXPIRY_NOT_YET, EXPIRY_HELD, EXPIRY_READY } expiry;
+typedef struct expiry_life {
+    char lane[72];
+    uint64_t when;
+} expiry_life;
+expiry archive_expiry(const message *m, char *const *seen, size_t seen_count, const expiry_life *life, size_t life_count, uint64_t now);
+
 /* Validates archive/<YYYY-MM>/<id>.post and its archived chain to DONE or REFUSED.
    Returns S_OK (valid terminal archived job, sets *links_out if non-NULL), S_NOTHING (no archive post), or S_DAMAGED. */
 s_result archive_has_terminal_job(const char *folder, const char *id, unsigned *links_out);
+
+/* Reads who should see a message (the heartbeats, for project/all) and decides with archive_expiry. A sessions
+   listing that fails part way is S_DAMAGED and no decision. seen holds the names of its marks, already validated. */
+s_result archive_expiry_of(store *s, const message *m, char *const *seen, size_t seen_count, uint64_t now, expiry *out);
+
+/* A finished move: a terminal archived job, or an archived post of a message that is not a job (*non_job), whose
+   live post the caller found gone. S_NOTHING when nothing is archived, S_DAMAGED when the archive is. */
+s_result archive_has_closed(const char *folder, const char *id, unsigned *links_out, bool *non_job);
 
 /* True iff live event <id>.<event> (whose live .post is missing) is a clean interrupted-archive remnant
    matching a validated archived terminal job. */

@@ -58,7 +58,7 @@ Legend: ✅ works · 📋 planned
 | Codex and Antigravity | ✅ | They run `helio` between sections of an unattended run |
 | Due times, overlap warnings | ✅ | Shown by the inbox and by `helio working` |
 | Daily summary | ✅ | Written by the first inbox or hook of the day |
-| Archive by month, expiry | 📋 | [§1 to §3 and §12](todo/01-heliograph/TODO-01-heliograph.md) |
+| Archive by month, expiry | ✅ | `helio archive` and the first inbox of the day move closed jobs, and seen heads-ups, findings and answers, 30 days on; an unseen one stays and is counted in the daily summary |
 | Silent takers, messages for one session | ✅ | `helio hello`, `silent:` reporting, and `--for-session` targeting |
 | Projects kept apart in log and show | ✅ | `may_see` scopes `log`, `show`, `answer`, and job commands to your project |
 | Mark for landed work | ✅ | `helio landed <id> <commit>` links a commit without closing the job |

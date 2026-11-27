@@ -1,4 +1,5 @@
 #include "watch.h"
+#include "archive.h"
 
 enum { MOST_PATHS = 2000 };
 
@@ -287,6 +288,53 @@ s_result watch_working(store *s, const place *p, const char *me, const char *pat
     return result;
 }
 
+/* Decides whether a heads-up, finding or answer past 30 days is held for someone who has not seen it. Its seen marks
+   are the names after its post in the sorted listing; one that cannot be read or is damaged, or a sessions listing
+   that fails, leaves the decision unmade (false), so the day's summary is deferred rather than frozen without it. */
+static bool summary_held(store *s, size_t post_at, const message *m, uint64_t now, bool *held) {
+    *held = false;
+    if (archive_expiry(m, NULL, 0, NULL, 0, now) == EXPIRY_NOT_YET) return true; /* a young one is not read */
+    size_t id_n = len(m->id);
+    char **seen = NULL;
+    size_t count = 0, cap = 0;
+    bool ok = true;
+    for (size_t k = post_at + 1; ok && k < s->count; k++) {
+        const char *name = s->names[k];
+        bool mine = true;
+        for (size_t c = 0; c < id_n && mine; c++) mine = name[c] == m->id[c];
+        if (!mine || name[id_n] != '.') break;
+        const char *ev = name + id_n + 1;
+        if (!starts(ev, "seen.")) continue;
+        text at = {0};
+        add(&at, s->folder), add(&at, "/messages/"), add(&at, name);
+        char *data = NULL;
+        size_t length = 0;
+        p_result r = at.failed ? P_FAILED : p_read(at.data, MOST_FILE, &data, &length);
+        text_free(&at);
+        if (r == P_MISSING) continue;
+        ok = r == P_OK && store_valid_seen_event(ev) && length == 5 && same(data, "seen\n");
+        p_free(data);
+        if (!ok) break;
+        if (count == cap) {
+            size_t next_cap = cap ? cap * 2 : 8;
+            char **next = p_alloc(next_cap * sizeof *next);
+            if (!next) {
+                ok = false;
+                break;
+            }
+            for (size_t i = 0; i < count; i++) next[i] = seen[i];
+            p_free(seen);
+            seen = next, cap = next_cap;
+        }
+        seen[count++] = (char *)ev;
+    }
+    expiry e = EXPIRY_NOT_YET;
+    if (ok) ok = archive_expiry_of(s, m, seen, count, now, &e) == S_OK;
+    p_free(seen);
+    *held = ok && e == EXPIRY_HELD;
+    return ok;
+}
+
 static void add_summary_item(text *part, unsigned *count, const message *m, const job *j) {
     (*count)++;
     if (*count <= 100) {
@@ -311,9 +359,10 @@ s_result watch_summary(store *s, const place *here) {
     p_result got = full ? P_FAILED : p_read(path.data, 1 << 20, &there, &length);
     if (got != P_OK && got != P_MISSING) result = S_DAMAGED;
     else if (got == P_MISSING) {
-        static const char *const titles[] = {"Overdue", "Silent", "Open", "Taken", "Done in the last day", "Refused in the last day"};
-        text parts[6] = {0}, out = {0};
-        unsigned counts[6] = {0}, damaged = 0;
+        static const char *const titles[] = {"Overdue", "Silent", "Open", "Taken", "Done in the last day", "Refused in the last day", "Held unseen"};
+        enum { PARTS = 7, HELD = 6 };
+        text parts[PARTS] = {0}, out = {0};
+        unsigned counts[PARTS] = {0}, damaged = 0;
         uint64_t now = p_now();
         session_cache sc = {0};
         bool liveness_err = false;
@@ -349,6 +398,13 @@ s_result watch_summary(store *s, const place *here) {
                         add_summary_item(&parts[part], &counts[part], &m, &j);
                     }
                 }
+            } else {
+                bool held = false;
+                if (!summary_held(s, i, &m, now, &held)) liveness_err = true;
+                else if (held) {
+                    job none = {0};
+                    add_summary_item(&parts[HELD], &counts[HELD], &m, &none);
+                }
             }
             message_free(&m);
             p_free(id);
@@ -358,13 +414,13 @@ s_result watch_summary(store *s, const place *here) {
             /* Do not freeze an incomplete daily summary when session or threshold reads failed:
                return S_NOTHING (deferred) so the caller prints a diagnostic, retries on the next
                call once the transient fault clears, and lets the caller's own inbox decide its exit code. */
-            for (int i = 0; i < 6; i++) text_free(&parts[i]);
+            for (int i = 0; i < PARTS; i++) text_free(&parts[i]);
             s->why = "the summary was deferred: session or threshold could not be read";
             p_free(there), text_free(&day), text_free(&folder), text_free(&path), text_free(&unique);
             return S_NOTHING;
         } else {
             add(&out, "# Heliograph "), add(&out, day.data), add(&out, "\n\nAs it stood at "), add_time(&out, now), add(&out, ".\n");
-            for (int i = 0; i < 6; i++) {
+            for (int i = 0; i < PARTS; i++) {
                 add(&out, "\n## "), add(&out, titles[i]), add(&out, ": "), add_number(&out, counts[i], 0), add(&out, "\n\n");
                 if (parts[i].data) add(&out, parts[i].data);
                 if (counts[i] > 100) add(&out, "- and more: helio log\n");

@@ -2579,6 +2579,342 @@ class OutsideWatch:
         os.close(self.fd)
 
 
+class Expiry(Base):
+    """Seen heads-ups, findings and answers leave the working store 30 days after they were sent, once all who should
+    see them have; an unseen one stays, in the inbox and in the day's summary."""
+
+    T0 = 1_800_000_000_000_000  # 2027-01-15T08:00:00Z
+    DAY = 86_400_000_000
+    D30 = 30 * DAY
+
+    def at(self, now_us, *args, me=None, cwd=None, body=b""):
+        command = [str(RACER), "--now", str(now_us), *args, "--store", str(self.store), *(["--as", me] if me else [])]
+        clean = {k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "ANTIGRAVITY_CONVERSATION_ID")}
+        return subprocess.run(command, input=body, capture_output=True, timeout=60, cwd=cwd or self.store, env=clean)
+
+    def post_at(self, now_us, command, to, subject, *more, me="os/main", cwd=None):
+        r = self.at(now_us, command, to, subject, *more, me=me, cwd=cwd, body=b"body of " + subject.encode())
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout.decode().strip()
+
+    def month(self, mid):
+        return time.strftime("%Y-%m", time.gmtime(int(mid.split("-")[0]) / 1_000_000))
+
+    def live(self, mid):
+        return (self.store / f"messages/{mid}.post").exists()
+
+    def mark(self, lane, session=""):
+        name = "seen." + lane.replace("/", "+")
+        if session:
+            name += "+" + hashlib.sha256(session.encode()).hexdigest()[:32]
+        return name
+
+    def archive_at(self, now_us, code=None):
+        r = self.at(now_us, "archive")
+        if code is not None:
+            self.assertEqual(r.returncode, code, r.stdout + r.stderr)
+        return r
+
+    def expiry(self, kind, to, sent, now, *rest, frm="os/main", for_session="-"):
+        r = subprocess.run([str(RACER), "--expiry", kind, frm, to, for_session, str(sent), str(now), *rest], capture_output=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout.decode().strip()
+
+    def test_the_decision_at_the_boundary_for_every_kind(self):
+        sent = self.T0
+        for kind in ("headsup", "finding", "answer"):
+            seen = ("seen.os+apps",)
+            self.assertEqual(self.expiry(kind, "os/apps", sent, sent + self.D30 - 1, *seen), "not-yet", kind)
+            self.assertEqual(self.expiry(kind, "os/apps", sent, sent + self.D30, *seen), "ready", kind)
+            self.assertEqual(self.expiry(kind, "os/apps", sent, sent + self.D30 + 1, *seen), "ready", kind)
+            self.assertEqual(self.expiry(kind, "os/apps", sent, sent + self.D30), "held", kind)
+            self.assertEqual(self.expiry(kind, "os/apps", sent, sent + self.D30 + 1), "held", kind)
+            # A future id (the clock stepped back) is never aged by unsigned subtraction.
+            self.assertEqual(self.expiry(kind, "os/apps", sent + self.DAY, sent, *seen), "not-yet", kind)
+        # The owner's alert mark is never the reader, also on a message for project/all, where the owner is a lane.
+        late = sent + self.D30
+        self.assertEqual(self.expiry("headsup", "os/all", sent, late, "seen.os+apps", "seen.os+owner~alert", f"life:os/owner@{sent + 1}"), "held")
+        self.assertEqual(self.expiry("headsup", "os/all", sent, late, "seen.os+owner~alert"), "held")
+        self.assertEqual(self.expiry("headsup", "os/all", sent, late, "seen.os+apps", "seen.os+owner", f"life:os/owner@{sent + 1}"), "ready")
+        # A job never expires this way: its own rule is the closed-job archive.
+        self.assertEqual(self.expiry("request", "os/apps", sent, sent + 2 * self.D30, "seen.os+apps"), "not-yet")
+        self.assertEqual(self.expiry("handoff", "os/apps", sent, sent + 2 * self.D30, "seen.os+apps"), "not-yet")
+
+    def test_who_has_seen_it_is_read_from_real_marks_on_one_message(self):
+        put(self.store / "helio.conf", "project: os\nsilent: 60\n")
+        m = 60_000_000
+        one = self.post_at(self.T0, "tell", "os/apps", "for s1", "--for-session", "s1")
+        # The owner opens it after s1 went silent: the lane-wide ~alert mark is the owner's, not the reader's.
+        self.assertEqual(self.at(self.T0 + 65 * m, "show", one, me="os/owner").returncode, 0)
+        self.assertTrue((self.store / f"messages/{one}.seen.os+owner~alert").exists())
+        late = self.T0 + self.D30
+        self.archive_at(late, 1)
+        self.assertTrue(self.live(one))
+        # A sibling session's mark and the bare lane's mark are not s1's.
+        put(self.store / f"messages/{one}.{self.mark('os/apps', 's2')}", "seen\n")
+        put(self.store / f"messages/{one}.{self.mark('os/apps')}", "seen\n")
+        self.archive_at(late, 1)
+        self.assertTrue(self.live(one))
+        # s1 reads it: ready, moved.
+        self.assertEqual(self.at(late, "show", one, "--session", "s1", me="os/apps").returncode, 0)
+        self.assertTrue((self.store / f"messages/{one}.{self.mark('os/apps', 's1')}").exists())
+        self.archive_at(late + 1, 0)
+        self.assertFalse(self.live(one))
+        self.assertTrue((self.store / f"archive/{self.month(one)}/{one}.{self.mark('os/apps', 's1')}").exists())
+
+        # A lane-wide message is seen by a named session of the lane.
+        wide = self.post_at(self.T0 + 1, "find", "os/apps", "lane-wide")
+        self.archive_at(late + 2, 1)
+        self.assertTrue(self.live(wide))
+        self.assertEqual(self.at(late + 3, "show", wide, "--session", "s9", me="os/apps").returncode, 0)
+        self.archive_at(late + 4, 0)
+        self.assertFalse(self.live(wide))
+
+    def test_a_message_for_all_waits_for_every_lane_alive_since_it_was_sent(self):
+        self.assertEqual(self.at(self.T0 - self.DAY, "hello", "codex", me="os/old").returncode, 0)
+        msg = self.post_at(self.T0, "tell", "os/all", "everyone")
+        self.assertEqual(self.at(self.T0 + 60_000_000, "hello", "codex", me="os/ui").returncode, 0)
+        self.assertEqual(self.at(self.T0 + 120_000_000, "hello", "codex", me="os/apps").returncode, 0)
+        late = self.T0 + self.D30
+        self.archive_at(late, 1)  # nobody has seen it: held
+        self.assertTrue(self.live(msg))
+        self.assertEqual(self.at(late, "show", msg, me="os/apps").returncode, 0)
+        self.archive_at(late + 1, 1)  # os/ui is alive since and has not seen it
+        self.assertTrue(self.live(msg))
+        self.assertIn(msg, self.at(late + 2, me="os/ui").stdout.decode())
+        self.assertEqual(self.at(late + 3, "show", msg, me="os/ui").returncode, 0)
+        self.archive_at(late + 4, 0)  # os/old has shown no life since it was sent and does not hold it
+        self.assertFalse(self.live(msg))
+
+    def test_a_repository_message_waits_for_heartbeats_in_that_repository(self):
+        repo_a, repo_b = self.store / "repo-a", self.store / "repo-b"
+        repo_a.mkdir(), repo_b.mkdir()
+        put(repo_a / "helio.conf", "project: os\nrepository: repo-a\n")
+        put(repo_b / "helio.conf", "project: os\nrepository: repo-b\n")
+        t = self.T0
+        self.assertEqual(self.at(t, "hello", "claude", "--session", "w1", me="os/dev1", cwd=repo_a).returncode, 0)
+        self.assertEqual(self.at(t, "hello", "codex", me="os/dev2", cwd=repo_a).returncode, 0)
+        msg = self.post_at(t + 1, "tell", "path:docs/unowned.md", "repo-a news", cwd=repo_a)
+        post = (self.store / f"messages/{msg}.post").read_text()
+        self.assertIn("to: os/all\n", post)
+        self.assertIn("repository: repo-a\n", post)
+        # dev1 works in repo-a after it was sent, then moves to repo-b without reading it; dev3 lives only in repo-b.
+        self.assertEqual(self.at(t + 2, "hello", "claude", "--session", "w1", me="os/dev1", cwd=repo_a).returncode, 0)
+        self.assertEqual(self.at(t + 3, "hello", "claude", "--session", "w1", me="os/dev1", cwd=repo_b).returncode, 0)
+        self.assertEqual(self.at(t + 4, "hello", "codex", me="os/dev3", cwd=repo_b).returncode, 0)
+        late = t + self.D30 + 10
+        self.assertEqual(self.at(late, "show", msg, me="os/dev2", cwd=repo_a).returncode, 0)
+        self.archive_at(late + 1, 1)  # dev1's repo-a heartbeat after sending holds it
+        self.assertTrue(self.live(msg))
+        self.assertEqual(self.at(late + 2, "show", msg, "--session", "w1", me="os/dev1", cwd=repo_a).returncode, 0)
+        self.archive_at(late + 3, 0)  # dev3, alive only in repo-b, does not hold it
+        self.assertFalse(self.live(msg))
+
+    def test_an_audience_that_cannot_be_read_is_damage_and_no_decision(self):
+        self.assertEqual(self.at(self.T0 + 1, "hello", "codex", me="os/ui").returncode, 0)
+        msg = self.post_at(self.T0, "tell", "os/all", "everyone")
+        late = self.T0 + self.D30
+        self.assertEqual(self.at(late, "show", msg, me="os/apps").returncode, 0)
+        # One heartbeat record is damaged among readable ones: the listing gives os/apps and fails part way.
+        record = self.store / "sessions/os+ui"
+        good = record.read_bytes()
+        put(record, "damaged\n")
+        try:
+            r = self.archive_at(late + 1, 3)
+            self.assertIn(msg, (r.stdout + r.stderr).decode())
+            self.assertTrue(self.live(msg))
+            # The first inbox of the day defers the summary instead of freezing it without the decision.
+            day = time.strftime("%Y-%m-%d", time.gmtime((late + 1) / 1_000_000))
+            inbox = self.at(late + 1, me="os/apps")
+            self.assertIn(b"the summary was deferred", inbox.stderr)
+            self.assertFalse((self.store / f"summary/{day}.md").exists())
+        finally:
+            record.write_bytes(good)
+        # After repair the whole audience decides: os/ui is alive since and has not seen it.
+        self.archive_at(late + 2, 1)
+        self.assertTrue(self.live(msg))
+        self.assertEqual(self.at(late + 3, "show", msg, me="os/ui").returncode, 0)
+        self.archive_at(late + 4, 0)
+        self.assertFalse(self.live(msg))
+
+    def test_a_moved_message_is_whole_in_the_archive_and_still_answers(self):
+        msg = self.post_at(self.T0, "tell", "os/apps", "keyed note", "--key", "k-note")
+        late = self.T0 + self.D30
+        self.assertEqual(self.at(late, "show", msg, me="os/apps").returncode, 0)
+        before = {f.name: f.read_bytes() for f in (self.store / "messages").glob(f"{msg}.*")}
+        self.assertEqual(sorted(before), sorted([f"{msg}.post", f"{msg}.{self.mark('os/apps')}"]))
+        self.archive_at(late, 0)
+        self.assertFalse(self.live(msg))
+        for name, data in before.items():
+            self.assertEqual((self.store / f"archive/{self.month(msg)}/{name}").read_bytes(), data)
+        self.assertEqual(list((self.store / "messages").glob(f"{msg}.*")), [])
+        shown = self.at(late + 1, "show", msg, me="os/apps")
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        self.assertIn("keyed note", shown.stdout.decode())
+        again = self.at(late + 1, "tell", "os/apps", "keyed note", "--key", "k-note", me="os/main", body=b"body of keyed note")
+        self.assertEqual((again.returncode, again.stdout.decode().strip()), (0, msg), again.stderr)
+        self.assertEqual(list((self.store / "messages").glob(f"{msg}.post")), [])
+        reply = self.at(late + 2, "answer", msg, "thanks", me="os/apps", body=b"got it")
+        self.assertEqual(reply.returncode, 0, reply.stderr)
+        self.assertEqual(self.at(late + 3, "check").returncode, 0)
+
+    def test_the_daily_inbox_moves_a_ready_message(self):
+        found = self.post_at(self.T0, "find", "os/apps", "daily one")
+        late = self.T0 + self.D30
+        self.assertEqual(self.at(late, "show", found, me="os/apps").returncode, 0)
+        self.assertTrue(self.live(found))
+        self.assertIn(self.at(late + self.DAY, me="os/apps").returncode, (0, 1))
+        self.assertFalse(self.live(found))
+        self.assertTrue((self.store / f"archive/{self.month(found)}/{found}.post").exists())
+
+    def cut(self, now_us, stage):
+        with subprocess.Popen(
+            [str(RACER), "--now", str(now_us), "--pause-cli", stage, str(self.store), "archive", "--store", str(self.store)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=self.store,
+            env={k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_SESSION")},
+        ) as proc:
+            try:
+                Archive.wait_for(self, self.store / f"paused.{stage}")
+                proc.kill()
+                proc.wait(timeout=15)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+        (self.store / f"paused.{stage}").unlink(missing_ok=True)
+
+    def test_a_move_cut_at_every_pause_is_finished_by_the_next_run(self):
+        late = self.T0 + self.D30
+        for n, stage in enumerate(("before-copy-post", "after-copy-post", "before-copy-seen", "before-remove-post", "after-remove-post", "before-remove-seen", "after-remove-seen")):
+            with self.subTest(stage=stage):
+                msg = self.post_at(self.T0 + n, "tell", "os/apps", f"cut {stage}")
+                self.assertEqual(self.at(late, "show", msg, me="os/apps").returncode, 0)
+                before = {f.name: f.read_bytes() for f in (self.store / "messages").glob(f"{msg}.*")}
+                self.cut(late + n, stage)
+                chk = self.at(late + n, "check")
+                self.assertEqual(chk.returncode, 0, f"{stage}: {chk.stdout + chk.stderr}")
+                # A cut after the last removal left nothing to finish: the retry finds nothing (exit 1).
+                self.archive_at(late + n, 1 if stage == "after-remove-seen" else 0)
+                self.assertEqual(list((self.store / "messages").glob(f"{msg}.*")), [], stage)
+                for name, data in before.items():
+                    self.assertEqual((self.store / f"archive/{self.month(msg)}/{name}").read_bytes(), data, stage)
+                self.assertEqual(self.at(late + n, "check").returncode, 0, stage)
+
+    def test_a_lane_that_returns_after_the_copy_keeps_the_message(self):
+        msg = self.post_at(self.T0, "tell", "os/all", "everyone")
+        late = self.T0 + self.D30
+        self.assertEqual(self.at(late, "show", msg, me="os/apps").returncode, 0)
+        self.cut(late, "after-copy-post")
+        self.assertTrue((self.store / f"archive/{self.month(msg)}/{msg}.post").exists())
+        self.assertTrue(self.live(msg))
+        # os/ui announces itself before the retry: the copy is not proof, the decision is made again.
+        self.assertEqual(self.at(late + 1, "hello", "codex", me="os/ui").returncode, 0)
+        self.archive_at(late + 2, 1)
+        self.assertTrue(self.live(msg))
+        self.assertIn(msg, self.at(late + 3, me="os/ui").stdout.decode())
+        self.assertEqual(self.at(late + 3, "check").returncode, 0)
+        self.assertEqual(self.at(late + 4, "show", msg, me="os/ui").returncode, 0)
+        self.archive_at(late + 5, 0)
+        self.assertFalse(self.live(msg))
+
+    def test_a_read_and_a_keyed_retry_racing_the_move_lose_nothing(self):
+        msg = self.post_at(self.T0, "tell", "os/apps", "raced", "--key", "k-race")
+        late = self.T0 + self.D30
+        self.assertEqual(self.at(late, "show", msg, me="os/apps").returncode, 0)
+        stage = "before-remove-post"
+        clean = {k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_SESSION")}
+        with subprocess.Popen(
+            [str(RACER), "--now", str(late), "--pause-cli", stage, str(self.store), "archive", "--store", str(self.store)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=self.store, env=clean,
+        ) as proc:
+            try:
+                Archive.wait_for(self, self.store / f"paused.{stage}")
+                # While the archiver holds before removing the post: a second session reads it, the sender repeats.
+                self.assertEqual(self.at(late, "show", msg, "--session", "s2", me="os/apps").returncode, 0)
+                again = self.at(late, "tell", "os/apps", "raced", "--key", "k-race", me="os/main", body=b"body of raced")
+                self.assertEqual((again.returncode, again.stdout.decode().strip()), (0, msg), again.stderr)
+                put(self.store / f"resume.{stage}", "go\n")
+                self.assertEqual(proc.wait(timeout=30), 0)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+        (self.store / f"paused.{stage}").unlink(missing_ok=True)
+        (self.store / f"resume.{stage}").unlink(missing_ok=True)
+        self.archive_at(late + 1)  # sweeps the late mark if the first run's batch scan did not
+        self.assertEqual(list((self.store / "messages").glob(f"{msg}.*")), [])
+        arch = self.store / f"archive/{self.month(msg)}"
+        self.assertEqual((arch / f"{msg}.{self.mark('os/apps')}").read_bytes(), b"seen\n")
+        self.assertEqual((arch / f"{msg}.{self.mark('os/apps', 's2')}").read_bytes(), b"seen\n")
+        rows = [line for line in self.at(late + 2, "log", "--all", me="os/main").stdout.decode().splitlines() if msg in line]
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(self.at(late + 2, "check").returncode, 0)
+
+    def test_orphan_marks_and_steps_of_an_archived_message_are_damage(self):
+        late = self.T0 + self.D30
+        orphan = f"{self.T0 + 7:016d}-abc777"
+        put(self.store / f"messages/{orphan}.{self.mark('os/apps')}", "seen\n")
+        chk = self.at(late, "check")
+        self.assertEqual(chk.returncode, 3)
+        self.assertIn(orphan, (chk.stdout + chk.stderr).decode())
+        self.assertEqual(self.archive_at(late, 3).returncode, 3)
+        (self.store / f"messages/{orphan}.{self.mark('os/apps')}").unlink()
+
+        # A damaged seen mark is damage and no decision: the message stays live.
+        bad = self.post_at(self.T0 + 8, "tell", "os/apps", "bad mark")
+        put(self.store / f"messages/{bad}.{self.mark('os/apps')}", "nope\n")
+        r = self.archive_at(late + 8, 3)
+        self.assertIn(bad, (r.stdout + r.stderr).decode())
+        self.assertEqual(self.archive_at(late + 7, 1).returncode, 1)  # one tick younger: age alone, its mark not read
+        self.assertTrue(self.live(bad))
+        put(self.store / f"messages/{bad}.{self.mark('os/apps')}", "seen\n")
+
+        msg = self.post_at(self.T0, "tell", "os/apps", "moved")
+        self.assertEqual(self.at(late, "show", msg, me="os/apps").returncode, 0)
+        self.archive_at(late, 0)
+        step = self.store / f"messages/{msg}.link.0000"
+        put(step, "by: os/apps\ntime: 2027-02-14T08:00:00Z\nsession: \nstate: taken\nnote: \nend: yes\n")
+        chk = self.at(late + 1, "check")
+        self.assertEqual(chk.returncode, 3, chk.stdout + chk.stderr)
+        self.assertIn(msg, (chk.stdout + chk.stderr).decode())
+        r = self.archive_at(late + 1, 3)
+        self.assertIn(msg, (r.stdout + r.stderr).decode())
+        self.assertTrue(step.exists())
+
+    def summary_of(self, now_us):
+        day = time.strftime("%Y-%m-%d", time.gmtime(now_us / 1_000_000))
+        return self.store / f"summary/{day}.md"
+
+    def held_part(self, text):
+        part = text.split("## Held unseen: ", 1)[1].split("\n## ", 1)[0]
+        count = int(part.split("\n", 1)[0])
+        ids = [line.split(" ", 2)[1] for line in part.splitlines() if line.startswith("- ")]
+        return count, ids
+
+    def test_held_messages_are_counted_in_the_day_summary(self):
+        first = self.T0 + self.D30 + self.DAY
+        none_yet = self.at(self.T0, me="os/apps")
+        self.assertIn(none_yet.returncode, (0, 1))
+        self.assertEqual(self.held_part(self.summary_of(self.T0).read_text()), (0, []))
+
+        held_a = self.post_at(self.T0 + 1, "tell", "os/apps", "held a")
+        held_b = self.post_at(self.T0 + 2, "find", "os/ui", "held b")
+        ready = self.post_at(self.T0 + 3, "tell", "os/apps", "ready")
+        young = self.post_at(first - self.DAY, "tell", "os/apps", "young")
+        self.assertEqual(self.at(self.T0 + 4, "show", ready, me="os/apps").returncode, 0)
+        inbox = self.at(first, me="os/apps")
+        self.assertEqual(inbox.returncode, 0, inbox.stderr)
+        self.assertIn(held_a, inbox.stdout.decode())
+        saved = self.summary_of(first).read_bytes()
+        count, ids = self.held_part(saved.decode())
+        self.assertEqual((count, sorted(ids)), (2, sorted([held_a, held_b])))
+        self.assertNotIn(ready, ids)
+        self.assertNotIn(young, ids)
+        self.assertTrue(self.live(held_a) and self.live(held_b))
+        # The saved summary is the morning's: a later read does not change it.
+        self.assertEqual(self.at(first + 1, "show", held_a, me="os/apps").returncode, 0)
+        self.assertIn(self.at(first + 2, me="os/apps").returncode, (0, 1))
+        self.assertEqual(self.summary_of(first).read_bytes(), saved)
+
+
 class ArchiveSwap(Base):
     """A program that can write the store swaps archive/ or archive/<month>/ for a link to a folder outside it
     while a command holds that folder. Nothing outside the store is ever opened, listed, read, written or

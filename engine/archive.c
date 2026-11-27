@@ -1,4 +1,5 @@
 #include "archive.h"
+#include "place.h"
 
 static const uint64_t ARCHIVE_AGE_US = 30ull * 86400ull * 1000000ull;
 static const char ARCHIVE_SEEN[] = "seen\n";
@@ -36,6 +37,68 @@ static bool valid_id(const char *id) {
     for (size_t i = 0; i < n; i++)
         if (!((id[i] >= '0' && id[i] <= '9') || (id[i] >= 'a' && id[i] <= 'f') || (id[i] == '-' && i))) return false;
     return true;
+}
+
+/* The lane a seen mark names ("seen.<proj>+<lane>" then nothing, "+<hash>" or "~alert..."), and what follows it. */
+static bool seen_mark_lane(const char *ev, char lane[72], const char **rest) {
+    if (!starts(ev, "seen.")) return false;
+    const char *p = ev + 5;
+    size_t n = 0;
+    bool project_done = false;
+    for (; *p; p++) {
+        char c = *p;
+        if (c == '+' && !project_done) c = '/', project_done = true;
+        else if (c == '+' || c == '~') break;
+        if (n + 1 >= 72) return false;
+        lane[n++] = c;
+    }
+    lane[n] = 0;
+    *rest = p;
+    return project_done;
+}
+
+/* True when the lane is one a message for project/all reaches: in its project, and not its sender. */
+static bool all_reaches(const message *m, const char *lane) {
+    size_t n = len(m->to);
+    if (n <= 4 || same(m->from, lane)) return false;
+    for (size_t i = 0; i < n - 3; i++) /* the project and its slash */
+        if (lane[i] != m->to[i]) return false;
+    return lane[n - 3] != 0;
+}
+
+expiry archive_expiry(const message *m, char *const *seen, size_t seen_count, const expiry_life *life, size_t life_count, uint64_t now) {
+    uint64_t sent = message_time(m);
+    if (is_job(m) || now < sent || now - sent < ARCHIVE_AGE_US) return EXPIRY_NOT_YET;
+    size_t to_n = len(m->to);
+    bool to_all = to_n > 4 && same(m->to + to_n - 4, "/all");
+    const char *for_s = m->for_session ? m->for_session : "";
+    bool any = false;
+    for (size_t i = 0; i < seen_count; i++) {
+        char lane[72];
+        const char *rest = NULL;
+        if (!seen_mark_lane(seen[i], lane, &rest) || *rest == '~') continue; /* an owner's alert is not the reader */
+        if (to_all ? !all_reaches(m, lane) : !same(lane, m->to)) continue;
+        if (*for_s) {
+            text want = {0};
+            bool match = store_seen_event_name(&want, (actor){.lane = lane, .session = for_s}) && same(want.data, seen[i]);
+            text_free(&want);
+            if (!match) continue;
+        }
+        any = true;
+        if (!to_all || *for_s) return EXPIRY_READY;
+    }
+    if (!any) return EXPIRY_HELD;
+    for (size_t k = 0; k < life_count; k++) {
+        if (life[k].when < sent || !all_reaches(m, life[k].lane)) continue;
+        bool read = false;
+        for (size_t i = 0; i < seen_count && !read; i++) {
+            char lane[72];
+            const char *rest = NULL;
+            read = seen_mark_lane(seen[i], lane, &rest) && *rest != '~' && same(lane, life[k].lane);
+        }
+        if (!read) return EXPIRY_HELD;
+    }
+    return EXPIRY_READY;
 }
 
 static void live_path(const char *folder, text *out, const char *id, const char *event) {
@@ -221,10 +284,26 @@ s_result archive_has_terminal_job(const char *folder, const char *id, unsigned *
     return S_OK;
 }
 
+s_result archive_has_closed(const char *folder, const char *id, unsigned *links_out, bool *non_job) {
+    if (links_out) *links_out = 0;
+    if (non_job) *non_job = false;
+    store tmp = {.folder = folder};
+    message m = {0};
+    s_result mr = archive_read_message(&tmp, id, &m);
+    bool job = mr == S_OK && is_job(&m);
+    message_free(&m);
+    if (mr != S_OK) return mr;
+    if (job) return archive_has_terminal_job(folder, id, links_out);
+    if (non_job) *non_job = true;
+    return S_OK;
+}
+
 bool archive_is_clean_remnant(const char *folder, const char *id, const char *event, const char *data, size_t length) {
     unsigned arch_links = 0;
-    if (archive_has_terminal_job(folder, id, &arch_links) != S_OK) return false;
+    bool non_job = false;
+    if (archive_has_closed(folder, id, &arch_links, &non_job) != S_OK) return false;
     if (starts(event, "seen.")) return store_valid_seen_event(event) && length == len(ARCHIVE_SEEN) && same(data, ARCHIVE_SEEN);
+    if (non_job) return false; /* a step or landed mark is never part of a message that is not a job */
     if (starts(event, "landed.")) {
         if (!store_valid_landed_event(event) || !store_valid_landed_payload(data, length, event + 7)) return false;
         char month[8];
@@ -380,6 +459,7 @@ typedef struct {
     bool post_removed;
     bool did_unlink;
     bool peer_moved;
+    bool non_job; /* a heads-up, finding or answer: it has no steps and no landed marks */
 } batch_item;
 
 typedef struct {
@@ -486,6 +566,10 @@ static bool ensure_archive_month(const char *folder, const char *month) {
 static s_result sweep_item_tail(const char *folder, const batch_item *it,
                                 void (*pause)(void *user, const char *stage), void *pause_user, const char **why) {
     s_result res = S_OK;
+    if (it->non_job && (it->links.count > 0 || it->landed.count > 0)) {
+        *why = "a message that is not a job has steps or landed marks";
+        return S_DAMAGED;
+    }
     for (size_t i = 0; res == S_OK && i < it->seen.count; i++) {
         text src = {0};
         arch_at dst = {0};
@@ -669,6 +753,135 @@ static p_result remove_post_exclusive(const char *path) {
     return r;
 }
 
+typedef struct {
+    expiry_life *items;
+    size_t count, cap;
+    const char *repository;
+    bool failed;
+} life_list;
+
+static bool life_each(void *user, const session_info *info) {
+    life_list *l = user;
+    if (l->count == l->cap) {
+        size_t cap = l->cap ? l->cap * 2 : 16;
+        expiry_life *next = p_alloc(cap * sizeof *next);
+        if (!next) return l->failed = true, false;
+        for (size_t i = 0; i < l->count; i++) next[i] = l->items[i];
+        p_free(l->items);
+        l->items = next, l->cap = cap;
+    }
+    expiry_life *e = &l->items[l->count++];
+    size_t n = 0;
+    for (; info->lane[n] && n + 1 < sizeof e->lane; n++) e->lane[n] = info->lane[n];
+    e->lane[n] = 0;
+    e->when = place_session_repo_when(info, l->repository);
+    return true;
+}
+
+s_result archive_expiry_of(store *s, const message *m, char *const *seen, size_t seen_count, uint64_t now, expiry *out) {
+    *out = EXPIRY_NOT_YET;
+    size_t to_n = len(m->to);
+    bool to_all = to_n > 4 && same(m->to + to_n - 4, "/all");
+    life_list l = {.repository = m->repository ? m->repository : ""};
+    if (to_all && archive_expiry(m, seen, seen_count, NULL, 0, now) == EXPIRY_READY) { /* the heartbeats can only hold it */
+        /* A message for one repository is waited for by the heartbeats in that repository, never the merged row. */
+        p_result r = *l.repository ? place_lane_sessions_repo(s, NULL, l.repository, life_each, &l) : place_each_session(s, life_each, &l);
+        if (r == P_MISSING) l.count = 0;
+        else if (r != P_OK || l.failed) {
+            p_free(l.items);
+            s->why = "the sessions cannot be read, so who should see it is not known";
+            return S_DAMAGED;
+        }
+    }
+    *out = archive_expiry(m, seen, seen_count, l.items, l.count, now);
+    p_free(l.items);
+    return S_OK;
+}
+
+/* Moves a heads-up, finding or answer that is ready: its seen marks are read and checked, who should see it is
+   decided again from them and the heartbeats on every attempt, then the post and the marks are copied before the
+   post is removed. An archived copy beside the live post is an unfinished move and stays while it is held. */
+static s_result move_non_job(const char *folder, batch_item *it, const message *m, const char *post_path, uint64_t now,
+                             text *report, void (*pause)(void *user, const char *stage), void *pause_user) {
+    const char *why = NULL;
+    /* A young message is decided by its age alone: its marks are not read, so their damage is check's to name. */
+    if (archive_expiry(m, NULL, 0, NULL, 0, now) == EXPIRY_NOT_YET) return S_NOTHING;
+    if (it->links.count > 0 || it->landed.count > 0) {
+        add_report(report, it->id, "a message that is not a job has steps or landed marks");
+        return S_DAMAGED;
+    }
+    str_list present = {0};
+    for (size_t i = 0; i < it->seen.count; i++) {
+        text sp = {0};
+        live_path(folder, &sp, it->id, it->seen.items[i]);
+        char *sd = NULL;
+        size_t sl = 0;
+        p_result sr = sp.failed ? P_FAILED : p_read(sp.data, MOST_FILE, &sd, &sl);
+        text_free(&sp);
+        if (sr == P_MISSING) continue;
+        bool ok_seen = sr == P_OK && store_valid_seen_event(it->seen.items[i]) && sl == len(ARCHIVE_SEEN) && same(sd, ARCHIVE_SEEN);
+        p_free(sd);
+        if (!ok_seen || !list_push(&present, it->seen.items[i], len(it->seen.items[i]))) {
+            list_free(&present);
+            add_report(report, it->id, ok_seen ? "out of memory" : sr == P_OK ? "a seen mark is damaged" : "a seen mark cannot be read");
+            return S_DAMAGED;
+        }
+    }
+    store tmp = {.folder = folder};
+    expiry e = EXPIRY_NOT_YET;
+    s_result er = archive_expiry_of(&tmp, m, present.items, present.count, now, &e);
+    list_free(&present);
+    if (er != S_OK) {
+        add_report(report, it->id, tmp.why);
+        return S_DAMAGED;
+    }
+    if (e != EXPIRY_READY) return S_NOTHING;
+    if (!ensure_archive_month(folder, it->month)) {
+        add_report(report, it->id, "archive folder cannot be created");
+        return S_DAMAGED;
+    }
+    arch_at dst_post = {0};
+    arch_at_of(&dst_post, folder, it->month, it->id, "post");
+    if (pause) pause(pause_user, "before-copy-post");
+    s_result cr = dst_post.name.failed ? (why = "out of memory", S_DAMAGED) : copy_durable(post_path, &dst_post, &why);
+    arch_at_free(&dst_post);
+    if (cr == S_DAMAGED) {
+        add_report(report, it->id, why);
+        return S_DAMAGED;
+    }
+    if (pause) pause(pause_user, "after-copy-post");
+    for (size_t i = 0; i < it->seen.count; i++) {
+        text ssrc = {0};
+        arch_at sdst = {0};
+        live_path(folder, &ssrc, it->id, it->seen.items[i]);
+        arch_at_of(&sdst, folder, it->month, it->id, it->seen.items[i]);
+        if (pause) pause(pause_user, "before-copy-seen");
+        char *probe = NULL;
+        size_t plen = 0;
+        p_result pr = ssrc.failed ? P_FAILED : p_read(ssrc.data, MOST_FILE, &probe, &plen);
+        p_free(probe);
+        s_result sr = pr == P_MISSING ? S_OK : ssrc.failed || sdst.name.failed ? (why = "out of memory", S_DAMAGED) : copy_durable(ssrc.data, &sdst, &why);
+        text_free(&ssrc), arch_at_free(&sdst);
+        if (sr == S_DAMAGED) {
+            add_report(report, it->id, why);
+            return S_DAMAGED;
+        }
+    }
+    if (pause) pause(pause_user, "before-remove-post");
+    p_result rm_post = remove_post_exclusive(post_path);
+    if (rm_post != P_OK && rm_post != P_MISSING) {
+        add_report(report, it->id, "the post could not be removed");
+        return S_DAMAGED;
+    }
+    if (pause) pause(pause_user, "after-remove-post");
+    it->arch_links = 0;
+    it->non_job = true;
+    it->post_removed = true;
+    it->did_unlink = (rm_post == P_OK);
+    it->peer_moved = (rm_post == P_MISSING);
+    return S_OK;
+}
+
 /* Prepares and copies one item (and removes its live .post). Leaves live tail sweep for the single batch pass! */
 static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_t now,
                                      text *report, void (*pause)(void *user, const char *stage), void *pause_user) {
@@ -689,7 +902,8 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
     if (pr == P_MISSING) {
         text_free(&post_p);
         unsigned alinks = 0;
-        s_result tr = archive_has_terminal_job(folder, it->id, &alinks);
+        bool non_job = false;
+        s_result tr = archive_has_closed(folder, it->id, &alinks, &non_job);
         if (tr != S_OK) {
             /* Live link/seen/rm.part without live post and without a validated archived terminal job is genuine damage!
                An ordinary <id>.post.<u >.part without an archived job is a live store_post in flight and is ignored. */
@@ -707,6 +921,7 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
             return S_DAMAGED;
         }
         it->arch_links = alinks;
+        it->non_job = non_job;
         it->peer_moved = true;
         it->post_removed = true;
         return S_OK;
@@ -837,9 +1052,10 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
         return S_DAMAGED;
     }
     if (!is_job(&m)) {
+        s_result nr = move_non_job(folder, it, &m, post_p.data, now, report, pause, pause_user);
         message_free(&m);
         text_free(&post_p);
-        return S_NOTHING;
+        return nr;
     }
 
     /* Build mini.names from the single batch scan (zero extra p_list calls!). */

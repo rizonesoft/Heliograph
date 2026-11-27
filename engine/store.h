@@ -67,6 +67,8 @@ bool store_valid_seen_event(const char *ev);        /* seen.<proj>+<lane>[+<32-h
 s_result store_check(store *s, text *report);       /* S_DAMAGED when anything is wrong */
 
 bool is_job(const message *m);
+uint64_t message_time(const message *m); /* when it was sent: the id's microseconds, else its time line */
+bool store_seen_event_name(text *out, actor me); /* the seen mark me writes, "seen.<proj>+<lane>[+<32-hex>]" */
 bool is_for(const message *m, actor me);
 bool may_see(const message *m, const char *lane); /* same project on either side, or addressed to lane */
 s_result store_was_seen(store *s, const char *id, actor me, bool alert, unsigned alert_links, bool *seen_out);

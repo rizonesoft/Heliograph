@@ -323,6 +323,8 @@ int racer(int count, char **args) {
         uint64_t v = 0;
         for (const char *p = args[2]; *p >= '0' && *p <= '9'; p++) v = v * 10 + (uint64_t)(*p - '0');
         plat_now_override = v;
+        /* --now <us> --pause-cli ...: a cut at a pause under the fixed clock. */
+        if (same(args[3], "--pause-cli")) return racer(count - 2, args + 2);
         return helio(count - 2, args + 2);
     }
     if (count >= 4 && same(args[1], "--max-names")) {
@@ -551,6 +553,35 @@ int racer(int count, char **args) {
         job j7 = {.state = TAKEN, .when = T - 5 * M, .by = "os/apps", .session = "s-quiet"};
         if (is_silent(sess, 4, &j7, T, 120 * M)) return 22;
         return 0;
+    }
+    /* --expiry <kind> <from> <to> <for-session or -> <sent-us> <now-us> [seen.<mark>...] [life:<lane>@<us>...]:
+       prints archive_expiry's answer (not-yet, held or ready) for that message, with no store open. */
+    if (count >= 8 && same(args[1], "--expiry")) {
+        text id = {0};
+        uint64_t sent = 0, now = 0;
+        for (const char *p = args[6]; *p; p++) sent = sent * 10 + (uint64_t)(*p - '0');
+        for (const char *p = args[7]; *p; p++) now = now * 10 + (uint64_t)(*p - '0');
+        add_number(&id, sent, 0), add(&id, "-abc123");
+        message m = {.id = id.data, .time = "", .kind = args[2], .from = args[3], .to = args[4], .for_session = same(args[5], "-") ? "" : args[5], .repository = ""};
+        char *seen[64];
+        expiry_life life[64];
+        size_t ns = 0, nl = 0;
+        for (int i = 8; i < count && ns < 64 && nl < 64; i++) {
+            if (starts(args[i], "life:")) {
+                const char *at = args[i] + 5;
+                size_t n = 0;
+                while (at[n] && at[n] != '@' && n + 1 < sizeof life[nl].lane) life[nl].lane[n] = at[n], n++;
+                life[nl].lane[n] = 0;
+                uint64_t w = 0;
+                for (const char *p = at[n] == '@' ? at + n + 1 : ""; *p; p++) w = w * 10 + (uint64_t)(*p - '0');
+                life[nl++].when = w;
+            } else {
+                seen[ns++] = args[i];
+            }
+        }
+        expiry e = archive_expiry(&m, seen, ns, life, nl, now);
+        text_free(&id);
+        return p_print(e == EXPIRY_READY ? "ready\n" : e == EXPIRY_HELD ? "held\n" : "not-yet\n") ? 0 : 3;
     }
     if (count >= 2 && same(args[1], "--test-may-see")) {
         static const struct { const char *from, *to, *lane; bool expect; } cases[] = {

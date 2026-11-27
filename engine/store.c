@@ -232,6 +232,15 @@ s_result store_message(store *s, const char *id, message *out) {
 
 bool is_job(const message *m) { return same(m->kind, "request") || same(m->kind, "handoff"); }
 
+uint64_t message_time(const message *m) {
+    uint64_t us = 0;
+    const char *p = m->id;
+    while (*p >= '0' && *p <= '9') us = us * 10 + (uint64_t)(*p++ - '0');
+    if (*p == '-' && us) return us;
+    read_time(m->time, &us);
+    return us;
+}
+
 static bool lane_is_for(const message *m, const char *lane) {
     size_t n = len(m->to);
     if (same(m->to, lane)) return true;
@@ -342,6 +351,11 @@ static void seen_name_ex(text *out, actor me, bool alert, unsigned alert_links) 
         else add(out, "+"), add_bytes(out, h.data, 32);
         text_free(&h);
     }
+}
+
+bool store_seen_event_name(text *out, actor me) {
+    seen_name_ex(out, me, false, 0);
+    return !out->failed;
 }
 
 static s_result event_of_len(store *s, const char *id, const char *event, char **data, size_t *length_out);
