@@ -53,6 +53,7 @@ title: "TODO-01 -- Heliograph"
 | 16 | §16 | Installer for Windows sessions | §15 | [x] |
 | 17 | §17 | Installed program replaced after a tested phase | §15, §16 | [x] |
 | 18 | §18 | Session tie and listing tests held to their result | §14 | [ ] |
+| 19 | §19 | Archive paths opened without following a swapped folder | §3 | [ ] |
 
 ## 1. Steps that notice an archived job
 
@@ -530,6 +531,28 @@ Filed 2026-11-26 from the last reconciliation of `D01 T01 §14` (`docs/reviews/0
 - [ ] Commit: `tests: an exact agent tie and the session listing are held to their result`
 
 **Test checkpoint:** `python3 ../SDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
+
+## 19. Archive paths opened without following a swapped folder
+
+Filed 2026-11-27 from the Astra review round 2 of `b9388b0` (P2, pre-existing, recorded with the `a9d9505` fix for the archive folder created meanwhile). `check_arch_dirs` in `engine/archive.c` checks `archive/` and `archive/<month>/` once, then `archive_read_message`, `archive_read_job_ex` and `archive_write_seen` open `archive/<month>/<id>.*` by path again. A program with write access to the store that swaps either folder for a symlink between the check and the open sends the read or the write outside the store, because `lstat` and `O_NOFOLLOW` in `p_read` of `src/plat_linux.c` guard only the last component, and `GetFileAttributesW` in `src/plat_windows.c` checks only the folder it names.
+
+**Phase:** 2
+**Needs:** none
+**Surface:** no
+
+**Build order:**
+
+1. Open archive files relative to a held folder on Linux. Done when: a folder swapped for a symlink after the check is refused, not followed.
+2. Open archive files relative to a held folder handle on Windows. Done when: a folder swapped for a reparse point after the check is refused.
+3. Prove both with a paused swap. Done when: the regression fails on the path-based opens and passes on the held ones.
+
+- [ ] Add a platform call in `engine/plat.h` that opens `archive/<month>/` as a held folder (`O_DIRECTORY | O_NOFOLLOW` per component on Linux, `FILE_FLAG_OPEN_REPARSE_POINT` with a reparse-point refusal on Windows) and reads, writes and lists names inside it. Done when: `src/plat_linux.c` and `src/plat_windows.c` both build it and a symlinked component returns `P_FAILED`.
+- [ ] Route `archive_read_message`, `archive_read_job_ex`, `archive_write_seen`, `archive_has_terminal_job` and `archive_is_clean_remnant` in `engine/archive.c` through the held folder. Done when: no archive read or write opens `archive/<month>/<id>.*` by a full path.
+- [ ] Add a racer pause between `check_arch_dirs` and the open in `tests/racer.c` and a test in `tests/test_helio.py` that swaps `archive/` for a symlink to a folder holding a valid post while paused. Done when: `show` of that id exits 3, nothing outside the store is read or written, and the test fails on the parent commit. Cheaper substitute: a swap of `archive/<month>/` only.
+- [ ] Run the Windows half through `prove.py` with a junction in place of `archive/`. Done when: `proved on Windows` is printed with the new test passing.
+- [ ] Commit: `archive: a folder swapped after its check is never followed`
+
+**Test checkpoint:** `python3 ../SDK/tools/app_build.py .` exits 0 and the swap test fails when the held-folder opens are reverted.
 
 ## Verification
 
