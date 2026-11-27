@@ -52,7 +52,7 @@ title: "TODO-01 -- Heliograph"
 | 15 | §15 | Quick installer | -- | [x] |
 | 16 | §16 | Installer for Windows sessions | §15 | [x] |
 | 17 | §17 | Installed program replaced after a tested phase | §15, §16 | [x] |
-| 18 | §18 | Session tie and listing tests held to their result | §14 | [ ] |
+| 18 | §18 | Session tie and listing tests held to their result | §14 | [x] |
 | 19 | §19 | Archive paths opened without following a swapped folder | §3 | [ ] |
 
 ## 1. Steps that notice an archived job
@@ -538,6 +538,9 @@ Filed 2026-11-26 from the last reconciliation of `D01 T01 §14` (`docs/reviews/0
 
 **Test checkpoint:** `python3 ../SDK/tools/app_build.py .` exits 0 on the section's commit; the new case fails with the repository comparison removed from the `latest` choice and, separately, with it removed from the agent choice in `merge_record`; and the listing case fails when `--list-sessions` in `tests/racer.c` returns 3 after printing its rows.
 **Corrected 2026-11-27:** said the new tests fail "when their production change is reverted", but §18 changes tests only (plan review finding 4).
+
+> **Verified:** 2026-11-27 | §18 | a0dcccdd758e5d89c269f5c4cd0a88ccba6ca8bb
+> **Review:** `docs/reviews/d01-t01-s18.json`
 
 ## 19. Archive paths opened without following a swapped folder
 
