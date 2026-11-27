@@ -42,12 +42,82 @@ static void live_path(const char *folder, text *out, const char *id, const char 
     add(out, folder), add(out, "/messages/"), add(out, id), add(out, "."), add(out, event);
 }
 
-static void arch_dir(const char *folder, const char *month, text *out) {
-    add(out, folder), add(out, "/archive/"), add(out, month);
+/* The test pause for archive folder operations, set by archive_pauses; NULL in production. */
+static void (*arch_pause_fn)(void *user, const char *stage);
+static void *arch_pause_user;
+
+void archive_pauses(void (*pause)(void *user, const char *stage), void *user) { arch_pause_fn = pause, arch_pause_user = user; }
+
+static void arch_pause(const char *stage) {
+    if (arch_pause_fn && stage) arch_pause_fn(arch_pause_user, stage);
 }
 
-static void arch_path(const char *folder, const char *month, text *out, const char *id, const char *event) {
-    arch_dir(folder, month, out), add(out, "/"), add(out, id), add(out, "."), add(out, event);
+/* A file under archive/<month>/ (or, with no month, under archive/), named inside its folder rather than by a
+   full path: every operation holds the folder through p_dir_open, which refuses a symlink or junction in place of
+   archive/ or the month folder, and acts on the name inside the held folder. */
+typedef struct {
+    const char *folder;
+    const char *month;
+    text name;
+} arch_at;
+
+static void arch_at_of(arch_at *a, const char *folder, const char *month, const char *id, const char *event) {
+    a->folder = folder, a->month = month, a->name = (text){0};
+    add(&a->name, id), add(&a->name, "."), add(&a->name, event);
+}
+
+static void arch_at_free(arch_at *a) { text_free(&a->name); }
+
+/* Holds archive/ (month NULL) or archive/<month>/ under the store folder. */
+static p_result arch_hold(const char *folder, const char *month, p_dir **out) {
+    text rel = {0};
+    add(&rel, "archive");
+    if (month) add(&rel, "/"), add(&rel, month);
+    p_result r = rel.failed ? P_FAILED : p_dir_open(folder, rel.data, out);
+    text_free(&rel);
+    return r;
+}
+
+static p_result arch_read_at(const arch_at *a, size_t most, char **data, size_t *length, const char *stage) {
+    p_dir *d = NULL;
+    p_result r = a->name.failed ? P_FAILED : arch_hold(a->folder, a->month, &d);
+    if (r != P_OK) return r;
+    arch_pause(stage);
+    r = p_dir_read(d, a->name.data, most, data, length);
+    p_dir_close(d);
+    return r;
+}
+
+static p_result arch_read(const arch_at *a, size_t most, char **data, size_t *length) { return arch_read_at(a, most, data, length, NULL); }
+
+static p_result arch_write(const arch_at *a, const char *data, size_t length, bool replace, const char *unique, const char *stage) {
+    p_dir *d = NULL;
+    p_result r = a->name.failed ? P_FAILED : arch_hold(a->folder, a->month, &d);
+    if (r != P_OK) return r;
+    arch_pause(stage);
+    r = p_dir_write(d, a->name.data, data, length, replace, unique);
+    p_dir_close(d);
+    return r;
+}
+
+static p_result arch_sync(const arch_at *a) {
+    p_dir *d = NULL;
+    p_result r = a->name.failed ? P_FAILED : arch_hold(a->folder, a->month, &d);
+    if (r != P_OK) return r;
+    r = p_dir_sync(d, a->name.data);
+    p_dir_close(d);
+    return r;
+}
+
+/* Lists archive/ (month NULL) or archive/<month>/ through the held folder. */
+static p_result arch_list(const char *folder, const char *month, bool (*each)(void *user, const char *name), void *user, const char *stage) {
+    p_dir *d = NULL;
+    p_result r = arch_hold(folder, month, &d);
+    if (r != P_OK) return r;
+    arch_pause(stage);
+    r = p_dir_list(d, each, user);
+    p_dir_close(d);
+    return r;
 }
 
 static void link_suffix(text *out, unsigned n) {
@@ -67,20 +137,13 @@ static bool parse_link_index(const char *ev, unsigned *out) {
     return true;
 }
 
-/* Verifies archive/ and archive/<month>/ are real directories (never symlinks/reparse points) if present.
-   Returns S_OK (both are real dirs), S_NOTHING (either is absent), or S_DAMAGED (symlink or non-dir). */
+/* Holds archive/<month>/ once to learn whether it is there: S_OK (a real folder below a real archive/), S_NOTHING
+   (either is absent) or S_DAMAGED (a symlink, a junction or not a folder). */
 static s_result check_arch_dirs(const char *folder, const char *month) {
-    text a = {0}, m = {0};
-    add(&a, folder), add(&a, "/archive");
-    arch_dir(folder, month, &m);
-    if (a.failed || m.failed) {
-        text_free(&a), text_free(&m);
-        return S_DAMAGED;
-    }
-    p_result ar = p_real_dir(a.data);
-    p_result mr = ar == P_OK ? p_real_dir(m.data) : ar;
-    text_free(&a), text_free(&m);
-    return mr == P_OK ? S_OK : mr == P_MISSING ? S_NOTHING : S_DAMAGED;
+    p_dir *d = NULL;
+    p_result r = arch_hold(folder, month, &d);
+    p_dir_close(d);
+    return r == P_OK ? S_OK : r == P_MISSING ? S_NOTHING : S_DAMAGED;
 }
 
 s_result archive_read_message(store *s, const char *id, message *out) {
@@ -93,12 +156,12 @@ s_result archive_read_message(store *s, const char *id, message *out) {
         s->why = "the archive folder is not a real directory";
         return S_DAMAGED;
     }
-    text at = {0};
-    arch_path(s->folder, month, &at, id, "post");
+    arch_at at = {0};
+    arch_at_of(&at, s->folder, month, id, "post");
     char *data = NULL;
     size_t length = 0;
-    p_result r = at.failed ? P_FAILED : p_read(at.data, MOST_FILE, &data, &length);
-    text_free(&at);
+    p_result r = at.name.failed ? P_FAILED : arch_read_at(&at, MOST_FILE, &data, &length, "arch-held");
+    arch_at_free(&at);
     if (r == P_MISSING) return S_NOTHING;
     if (r != P_OK) {
         s->why = "an archived message cannot be read";
@@ -127,13 +190,14 @@ s_result archive_has_terminal_job(const char *folder, const char *id, unsigned *
     job now = {.state = OPEN};
     bool ok = true;
     for (; now.links < MOST_LINKS; now.links++) {
-        text ev = {0}, at = {0};
+        text ev = {0};
+        arch_at at = {0};
         link_suffix(&ev, now.links);
-        if (!ev.failed) arch_path(folder, month, &at, id, ev.data);
+        if (!ev.failed) arch_at_of(&at, folder, month, id, ev.data);
         char *data = NULL;
         size_t length = 0;
-        p_result r = ev.failed || at.failed ? P_FAILED : p_read(at.data, MOST_FILE, &data, &length);
-        text_free(&ev), text_free(&at);
+        p_result r = ev.failed || at.name.failed ? P_FAILED : arch_read(&at, MOST_FILE, &data, &length);
+        text_free(&ev), arch_at_free(&at);
         if (r == P_MISSING) break;
         if (r != P_OK || len(data) != length) {
             if (r == P_OK) p_free(data);
@@ -162,12 +226,12 @@ bool archive_is_clean_remnant(const char *folder, const char *id, const char *ev
         if (!store_valid_landed_event(event) || !store_valid_landed_payload(data, length, event + 7)) return false;
         char month[8];
         if (!archive_month(id, month)) return false;
-        text dst = {0};
-        arch_path(folder, month, &dst, id, event);
+        arch_at dst = {0};
+        arch_at_of(&dst, folder, month, id, event);
         char *adata = NULL;
         size_t alen = 0;
-        p_result r = dst.failed ? P_FAILED : p_read(dst.data, MOST_FILE, &adata, &alen);
-        text_free(&dst);
+        p_result r = dst.name.failed ? P_FAILED : arch_read(&dst, MOST_FILE, &adata, &alen);
+        arch_at_free(&dst);
         bool equal = r == P_OK && alen == length;
         for (size_t i = 0; equal && i < length; i++) equal = adata[i] == data[i];
         p_free(adata);
@@ -178,20 +242,21 @@ bool archive_is_clean_remnant(const char *folder, const char *id, const char *ev
     if (idx >= arch_links) return true; /* late step from a writer that raced post removal */
     char month[8];
     if (!archive_month(id, month)) return false;
-    text dst = {0};
-    arch_path(folder, month, &dst, id, event);
+    arch_at dst = {0};
+    arch_at_of(&dst, folder, month, id, event);
     char *adata = NULL;
     size_t alen = 0;
-    p_result r = dst.failed ? P_FAILED : p_read(dst.data, MOST_FILE, &adata, &alen);
-    text_free(&dst);
+    p_result r = dst.name.failed ? P_FAILED : arch_read(&dst, MOST_FILE, &adata, &alen);
+    arch_at_free(&dst);
     bool equal = r == P_OK && alen == length;
     for (size_t i = 0; equal && i < length; i++) equal = adata[i] == data[i];
     p_free(adata);
     return equal;
 }
 
-static s_result copy_durable_ex(const char *src, const char *dst, const char **why, bool *created,
-                                void (*pause)(void *user, const char *stage), void *pause_user, const char *after_read_stage) {
+static s_result copy_durable_ex(const char *src, const arch_at *dst, const char **why, bool *created,
+                                void (*pause)(void *user, const char *stage), void *pause_user, const char *after_read_stage,
+                                const char *write_stage) {
     if (created) *created = false;
     char *data = NULL;
     size_t length = 0;
@@ -199,9 +264,9 @@ static s_result copy_durable_ex(const char *src, const char *dst, const char **w
     if (r == P_MISSING) {
         char *there = NULL;
         size_t tlen = 0;
-        p_result dr = p_read(dst, MOST_FILE, &there, &tlen);
+        p_result dr = arch_read(dst, MOST_FILE, &there, &tlen);
         p_free(there);
-        if (dr == P_OK) return p_sync(dst) == P_OK ? S_NOTHING : (*why = "an archive copy cannot be flushed", S_DAMAGED);
+        if (dr == P_OK) return arch_sync(dst) == P_OK ? S_NOTHING : (*why = "an archive copy cannot be flushed", S_DAMAGED);
         *why = "a live file vanished before its archive copy was present";
         return S_DAMAGED;
     }
@@ -212,11 +277,11 @@ static s_result copy_durable_ex(const char *src, const char *dst, const char **w
     if (pause && after_read_stage) pause(pause_user, after_read_stage);
     text unique = {0};
     add_number(&unique, p_tick(), 0);
-    p_result w = unique.failed ? P_FAILED : p_write(dst, data, length, false, unique.data);
+    p_result w = unique.failed ? P_FAILED : arch_write(dst, data, length, false, unique.data, write_stage);
     text_free(&unique);
     if (w == P_OK) {
         p_free(data);
-        if (p_sync(dst) != P_OK) {
+        if (arch_sync(dst) != P_OK) {
             *why = "an archive copy cannot be flushed";
             return S_DAMAGED;
         }
@@ -226,7 +291,7 @@ static s_result copy_durable_ex(const char *src, const char *dst, const char **w
     if (w == P_EXISTS) {
         char *there = NULL;
         size_t tlen = 0;
-        p_result dr = p_read(dst, MOST_FILE, &there, &tlen);
+        p_result dr = arch_read(dst, MOST_FILE, &there, &tlen);
         bool equal = dr == P_OK && tlen == length;
         for (size_t i = 0; equal && i < length; i++) equal = there[i] == data[i];
         p_free(there);
@@ -235,7 +300,7 @@ static s_result copy_durable_ex(const char *src, const char *dst, const char **w
             *why = "archive copy differs from live file";
             return S_DAMAGED;
         }
-        if (p_sync(dst) != P_OK) {
+        if (arch_sync(dst) != P_OK) {
             *why = "an archive copy cannot be flushed";
             return S_DAMAGED;
         }
@@ -246,13 +311,13 @@ static s_result copy_durable_ex(const char *src, const char *dst, const char **w
     return S_DAMAGED;
 }
 
-static s_result copy_durable(const char *src, const char *dst, const char **why) {
-    return copy_durable_ex(src, dst, why, NULL, NULL, NULL, NULL);
+static s_result copy_durable(const char *src, const arch_at *dst, const char **why) {
+    return copy_durable_ex(src, dst, why, NULL, NULL, NULL, NULL, "before-arch-copy");
 }
 
-static s_result copy_durable_paused(const char *src, const char *dst, const char **why,
+static s_result copy_durable_paused(const char *src, const arch_at *dst, const char **why,
                                     void (*pause)(void *user, const char *stage), void *pause_user, const char *after_read_stage) {
-    return copy_durable_ex(src, dst, why, NULL, pause, pause_user, after_read_stage);
+    return copy_durable_ex(src, dst, why, NULL, pause, pause_user, after_read_stage, "before-arch-copy");
 }
 
 typedef struct {
@@ -400,12 +465,18 @@ static void add_report(text *report, const char *id, const char *why) {
     text_free(&clean_id);
 }
 
+/* Makes archive/ in the store folder, then the month folder inside the held archive/, so a swap of archive/ for a
+   link between the two is refused rather than followed. */
 static bool ensure_archive_month(const char *folder, const char *month) {
-    text a = {0}, m = {0};
+    text a = {0};
     add(&a, folder), add(&a, "/archive");
-    arch_dir(folder, month, &m);
-    bool ok = !a.failed && !m.failed && p_folder(a.data) == P_OK && p_folder(m.data) == P_OK;
-    text_free(&a), text_free(&m);
+    bool ok = !a.failed && p_folder(a.data) == P_OK;
+    text_free(&a);
+    if (!ok) return false;
+    arch_pause("before-make-month");
+    p_dir *d = NULL;
+    ok = arch_hold(folder, NULL, &d) == P_OK && p_dir_folder(d, month) == P_OK;
+    p_dir_close(d);
     return ok;
 }
 
@@ -415,12 +486,13 @@ static s_result sweep_item_tail(const char *folder, const batch_item *it,
                                 void (*pause)(void *user, const char *stage), void *pause_user, const char **why) {
     s_result res = S_OK;
     for (size_t i = 0; res == S_OK && i < it->seen.count; i++) {
-        text src = {0}, dst = {0};
+        text src = {0};
+        arch_at dst = {0};
         live_path(folder, &src, it->id, it->seen.items[i]);
-        arch_path(folder, it->month, &dst, it->id, it->seen.items[i]);
+        arch_at_of(&dst, folder, it->month, it->id, it->seen.items[i]);
         char *data = NULL;
         size_t length = 0;
-        p_result sr = src.failed || dst.failed ? P_FAILED : p_read(src.data, MOST_FILE, &data, &length);
+        p_result sr = src.failed || dst.name.failed ? P_FAILED : p_read(src.data, MOST_FILE, &data, &length);
         if (sr == P_OK) {
             bool valid_seen = store_valid_seen_event(it->seen.items[i]) && length == len(ARCHIVE_SEEN) && same(data, ARCHIVE_SEEN);
             p_free(data);
@@ -428,7 +500,7 @@ static s_result sweep_item_tail(const char *folder, const batch_item *it,
                 *why = "a seen mark is damaged";
                 res = S_DAMAGED;
             } else {
-                s_result cr = copy_durable(src.data, dst.data, why);
+                s_result cr = copy_durable(src.data, &dst, why);
                 if (cr == S_DAMAGED) res = S_DAMAGED;
                 else {
                     if (pause) pause(pause_user, "before-remove-seen");
@@ -440,17 +512,18 @@ static s_result sweep_item_tail(const char *folder, const batch_item *it,
             *why = "a seen mark cannot be read";
             res = S_DAMAGED;
         }
-        text_free(&src), text_free(&dst);
+        text_free(&src), arch_at_free(&dst);
     }
     if (res == S_OK && pause) pause(pause_user, "after-remove-seen");
     for (size_t i = 0; res == S_OK && i < it->landed.count; i++) {
         const char *ev = it->landed.items[i];
-        text src = {0}, dst = {0};
+        text src = {0};
+        arch_at dst = {0};
         live_path(folder, &src, it->id, ev);
-        arch_path(folder, it->month, &dst, it->id, ev);
+        arch_at_of(&dst, folder, it->month, it->id, ev);
         char *data = NULL;
         size_t length = 0;
-        p_result sr = src.failed || dst.failed ? P_FAILED : p_read(src.data, MOST_FILE, &data, &length);
+        p_result sr = src.failed || dst.name.failed ? P_FAILED : p_read(src.data, MOST_FILE, &data, &length);
         if (sr == P_OK) {
             bool valid_landed = store_valid_landed_event(ev) && store_valid_landed_payload(data, length, ev + 7);
             p_free(data);
@@ -458,7 +531,7 @@ static s_result sweep_item_tail(const char *folder, const batch_item *it,
                 *why = "a landed mark is damaged";
                 res = S_DAMAGED;
             } else {
-                s_result cr = copy_durable_paused(src.data, dst.data, why, pause, pause_user, "after-read-landed");
+                s_result cr = copy_durable_paused(src.data, &dst, why, pause, pause_user, "after-read-landed");
                 if (cr == S_DAMAGED) res = S_DAMAGED;
                 else {
                     if (pause) pause(pause_user, "before-remove-landed");
@@ -470,24 +543,25 @@ static s_result sweep_item_tail(const char *folder, const batch_item *it,
             *why = "a landed mark cannot be read";
             res = S_DAMAGED;
         }
-        text_free(&src), text_free(&dst);
+        text_free(&src), arch_at_free(&dst);
     }
     for (size_t i = it->links.count; res == S_OK && i-- > 0;) {
         const char *ev = it->links.items[i];
-        text src = {0}, dst = {0};
+        text src = {0};
+        arch_at dst = {0};
         live_path(folder, &src, it->id, ev);
-        arch_path(folder, it->month, &dst, it->id, ev);
+        arch_at_of(&dst, folder, it->month, it->id, ev);
         char *ldata = NULL;
         size_t llen = 0;
-        p_result lr = src.failed || dst.failed ? P_FAILED : p_read(src.data, MOST_FILE, &ldata, &llen);
+        p_result lr = src.failed || dst.name.failed ? P_FAILED : p_read(src.data, MOST_FILE, &ldata, &llen);
         if (lr == P_MISSING) {
-            text_free(&src), text_free(&dst);
+            text_free(&src), arch_at_free(&dst);
             continue;
         }
         if (lr != P_OK) {
             *why = "a live step cannot be read";
             res = S_DAMAGED;
-            text_free(&src), text_free(&dst);
+            text_free(&src), arch_at_free(&dst);
             break;
         }
         unsigned idx = 0;
@@ -496,13 +570,13 @@ static s_result sweep_item_tail(const char *folder, const batch_item *it,
             p_free(ldata);
             *why = "a step name is damaged";
             res = S_DAMAGED;
-            text_free(&src), text_free(&dst);
+            text_free(&src), arch_at_free(&dst);
             break;
         }
         if (idx < it->arch_links) {
             char *adata = NULL;
             size_t alen = 0;
-            p_result ar = p_read(dst.data, MOST_FILE, &adata, &alen);
+            p_result ar = arch_read(&dst, MOST_FILE, &adata, &alen);
             bool equal = ar == P_OK && alen == llen;
             for (size_t k = 0; equal && k < llen; k++) equal = adata[k] == ldata[k];
             p_free(adata);
@@ -510,21 +584,21 @@ static s_result sweep_item_tail(const char *folder, const batch_item *it,
                 p_free(ldata);
                 *why = "archive copy differs from live step";
                 res = S_DAMAGED;
-                text_free(&src), text_free(&dst);
+                text_free(&src), arch_at_free(&dst);
                 break;
             }
-            if (p_sync(dst.data) != P_OK) {
+            if (arch_sync(&dst) != P_OK) {
                 p_free(ldata);
                 *why = "an archive copy cannot be flushed";
                 res = S_DAMAGED;
-                text_free(&src), text_free(&dst);
+                text_free(&src), arch_at_free(&dst);
                 break;
             }
         }
         p_free(ldata);
         if (pause) pause(pause_user, "before-remove-link");
         p_result rm = p_remove(src.data);
-        text_free(&src), text_free(&dst);
+        text_free(&src), arch_at_free(&dst);
         if (rm != P_OK && rm != P_MISSING) *why = "a step could not be removed", res = S_DAMAGED;
     }
     for (size_t i = 0; res == S_OK && i < it->rm_parts.count; i++) {
@@ -652,33 +726,34 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
             add_report(report, it->id, "archive folder cannot be created");
             return S_DAMAGED;
         }
-        text dst_post = {0};
-        arch_path(folder, it->month, &dst_post, it->id, "post");
+        arch_at dst_post = {0};
+        arch_at_of(&dst_post, folder, it->month, it->id, "post");
         char *adata = NULL;
         size_t alen = 0;
-        p_result ar = dst_post.failed ? P_FAILED : p_read(dst_post.data, MOST_FILE, &adata, &alen);
+        p_result ar = dst_post.name.failed ? P_FAILED : arch_read(&dst_post, MOST_FILE, &adata, &alen);
         bool equal = ar == P_OK && alen == plen;
         for (size_t k = 0; equal && k < plen; k++) equal = adata[k] == pdata[k];
         p_free(adata);
         p_free(pdata);
         if (!equal) {
-            text_free(&dst_post), text_free(&post_p);
+            arch_at_free(&dst_post), text_free(&post_p);
             add_report(report, it->id, "archive copy differs from live file");
             return S_DAMAGED;
         }
-        if (p_sync(dst_post.data) != P_OK) {
-            text_free(&dst_post), text_free(&post_p);
+        if (arch_sync(&dst_post) != P_OK) {
+            arch_at_free(&dst_post), text_free(&post_p);
             add_report(report, it->id, "an archive copy cannot be flushed");
             return S_DAMAGED;
         }
-        text_free(&dst_post);
+        arch_at_free(&dst_post);
         /* Verify, copy, and flush every remaining live step BEFORE unlinking the live post. */
         for (size_t i = 0; i < it->links.count; i++) {
-            text src = {0}, dst = {0};
+            text src = {0};
+            arch_at dst = {0};
             live_path(folder, &src, it->id, it->links.items[i]);
-            arch_path(folder, it->month, &dst, it->id, it->links.items[i]);
-            s_result cr = (src.failed || dst.failed) ? S_DAMAGED : copy_durable(src.data, dst.data, &why);
-            text_free(&src), text_free(&dst);
+            arch_at_of(&dst, folder, it->month, it->id, it->links.items[i]);
+            s_result cr = (src.failed || dst.name.failed) ? S_DAMAGED : copy_durable(src.data, &dst, &why);
+            text_free(&src), arch_at_free(&dst);
             if (cr == S_DAMAGED) {
                 text_free(&post_p);
                 add_report(report, it->id, why ? why : "an archive step cannot be preserved");
@@ -687,7 +762,8 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
         }
         /* Validate, copy, and flush every remaining live seen mark BEFORE unlinking the live post. */
         for (size_t i = 0; i < it->seen.count; i++) {
-            text src = {0}, dst = {0};
+            text src = {0};
+            arch_at dst = {0};
             live_path(folder, &src, it->id, it->seen.items[i]);
             char *sd = NULL;
             size_t sl = 0;
@@ -703,9 +779,9 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
                 add_report(report, it->id, "a seen mark is damaged");
                 return S_DAMAGED;
             }
-            arch_path(folder, it->month, &dst, it->id, it->seen.items[i]);
-            s_result cr = dst.failed ? S_DAMAGED : copy_durable(src.data, dst.data, &why);
-            text_free(&src), text_free(&dst);
+            arch_at_of(&dst, folder, it->month, it->id, it->seen.items[i]);
+            s_result cr = dst.name.failed ? S_DAMAGED : copy_durable(src.data, &dst, &why);
+            text_free(&src), arch_at_free(&dst);
             if (cr == S_DAMAGED) {
                 text_free(&post_p);
                 add_report(report, it->id, why ? why : "a seen mark cannot be preserved");
@@ -715,7 +791,8 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
         /* Validate, copy, and flush every remaining live landed mark BEFORE unlinking the live post. */
         for (size_t i = 0; i < it->landed.count; i++) {
             const char *ev = it->landed.items[i];
-            text src = {0}, dst = {0};
+            text src = {0};
+            arch_at dst = {0};
             live_path(folder, &src, it->id, ev);
             char *ld = NULL;
             size_t ll = 0;
@@ -731,9 +808,9 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
                 add_report(report, it->id, "a landed mark is damaged");
                 return S_DAMAGED;
             }
-            arch_path(folder, it->month, &dst, it->id, ev);
-            s_result cr = dst.failed ? S_DAMAGED : copy_durable(src.data, dst.data, &why);
-            text_free(&src), text_free(&dst);
+            arch_at_of(&dst, folder, it->month, it->id, ev);
+            s_result cr = dst.name.failed ? S_DAMAGED : copy_durable(src.data, &dst, &why);
+            text_free(&src), arch_at_free(&dst);
             if (cr == S_DAMAGED) {
                 text_free(&post_p);
                 add_report(report, it->id, why ? why : "a landed mark cannot be preserved");
@@ -848,11 +925,11 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
     }
 
     /* Copy post, steps, and seen marks to archive/<YYYY-MM>/ before removing anything. */
-    text dst_post = {0};
-    arch_path(folder, it->month, &dst_post, it->id, "post");
+    arch_at dst_post = {0};
+    arch_at_of(&dst_post, folder, it->month, it->id, "post");
     if (pause) pause(pause_user, "before-copy-post");
-    s_result cr = dst_post.failed ? (why = "out of memory", S_DAMAGED) : copy_durable(post_p.data, dst_post.data, &why);
-    text_free(&dst_post);
+    s_result cr = dst_post.name.failed ? (why = "out of memory", S_DAMAGED) : copy_durable(post_p.data, &dst_post, &why);
+    arch_at_free(&dst_post);
     if (cr == S_DAMAGED) {
         message_free(&m);
         text_free(&post_p);
@@ -862,15 +939,16 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
     if (pause) pause(pause_user, "after-copy-post");
 
     for (unsigned k = 0; k < j.links; k++) {
-        text lnm = {0}, lsrc = {0}, ldst = {0};
+        text lnm = {0}, lsrc = {0};
+        arch_at ldst = {0};
         link_suffix(&lnm, k);
         if (!lnm.failed) {
             live_path(folder, &lsrc, it->id, lnm.data);
-            arch_path(folder, it->month, &ldst, it->id, lnm.data);
+            arch_at_of(&ldst, folder, it->month, it->id, lnm.data);
         }
         if (pause) pause(pause_user, "before-copy-link");
-        s_result lr = lnm.failed || lsrc.failed || ldst.failed ? (why = "out of memory", S_DAMAGED) : copy_durable(lsrc.data, ldst.data, &why);
-        text_free(&lnm), text_free(&lsrc), text_free(&ldst);
+        s_result lr = lnm.failed || lsrc.failed || ldst.name.failed ? (why = "out of memory", S_DAMAGED) : copy_durable(lsrc.data, &ldst, &why);
+        text_free(&lnm), text_free(&lsrc), arch_at_free(&ldst);
         if (lr == S_DAMAGED) {
             message_free(&m);
             text_free(&post_p);
@@ -881,12 +959,13 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
     if (pause) pause(pause_user, "after-copy-links");
 
     for (size_t i = 0; i < it->seen.count; i++) {
-        text ssrc = {0}, sdst = {0};
+        text ssrc = {0};
+        arch_at sdst = {0};
         live_path(folder, &ssrc, it->id, it->seen.items[i]);
-        arch_path(folder, it->month, &sdst, it->id, it->seen.items[i]);
+        arch_at_of(&sdst, folder, it->month, it->id, it->seen.items[i]);
         if (pause) pause(pause_user, "before-copy-seen");
-        s_result sr = ssrc.failed || sdst.failed ? (why = "out of memory", S_DAMAGED) : copy_durable(ssrc.data, sdst.data, &why);
-        text_free(&ssrc), text_free(&sdst);
+        s_result sr = ssrc.failed || sdst.name.failed ? (why = "out of memory", S_DAMAGED) : copy_durable(ssrc.data, &sdst, &why);
+        text_free(&ssrc), arch_at_free(&sdst);
         if (sr == S_DAMAGED) {
             message_free(&m);
             text_free(&post_p);
@@ -895,13 +974,14 @@ static s_result copy_and_unlink_post(const char *folder, batch_item *it, uint64_
         }
     }
     for (size_t i = 0; i < it->landed.count; i++) {
-        text lsrc = {0}, ldst = {0};
+        text lsrc = {0};
+        arch_at ldst = {0};
         live_path(folder, &lsrc, it->id, it->landed.items[i]);
-        arch_path(folder, it->month, &ldst, it->id, it->landed.items[i]);
+        arch_at_of(&ldst, folder, it->month, it->id, it->landed.items[i]);
         if (pause) pause(pause_user, "before-copy-landed");
-        s_result lr = lsrc.failed || ldst.failed ? (why = "out of memory", S_DAMAGED)
-                    : copy_durable_paused(lsrc.data, ldst.data, &why, pause, pause_user, "after-read-landed");
-        text_free(&lsrc), text_free(&ldst);
+        s_result lr = lsrc.failed || ldst.name.failed ? (why = "out of memory", S_DAMAGED)
+                    : copy_durable_paused(lsrc.data, &ldst, &why, pause, pause_user, "after-read-landed");
+        text_free(&lsrc), arch_at_free(&ldst);
         if (lr == S_DAMAGED) {
             message_free(&m);
             text_free(&post_p);
@@ -1244,13 +1324,14 @@ static s_result archive_read_job_ex(store *s, const message *m, const str_list *
         return S_DAMAGED;
     }
     for (; out->links < MOST_LINKS; out->links++) {
-        text ev = {0}, at = {0};
+        text ev = {0};
+        arch_at at = {0};
         link_suffix(&ev, out->links);
-        if (!ev.failed) arch_path(s->folder, month, &at, m->id, ev.data);
+        if (!ev.failed) arch_at_of(&at, s->folder, month, m->id, ev.data);
         char *data = NULL;
         size_t length = 0;
-        p_result r = ev.failed || at.failed ? P_FAILED : p_read(at.data, MOST_FILE, &data, &length);
-        text_free(&ev), text_free(&at);
+        p_result r = ev.failed || at.name.failed ? P_FAILED : arch_read(&at, MOST_FILE, &data, &length);
+        text_free(&ev), arch_at_free(&at);
         if (r == P_MISSING) {
             if (known_links) {
                 if (known_links->count != out->links) {
@@ -1258,11 +1339,8 @@ static s_result archive_read_job_ex(store *s, const message *m, const str_list *
                     return S_DAMAGED;
                 }
             } else {
-                text mdir = {0};
-                arch_dir(s->folder, month, &mdir);
                 arch_gap_ctx g = {.id = m->id, .id_len = len(m->id), .min_link = out->links, .has_higher = false};
-                p_result lr = mdir.failed ? P_FAILED : p_list(mdir.data, scan_arch_gap, &g);
-                text_free(&mdir);
+                p_result lr = arch_list(s->folder, month, scan_arch_gap, &g, NULL);
                 if (lr != P_OK) {
                     s->why = "the archive cannot be read";
                     return S_DAMAGED;
@@ -1315,27 +1393,28 @@ s_result archive_write_seen(store *s, const char *id, const char *seen_event) {
         s->why = "the archive folder is not a real directory";
         return S_DAMAGED;
     }
-    text at = {0}, unique = {0};
-    arch_path(s->folder, month, &at, id, seen_event);
+    text unique = {0};
+    arch_at at = {0};
+    arch_at_of(&at, s->folder, month, id, seen_event);
     add_number(&unique, p_tick(), 0);
-    p_result r = at.failed || unique.failed ? P_FAILED : p_write(at.data, ARCHIVE_SEEN, len(ARCHIVE_SEEN), false, unique.data);
+    p_result r = at.name.failed || unique.failed ? P_FAILED : arch_write(&at, ARCHIVE_SEEN, len(ARCHIVE_SEEN), false, unique.data, "before-arch-seen");
     text_free(&unique);
     if (r == P_OK) {
-        text_free(&at);
+        arch_at_free(&at);
         return S_OK;
     }
     if (r == P_EXISTS) {
         char *data = NULL;
         size_t length = 0;
-        p_result rr = p_read(at.data, MOST_FILE, &data, &length);
-        text_free(&at);
+        p_result rr = arch_read(&at, MOST_FILE, &data, &length);
+        arch_at_free(&at);
         bool ok = rr == P_OK && length == len(ARCHIVE_SEEN) && same(data, ARCHIVE_SEEN);
         p_free(data);
         if (ok) return S_OK;
         s->why = "a seen mark is damaged";
         return S_DAMAGED;
     }
-    text_free(&at);
+    arch_at_free(&at);
     s->why = r == P_UNFLUSHED ? "the store cannot be flushed" : "the archive cannot be written";
     return S_DAMAGED;
 }
@@ -1408,18 +1487,19 @@ static bool attach_arch_events(void *user, const char *name);
 s_result archive_read_landed_one(const char *folder, const char *id, const char *commit) {
     char month[8];
     if (!valid_id(id) || !archive_month(id, month)) return S_NOTHING;
-    text ev = {0}, ap = {0};
+    text ev = {0};
+    arch_at ap = {0};
     add(&ev, "landed."), add(&ev, commit);
     if (ev.failed || !store_valid_landed_event(ev.data)) {
         text_free(&ev);
         return S_DAMAGED;
     }
-    arch_path(folder, month, &ap, id, ev.data);
+    arch_at_of(&ap, folder, month, id, ev.data);
     text_free(&ev);
     char *data = NULL;
     size_t length = 0;
-    p_result r = ap.failed ? P_FAILED : p_read(ap.data, MOST_FILE, &data, &length);
-    text_free(&ap);
+    p_result r = ap.name.failed ? P_FAILED : arch_read(&ap, MOST_FILE, &data, &length);
+    arch_at_free(&ap);
     if (r == P_MISSING) return S_NOTHING;
     if (r != P_OK) return S_DAMAGED;
     bool ok = store_valid_landed_payload(data, length, commit);
@@ -1437,7 +1517,8 @@ s_result archive_promote_landed(const char *folder, const char *id, const char *
         if (why) *why = "archive folder cannot be created";
         return S_DAMAGED;
     }
-    text ev = {0}, src = {0}, dst = {0};
+    text ev = {0}, src = {0};
+    arch_at dst = {0};
     add(&ev, "landed."), add(&ev, commit);
     if (ev.failed || !store_valid_landed_event(ev.data)) {
         text_free(&ev);
@@ -1445,17 +1526,17 @@ s_result archive_promote_landed(const char *folder, const char *id, const char *
         return S_DAMAGED;
     }
     live_path(folder, &src, id, ev.data);
-    arch_path(folder, month, &dst, id, ev.data);
+    arch_at_of(&dst, folder, month, id, ev.data);
     text_free(&ev);
     const char *cwhy = NULL;
-    s_result cr = (src.failed || dst.failed) ? (cwhy = "out of memory", S_DAMAGED) : copy_durable(src.data, dst.data, &cwhy);
+    s_result cr = (src.failed || dst.name.failed) ? (cwhy = "out of memory", S_DAMAGED) : copy_durable_ex(src.data, &dst, &cwhy, NULL, NULL, NULL, NULL, "before-landed-promote");
     if (cr == S_DAMAGED) {
-        text_free(&src), text_free(&dst);
+        text_free(&src), arch_at_free(&dst);
         if (why) *why = cwhy ? cwhy : "an archive copy cannot be written";
         return S_DAMAGED;
     }
     p_result rm = p_remove(src.data);
-    text_free(&src), text_free(&dst);
+    text_free(&src), arch_at_free(&dst);
     if (rm != P_OK && rm != P_MISSING) {
         if (why) *why = "a landed mark could not be removed";
         return S_DAMAGED;
@@ -1575,12 +1656,12 @@ static s_result format_arch_landed_events(const store *s, const char *month, con
                 if (why) *why = "a landed mark is damaged";
                 return S_DAMAGED;
             }
-            text ap = {0};
-            arch_path(s->folder, month, &ap, id, ev);
+            arch_at ap = {0};
+            arch_at_of(&ap, s->folder, month, id, ev);
             char *data = NULL;
             size_t length = 0;
-            p_result r = ap.failed ? P_FAILED : p_read(ap.data, MOST_FILE, &data, &length);
-            text_free(&ap);
+            p_result r = ap.name.failed ? P_FAILED : arch_read(&ap, MOST_FILE, &data, &length);
+            arch_at_free(&ap);
             bool ok = r == P_OK && store_valid_landed_payload(data, length, ev + 7);
             p_free(data);
             if (!ok) {
@@ -1604,18 +1685,17 @@ static s_result format_arch_landed_events(const store *s, const char *month, con
 s_result archive_each_landed(const char *folder, const char *id, bool (*each)(void *user, const char *commit), void *user, const char **why) {
     char month[8];
     if (!valid_id(id) || !archive_month(id, month)) return S_OK;
-    text mdir = {0}, prefix = {0}, bare = {0};
-    arch_dir(folder, month, &mdir);
+    text prefix = {0}, bare = {0};
     add(&prefix, id), add(&prefix, ".landed.");
     add(&bare, id), add(&bare, ".landed");
-    if (mdir.failed || prefix.failed || bare.failed) {
-        text_free(&mdir), text_free(&prefix), text_free(&bare);
+    if (prefix.failed || bare.failed) {
+        text_free(&prefix), text_free(&bare);
         if (why) *why = "out of memory";
         return S_DAMAGED;
     }
     arch_landed_ctx ctx = {.prefix = prefix.data, .prefix_len = prefix.length, .bare = bare.data};
-    p_result lr = p_list(mdir.data, gather_arch_landed, &ctx);
-    text_free(&mdir), text_free(&prefix), text_free(&bare);
+    p_result lr = arch_list(folder, month, gather_arch_landed, &ctx, NULL);
+    text_free(&prefix), text_free(&bare);
     if (lr == P_MISSING) {
         list_free(&ctx.events);
         return S_OK;
@@ -1628,12 +1708,12 @@ s_result archive_each_landed(const char *folder, const char *id, bool (*each)(vo
     sort_list(&ctx.events);
     for (size_t i = 0; i < ctx.events.count; i++) {
         const char *ev = ctx.events.items[i];
-        text ap = {0};
-        arch_path(folder, month, &ap, id, ev);
+        arch_at ap = {0};
+        arch_at_of(&ap, folder, month, id, ev);
         char *data = NULL;
         size_t length = 0;
-        p_result r = ap.failed ? P_FAILED : p_read(ap.data, MOST_FILE, &data, &length);
-        text_free(&ap);
+        p_result r = ap.name.failed ? P_FAILED : arch_read(&ap, MOST_FILE, &data, &length);
+        arch_at_free(&ap);
         bool ok = r == P_OK && store_valid_landed_payload(data, length, ev + 7);
         p_free(data);
         if (!ok) {
@@ -1654,12 +1734,8 @@ s_result archive_each_landed(const char *folder, const char *id, bool (*each)(vo
 size_t archive_every(store *s, char *const *emitted, size_t emitted_count,
                      bool (*visible)(const message *m, void *user),
                      bool (*each)(store *s, const message *m, const job *known, const char *landed, void *user), void *user) {
-    text root = {0};
-    add(&root, s->folder), add(&root, "/archive");
-    if (root.failed) return 1;
     month_list_ctx ml = {0};
-    p_result r = p_list(root.data, gather_months, &ml);
-    text_free(&root);
+    p_result r = arch_list(s->folder, NULL, gather_months, &ml, "arch-root-held");
     if (r == P_MISSING) {
         list_free(&ml.months), list_free(&ml.bad);
         return 0;
@@ -1673,11 +1749,8 @@ size_t archive_every(store *s, char *const *emitted, size_t emitted_count,
     /* Iterate newest month first (descending YYYY-MM). */
     for (size_t mi = ml.months.count; mi-- > 0;) {
         const char *month = ml.months.items[mi];
-        text mdir = {0};
-        arch_dir(s->folder, month, &mdir);
-        if (mdir.failed || p_real_dir(mdir.data) != P_OK) {
+        if (check_arch_dirs(s->folder, month) != S_OK) {
             damaged++;
-            text_free(&mdir);
             continue;
         }
         char *cursor = NULL;
@@ -1688,7 +1761,7 @@ size_t archive_every(store *s, char *const *emitted, size_t emitted_count,
             size_t batch_cap = 2048;
 #endif
             batch_ctx b = {.ids = {.cap_limit = batch_cap}, .after = cursor, .truncated = false};
-            p_result lr = p_list(mdir.data, gather_arch_post_batch, &b);
+            p_result lr = arch_list(s->folder, month, gather_arch_post_batch, &b, NULL);
             if (lr != P_OK || b.ids.failed) {
                 damaged++;
                 list_free(&b.ids);
@@ -1705,7 +1778,7 @@ size_t archive_every(store *s, char *const *emitted, size_t emitted_count,
                 damaged++;
             } else {
                 for (size_t i = 0; i < b.ids.count; i++) be.items[i].id = b.ids.items[i];
-                if (p_list(mdir.data, attach_arch_events, &be) != P_OK || be.failed) {
+                if (arch_list(s->folder, month, attach_arch_events, &be, NULL) != P_OK || be.failed) {
                     damaged++;
                 } else {
                     bool keep_going = true;
@@ -1770,7 +1843,6 @@ size_t archive_every(store *s, char *const *emitted, size_t emitted_count,
             }
         }
         p_free(cursor);
-        text_free(&mdir);
     }
     list_free(&ml.months), list_free(&ml.bad);
     return damaged;
@@ -1873,10 +1945,10 @@ static bool attach_arch_events(void *user, const char *name) {
 }
 
 /* Returns S_OK if equal, S_NOTHING if live file b vanished concurrently, S_DAMAGED if mismatched or unreadable. */
-static s_result compare_arch_live(const char *a, const char *b) {
+static s_result compare_arch_live(const arch_at *a, const char *b) {
     char *da = NULL, *db = NULL;
     size_t la = 0, lb = 0;
-    p_result ra = p_read(a, MOST_FILE, &da, &la);
+    p_result ra = arch_read(a, MOST_FILE, &da, &la);
     p_result rb = p_read(b, MOST_FILE, &db, &lb);
     if (rb == P_MISSING) {
         p_free(da), p_free(db);
@@ -1896,12 +1968,8 @@ static void report_arch_file(text *report, const char *month, const char *id, co
 }
 
 s_result archive_check(store *s, text *report) {
-    text root = {0};
-    add(&root, s->folder), add(&root, "/archive");
-    if (root.failed) return S_DAMAGED;
     month_list_ctx ml = {0};
-    p_result r = p_list(root.data, gather_months, &ml);
-    text_free(&root);
+    p_result r = arch_list(s->folder, NULL, gather_months, &ml, "arch-root-held");
     if (r == P_MISSING) {
         list_free(&ml.months), list_free(&ml.bad);
         return S_OK;
@@ -1919,12 +1987,9 @@ s_result archive_check(store *s, text *report) {
     sort_list(&ml.months);
     for (size_t mi = 0; mi < ml.months.count; mi++) {
         const char *month = ml.months.items[mi];
-        text mdir = {0};
-        arch_dir(s->folder, month, &mdir);
-        if (mdir.failed || p_real_dir(mdir.data) != P_OK) {
+        if (check_arch_dirs(s->folder, month) != S_OK) {
             report_arch(report, month, "", "archive month is not a real directory");
             all = S_DAMAGED;
-            text_free(&mdir);
             continue;
         }
         char *cursor = NULL;
@@ -1943,7 +2008,7 @@ s_result archive_check(store *s, text *report) {
                 .check_bad = first_pass,
             };
             first_pass = false;
-            p_result lr = p_list(mdir.data, gather_arch_check_batch, &ac);
+            p_result lr = arch_list(s->folder, month, gather_arch_check_batch, &ac, NULL);
             if (ac.had_bad) all = S_DAMAGED;
             if (lr != P_OK || ac.ids.ids.failed) {
                 report_arch(report, month, "", "the archive month cannot be read");
@@ -1963,7 +2028,7 @@ s_result archive_check(store *s, text *report) {
                 break;
             }
             for (size_t i = 0; i < ac.ids.ids.count; i++) be.items[i].id = ac.ids.ids.items[i];
-            if (p_list(mdir.data, attach_arch_events, &be) != P_OK || be.failed) {
+            if (arch_list(s->folder, month, attach_arch_events, &be, NULL) != P_OK || be.failed) {
                 report_arch(report, month, "", "the archive month cannot be read");
                 all = S_DAMAGED;
             } else {
@@ -1991,11 +2056,12 @@ s_result archive_check(store *s, text *report) {
                            If a live file disappears concurrently as the archiver completes, fall through to archive-only check. */
                         bool vanished = false;
                         if (it->post_removed) {
-                            text ap = {0}, lp = {0};
-                            arch_path(s->folder, month, &ap, it->id, "post");
+                            text lp = {0};
+                            arch_at ap = {0};
+                            arch_at_of(&ap, s->folder, month, it->id, "post");
                             live_path(s->folder, &lp, it->id, "post");
-                            s_result eq = ap.failed || lp.failed ? S_DAMAGED : compare_arch_live(ap.data, lp.data);
-                            text_free(&ap), text_free(&lp);
+                            s_result eq = ap.name.failed || lp.failed ? S_DAMAGED : compare_arch_live(&ap, lp.data);
+                            arch_at_free(&ap), text_free(&lp);
                             if (eq == S_NOTHING) vanished = true;
                             else if (eq != S_OK) {
                                 report_arch_file(report, month, it->id, "post", "archived post conflicts with live post");
@@ -2003,11 +2069,12 @@ s_result archive_check(store *s, text *report) {
                             }
                         }
                         for (size_t k = 0; !vanished && k < it->links.count; k++) {
-                            text ap = {0}, lp = {0};
-                            arch_path(s->folder, month, &ap, it->id, it->links.items[k]);
+                            text lp = {0};
+                            arch_at ap = {0};
+                            arch_at_of(&ap, s->folder, month, it->id, it->links.items[k]);
                             live_path(s->folder, &lp, it->id, it->links.items[k]);
-                            s_result eq = ap.failed || lp.failed ? S_DAMAGED : compare_arch_live(ap.data, lp.data);
-                            text_free(&ap), text_free(&lp);
+                            s_result eq = ap.name.failed || lp.failed ? S_DAMAGED : compare_arch_live(&ap, lp.data);
+                            arch_at_free(&ap), text_free(&lp);
                             if (eq == S_NOTHING) vanished = true;
                             else if (eq != S_OK) {
                                 report_arch_file(report, month, it->id, it->links.items[k], "archived step conflicts with live step");
@@ -2015,11 +2082,12 @@ s_result archive_check(store *s, text *report) {
                             }
                         }
                         for (size_t k = 0; !vanished && k < it->seen.count; k++) {
-                            text ap = {0}, lp = {0};
-                            arch_path(s->folder, month, &ap, it->id, it->seen.items[k]);
+                            text lp = {0};
+                            arch_at ap = {0};
+                            arch_at_of(&ap, s->folder, month, it->id, it->seen.items[k]);
                             live_path(s->folder, &lp, it->id, it->seen.items[k]);
-                            s_result eq = ap.failed || lp.failed ? S_DAMAGED : compare_arch_live(ap.data, lp.data);
-                            text_free(&ap), text_free(&lp);
+                            s_result eq = ap.name.failed || lp.failed ? S_DAMAGED : compare_arch_live(&ap, lp.data);
+                            arch_at_free(&ap), text_free(&lp);
                             if (eq == S_NOTHING) vanished = true;
                             else if (eq != S_OK) {
                                 report_arch_file(report, month, it->id, it->seen.items[k], "archived seen mark conflicts with live seen mark");
@@ -2027,11 +2095,12 @@ s_result archive_check(store *s, text *report) {
                             }
                         }
                         for (size_t k = 0; !vanished && k < it->landed.count; k++) {
-                            text ap = {0}, lp = {0};
-                            arch_path(s->folder, month, &ap, it->id, it->landed.items[k]);
+                            text lp = {0};
+                            arch_at ap = {0};
+                            arch_at_of(&ap, s->folder, month, it->id, it->landed.items[k]);
                             live_path(s->folder, &lp, it->id, it->landed.items[k]);
-                            s_result eq = ap.failed || lp.failed ? S_DAMAGED : compare_arch_live(ap.data, lp.data);
-                            text_free(&ap), text_free(&lp);
+                            s_result eq = ap.name.failed || lp.failed ? S_DAMAGED : compare_arch_live(&ap, lp.data);
+                            arch_at_free(&ap), text_free(&lp);
                             if (eq == S_NOTHING) vanished = true;
                             else if (eq != S_OK) {
                                 report_arch_file(report, month, it->id, it->landed.items[k], "archived landed mark conflicts with live landed mark");
@@ -2073,12 +2142,12 @@ s_result archive_check(store *s, text *report) {
                     bool was_job = is_job(&m);
                     message_free(&m);
                     for (size_t k = 0; k < it->seen.count; k++) {
-                        text ap = {0};
-                        arch_path(s->folder, month, &ap, it->id, it->seen.items[k]);
+                        arch_at ap = {0};
+                        arch_at_of(&ap, s->folder, month, it->id, it->seen.items[k]);
                         char *sd = NULL;
                         size_t sl = 0;
-                        p_result sr = ap.failed ? P_FAILED : p_read(ap.data, MOST_FILE, &sd, &sl);
-                        text_free(&ap);
+                        p_result sr = ap.name.failed ? P_FAILED : arch_read(&ap, MOST_FILE, &sd, &sl);
+                        arch_at_free(&ap);
                         bool ok_seen = sr == P_OK && store_valid_seen_event(it->seen.items[k]) && sl == len(ARCHIVE_SEEN) && same(sd, ARCHIVE_SEEN);
                         p_free(sd);
                         if (!ok_seen) {
@@ -2089,12 +2158,12 @@ s_result archive_check(store *s, text *report) {
                     if (was_job) {
                         for (size_t k = 0; k < it->landed.count; k++) {
                             const char *ev = it->landed.items[k];
-                            text ap = {0};
-                            arch_path(s->folder, month, &ap, it->id, ev);
+                            arch_at ap = {0};
+                            arch_at_of(&ap, s->folder, month, it->id, ev);
                             char *ld = NULL;
                             size_t ll = 0;
-                            p_result lr = ap.failed ? P_FAILED : p_read(ap.data, MOST_FILE, &ld, &ll);
-                            text_free(&ap);
+                            p_result lr = ap.name.failed ? P_FAILED : arch_read(&ap, MOST_FILE, &ld, &ll);
+                            arch_at_free(&ap);
                             bool ok_landed = lr == P_OK && store_valid_landed_event(ev) && store_valid_landed_payload(ld, ll, ev + 7);
                             p_free(ld);
                             if (!ok_landed) {
@@ -2126,7 +2195,6 @@ s_result archive_check(store *s, text *report) {
             }
         }
         p_free(cursor);
-        text_free(&mdir);
     }
     list_free(&ml.months), list_free(&ml.bad);
     return all;

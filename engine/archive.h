@@ -2,6 +2,9 @@
 #pragma once
 #include "store.h"
 
+/* Sets the test pause called inside archive folder operations once the folder is held (NULL in production). */
+void archive_pauses(void (*pause)(void *user, const char *stage), void *user);
+
 /* Derives "YYYY-MM" from a message id's leading epoch-microseconds timestamp. */
 bool archive_month(const char *id, char out[8]);
 

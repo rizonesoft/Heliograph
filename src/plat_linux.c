@@ -42,10 +42,10 @@ static bool passing_linux(int attempt, int err) {
     return true;
 }
 
-p_result p_read(const char *path, size_t most, char **data, size_t *length) {
+static p_result read_at(int dir, const char *path, size_t most, char **data, size_t *length) {
     struct stat info;
     for (int attempt = 0;; attempt++) {
-        int file = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK); /* never a pipe, a link or a device */
+        int file = openat(dir, path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK); /* never a pipe, a link or a device */
         if (file < 0) {
             if (passing_linux(attempt, errno)) continue;
             return why();
@@ -58,6 +58,8 @@ p_result p_read(const char *path, size_t most, char **data, size_t *length) {
     }
 }
 
+p_result p_read(const char *path, size_t most, char **data, size_t *length) { return read_at(AT_FDCWD, path, most, data, length); }
+
 p_result p_input(size_t most, char **data, size_t *length) { return all(0, most, data, length); }
 
 /* The name is on the disk too, not only the bytes. */
@@ -67,10 +69,12 @@ bool plat_fail_write_flush = false;
 bool plat_fail_sync = false;
 uint64_t plat_now_override = 0;
 #endif
-static bool settle(const char *path) {
+/* Flushes the folder that holds path: the held folder itself when dir is one, else path's parent. */
+static bool settle_at(int dir, const char *path) {
 #ifdef HELIO_TEST_HOOKS
     if (plat_fail_flush) return false;
 #endif
+    if (dir != AT_FDCWD) return !fsync(dir);
     char folder[4096];
     const char *slash = strrchr(path, '/');
     if (slash == path) {
@@ -88,10 +92,10 @@ static bool settle(const char *path) {
     return good;
 }
 
-p_result p_write(const char *path, const char *data, size_t length, bool replace, const char *unique) {
+static p_result write_at(int dir, const char *path, const char *data, size_t length, bool replace, const char *unique) {
     char temp[4096];
     if ((size_t)snprintf(temp, sizeof temp, "%s.%s.part", path, unique) >= sizeof temp) return P_FAILED;
-    int file = open(temp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    int file = openat(dir, temp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (file < 0) return errno == ENOENT ? P_MISSING : P_FAILED; /* a taken temporary name says nothing about path */
     size_t done = 0;
     bool good = true;
@@ -107,17 +111,22 @@ p_result p_write(const char *path, const char *data, size_t length, bool replace
     good = good && !fsync(file);
     good = !close(file) && good;
     p_result result = P_FAILED;
-    if (good && replace) result = rename(temp, path) ? why() : P_OK;
-    else if (good) result = link(temp, path) ? why() : P_OK; /* fails when the name is taken, on D: too */
-    if (!(good && replace && result == P_OK)) unlink(temp);
+    if (good && replace) result = renameat(dir, temp, dir, path) ? why() : P_OK;
+    else if (good) result = linkat(dir, temp, dir, path, 0) ? why() : P_OK; /* fails when the name is taken, on D: too */
+    if (!(good && replace && result == P_OK)) unlinkat(dir, temp, 0);
 #ifdef HELIO_TEST_HOOKS
     if (result == P_OK && plat_fail_write_flush) return P_UNFLUSHED;
 #endif
-    if (result == P_OK && !settle(path)) result = P_UNFLUSHED;
+    if (result == P_OK && !settle_at(dir, path)) result = P_UNFLUSHED;
     return result;
 }
 
+p_result p_write(const char *path, const char *data, size_t length, bool replace, const char *unique) {
+    return write_at(AT_FDCWD, path, data, length, replace, unique);
+}
+
 p_result p_create_excl(const char *path, const char *data, size_t length) {
+    const int dir = AT_FDCWD;
 #ifdef HELIO_TEST_HOOKS
     if (plat_fail_sync) return P_FAILED;
 #endif
@@ -153,7 +162,7 @@ p_result p_create_excl(const char *path, const char *data, size_t length) {
 #ifdef HELIO_TEST_HOOKS
         if (plat_fail_write_flush) return P_UNFLUSHED;
 #endif
-        return settle(path) ? P_OK : P_UNFLUSHED;
+        return settle_at(dir, path) ? P_OK : P_UNFLUSHED;
     }
     int file = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
     if (file < 0) return why();
@@ -166,7 +175,7 @@ p_result p_create_excl(const char *path, const char *data, size_t length) {
 #ifdef HELIO_TEST_HOOKS
     if (plat_fail_write_flush) return P_UNFLUSHED;
 #endif
-    return settle(path) ? P_OK : P_UNFLUSHED;
+    return settle_at(dir, path) ? P_OK : P_UNFLUSHED;
 }
 
 p_result p_file_mtime(const char *path, uint64_t *mtime_us) {
@@ -178,6 +187,7 @@ p_result p_file_mtime(const char *path, uint64_t *mtime_us) {
 }
 
 p_result p_claim_remove(const char *path, const char *unique) {
+    const int dir = AT_FDCWD;
     char temp[4096];
     if ((size_t)snprintf(temp, sizeof temp, "%s.%s.rm.part", path, unique) >= sizeof temp) return P_FAILED;
     for (int attempt = 0;; attempt++) {
@@ -186,52 +196,59 @@ p_result p_claim_remove(const char *path, const char *unique) {
     }
     for (int attempt = 0;; attempt++) {
         if (!unlink(temp)) break;
-        if (!passing_linux(attempt, errno)) return errno == ENOENT ? (settle(path) ? P_OK : P_FAILED) : P_FAILED;
+        if (!passing_linux(attempt, errno)) return errno == ENOENT ? (settle_at(dir, path) ? P_OK : P_FAILED) : P_FAILED;
     }
-    return settle(path) ? P_OK : P_FAILED;
+    return settle_at(dir, path) ? P_OK : P_FAILED;
 }
 
-p_result p_remove(const char *path) {
+static p_result remove_at(int dir, const char *path) {
     for (int attempt = 0;; attempt++) {
-        if (!unlink(path)) break;
+        if (!unlinkat(dir, path, 0)) break;
         if (!passing_linux(attempt, errno)) return why();
     }
-    return settle(path) ? P_OK : P_FAILED;
+    return settle_at(dir, path) ? P_OK : P_FAILED;
 }
 
-p_result p_sync(const char *path) {
+p_result p_remove(const char *path) { return remove_at(AT_FDCWD, path); }
+
+static p_result sync_at(int dir, const char *path) {
 #ifdef HELIO_TEST_HOOKS
     if (plat_fail_flush || plat_fail_sync) return P_FAILED;
 #endif
     int file = -1;
     for (int attempt = 0;; attempt++) {
-        file = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+        file = openat(dir, path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
         if (file >= 0 || !passing_linux(attempt, errno)) break;
     }
     if (file < 0) return why();
     struct stat info;
     bool good = !fstat(file, &info) && S_ISREG(info.st_mode) && !fsync(file);
     close(file);
-    return good && settle(path) ? P_OK : P_FAILED;
+    return good && settle_at(dir, path) ? P_OK : P_FAILED;
 }
 
-static bool sync_dir(const char *path) {
+p_result p_sync(const char *path) { return sync_at(AT_FDCWD, path); }
+
+static bool sync_dir(int dir, const char *path) {
 #ifdef HELIO_TEST_HOOKS
     if (plat_fail_flush) return false;
 #endif
-    int file = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    int file = openat(dir, path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (file < 0) return false;
     bool good = !fsync(file);
     close(file);
     return good;
 }
 
-p_result p_folder(const char *path) {
+static p_result folder_at(int dir, const char *path) {
     struct stat info;
-    if (!mkdir(path, 0700)) return settle(path) && sync_dir(path) ? P_OK : P_FAILED;
-    if (errno == EEXIST && !lstat(path, &info) && S_ISDIR(info.st_mode)) return settle(path) && sync_dir(path) ? P_OK : P_FAILED;
+    if (!mkdirat(dir, path, 0700)) return settle_at(dir, path) && sync_dir(dir, path) ? P_OK : P_FAILED;
+    if (errno == EEXIST && !fstatat(dir, path, &info, AT_SYMLINK_NOFOLLOW) && S_ISDIR(info.st_mode))
+        return settle_at(dir, path) && sync_dir(dir, path) ? P_OK : P_FAILED;
     return errno == EEXIST ? P_FAILED : why();
 }
+
+p_result p_folder(const char *path) { return folder_at(AT_FDCWD, path); }
 
 p_result p_real_dir(const char *path) {
     struct stat info;
@@ -247,8 +264,8 @@ p_result p_cwd(char **path_out) {
     return P_OK;
 }
 
-p_result p_list(const char *path, bool (*each)(void *user, const char *name), void *user) {
-    int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+static p_result list_at(int dir, const char *path, bool (*each)(void *user, const char *name), void *user) {
+    int fd = openat(dir, path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) return why();
     DIR *folder = fdopendir(fd);
     if (!folder) {
@@ -264,6 +281,65 @@ p_result p_list(const char *path, bool (*each)(void *user, const char *name), vo
     closedir(folder);
     return result;
 }
+
+p_result p_list(const char *path, bool (*each)(void *user, const char *name), void *user) { return list_at(AT_FDCWD, path, each, user); }
+
+/* A folder held by its descriptor. Each folder of rel is opened from the one before with O_NOFOLLOW, so
+   a symlink anywhere below root is refused, and every name inside is then reached through the held
+   descriptor, never through a path that could be swapped meanwhile. */
+struct p_dir {
+    int fd;
+};
+
+p_result p_dir_open(const char *root, const char *rel, p_dir **out) {
+    *out = NULL;
+    int at = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (at < 0) return why();
+    char part[256];
+    for (const char *p = rel; *p;) {
+        size_t n = 0;
+        while (p[n] && p[n] != '/') n++;
+        if (!n || n >= sizeof part || (n == 1 && p[0] == '.') || (n == 2 && p[0] == '.' && p[1] == '.')) {
+            close(at);
+            return P_FAILED;
+        }
+        memcpy(part, p, n), part[n] = 0;
+        int next = openat(at, part, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        int err = errno;
+        close(at);
+        if (next < 0) return err == ENOENT ? P_MISSING : P_FAILED; /* ELOOP or ENOTDIR: a link or not a folder */
+        at = next;
+        p += n;
+        if (*p == '/') p++;
+    }
+    p_dir *dir = p_alloc(sizeof *dir);
+    if (!dir) {
+        close(at);
+        return P_FAILED;
+    }
+    dir->fd = at;
+    *out = dir;
+    return P_OK;
+}
+
+void p_dir_close(p_dir *dir) {
+    if (!dir) return;
+    close(dir->fd);
+    p_free(dir);
+}
+
+static bool plain_name(const char *name) { return *name && !strchr(name, '/') && strcmp(name, ".") && strcmp(name, ".."); }
+
+p_result p_dir_read(p_dir *dir, const char *name, size_t most, char **data, size_t *length) {
+    return plain_name(name) ? read_at(dir->fd, name, most, data, length) : P_FAILED;
+}
+p_result p_dir_write(p_dir *dir, const char *name, const char *data, size_t length, bool replace, const char *unique) {
+    return plain_name(name) ? write_at(dir->fd, name, data, length, replace, unique) : P_FAILED;
+}
+p_result p_dir_remove(p_dir *dir, const char *name) { return plain_name(name) ? remove_at(dir->fd, name) : P_FAILED; }
+p_result p_dir_sync(p_dir *dir, const char *name) { return plain_name(name) ? sync_at(dir->fd, name) : P_FAILED; }
+p_result p_dir_folder(p_dir *dir, const char *name) { return plain_name(name) ? folder_at(dir->fd, name) : P_FAILED; }
+p_result p_dir_list(p_dir *dir, bool (*each)(void *user, const char *name), void *user) { return list_at(dir->fd, ".", each, user); }
 
 uint64_t p_now(void) {
 #ifdef HELIO_TEST_HOOKS

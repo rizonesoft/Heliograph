@@ -1940,7 +1940,15 @@ class Archive(Base):
                             gone = st / f"gone-{folder.name}-{n}"
                             n += 1
                             folder.mkdir()
-                            folder.rename(gone)
+                            while True:
+                                try:
+                                    folder.rename(gone)
+                                    break
+                                except PermissionError:
+                                    if not ON_WINDOWS:
+                                        raise
+                                    # Windows: the racer holds the folder (no FILE_SHARE_DELETE) while it looks.
+                                    time.sleep(0.001)
                             gone.rmdir()
                     except OSError as e:
                         errors.append(e)
@@ -2334,6 +2342,286 @@ class Archive(Base):
             if (self.store / f).exists():
                 (self.store / f).unlink()
         self.assertEqual(self.helio("check", me=None).returncode, 0)
+
+
+class OutsideWatch:
+    """Every open, listing, read, write and creation inside the watched folders, through Linux inotify: a store
+    operation that followed a link out of the store shows here, whatever it then did with what it found."""
+
+    def __init__(self, folders):
+        import ctypes
+        self.libc = ctypes.CDLL(None, use_errno=True)
+        self.fd = self.libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+        if self.fd < 0:
+            raise OSError(ctypes.get_errno(), "inotify_init1")
+        for folder in folders:
+            if self.libc.inotify_add_watch(self.fd, str(folder).encode(), 0xFFF) < 0:
+                raise OSError(ctypes.get_errno(), f"inotify_add_watch {folder}")
+
+    def events(self):
+        import struct
+        found = []
+        while True:
+            try:
+                data = os.read(self.fd, 65536)
+            except BlockingIOError:
+                return found
+            at = 0
+            while at < len(data):
+                _, mask, _, size = struct.unpack_from("iIII", data, at)
+                found.append((hex(mask), data[at + 16:at + 16 + size].rstrip(b"\0").decode()))
+                at += 16 + size
+
+    def close(self):
+        os.close(self.fd)
+
+
+class ArchiveSwap(Base):
+    """A program that can write the store swaps archive/ or archive/<month>/ for a link to a folder outside it
+    while a command holds that folder. Nothing outside the store is ever opened, listed, read, written or
+    created, and a command that cannot finish keeps its live source for a retry."""
+
+    FEB = 1739577600_000_000  # 2025-02-15T00:00:00Z
+    make_aged_closed_job = Archive.make_aged_closed_job
+    wait_for = Archive.wait_for
+
+    def setUp(self):
+        super().setUp()
+        self.outside_temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.outside_temp.cleanup)
+        self.outside = Path(self.outside_temp.name)
+
+    def planted_post(self, job, subject="planted-subject"):
+        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(job.split("-")[0]) / 1_000_000))
+        body = "planted body"
+        return (f"id: {job}\ntime: {ts}\nfrom: os/main\nto: os/userland\nkind: request\nabout: \nurgency: next\nre: \n"
+                f"due: \nlength: {len(body)}\nsubject: {subject}\n\n{body}")
+
+    def archived_job(self, created_us=None, subject="old-job"):
+        job = self.make_aged_closed_job(created_us=created_us or self.FEB, subject=subject)
+        r = self.helio("archive", me=None)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue((self.store / f"archive/2025-02/{job}.post").is_file())
+        return job
+
+    def paused(self, stage, *arguments, me=None, stages=None):
+        command = [str(RACER), "--pause-cli", stages or stage, str(self.store), *arguments, "--store", str(self.store), *(["--as", me] if me else [])]
+        clean = {k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "ANTIGRAVITY_CONVERSATION_ID")}
+        proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.store, env=clean)
+        try:
+            self.wait_for(self.store / f"paused.{stage}")
+        except BaseException:
+            proc.kill()
+            proc.communicate()
+            raise
+        return proc
+
+    def resume(self, proc, stage):
+        put(self.store / f"resume.{stage}", "go")
+        out, err = proc.communicate(timeout=60)
+        for name in (f"paused.{stage}", f"resume.{stage}"):
+            (self.store / name).unlink(missing_ok=True)
+        self.assertNotEqual(proc.returncode, 105, "the pause timed out")
+        return proc.returncode, out, err
+
+    def swap(self, rel, target):
+        real = self.store / rel
+        real.rename(real.with_name(real.name + ".real"))
+        os.symlink(target, real)
+
+    def unswap(self, rel):
+        real = self.store / rel
+        real.unlink()
+        real.with_name(real.name + ".real").rename(real)
+
+    def watch(self, *folders):
+        w = OutsideWatch(folders)
+        self.addCleanup(w.close)
+        return w
+
+
+@unittest.skipIf(ON_WINDOWS, "symlinks and inotify: Linux; Windows has ArchiveJunction")
+class ArchiveSwapLinux(ArchiveSwap):
+    def test_show_never_reads_a_folder_swapped_while_it_is_held(self):
+        job = self.archived_job()
+        (self.outside / "2025-02").mkdir()
+        put(self.outside / f"2025-02/{job}.post", self.planted_post(job))
+        put(self.outside / f"{job}.post", self.planted_post(job))
+        for rel, target in (("archive", self.outside), ("archive/2025-02", self.outside)):
+            with self.subTest(swapped=rel):
+                w = self.watch(self.outside, self.outside / "2025-02")
+                proc = self.paused("arch-held", "show", job, me="os/userland")
+                self.swap(rel, target)
+                try:
+                    rc, out, err = self.resume(proc, "arch-held")
+                finally:
+                    self.unswap(rel)
+                self.assertEqual(w.events(), [], "something outside the store was opened")
+                self.assertIn(rc, (0, 3), err)
+                self.assertNotIn(b"planted", out)
+                if rc == 0:
+                    self.assertIn(b"old-job", out)
+                again = self.helio("show", job, me="os/userland")
+                self.assertEqual(again.returncode, 0, again.stderr)
+                self.assertIn(b"old-job", again.stdout)
+
+    def test_the_archive_listing_never_follows_a_swapped_archive_folder(self):
+        job = self.archived_job()
+        planted = f"{1741000000_000_000:016d}-def456"  # 2025-03
+        (self.outside / "2025-03").mkdir()
+        put(self.outside / f"2025-03/{planted}.post", self.planted_post(planted))
+        put(self.outside / f"2025-03/{planted}.link.0000", "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: taken\nnote: \nend: yes\n")
+        put(self.outside / f"2025-03/{planted}.link.0001", "by: os/userland\ntime: 2025-04-15T12:00:00Z\nsession: \nstate: done\nnote: ok\nend: yes\n")
+        for command, me in ((("log", "--all"), "os/main"), (("check",), None)):
+            with self.subTest(command=command[0]):
+                control = self.helio(*command, me=me)
+                self.assertEqual(control.returncode, 0, control.stderr)
+                if command[0] == "log":
+                    self.assertIn(job.encode(), control.stdout)
+                w = self.watch(self.outside, self.outside / "2025-03")
+                proc = self.paused("arch-root-held", *command, me=me)
+                self.swap("archive", self.outside)
+                try:
+                    rc, out, err = self.resume(proc, "arch-root-held")
+                finally:
+                    self.unswap("archive")
+                self.assertEqual(w.events(), [], "the listing followed the link out of the store")
+                self.assertNotIn(planted.encode(), out + err)
+                self.assertNotIn(b"2025-03", out + err)
+
+    def test_writes_stay_in_the_store_and_keep_their_live_source(self):
+        job = self.archived_job()
+        fresh = self.make_aged_closed_job(created_us=self.FEB + 5, subject="fresh-job")
+        ids = {}
+        (self.outside / "m").mkdir()
+        cases = (
+            ("before-arch-copy", ("archive",), None, lambda: (self.store / f"messages/{fresh}.post").is_file(),
+             lambda: (self.store / f"archive/2025-02/{fresh}.post").is_file() and not (self.store / f"messages/{fresh}.post").exists()),
+            ("before-arch-seen", ("show", job), "os/userland", lambda: True,
+             lambda: (self.store / f"archive/2025-02/{job}.seen.os+userland").is_file()),
+            ("before-landed-promote", None, "os/main", lambda: (self.store / f"messages/{ids['landing']}.landed.abc1234").is_file(),
+             lambda: (self.store / f"archive/2025-02/{ids['landing']}.landed.abc1234").is_file()),
+        )
+        for stage, command, me, live_kept, done in cases:
+            with self.subTest(stage=stage):
+                w = self.watch(self.outside, self.outside / "m")
+                if stage == "before-landed-promote":
+                    # A landed mark is written while an archiver moves its job, so it is promoted into the archive.
+                    ids["landing"] = self.make_aged_closed_job(created_us=self.FEB + 9, subject="landing-job")
+                    command = ("landed", ids["landing"], "abc1234")
+                    proc = self.paused("landed", *command, me=me, stages="landed,before-landed-promote")
+                    moved = self.helio("archive", me=None)
+                    self.assertEqual(moved.returncode, 0, moved.stderr)
+                    put(self.store / "resume.landed", "go")
+                    self.wait_for(self.store / f"paused.{stage}")
+                    for name in ("paused.landed", "resume.landed"):
+                        (self.store / name).unlink(missing_ok=True)
+                else:
+                    proc = self.paused(stage, *command, me=me)
+                self.swap("archive/2025-02", self.outside / "m")
+                try:
+                    rc, out, err = self.resume(proc, stage)
+                finally:
+                    self.unswap("archive/2025-02")
+                self.assertEqual(w.events(), [], "a write followed the link out of the store")
+                self.assertEqual(list(self.outside.joinpath("m").iterdir()), [])
+                self.assertIn(rc, (0, 3), err)
+                if rc == 3:
+                    self.assertTrue(live_kept(), "the live source was removed although its write was refused")
+                # A refused promotion leaves the job archived with its landed mark live, which the next archive run
+                # carries across; every other command is retried as it was.
+                retry = self.helio("archive", me=None) if stage == "before-landed-promote" else self.helio(*command, me=me)
+                self.assertIn(retry.returncode, (0, 1), retry.stderr)
+                self.assertTrue(done(), f"the retry of {stage} did not finish")
+                self.assertEqual(self.helio("check", me=None).returncode, 0)
+
+    def test_the_first_archive_of_a_month_never_makes_its_folder_outside(self):
+        self.archived_job()
+        march = self.make_aged_closed_job(created_us=1741000000_000_000, subject="march-job")
+        w = self.watch(self.outside)
+        proc = self.paused("before-make-month", "archive")
+        self.swap("archive", self.outside)
+        try:
+            rc, out, err = self.resume(proc, "before-make-month")
+        finally:
+            self.unswap("archive")
+        self.assertEqual(w.events(), [], "the month folder was made outside the store")
+        self.assertEqual(list(self.outside.iterdir()), [])
+        self.assertIn(rc, (0, 3), err)
+        in_store = (self.store / f"messages/{march}.post").is_file() or any(self.store.glob(f"archive*/2025-03/{march}.post"))
+        self.assertTrue(in_store, "the job left the store")
+        retry = self.helio("archive", me=None)
+        self.assertIn(retry.returncode, (0, 1), retry.stderr)
+        self.assertTrue((self.store / f"archive/2025-03/{march}.post").is_file())
+
+
+@unittest.skipUnless(ON_WINDOWS, "junctions and sharing modes: Windows")
+class ArchiveJunction(ArchiveSwap):
+    def junction(self, rel, target):
+        import _winapi
+        real = self.store / rel
+        real.rename(real.with_name(real.name + ".real"))
+        _winapi.CreateJunction(str(target), str(real))
+
+    def unjunction(self, rel):
+        real = self.store / rel
+        os.rmdir(real)  # removes the junction, never its target
+        real.with_name(real.name + ".real").rename(real)
+
+    def test_a_junction_in_place_of_either_folder_is_refused(self):
+        job = self.archived_job()
+        (self.outside / "2025-02").mkdir()
+        (self.outside / "2031-07").mkdir()  # a month name only the outside folder has: listed, it would be reported
+        put(self.outside / f"2025-02/{job}.post", self.planted_post(job))
+        put(self.outside / f"{job}.post", self.planted_post(job))
+        for rel, target in (("archive", self.outside), ("archive/2025-02", self.outside)):
+            with self.subTest(junction=rel):
+                self.junction(rel, target)
+                try:
+                    shown = self.helio("show", job, me="os/userland")
+                    listed = self.helio("log", "--all", me="os/main")
+                    checked = self.helio("check", me=None)
+                finally:
+                    self.unjunction(rel)
+                self.assertEqual(shown.returncode, 3, shown.stdout + shown.stderr)
+                for r in (shown, listed, checked):
+                    self.assertNotIn(b"planted", r.stdout + r.stderr)
+                    self.assertNotIn(b"2031-07", r.stdout + r.stderr, "a folder outside the store was listed")
+                self.assertEqual(checked.returncode, 3)
+
+    def test_a_file_link_in_place_of_the_post_is_refused(self):
+        job = self.archived_job()
+        put(self.outside / "planted.post", self.planted_post(job))
+        post = self.store / f"archive/2025-02/{job}.post"
+        post.rename(post.with_name(post.name + ".real"))
+        try:
+            os.symlink(self.outside / "planted.post", post)
+        except OSError as e:
+            post.with_name(post.name + ".real").rename(post)
+            self.skipTest(f"no file symlink privilege here: {e}")
+        try:
+            shown = self.helio("show", job, me="os/userland")
+        finally:
+            post.unlink()
+            post.with_name(post.name + ".real").rename(post)
+        self.assertEqual(shown.returncode, 3, shown.stdout + shown.stderr)
+        self.assertNotIn(b"planted", shown.stdout + shown.stderr)
+
+    def test_a_held_folder_cannot_be_renamed_until_the_command_ends(self):
+        job = self.archived_job()
+        for rel in ("archive", "archive/2025-02"):
+            with self.subTest(held=rel):
+                proc = self.paused("arch-held", "show", job, me="os/userland")
+                real = self.store / rel
+                try:
+                    with self.assertRaises(PermissionError):
+                        real.rename(real.with_name(real.name + ".moved"))
+                finally:
+                    rc, out, err = self.resume(proc, "arch-held")
+                self.assertEqual(rc, 0, err)
+                self.assertIn(b"old-job", out)
+                real.rename(real.with_name(real.name + ".moved"))
+                real.with_name(real.name + ".moved").rename(real)
 
 
 class Sessions(Base):

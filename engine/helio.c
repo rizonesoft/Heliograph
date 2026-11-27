@@ -720,6 +720,7 @@ static int init(const char *folder, bool from_default) {
 }
 
 static int run(options *o, void (*pause)(void *user, const char *stage), void *pause_user) {
+    archive_pauses(pause, pause_user);
     const char *command = o->count ? o->words[0] : "inbox";
     if (same(command, "help")) {
         if (o->for_session_flag) return fail("--for-session is only for sending a message", 2);

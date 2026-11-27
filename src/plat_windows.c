@@ -426,3 +426,197 @@ bool p_error(const char *text) {
     DWORD done;
     return out && out != INVALID_HANDLE_VALUE && WriteFile(out, text, (DWORD)im_length(text), &done, NULL);
 }
+
+/* A folder held by handles on each folder of its path from the root. Each is opened as itself (never through a
+   reparse point) and without FILE_SHARE_DELETE, so on NTFS none can be renamed or removed while held, and each
+   is refused when it is a reparse point. Names inside are then reached through that unchangeable path; a file is
+   opened as itself too and refused when it is a reparse point. Over \\wsl.localhost a Linux symlink is a reparse
+   point Windows cannot traverse, so it is refused the same way. */
+enum { MOST_HELD = 4 };
+struct p_dir {
+    char *path;
+    HANDLE held[MOST_HELD];
+    int count;
+};
+
+static p_result hold_folder(const char *path, HANDLE *out) {
+    wchar_t *wide = im_wide(path);
+    if (!wide) return P_FAILED;
+    HANDLE h = INVALID_HANDLE_VALUE;
+    DWORD err = 0;
+    for (int attempt = 0;; attempt++) {
+        h = CreateFileW(wide, FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+                        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+        if (h != INVALID_HANDLE_VALUE) break;
+        err = GetLastError();
+        if (!passing_win(attempt, err)) break;
+    }
+    if (h == INVALID_HANDLE_VALUE) {
+        im_free(wide);
+        return err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND ? P_MISSING : P_FAILED;
+    }
+    DWORD attrs = GetFileAttributesW(wide); /* the held folder: its name cannot change while h is open */
+    im_free(wide);
+    if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY) || (attrs & FILE_ATTRIBUTE_REPARSE_POINT)) {
+        CloseHandle(h);
+        return P_FAILED;
+    }
+    *out = h;
+    return P_OK;
+}
+
+void p_dir_close(p_dir *dir) {
+    if (!dir) return;
+    for (int i = dir->count; i-- > 0;) CloseHandle(dir->held[i]);
+    im_free(dir->path);
+    im_free(dir);
+}
+
+p_result p_dir_open(const char *root, const char *rel, p_dir **out) {
+    *out = NULL;
+    p_dir *dir = im_alloc(sizeof *dir);
+    if (!dir) return P_FAILED;
+    im_text path = {0};
+    im_add(&path, root);
+    p_result r = path.failed ? P_FAILED : P_OK;
+    for (const char *p = rel; r == P_OK && *p;) {
+        size_t n = 0;
+        while (p[n] && p[n] != '/' && p[n] != '\\') n++;
+        if (!n || dir->count == MOST_HELD || (n == 1 && p[0] == '.') || (n == 2 && p[0] == '.' && p[1] == '.')) {
+            r = P_FAILED;
+            break;
+        }
+        im_add(&path, "/"), im_add_bytes(&path, p, n);
+        if (path.failed) {
+            r = P_FAILED;
+            break;
+        }
+        r = hold_folder(path.data, &dir->held[dir->count]);
+        if (r == P_OK) dir->count++;
+        p += n;
+        if (*p) p++;
+    }
+    if (r != P_OK) {
+        im_text_free(&path);
+        p_dir_close(dir);
+        return r;
+    }
+    dir->path = path.data;
+    *out = dir;
+    return P_OK;
+}
+
+static bool plain_name(const char *name) {
+    if (!*name || (name[0] == '.' && (!name[1] || (name[1] == '.' && !name[2])))) return false;
+    for (const char *p = name; *p; p++)
+        if (*p == '/' || *p == '\\' || *p == ':') return false;
+    return true;
+}
+
+static char *inside(const p_dir *dir, const char *name) {
+    if (!plain_name(name)) return NULL;
+    im_text t = {0};
+    im_add(&t, dir->path), im_add(&t, "/"), im_add(&t, name);
+    if (t.failed) {
+        im_text_free(&t);
+        return NULL;
+    }
+    return t.data;
+}
+
+/* Opens a file inside a held folder as itself, without FILE_SHARE_DELETE so its name stays put while it is checked,
+   and refuses a reparse point or a folder in its place. */
+static p_result open_inside(const char *path, DWORD access, HANDLE *out) {
+    wchar_t *wide = im_wide(path);
+    if (!wide) return P_FAILED;
+    HANDLE h = INVALID_HANDLE_VALUE;
+    DWORD err = 0;
+    for (int attempt = 0;; attempt++) {
+        h = CreateFileW(wide, access, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+        if (h != INVALID_HANDLE_VALUE) break;
+        err = GetLastError();
+        if (!passing_win(attempt, err)) break;
+    }
+    if (h == INVALID_HANDLE_VALUE) {
+        im_free(wide);
+        return err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND ? P_MISSING : P_FAILED;
+    }
+    DWORD attrs = GetFileAttributesW(wide);
+    im_free(wide);
+    if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))) {
+        CloseHandle(h);
+        return P_FAILED;
+    }
+    *out = h;
+    return P_OK;
+}
+
+p_result p_dir_read(p_dir *dir, const char *name, size_t most, char **data, size_t *length) {
+    char *path = inside(dir, name);
+    if (!path) return P_FAILED;
+    HANDLE h;
+    p_result r = open_inside(path, GENERIC_READ, &h);
+    im_free(path);
+    if (r != P_OK) return r;
+    im_text text = {0};
+    char part[4096];
+    DWORD got = 0;
+    for (r = P_OK; r == P_OK;) {
+        if (!ReadFile(h, part, sizeof part, &got, NULL)) r = P_FAILED;
+        else if (!got) break;
+        else if (got > most - text.length) r = P_TOO_LARGE;
+        else if (im_add_bytes(&text, part, got), text.failed) r = P_FAILED;
+    }
+    CloseHandle(h);
+    if (r == P_OK && !text.data) im_add_bytes(&text, "", 0);
+    if (r == P_OK && text.failed) r = P_FAILED;
+    if (r != P_OK) {
+        im_text_free(&text);
+        return r;
+    }
+    *data = text.data, *length = text.length;
+    return P_OK;
+}
+
+p_result p_dir_write(p_dir *dir, const char *name, const char *data, size_t length, bool replace, const char *unique) {
+    char *path = inside(dir, name);
+    if (!path) return P_FAILED;
+    p_result r = p_write(path, data, length, replace, unique); /* a new temporary file moved onto the name: never through a link */
+    im_free(path);
+    return r;
+}
+
+p_result p_dir_remove(p_dir *dir, const char *name) {
+    char *path = inside(dir, name);
+    if (!path) return P_FAILED;
+    p_result r = p_remove(path); /* removes a link in its place, never its target */
+    im_free(path);
+    return r;
+}
+
+p_result p_dir_sync(p_dir *dir, const char *name) {
+#ifdef HELIO_TEST_HOOKS
+    if (plat_fail_flush || plat_fail_sync) return P_FAILED;
+#endif
+    char *path = inside(dir, name);
+    if (!path) return P_FAILED;
+    HANDLE h;
+    p_result r = open_inside(path, GENERIC_WRITE, &h);
+    if (r == P_OK) {
+        bool ok = FlushFileBuffers(h) != 0;
+        CloseHandle(h);
+        r = ok && settle_win(path) ? P_OK : P_FAILED;
+    }
+    im_free(path);
+    return r;
+}
+
+p_result p_dir_folder(p_dir *dir, const char *name) {
+    char *path = inside(dir, name);
+    if (!path) return P_FAILED;
+    p_result r = p_folder(path); /* refuses a reparse point in its place */
+    im_free(path);
+    return r;
+}
+
+p_result p_dir_list(p_dir *dir, bool (*each)(void *user, const char *name), void *user) { return p_list(dir->path, each, user); }

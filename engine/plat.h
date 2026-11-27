@@ -24,6 +24,20 @@ p_result p_folder(const char *path);
    nothing is there, P_FAILED when something else is there or it cannot be looked at. One call, so a folder
    another program creates meanwhile is never mistaken for one that is not a real directory. */
 p_result p_real_dir(const char *path);
+/* A folder held open below a trusted root, for acting on names inside it without following a folder swapped
+   meanwhile. p_dir_open opens rel ("a" or "a/b", no "." or "..") under root: P_MISSING when a folder of it is
+   absent, P_FAILED when one is a symlink, a junction or anything but a real folder. While held, the folder cannot
+   be renamed or removed on Windows; on Linux every name is reached through the held descriptor. The calls below
+   act on a plain name inside it, never following a link in its place, and match their path counterparts. */
+typedef struct p_dir p_dir;
+p_result p_dir_open(const char *root, const char *rel, p_dir **out);
+void p_dir_close(p_dir *dir);
+p_result p_dir_read(p_dir *dir, const char *name, size_t most, char **data, size_t *length);
+p_result p_dir_write(p_dir *dir, const char *name, const char *data, size_t length, bool replace, const char *unique);
+p_result p_dir_remove(p_dir *dir, const char *name);
+p_result p_dir_sync(p_dir *dir, const char *name);
+p_result p_dir_folder(p_dir *dir, const char *name);
+p_result p_dir_list(p_dir *dir, bool (*each)(void *user, const char *name), void *user);
 /* Current working directory as newly allocated UTF-8 string, or P_FAILED. */
 p_result p_cwd(char **path_out);
 p_result p_list(const char *path, bool (*each)(void *user, const char *name), void *user);
