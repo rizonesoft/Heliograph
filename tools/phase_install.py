@@ -22,8 +22,29 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Callable
+
+
+def _load_win_launch() -> Any:
+    import importlib.util
+
+    path = Path(__file__).resolve().parent / "win_launch.py"
+    if not path.is_file():
+        raise ImportError(f"Heliograph's Windows launcher is missing: {path} (ship tools/win_launch.py with tools/install.py)")
+    spec = importlib.util.spec_from_file_location("helio_win_launch", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+win_launch = _load_win_launch()
+# The seams a test replaces to inject a relay timeout and record the waits.
+win_run: Callable[..., subprocess.CompletedProcess] = subprocess.run
+win_sleep: Callable[[float], None] = time.sleep
 
 PHASE_LOCK_NAME = ".phase.lock"
 PHASE_JOURNAL_NAME = "phase.journal.json"
@@ -349,19 +370,27 @@ def _run(
     input_text: str | None = None,
     timeout: int = 1800,
     install_mod: Any | None = None,
+    repeatable: bool | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    """Runs argv; a Windows program (repeatable given) goes through win_launch.run_windows."""
+    common = dict(
+        cwd=str(cwd) if cwd is not None else None,
+        env=env,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+    )
+    if input_text is not None:
+        common["input"] = input_text
     try:
+        if repeatable is not None:
+            return win_launch.run_windows(argv, repeatable=repeatable, run=win_run, sleep=win_sleep, **common)
         return subprocess.run(
             argv,
-            cwd=str(cwd) if cwd is not None else None,
-            env=env,
-            input=input_text,
             stdin=subprocess.DEVNULL if input_text is None else None,
             capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
+            **common,
         )
     except subprocess.TimeoutExpired as exc:
         if install_mod is not None:
@@ -564,7 +593,7 @@ def _probe_win_state(
         "print(json.dumps({'dest': str(dest), 'manifest': manifest, 'status_code': st_code, "
         "'status_lines': st_lines, 'exe_sha': exe_sha, 'phase_marker_tx': marker_tx}))\n"
     )
-    res = _run([python_exe, "-B", "-c", code, win_install_py_win, win_to_raw or "", reg_key], timeout=60, install_mod=install_mod)
+    res = _run([python_exe, "-B", "-c", code, win_install_py_win, win_to_raw or "", reg_key], timeout=60, install_mod=install_mod, repeatable=True)
     if res.returncode != 0:
         msg = f"Windows state probe failed (exit {res.returncode}): {(res.stderr or res.stdout).strip()}"
         if install_mod is not None:
@@ -626,6 +655,7 @@ def _win_phase_marker_call(
         input_text=stdin_json,
         timeout=60,
         install_mod=install_mod,
+        repeatable=True,  # begin, end, recover, snapshot_prev and restore_prev are idempotent for one tx_id
     )
     if res.returncode != 0:
         msg = f"Windows phase {action} failed (exit {res.returncode}): {(res.stderr or res.stdout).strip()}"
@@ -642,7 +672,9 @@ def _run_win_cli(
     *,
     timeout: int = 300,
 ) -> subprocess.CompletedProcess[str]:
-    return _run([python_exe, "-B", install_py_win, "--windows", *args], timeout=timeout)
+    """`install.py --windows` with args: --status only reads and is started again after a relay timeout; an install,
+    --back or --remove changes state and is started once."""
+    return _run([python_exe, "-B", install_py_win, "--windows", *args], timeout=timeout, repeatable="--status" in args)
 
 
 def _run_clean_win_helio(
@@ -680,7 +712,24 @@ def _run_clean_win_helio(
         "stdin=sys.stdin, capture_output=False)\n"
         "sys.exit(res.returncode)\n"
     )
-    return _run([python_exe, "-B", "-c", helper, reg_key, *helio_args], input_text=input_text, timeout=timeout)
+    # `check` and `show` only read (a seen mark written twice is the same mark); anything else, such as the smoke
+    # `ask`, is started once, since a second start would send a second message.
+    command = next((a for i, a in enumerate(helio_args) if not a.startswith("-") and (i == 0 or helio_args[i - 1] not in ("--store", "--as"))), "")
+    return _run([python_exe, "-B", "-c", helper, reg_key, *helio_args], input_text=input_text, timeout=timeout,
+                repeatable=command in ("check", "show"))
+
+
+def _run_snapshot_proof(python_exe: str, win_tests_dir: str, env: dict[str, str], *, install_mod: Any | None = None) -> subprocess.CompletedProcess[str]:
+    """The Windows unittest run against the captured snapshot: a whole suite sets up and changes state, so it is
+    started once."""
+    return _run(
+        [python_exe, "-B", "-m", "unittest", "discover", "-s", win_tests_dir, "-v"],
+        cwd=Path("/mnt/c/Windows/Temp"),
+        env=env,
+        timeout=3600,
+        install_mod=install_mod,
+        repeatable=False,
+    )
 
 
 def _run_clean_wsl_helio(
@@ -1515,13 +1564,7 @@ def run_phase_install(
             "PYTHONDONTWRITEBYTECODE": "1",
             "WSLENV": "IMPOSSIBLE_BUILD:IMPOSSIBLE_SDK_DIR:PYTHONDONTWRITEBYTECODE",
         }
-        snap_proof = _run(
-            [python_exe, "-B", "-m", "unittest", "discover", "-s", win_tests_dir, "-v"],
-            cwd=Path("/mnt/c/Windows/Temp"),
-            env=snap_env,
-            timeout=3600,
-            install_mod=install_mod,
-        )
+        snap_proof = _run_snapshot_proof(python_exe, win_tests_dir, snap_env, install_mod=install_mod)
         if snap_proof.returncode != 0:
             raise install_mod.InstallError(
                 f"refusing phase install: isolated snapshot Windows proof failed (exit {snap_proof.returncode})",

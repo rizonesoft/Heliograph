@@ -21,6 +21,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import time
 import sys
 import tempfile
 import types
@@ -1726,6 +1727,25 @@ def _load_win_install():
     return mod
 
 
+def _load_win_launch():
+    path = Path(__file__).resolve().parent / "win_launch.py"
+    import importlib.util
+
+    if not path.is_file():
+        raise InstallError(f"Heliograph's Windows launcher is missing: {path} (ship tools/win_launch.py with tools/install.py)", code=3)
+    spec = importlib.util.spec_from_file_location("helio_win_launch", path)
+    if spec is None or spec.loader is None:
+        raise InstallError(f"cannot load Windows launcher at {path}", code=3)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# The seams a test replaces to inject a WSL relay timeout and record the waits.
+win_run = subprocess.run
+win_sleep = time.sleep
+
+
 def _load_phase_install():
     phase_mod_path = Path(__file__).resolve().parent / "phase_install.py"
     import importlib.util
@@ -1762,11 +1782,13 @@ def run_windows_from_wsl(
     except win_mod.WinInstallError as exc:
         raise InstallError(str(exc), code=exc.code) from exc
 
+    launch = _load_win_launch()
     if mode in ("status", "back", "remove"):
         cmd = [python_exe, "-B", install_py_win, "--windows", f"--{mode}", "--reg-key", reg_key]
         if win_to_raw:
             cmd.extend(["--to", win_to_raw])
-        res = subprocess.run(cmd, stdin=subprocess.DEVNULL, check=False)
+        # --status only reads, so a start the WSL relay timed out is made again; --back and --remove change state.
+        res = launch.run_windows(cmd, repeatable=mode == "status", forward=True, run=win_run, sleep=win_sleep)
         return res.returncode
 
     def_store = repo.parent / "Heliograph-signals"
@@ -1814,7 +1836,7 @@ def run_windows_from_wsl(
             cmd.append("--dirty")
         if win_to_raw:
             cmd.extend(["--to", win_to_raw])
-        res = subprocess.run(cmd, stdin=subprocess.DEVNULL, check=False)
+        res = launch.run_windows(cmd, repeatable=False, forward=True, run=win_run, sleep=win_sleep)  # an install: once
         return res.returncode
 
 

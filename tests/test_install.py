@@ -18,6 +18,23 @@ REPO = Path(__file__).resolve().parents[1]
 INSTALL_SCRIPT = REPO / "tools" / "install.py"
 
 
+_WIN_LAUNCH = []
+
+
+def win_start(argv, *, repeatable, **run_args):
+    """Starts a Windows program from WSL through tools/win_launch.py, again after a WSL relay timeout when the step is
+    safe to run twice (a probe, a read, a cleanup, or a fixture step with a stable name). The Popen launches that keep
+    a Windows program or file held for a test (`holder`, `proc` and `p` in test_held_windows_exe_concurrent_caller_during_publication,
+    and `holder`/`holder_a` in the busy-exe tests) keep their own lifetime and readiness checks and start once."""
+    if not _WIN_LAUNCH:
+        spec = importlib.util.spec_from_file_location("helio_win_launch_tests", REPO / "tools" / "win_launch.py")
+        assert spec and spec.loader
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _WIN_LAUNCH.append(mod)
+    return _WIN_LAUNCH[0].run_windows(argv, repeatable=repeatable, **run_args)
+
+
 def load_installer():
     spec = importlib.util.spec_from_file_location("helio_install", INSTALL_SCRIPT)
     assert spec and spec.loader
@@ -131,6 +148,7 @@ class TestQuickInstaller(unittest.TestCase):
             (fixture_repo / "tests").mkdir(parents=True)
             (fixture_repo / "tools").mkdir(parents=True)
             shutil.copy2(INSTALL_SCRIPT, fixture_repo / "tools" / "install.py")
+            shutil.copy2(REPO / "tools" / "win_launch.py", fixture_repo / "tools" / "win_launch.py")  # ships with the installer
 
             def write_fixture_sources(tag: str) -> None:
                 (fixture_repo / "src" / "helio_fixture.c").write_text(
@@ -1286,13 +1304,12 @@ class TestQuickInstaller(unittest.TestCase):
                     if pinned_proc:
                         pinned_alive_after[0] = pinned_proc[0].poll() is None
                     # Verify a fresh caller can open and execute helio.exe by name immediately after replacement.
-                    after_r = subprocess.run(
+                    after_r = win_start(
                         [str(to_dir / "helio.exe"), "help"],
                         stdin=subprocess.DEVNULL,
                         capture_output=True,
                         text=True,
-                        timeout=30,
-                    )
+                        timeout=30, repeatable=True)
                     if after_r.returncode != 0:
                         win_failures.append(f"post-replace helio.exe rc={after_r.returncode} stderr={after_r.stderr}")
 
@@ -1308,13 +1325,12 @@ class TestQuickInstaller(unittest.TestCase):
                 if Path(os.fspath(path_arg)).resolve() == exe_target:
                     # Non-atomic removal/rename-away of helio.exe anywhere in install() creates a gap; probe by name right now.
                     try:
-                        r = subprocess.run(
+                        r = win_start(
                             [str(to_dir / "helio.exe"), "help"],
                             stdin=subprocess.DEVNULL,
                             capture_output=True,
                             text=True,
-                            timeout=30,
-                        )
+                            timeout=30, repeatable=True)
                         detail = f"probe rc={r.returncode}"
                     except OSError as exc:
                         detail = f"probe raised {type(exc).__name__}: {exc}"
@@ -1758,13 +1774,14 @@ class TestQuickInstaller(unittest.TestCase):
         self.assertIn("install.py --windows --remove", readme)
 
         reg_key = f"Software\\HeliographTest\\wsl_{uuid.uuid4().hex[:12]}"
-        win_tmp_raw = subprocess.run(
-            ["python.exe", "-c", "import tempfile; print(tempfile.mkdtemp(prefix='helio_win_wsl_'))"],
+        # A stable name made with exist_ok, so a start the WSL relay timed out can be made again.
+        win_tmp_raw = win_start(
+            ["python.exe", "-c", "import os, sys, tempfile; p = os.path.join(tempfile.gettempdir(), sys.argv[1]); os.makedirs(p, exist_ok=True); print(p)",
+             f"helio_win_wsl_{uuid.uuid4().hex[:12]}"],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
-            check=True,
-        ).stdout.strip()
+            check=True, repeatable=True).stdout.strip()
         win_to = win_tmp_raw + "\\Heliograph"
         try:
             with tempfile.TemporaryDirectory() as tmp:
@@ -1838,7 +1855,7 @@ class TestQuickInstaller(unittest.TestCase):
                     reg_key=reg_key,
                 )
                 self.assertEqual(rc_new, 0)
-                win_store_chk = subprocess.run(
+                win_store_chk = win_start(
                     [
                         "python.exe",
                         "-c",
@@ -1851,8 +1868,7 @@ class TestQuickInstaller(unittest.TestCase):
                     ],
                     stdin=subprocess.DEVNULL,
                     capture_output=True,
-                    text=True,
-                )
+                    text=True, repeatable=True)
                 self.assertEqual(win_store_chk.returncode, 0, win_store_chk.stdout + win_store_chk.stderr)
                 self.assertEqual(
                     self.mod.run_windows_from_wsl(repo=ok_repo, mode="remove", win_to_raw=win_to_new, store_raw=None, reg_key=reg_key),
@@ -1872,7 +1888,7 @@ class TestQuickInstaller(unittest.TestCase):
                 # appended to system PATH in real Windows user-PATH order) resolves to <win_to>\helio.cmd
                 # AND reads back the message sent from WSL!
                 expected_cmd = win_to + "\\helio.cmd"
-                shell_probe = subprocess.run(
+                shell_probe = win_start(
                     [
                         "python.exe",
                         "-c",
@@ -1899,8 +1915,7 @@ class TestQuickInstaller(unittest.TestCase):
                     ],
                     stdin=subprocess.DEVNULL,
                     capture_output=True,
-                    text=True,
-                )
+                    text=True, repeatable=True)
                 self.assertEqual(shell_probe.returncode, 0, shell_probe.stdout + shell_probe.stderr)
                 wcmd_lines = [p.lower() for p in [ln for ln in shell_probe.stdout.splitlines() if ln.startswith("WCMD:")][0].split("WCMD:", 1)[1].strip().split("|") if p]
                 wps_line = [ln for ln in shell_probe.stdout.splitlines() if ln.startswith("WPS:")][0].split("WPS:", 1)[1].strip()
@@ -1916,7 +1931,7 @@ class TestQuickInstaller(unittest.TestCase):
                 # displays the uniquely addressed WSL message within timeout AND stays quiet for an empty inbox!
                 settings = json.loads((REPO / ".claude" / "settings.json").read_text(encoding="utf-8"))
                 hook_cmd = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
-                hook_probe = subprocess.run(
+                hook_probe = win_start(
                     [
                         "python.exe",
                         "-c",
@@ -1947,8 +1962,7 @@ class TestQuickInstaller(unittest.TestCase):
                     ],
                     stdin=subprocess.DEVNULL,
                     capture_output=True,
-                    text=True,
-                )
+                    text=True, repeatable=True)
                 self.assertEqual(hook_probe.returncode, 0, hook_probe.stdout + hook_probe.stderr)
                 self.assertIn(msg_subject, hook_probe.stdout)
                 self.assertIn("HEMPTY: ''", hook_probe.stdout)
@@ -1957,7 +1971,7 @@ class TestQuickInstaller(unittest.TestCase):
                 # and bare `helio` reads back `def_subj` from the previous store!
                 rc_back = self.mod.main(["--windows", "--back", "--to", win_to, "--reg-key", reg_key])
                 self.assertEqual(rc_back, 0)
-                back_probe = subprocess.run(
+                back_probe = win_start(
                     [
                         "python.exe",
                         "-c",
@@ -1975,8 +1989,7 @@ class TestQuickInstaller(unittest.TestCase):
                     ],
                     stdin=subprocess.DEVNULL,
                     capture_output=True,
-                    text=True,
-                )
+                    text=True, repeatable=True)
                 self.assertEqual(back_probe.returncode, 0, back_probe.stdout + back_probe.stderr)
                 self.assertIn(def_subj, back_probe.stdout)
 
@@ -1985,12 +1998,11 @@ class TestQuickInstaller(unittest.TestCase):
                 empty_wsl_dir = root / "reachable_empty_wsl_dir"
                 empty_wsl_dir.mkdir()
                 empty_wsl_unc = subprocess.run(["wslpath", "-w", str(empty_wsl_dir)], capture_output=True, text=True, check=True).stdout.strip()
-                r_empty_wsl = subprocess.run(
+                r_empty_wsl = win_start(
                     ["python.exe", "-c", f"import subprocess; r=subprocess.run([{win_to + '\\\\bin\\\\helio.exe'!r}, 'check', '--store', {empty_wsl_unc!r}], capture_output=True, text=True); print(r.stderr); raise SystemExit(r.returncode)"],
                     stdin=subprocess.DEVNULL,
                     capture_output=True,
-                    text=True,
-                )
+                    text=True, repeatable=True)
                 self.assertEqual(r_empty_wsl.returncode, 3)
                 self.assertIn("there is no store here", r_empty_wsl.stdout)
                 self.assertNotIn("cannot reach WSL store", r_empty_wsl.stdout)
@@ -2022,7 +2034,7 @@ class TestQuickInstaller(unittest.TestCase):
                     0,
                 )
         finally:
-            subprocess.run(
+            win_start(
                 [
                     "python.exe",
                     "-c",
@@ -2034,8 +2046,7 @@ class TestQuickInstaller(unittest.TestCase):
                 ],
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
-                text=True,
-            )
+                text=True, repeatable=True)
 
 
 @unittest.skipUnless(os.name == "nt", "Windows-native installer tests run on Windows via prove.py")
@@ -2075,14 +2086,13 @@ class TestWindowsInstaller(unittest.TestCase):
                 outside_cwd.mkdir()
 
                 for sp, label in ((default_store, "msg-default"), (env_store, "msg-env"), (flag_store, "msg-flag")):
-                    r = subprocess.run([str(self.helio_exe), "init", "--store", str(sp)], capture_output=True, text=True)
+                    r = win_start([str(self.helio_exe), "init", "--store", str(sp)], capture_output=True, text=True, repeatable=True)
                     self.assertEqual(r.returncode, 0, r.stderr)
-                    t = subprocess.run(
+                    t = win_start(
                         [str(self.helio_exe), "tell", "demo/win", label, "--as", "demo/sender", "--store", str(sp)],
                         input=f"body for {label}\n",
                         capture_output=True,
-                        text=True,
-                    )
+                        text=True, repeatable=False)
                     self.assertEqual(t.returncode, 0, t.stderr)
 
                 exe_sha = self.win_mod.sha256_file(self.helio_exe)
@@ -2112,18 +2122,17 @@ class TestWindowsInstaller(unittest.TestCase):
                 base_env["PATH"] = f"{';'.join(clean_sys)};{reg_path_val}"
 
                 # Bare `helio` from cmd.exe outside win_to resolves to <win_to>\helio.cmd and reaches default_store.
-                w_cmd = subprocess.run(["cmd.exe", "/c", "where", "helio"], cwd=str(outside_cwd), env=base_env, capture_output=True, text=True)
+                w_cmd = win_start(["cmd.exe", "/c", "where", "helio"], cwd=str(outside_cwd), env=base_env, capture_output=True, text=True, repeatable=True)
                 self.assertEqual(w_cmd.returncode, 0, w_cmd.stderr)
                 where_lines = [ln.strip().lower() for ln in w_cmd.stdout.strip().splitlines() if ln.strip()]
                 self.assertIn(str((win_to / "helio.cmd").resolve()).lower(), where_lines)
                 self.assertTrue(where_lines[0].startswith(str(win_to.resolve()).lower() + "\\"), where_lines)
-                r_cmd = subprocess.run(
+                r_cmd = win_start(
                     ["cmd.exe", "/c", "helio", "inbox", "--as", "demo/win"],
                     cwd=str(outside_cwd),
                     env=base_env,
                     capture_output=True,
-                    text=True,
-                )
+                    text=True, repeatable=True)
                 self.assertEqual(r_cmd.returncode, 0, r_cmd.stdout + r_cmd.stderr)
                 self.assertIn("msg-default", r_cmd.stdout)
 
@@ -2147,61 +2156,55 @@ class TestWindowsInstaller(unittest.TestCase):
                 # HELIO_STORE overrides default_store; --store overrides HELIO_STORE.
                 env_override = dict(base_env)
                 env_override["HELIO_STORE"] = str(env_store)
-                r_env = subprocess.run(
+                r_env = win_start(
                     ["cmd.exe", "/c", "helio", "inbox", "--as", "demo/win"],
                     cwd=str(outside_cwd),
                     env=env_override,
                     capture_output=True,
-                    text=True,
-                )
+                    text=True, repeatable=True)
                 self.assertEqual(r_env.returncode, 0, r_env.stderr)
                 self.assertIn("msg-env", r_env.stdout)
                 self.assertNotIn("msg-default", r_env.stdout)
 
-                r_flag = subprocess.run(
+                r_flag = win_start(
                     ["cmd.exe", "/c", "helio", "inbox", "--as", "demo/win", "--store", str(flag_store)],
                     cwd=str(outside_cwd),
                     env=env_override,
                     capture_output=True,
-                    text=True,
-                )
+                    text=True, repeatable=True)
                 self.assertEqual(r_flag.returncode, 0, r_flag.stderr)
                 self.assertIn("msg-flag", r_flag.stdout)
                 self.assertNotIn("msg-env", r_flag.stdout)
 
                 # Forward stdin body, literal special args (e.g. `--key --store`), and exact exit codes.
-                r_tell = subprocess.run(
+                r_tell = win_start(
                     ["cmd.exe", "/c", "helio", "tell", "demo/stdin", "stdin-check", "--as", "demo/sender", "--key", "--store"],
                     input="forwarded stdin payload line\n",
                     cwd=str(outside_cwd),
                     env=base_env,
                     capture_output=True,
-                    text=True,
-                )
+                    text=True, repeatable=True)
                 self.assertEqual(r_tell.returncode, 0, r_tell.stdout + r_tell.stderr)
                 msg_id = r_tell.stdout.strip().splitlines()[-1].strip()
-                r_show = subprocess.run(
+                r_show = win_start(
                     ["cmd.exe", "/c", "helio", "show", msg_id, "--as", "demo/stdin"],
                     cwd=str(outside_cwd),
                     env=base_env,
                     capture_output=True,
-                    text=True,
-                )
+                    text=True, repeatable=True)
                 self.assertEqual(r_show.returncode, 0, r_show.stderr)
                 self.assertIn("forwarded stdin payload line", r_show.stdout)
 
-                r_bad_direct = subprocess.run(
+                r_bad_direct = win_start(
                     [str(self.helio_exe), "show", "nonexistent-id-123", "--store", str(default_store)],
                     capture_output=True,
-                    text=True,
-                )
-                r_bad = subprocess.run(
+                    text=True, repeatable=True)
+                r_bad = win_start(
                     ["cmd.exe", "/c", "helio", "show", "nonexistent-id-123"],
                     cwd=str(outside_cwd),
                     env=base_env,
                     capture_output=True,
-                    text=True,
-                )
+                    text=True, repeatable=True)
                 self.assertEqual(r_bad.returncode, r_bad_direct.returncode)
                 self.assertNotEqual(r_bad.returncode, 0)
 
@@ -2217,95 +2220,86 @@ class TestWindowsInstaller(unittest.TestCase):
                     win_to=win_to,
                     reg_key=reg_key,
                 )
-                r_unr = subprocess.run(
+                r_unr = win_start(
                     ["cmd.exe", "/c", "helio", "check"],
                     cwd=str(outside_cwd),
                     env=base_env,
                     capture_output=True,
-                    text=True,
-                )
+                    text=True, repeatable=True)
                 self.assertEqual(r_unr.returncode, 3, r_unr.stdout + r_unr.stderr)
                 self.assertIn("WSL", r_unr.stderr)
                 self.assertIn(bogus_distro, r_unr.stderr)
 
                 # Reachable HELIO_STORE and --store overrides still succeed when default WSL store is unreachable.
-                r_ov1 = subprocess.run(
+                r_ov1 = win_start(
                     ["cmd.exe", "/c", "helio", "check"],
                     cwd=str(outside_cwd),
                     env=env_override,
                     capture_output=True,
-                    text=True,
-                )
+                    text=True, repeatable=True)
                 self.assertEqual(r_ov1.returncode, 0, r_ov1.stderr)
-                r_ov2 = subprocess.run(
+                r_ov2 = win_start(
                     ["cmd.exe", "/c", "helio", "check", "--store", str(flag_store)],
                     cwd=str(outside_cwd),
                     env=base_env,
                     capture_output=True,
-                    text=True,
-                )
+                    text=True, repeatable=True)
                 self.assertEqual(r_ov2.returncode, 0, r_ov2.stderr)
 
                 # Failing command with an explicit reachable --store (including empty quoted arg AND comma-containing
                 # --about value that cmd.exe's shift would split!) returns helio.exe's exact exit code with NO WSL diagnostic!
                 for extra_args in (["--about", ""], ["--about", "ref,--key"]):
-                    r_fail_direct = subprocess.run(
+                    r_fail_direct = win_start(
                         [str(self.helio_exe), "show", "nonexistent-id-123", "--as", "demo/win", *extra_args, "--store", str(flag_store)],
                         capture_output=True,
-                        text=True,
-                    )
-                    r_fail_ov = subprocess.run(
+                        text=True, repeatable=True)
+                    r_fail_ov = win_start(
                         ["cmd.exe", "/c", "helio", "show", "nonexistent-id-123", "--as", "demo/win", *extra_args, "--store", str(flag_store)],
                         cwd=str(outside_cwd),
                         env=base_env,
                         capture_output=True,
-                        text=True,
-                    )
+                        text=True, repeatable=True)
                     self.assertEqual(r_fail_ov.returncode, r_fail_direct.returncode, extra_args)
                     self.assertNotEqual(r_fail_ov.returncode, 0)
                     self.assertNotIn("WSL", r_fail_ov.stderr)
                     self.assertNotIn(bogus_distro, r_fail_ov.stderr)
 
                 # Store-independent `helio help` STILL succeeds (exit 0) even when the default WSL distro is offline!
-                r_help = subprocess.run(
+                r_help = win_start(
                     ["cmd.exe", "/c", "helio", "help"],
                     cwd=str(outside_cwd),
                     env=base_env,
                     capture_output=True,
-                    text=True,
-                )
+                    text=True, repeatable=True)
                 self.assertEqual(r_help.returncode, 0, r_help.stdout + r_help.stderr)
                 self.assertIn("helio", r_help.stdout.lower())
 
                 # Offline `helio init` against unreachable WSL distro ALSO reports WSL + distro (exit 3)!
-                r_init_unr = subprocess.run(
+                r_init_unr = win_start(
                     ["cmd.exe", "/c", "helio", "init"],
                     cwd=str(outside_cwd),
                     env=base_env,
                     capture_output=True,
-                    text=True,
-                )
+                    text=True, repeatable=True)
                 self.assertEqual(r_init_unr.returncode, 3, r_init_unr.stdout + r_init_unr.stderr)
                 self.assertIn("WSL", r_init_unr.stderr)
                 self.assertIn(bogus_distro, r_init_unr.stderr)
 
                 # Explicit --store pointing to an unavailable UNC distro gets the standard store error
                 # (NOT the installed-default offline-WSL diagnostic!), and malformed ESC bytes are sanitized!
-                r_exp_unr = subprocess.run(
+                r_exp_unr = win_start(
                     [str(self.helio_exe), "check", "--store", bogus_unc],
                     capture_output=True,
-                    text=True,
-                )
+                    text=True, repeatable=True)
                 self.assertEqual(r_exp_unr.returncode, 3)
                 self.assertNotIn("cannot reach WSL store", r_exp_unr.stderr)
 
                 ctrl_env = dict(base_env)
                 ctrl_env["HELIO_DEFAULT_STORE"] = "\\\\wsl.localhost\\\x1b[31mEvil\\store"
-                r_ctrl = subprocess.run(
+                r_ctrl = win_start(
                     [str(self.helio_exe), "check"],
                     env=ctrl_env,
-                    capture_output=True,
-                )
+                    capture_output=True, repeatable=True)
                 self.assertEqual(r_ctrl.returncode, 3)
                 self.assertNotIn(b"\x1b", r_ctrl.stderr)
 
@@ -2320,13 +2314,12 @@ class TestWindowsInstaller(unittest.TestCase):
                     reg_key=reg_key,
                 )
                 self.assertIn("HELIO_DEFAULT_STORE_HEX=", (win_to / "helio.cmd").read_text(encoding="ascii"))
-                r_uni = subprocess.run(
+                r_uni = win_start(
                     ["cmd.exe", "/c", "helio", "check"],
                     cwd=str(outside_cwd),
                     env=base_env,
                     capture_output=True,
-                    text=True,
-                )
+                    text=True, repeatable=True)
                 self.assertEqual(r_uni.returncode, 0, r_uni.stdout + r_uni.stderr)
 
                 # Semicolon in --to is refused with exit 2; non-empty unrelated --store is refused with exit 2;
@@ -2503,7 +2496,7 @@ class TestWindowsInstaller(unittest.TestCase):
 
                 # A directory junction to win_to earlier on Path resolves its parent to win_to -> healthy status 0!
                 junc_dir = root / "win_to_junction"
-                mkj = subprocess.run(["cmd.exe", "/c", "mklink", "/J", str(junc_dir), str(win_to)], capture_output=True, text=True)
+                mkj = win_start(["cmd.exe", "/c", "mklink", "/J", str(junc_dir), str(win_to)], capture_output=True, text=True, repeatable=False)
                 self.assertEqual(mkj.returncode, 0, mkj.stdout + mkj.stderr)
                 with winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_key, 0, winreg.KEY_SET_VALUE) as k:
                     winreg.SetValueEx(k, "Path", 0, orig_rk, f"{junc_dir};{orig_rp}")
@@ -2513,7 +2506,7 @@ class TestWindowsInstaller(unittest.TestCase):
                 finally:
                     with winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_key, 0, winreg.KEY_SET_VALUE) as k:
                         winreg.SetValueEx(k, "Path", 0, orig_rk, orig_rp)
-                    subprocess.run(["cmd.exe", "/c", "rmdir", str(junc_dir)], capture_output=True, text=True)
+                    win_start(["cmd.exe", "/c", "rmdir", str(junc_dir)], capture_output=True, text=True, repeatable=False)
         finally:
             self._delete_reg_key(reg_key)
 
@@ -2525,7 +2518,7 @@ class TestWindowsInstaller(unittest.TestCase):
                 win_to = root / "Heliograph"
                 s1, s2 = root / "s1", root / "s2"
                 for sp in (s1, s2):
-                    subprocess.run([str(self.helio_exe), "init", "--store", str(sp)], check=True, capture_output=True)
+                    win_start([str(self.helio_exe), "init", "--store", str(sp)], check=True, capture_output=True, repeatable=True)
                 exe_a = root / "helio_a.exe"
                 exe_b = root / "helio_b.exe"
                 make_distinct_binary(self.helio_exe, exe_a, b"WIN_A")
@@ -2684,7 +2677,7 @@ class TestWindowsInstaller(unittest.TestCase):
                 root = Path(tmp)
                 win_to = root / "HeliographReg"
                 store = root / "reg_store"
-                subprocess.run([str(self.helio_exe), "init", "--store", str(store)], check=True, capture_output=True)
+                win_start([str(self.helio_exe), "init", "--store", str(store)], check=True, capture_output=True, repeatable=True)
                 exe_sha = self.win_mod.sha256_file(self.helio_exe)
 
                 # 1. Initially absent Path -> created as REG_EXPAND_SZ, broadcast called once; 2nd identical install is a true no-op; remove deletes Path.
@@ -2786,7 +2779,7 @@ class TestWindowsInstaller(unittest.TestCase):
             with tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 store = root / "crash_store"
-                subprocess.run([str(self.helio_exe), "init", "--store", str(store)], check=True, capture_output=True)
+                win_start([str(self.helio_exe), "init", "--store", str(store)], check=True, capture_output=True, repeatable=True)
                 exe_sha = self.win_mod.sha256_file(self.helio_exe)
 
                 for boundary in ("after_staging_journal", "after_journal", "after_exe", "after_cmd", "after_path", "after_manifest"):
@@ -3007,15 +3000,17 @@ class TestPhaseInstaller(unittest.TestCase):
             "except OSError:\n"
             "    pass\n"
         )
-        subprocess.run([self.python_exe, "-B", "-c", code, reg_key], stdin=subprocess.DEVNULL, capture_output=True)
+        win_start([self.python_exe, "-B", "-c", code, reg_key], stdin=subprocess.DEVNULL, capture_output=True, repeatable=True)
 
     def _win_temp_dir(self, name: str) -> str:
         code = (
             "import os, pathlib, sys, tempfile\n"
-            "d = pathlib.Path(tempfile.mkdtemp(prefix='helio_phase_')) / sys.argv[1]\n"
-            "print(str(d))\n"
+            "parent = pathlib.Path(tempfile.gettempdir()) / sys.argv[2]\n"
+            "parent.mkdir(exist_ok=True)\n"
+            "print(str(parent / sys.argv[1]))\n"
         )
-        res = subprocess.run([self.python_exe, "-B", "-c", code, name], stdin=subprocess.DEVNULL, capture_output=True, text=True, check=True)
+        # A stable parent name made with exist_ok, so a start the WSL relay timed out can be made again.
+        res = win_start([self.python_exe, "-B", "-c", code, name, f"helio_phase_{secrets.token_hex(6)}"], stdin=subprocess.DEVNULL, capture_output=True, text=True, check=True, repeatable=True)
         return res.stdout.strip().splitlines()[-1]
 
     def _cleanup_win_parent(self, win_dir: str) -> None:
@@ -3024,7 +3019,7 @@ class TestPhaseInstaller(unittest.TestCase):
             "p = pathlib.Path(sys.argv[1]).parent\n"
             "shutil.rmtree(p, ignore_errors=True)\n"
         )
-        subprocess.run([self.python_exe, "-B", "-c", code, win_dir], stdin=subprocess.DEVNULL, capture_output=True)
+        win_start([self.python_exe, "-B", "-c", code, win_dir], stdin=subprocess.DEVNULL, capture_output=True, repeatable=True)
 
     def _make_distinct_pair(self, out_dir: Path, tag: bytes) -> tuple[Path, Path]:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -4252,12 +4247,11 @@ class TestPhaseInstaller(unittest.TestCase):
                             "except Crash:\n"
                             "    pass\n"
                         )
-                        subprocess.run(
+                        win_start(
                             [self.python_exe, "-B", "-c", crash_helper, win_install_py_win, self.win_mod.wsl_to_windows_path(v3_e), v3_e_sha, win_store, win_c_to, boundary_name, reg_key_c],
                             check=True,
                             stdin=subprocess.DEVNULL,
-                            capture_output=True,
-                        )
+                            capture_output=True, repeatable=False)
                         win_crash_j = {
                             "schema_version": 2,
                             "managed_by": "heliograph-phase-installer",
@@ -4311,7 +4305,7 @@ class TestPhaseInstaller(unittest.TestCase):
                         "d = pathlib.Path(sys.argv[1]); d.mkdir(parents=True, exist_ok=True)\n"
                         "(d / '.phase-active.json').write_bytes(b'\\xff\\xfeinvalid-utf8')\n"
                     )
-                    subprocess.run([self.python_exe, "-B", "-c", bad_marker_helper, win_c_to], check=True, stdin=subprocess.DEVNULL)
+                    win_start([self.python_exe, "-B", "-c", bad_marker_helper, win_c_to], check=True, stdin=subprocess.DEVNULL, repeatable=False)
                     r_bad_m = self.phase_mod._run_win_cli(
                         self.python_exe,
                         install_py_win,
@@ -4319,11 +4313,10 @@ class TestPhaseInstaller(unittest.TestCase):
                     )
                     self.assertEqual(r_bad_m.returncode, 2, r_bad_m.stdout + r_bad_m.stderr)
                     # Clean bad marker for next sub-test.
-                    subprocess.run(
+                    win_start(
                         [self.python_exe, "-B", "-c", "import pathlib, sys; (pathlib.Path(sys.argv[1]) / '.phase-active.json').unlink(missing_ok=True)", win_c_to],
                         check=True,
-                        stdin=subprocess.DEVNULL,
-                    )
+                        stdin=subprocess.DEVNULL, repeatable=True)
 
                     # 13. Interrupt production `_rollback_phase_journal` right after Windows marker release (`after_rollback_marker_end`),
                     # verify `phase_state == "rolled_back"` was persisted by production code, allow an ordinary Windows installer
@@ -4618,11 +4611,10 @@ class TestPhaseInstaller(unittest.TestCase):
                     "print(json.dumps({'own': captured[0].name, 'other': other_captured[0].name}))\n"
                 )
                 win_tmps = json.loads(
-                    subprocess.check_output(
+                    win_start(
                         [self.python_exe, "-B", "-c", plant_win_foreign, win_to, self.win_mod.wsl_to_windows_path(a_e), fixed_tx, win_install_py_win, other_tx],
                         text=True,
-                        stdin=subprocess.DEVNULL,
-                    ).strip()
+                        stdin=subprocess.DEVNULL, repeatable=False, check=True).stdout.strip()
                 )
                 win_tmp_name = win_tmps["own"]
                 win_other_tmp_name = win_tmps["other"]
@@ -4697,11 +4689,10 @@ class TestPhaseInstaller(unittest.TestCase):
                     "assert sorted(p.name for p in b.iterdir() if 'phase-prev' in p.name) == sorted([p1.name, p2.name])\n"
                     "p1.unlink(); p2.unlink(); p3.unlink(); p4.unlink(); p6.unlink()\n"
                 )
-                subprocess.run(
+                win_start(
                     [self.python_exe, "-B", "-c", check_win_foreign, win_to, self.win_mod.wsl_to_windows_path(a_e), fixed_tx, win_tmp_name, win_other_tmp_name],
                     check=True,
-                    stdin=subprocess.DEVNULL,
-                )
+                    stdin=subprocess.DEVNULL, repeatable=True)
 
                 # Verify WSL has current=B, previous=A, and ordinary `--back` restores A!
                 wsl_m = self.mod.read_manifest(to_dir)
@@ -4911,11 +4902,10 @@ class TestPhaseInstaller(unittest.TestCase):
                     "    except PermissionError:\n"
                     "        pass\n"
                 )
-                subprocess.run(
+                win_start(
                     [self.python_exe, "-B", "-c", local_store_err_code, win_install_py_win],
                     check=True,
-                    stdin=subprocess.DEVNULL,
-                )
+                    stdin=subprocess.DEVNULL, repeatable=True)
 
                 self.phase_mod._run_win_cli(self.python_exe, install_py_win, ["--remove", "--to", win_to, "--reg-key", reg_key])
         finally:
@@ -5423,6 +5413,149 @@ class TestPhaseInstaller(unittest.TestCase):
         finally:
             self._delete_reg_key(reg_key)
             self._cleanup_win_parent(win_to)
+
+
+RELAY = "<3>WSL (1989472 - ) ERROR: UtilAcceptVsock:281: accept4 failed 110\n"
+
+
+def done(rc=0, out="", err=""):
+    return subprocess.CompletedProcess([], rc, out, err)
+
+
+class FakeWindows:
+    """Stands in for subprocess.run at a launcher's seam: answers each start with the next result (the last one
+    repeats) and records every start's argv and keyword arguments."""
+
+    def __init__(self, *results):
+        self.results = list(results)
+        self.calls = []
+
+    def __call__(self, argv, **kw):
+        self.calls.append((list(argv), kw))
+        r = self.results.pop(0) if len(self.results) > 1 else self.results[0]
+        return subprocess.CompletedProcess(list(argv), r.returncode, r.stdout, r.stderr)
+
+
+def load_win_launch():
+    spec = importlib.util.spec_from_file_location("helio_win_launch_test", REPO / "tools" / "win_launch.py")
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TestWinLaunch(unittest.TestCase):
+    """A Windows program started from WSL is started again only when WSL's interop relay timed out before it ran,
+    and only for a call that is safe to run twice."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.wl = load_win_launch()
+        cls.mod = load_installer()
+        cls.phase_mod = cls.mod._load_phase_install()
+
+    def launch(self, *results, repeatable=True, **kw):
+        fake, waits = FakeWindows(*results), []
+        res = self.wl.run_windows(["python.exe", "-c", "x"], repeatable=repeatable, run=fake, sleep=waits.append, **kw)
+        return res, len(fake.calls), waits
+
+    def test_only_the_relay_timeout_is_started_again_with_its_waits(self):
+        res, starts, waits = self.launch(done(1, "", RELAY), done(1, "", RELAY), done(0, "ok\n"))
+        self.assertEqual((res.returncode, res.stdout, starts, waits), (0, "ok\n", 3, [0.5, 1.0]))
+        res, starts, waits = self.launch(done(1, "", RELAY))
+        self.assertEqual((res.returncode, res.stdout, res.stderr, starts, waits), (1, "", RELAY, 4, [0.5, 1.0, 2.0]))
+        for result in (done(1, "partial\n", RELAY), done(2, "", RELAY), done(1, "", "first\n" + RELAY), done(1, "", RELAY + "more\n"),
+                       done(1, "", "Access is denied.\n"), done(0, "fine\n")):
+            with self.subTest(stdout=result.stdout, rc=result.returncode, stderr=result.stderr):
+                res, starts, waits = self.launch(result)
+                self.assertEqual((starts, waits, res.returncode, res.stdout, res.stderr), (1, [], result.returncode, result.stdout, result.stderr))
+        res, starts, waits = self.launch(done(1, "", RELAY), repeatable=False)
+        self.assertEqual((starts, waits), (1, []))
+
+    def test_check_comes_after_the_repeats_and_bytes_match_too(self):
+        fake, waits = FakeWindows(done(1, b"", RELAY.encode()), done(0, b"\x00ok")), []
+        res = self.wl.run_windows(["python.exe"], repeatable=True, check=True, run=fake, sleep=waits.append)
+        self.assertEqual((res.stdout, len(fake.calls)), (b"\x00ok", 2))
+        fake = FakeWindows(done(1, "", RELAY), done(3, "last out", "last err"))
+        with self.assertRaises(subprocess.CalledProcessError) as raised:
+            self.wl.run_windows(["python.exe"], repeatable=True, check=True, run=fake, sleep=lambda _: None)
+        self.assertEqual((raised.exception.returncode, raised.exception.output, raised.exception.stderr, len(fake.calls)), (3, "last out", "last err", 2))
+        self.assertTrue(all(kw["stdout"] == subprocess.PIPE and kw["stderr"] == subprocess.PIPE for _, kw in fake.calls))
+
+    def test_forward_writes_the_last_streams_once(self):
+        out, err = __import__("io").StringIO(), __import__("io").StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.launch(done(1, "", RELAY), done(0, "status: ok\n", "note\n"), forward=True)
+        self.assertEqual((out.getvalue(), err.getvalue()), ("status: ok\n", "note\n"))
+
+    def starts(self, call, *results):
+        fake = FakeWindows(*results)
+        with mock.patch.object(self.phase_mod, "win_run", fake), mock.patch.object(self.phase_mod, "win_sleep", lambda _: None):
+            with contextlib.suppress(Exception):
+                call()
+        return fake
+
+    def test_the_phase_installer_repeats_only_calls_safe_to_run_twice(self):
+        pm = self.phase_mod
+        cases = [
+            ("probe", True, lambda: pm._probe_win_state("python.exe", "C:\\t\\win_install.py", None, "Key")),
+            ("check", True, lambda: pm._run_clean_win_helio("python.exe", "Key", ["check"])),
+            ("show", True, lambda: pm._run_clean_win_helio("python.exe", "Key", ["--store", "S", "show", "1-a", "--as", "impossible/x"])),
+            ("smoke ask", False, lambda: pm._run_clean_win_helio("python.exe", "Key", ["--store", "S", "ask", "impossible/all", "s", "--as", "impossible/x"], input_text="b\n")),
+            ("status", True, lambda: pm._run_win_cli("python.exe", "i.py", ["--status", "--reg-key", "Key"])),
+            ("back", False, lambda: pm._run_win_cli("python.exe", "i.py", ["--back", "--reg-key", "Key", "--phase-tx", "t"])),
+            ("remove", False, lambda: pm._run_win_cli("python.exe", "i.py", ["--remove", "--reg-key", "Key", "--phase-tx", "t"])),
+            ("install", False, lambda: pm._run_win_cli("python.exe", "i.py", ["--source-exe", "x.exe", "--source-sha256", "0" * 64, "--commit", "c" * 40])),
+            ("snapshot proof", False, lambda: pm._run_snapshot_proof("python.exe", "C:\\t\\tests", {})),
+        ]
+        for action in ("begin", "end", "recover", "snapshot_prev", "restore_prev"):
+            cases.append((f"marker {action}", True, lambda a=action: pm._win_phase_marker_call("python.exe", "w.py", a, None, "Key", "tx1", stdin_json='{"pre_previous": null}')))
+        for name, repeatable, call in cases:
+            with self.subTest(call=name):
+                fake = self.starts(call, done(1, "", RELAY), done(1, "", RELAY), done(5, "", "final\n"))
+                self.assertEqual(len(fake.calls), 3 if repeatable else 1)
+                if name.startswith("marker"):
+                    self.assertEqual({kw.get("input") for _, kw in fake.calls}, {'{"pre_previous": null}'})
+
+    def test_install_py_status_is_repeated_and_printed_once_and_an_install_is_not(self):
+        m = self.mod
+        stub = mock.Mock()
+        stub.wsl_to_windows_path = lambda p: "C:\\x\\" + Path(p).name
+        stub.WinInstallError = RuntimeError
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = Path(tmp) / "helio.exe"
+            exe.write_bytes(b"MZ")
+            for mode, expect in (("status", 3), ("back", 1), ("remove", 1), ("install", 1)):
+                with self.subTest(mode=mode):
+                    fake, out = FakeWindows(done(1, "", RELAY), done(1, "", RELAY), done(0, "report\n")), __import__("io").StringIO()
+                    with mock.patch.object(m.shutil, "which", lambda name: "/fake/" + name), mock.patch.object(m, "_load_win_install", lambda: stub), \
+                         mock.patch.object(m, "win_run", fake), mock.patch.object(m, "win_sleep", lambda _: None), \
+                         mock.patch.object(m, "ensure_sdk_and_build", lambda *a: (exe, exe, "c" * 40, False)), contextlib.redirect_stdout(out), \
+                         contextlib.redirect_stderr(__import__("io").StringIO()):
+                        rc = m.run_windows_from_wsl(repo=REPO, mode=mode, win_to_raw=None, store_raw="C:\\store", reg_key="Key")
+                    self.assertEqual(len(fake.calls), expect)
+                    if mode == "status":
+                        self.assertEqual((rc, out.getvalue()), (0, "report\n"))
+                    else:
+                        self.assertEqual(rc, 1)
+
+    def test_the_launcher_ships_with_the_installer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = Path(tmp) / "tools"
+            tools.mkdir()
+            shutil.copy2(INSTALL_SCRIPT, tools / "install.py")
+            spec = importlib.util.spec_from_file_location("helio_install_alone", tools / "install.py")
+            alone = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(alone)
+            with self.assertRaises(alone.InstallError) as missing:
+                alone._load_win_launch()
+            self.assertIn("win_launch.py", str(missing.exception))
+            shutil.copy2(REPO / "tools" / "win_launch.py", tools / "win_launch.py")
+            r = subprocess.run([sys.executable, "-B", "-c",
+                                "import importlib.util,sys; s=importlib.util.spec_from_file_location('i', sys.argv[1]); m=importlib.util.module_from_spec(s); "
+                                "s.loader.exec_module(m); print(m._load_win_launch().relay_timed_out.__name__)", str(tools / "install.py")],
+                               cwd=tempfile.gettempdir(), capture_output=True, text=True, timeout=60)
+            self.assertEqual((r.returncode, r.stdout.strip()), (0, "relay_timed_out"), r.stderr)
 
 
 if __name__ == "__main__":
