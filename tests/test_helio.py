@@ -2435,6 +2435,8 @@ class JsonReply(Base):
         v = self.one(self.helio("--json", me="os/userland"), 3)
         self.assertIn("readable", v["text"])
         self.assertEqual(v["code"], 3)
+        if ON_WINDOWS:
+            return  # the folder permissions that make the next two writes fail are Linux's
         # A send whose session announcement fails afterwards: the id, and the failure as a warning.
         sessions = self.store / "sessions"
         sessions.mkdir(exist_ok=True)
