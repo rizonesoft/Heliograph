@@ -841,7 +841,7 @@ s_result archive_expiry_of(store *s, const message *m, char *const *seen_live, s
     size_t to_n = len(m->to);
     bool to_all = to_n > 4 && same(m->to + to_n - 4, "/all");
     life_list l = {.repository = m->repository ? m->repository : ""};
-    if (to_all && archive_expiry(m, seen, seen_count, NULL, 0, now) == EXPIRY_READY) { /* the heartbeats can only hold it */
+    if (to_all) { /* read even when nobody has seen it, so an unreadable audience is always damage */
         /* A message for one repository is waited for by the heartbeats in that repository, never the merged row. */
         p_result r = *l.repository ? place_lane_sessions_repo(s, NULL, l.repository, life_each, &l) : place_each_session(s, life_each, &l);
         if (r == P_MISSING) l.count = 0;
@@ -856,6 +856,24 @@ s_result archive_expiry_of(store *s, const message *m, char *const *seen_live, s
     p_free(l.items);
     list_free(&all);
     return S_OK;
+}
+
+/* Puts the archived copy of a post back in the live store when the read after its removal found someone who
+   should still see it. A post already there (a keyed retry's) is kept. */
+static s_result put_post_back(const char *folder, const batch_item *it, const char *post_path) {
+    arch_at src = {0};
+    arch_at_of(&src, folder, it->month, it->id, "post");
+    char *data = NULL;
+    size_t length = 0;
+    p_result rr = src.name.failed ? P_FAILED : arch_read(&src, MOST_FILE, &data, &length);
+    arch_at_free(&src);
+    if (rr != P_OK) return S_DAMAGED;
+    text unique = {0};
+    add_number(&unique, p_tick(), 0);
+    p_result wr = unique.failed ? P_FAILED : p_write(post_path, data, length, false, unique.data);
+    text_free(&unique);
+    p_free(data);
+    return wr == P_OK || wr == P_EXISTS ? S_OK : S_DAMAGED;
 }
 
 /* Moves a heads-up, finding or answer that is ready: its seen marks are read and checked, who should see it is
@@ -928,22 +946,36 @@ static s_result move_non_job(const char *folder, batch_item *it, const message *
         }
     }
     if (pause) pause(pause_user, "before-remove-post");
-    /* The decision is final only at the removal: read who should see it once more, so a lane that announced itself
-       while the copies were made keeps the post live (the copy beside it is an unfinished move). The heartbeats are
-       the last thing read before the post goes; there is no lock, so this read is the point the move takes effect. */
+    /* Who should see it is read again before the removal, and once more after it: there is no lock, so a lane that
+       announced itself before the post was gone is found by the read after, and the post is put back. A heartbeat
+       written after that read came after the removal. The copy beside a live post is an unfinished move. */
     er = archive_expiry_of(&tmp, m, present.items, present.count, now, &e);
-    list_free(&present);
-    if (er != S_OK) {
+    if (er != S_OK || e != EXPIRY_READY) {
+        list_free(&present);
+        if (er == S_OK) return S_NOTHING;
         add_report(report, it->id, tmp.why);
         return S_DAMAGED;
     }
-    if (e != EXPIRY_READY) return S_NOTHING;
+    if (pause) pause(pause_user, "before-unlink-post");
     p_result rm_post = remove_post_exclusive(post_path);
     if (rm_post != P_OK && rm_post != P_MISSING) {
+        list_free(&present);
         add_report(report, it->id, "the post could not be removed");
         return S_DAMAGED;
     }
     if (pause) pause(pause_user, "after-remove-post");
+    er = archive_expiry_of(&tmp, m, present.items, present.count, now, &e);
+    list_free(&present);
+    if (er != S_OK || e != EXPIRY_READY) {
+        s_result back = put_post_back(folder, it, post_path);
+        if (back != S_OK) {
+            add_report(report, it->id, "someone who should see it came back and the post cannot be put back");
+            return S_DAMAGED;
+        }
+        if (er == S_OK) return S_NOTHING;
+        add_report(report, it->id, tmp.why);
+        return S_DAMAGED;
+    }
     it->arch_links = 0;
     it->non_job = true;
     it->post_removed = true;

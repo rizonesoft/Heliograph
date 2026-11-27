@@ -2841,6 +2841,52 @@ class Expiry(Base):
         self.assertIn(msg, self.at(late + 1, me="os/ui").stdout.decode())
         self.assertEqual(self.at(late + 1, "check").returncode, 0)
 
+    def test_a_lane_that_returns_just_before_the_removal_gets_the_post_back(self):
+        msg = self.post_at(self.T0, "tell", "os/all", "everyone")
+        late = self.T0 + self.D30
+        self.assertEqual(self.at(late, "show", msg, me="os/apps").returncode, 0)
+        post = (self.store / f"messages/{msg}.post").read_bytes()
+        stage = "before-unlink-post"  # after the last read before the removal
+        clean = {k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_SESSION")}
+        with subprocess.Popen(
+            [str(RACER), "--now", str(late), "--pause-cli", stage, str(self.store), "archive", "--store", str(self.store)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=self.store, env=clean,
+        ) as proc:
+            try:
+                Archive.wait_for(self, self.store / f"paused.{stage}")
+                self.assertEqual(self.at(late, "hello", "codex", me="os/ui").returncode, 0)
+                put(self.store / f"resume.{stage}", "go\n")
+                self.assertEqual(proc.wait(timeout=30), 1)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+        (self.store / f"paused.{stage}").unlink(missing_ok=True)
+        (self.store / f"resume.{stage}").unlink(missing_ok=True)
+        self.assertEqual((self.store / f"messages/{msg}.post").read_bytes(), post)
+        self.assertIn(msg, self.at(late + 1, me="os/ui").stdout.decode())
+        self.assertEqual(self.at(late + 1, "check").returncode, 0)
+        self.assertEqual(self.at(late + 2, "show", msg, me="os/ui").returncode, 0)
+        self.archive_at(late + 3, 0)
+        self.assertFalse(self.live(msg))
+
+    def test_an_unread_broadcast_with_an_unreadable_audience_defers_the_summary(self):
+        self.assertEqual(self.at(self.T0 + 1, "hello", "codex", me="os/ui").returncode, 0)
+        msg = self.post_at(self.T0, "tell", "os/all", "nobody read it")
+        first = self.T0 + self.D30 + self.DAY
+        record = self.store / "sessions/os+ui"
+        good = record.read_bytes()
+        put(record, "damaged\n")
+        try:
+            inbox = self.at(first, me="os/apps")
+            self.assertIn(b"the summary was deferred", inbox.stderr)
+            self.assertFalse(self.summary_of(first).exists())
+            r = self.archive_at(first, 3)
+            self.assertIn(msg, (r.stdout + r.stderr).decode())
+        finally:
+            record.write_bytes(good)
+        self.assertIn(self.at(first + 1, me="os/apps").returncode, (0, 1))
+        self.assertEqual(self.held_part(self.summary_of(first).read_text()), (1, [msg]))
+
     def test_a_post_put_back_beside_a_finished_move_is_moved_again_not_held(self):
         # A keyed retry killed after it published leaves a live post whose marks are all in the archive.
         msg = self.post_at(self.T0, "tell", "os/apps", "put back", "--key", "k-back")
@@ -2867,6 +2913,7 @@ class Expiry(Base):
         msg = self.post_at(self.T0, "tell", "os/apps", "raced", "--key", "k-race")
         late = self.T0 + self.D30
         self.assertEqual(self.at(late, "show", msg, me="os/apps").returncode, 0)
+        post = (self.store / f"messages/{msg}.post").read_bytes()
         stage = "before-remove-post"
         clean = {k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_SESSION")}
         with subprocess.Popen(
@@ -2889,6 +2936,7 @@ class Expiry(Base):
         # The first run's own sweep after the removal moved the late mark: nothing is run again before looking.
         self.assertEqual(list((self.store / "messages").glob(f"{msg}.*")), [])
         arch = self.store / f"archive/{self.month(msg)}"
+        self.assertEqual((arch / f"{msg}.post").read_bytes(), post)
         self.assertEqual((arch / f"{msg}.{self.mark('os/apps')}").read_bytes(), b"seen\n")
         self.assertEqual((arch / f"{msg}.{self.mark('os/apps', 's2')}").read_bytes(), b"seen\n")
         rows = [line for line in self.at(late + 2, "log", "--all", me="os/main").stdout.decode().splitlines() if msg in line]
