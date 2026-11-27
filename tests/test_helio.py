@@ -1980,7 +1980,7 @@ class Archive(Base):
                 (st / "resume.before-copy-post").unlink(missing_ok=True)
                 self.assertEqual(p_a.returncode, 0, err_a)
                 counts = (int(out_a.decode().split()[0]), int(r_b.stdout.decode().split()[0]))
-                self.assertEqual(sorted(counts), [0, 1], counts)
+                self.assertEqual(counts, (0, 1), "the held archiver finds the job moved by the other one")
                 self.assertTrue((st / f"archive/2025-02/{j}.post").exists())
                 self.assertEqual([p.name for p in (st / "messages").iterdir() if p.name.startswith(j)], [])
         self.assertEqual(run(st, "check", me=None).returncode, 0)
