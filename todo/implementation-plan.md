@@ -30,17 +30,17 @@ Sections: 3 | Checklist items: 19
 
 Sections: 9 | Checklist items: 47
 
-| Status | Reference   | Deliverable                                             | Needs | Items |
-| ------ | ----------- | ------------------------------------------------------- | ----- | ----- |
-| [x]    | D01 T01 §4  | Sessions announced by every call                        | none  | 5     |
-| [x]    | D01 T01 §5  | Report of a silent taker                                | none  | 6     |
-| [x]    | D01 T01 §6  | Messages for one session                                | none  | 5     |
-| [x]    | D01 T01 §7  | Projects kept apart in log and show                     | none  | 4     |
-| [x]    | D01 T01 §8  | Mark for landed work                                    | none  | 5     |
-| [x]    | D01 T01 §9  | Fixed marks around every shown message                  | none  | 4     |
-| [x]    | D01 T01 §14 | Unowned paths kept to their repository                  | none  | 8     |
-| [ ]    | D01 T01 §18 | Session tie and listing tests held to their result      | none  | 4     |
-| [ ]    | D01 T01 §19 | Archive paths opened without following a swapped folder | none  | 6     |
+| Status | Reference   | Deliverable                                             | Needs               | Items |
+| ------ | ----------- | ------------------------------------------------------- | ------------------- | ----- |
+| [x]    | D01 T01 §4  | Sessions announced by every call                        | none                | 5     |
+| [x]    | D01 T01 §5  | Report of a silent taker                                | none                | 6     |
+| [x]    | D01 T01 §6  | Messages for one session                                | none                | 5     |
+| [x]    | D01 T01 §7  | Projects kept apart in log and show                     | none                | 4     |
+| [x]    | D01 T01 §8  | Mark for landed work                                    | none                | 5     |
+| [x]    | D01 T01 §9  | Fixed marks around every shown message                  | none                | 4     |
+| [x]    | D01 T01 §14 | Unowned paths kept to their repository                  | none                | 8     |
+| [ ]    | D01 T01 §18 | Session tie and listing tests held to their result      | none                | 4     |
+| [ ]    | D01 T01 §19 | Archive paths opened without following a swapped folder | wsl-windows-interop | 6     |
 
 ### Phase 3: Scripts and queues
 

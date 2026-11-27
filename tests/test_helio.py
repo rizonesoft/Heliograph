@@ -1951,13 +1951,17 @@ class Archive(Base):
         # One archiver is paused inside its move of a job, after it saw the job eligible and before it copies it, while
         # the other host archives the same job; then it resumes. Exactly one of them moves it, both exit 0, and the job
         # is archived once, in each direction (Windows paused through \\wsl.localhost, then Linux paused).
-        st = self.store
-        win_store = subprocess.run(["wslpath", "-w", str(st)], capture_output=True, text=True, check=True, timeout=30).stdout.strip()
+        # Each direction gets its own store, so a failure in one never leaves markers or jobs for the other.
+        # The other archiver must finish within 25 s, inside the 30 s the held racer waits before it gives up.
         win_racer = str(BUILD / "racer.exe")
         clean = {k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "ANTIGRAVITY_CONVERSATION_ID")}
         feb_us = 1739577600_000_000
         for n, paused_on_windows in enumerate((True, False)):
-            with self.subTest(paused="windows" if paused_on_windows else "linux"):
+            with self.subTest(paused="windows" if paused_on_windows else "linux"), tempfile.TemporaryDirectory() as tmp:
+                st = self.store = Path(tmp)
+                put(st / "helio.conf", "project: os\n")
+                self.assertEqual(run(st, "init", me=None).returncode, 0)
+                win_store = subprocess.run(["wslpath", "-w", str(st)], capture_output=True, text=True, check=True, timeout=30).stdout.strip()
                 j = self.make_aged_closed_job(created_us=feb_us + 900 + n, subject=f"meet-{n}")
                 if paused_on_windows:
                     held = [win_racer, "--pause-cli", "before-copy-post", win_store, "archive", "--store", win_store]
@@ -1968,7 +1972,7 @@ class Archive(Base):
                 p_a = subprocess.Popen(held, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=st, env=clean)
                 try:
                     self.wait_for(st / "paused.before-copy-post", timeout=60)
-                    r_b = subprocess.run(other, stdin=subprocess.DEVNULL, capture_output=True, timeout=120, cwd=st, env=clean)
+                    r_b = subprocess.run(other, stdin=subprocess.DEVNULL, capture_output=True, timeout=25, cwd=st, env=clean)
                     self.assertEqual(r_b.returncode, 0, r_b.stderr)
                     put(st / "resume.before-copy-post", "go")
                     out_a, err_a = p_a.communicate(timeout=120)
@@ -1976,14 +1980,12 @@ class Archive(Base):
                     if p_a.poll() is None:
                         p_a.kill()
                         p_a.wait(timeout=15)
-                (st / "paused.before-copy-post").unlink(missing_ok=True)
-                (st / "resume.before-copy-post").unlink(missing_ok=True)
                 self.assertEqual(p_a.returncode, 0, err_a)
                 counts = (int(out_a.decode().split()[0]), int(r_b.stdout.decode().split()[0]))
                 self.assertEqual(counts, (0, 1), "the held archiver finds the job moved by the other one")
                 self.assertTrue((st / f"archive/2025-02/{j}.post").exists())
                 self.assertEqual([p.name for p in (st / "messages").iterdir() if p.name.startswith(j)], [])
-        self.assertEqual(run(st, "check", me=None).returncode, 0)
+                self.assertEqual(run(st, "check", me=None).returncode, 0)
 
     def test_archived_show_seen_answer_and_chain_replay(self):
         # Multi-step jobs: (1) taken -> released -> taken by another session -> done; (2) taken -> refused.
