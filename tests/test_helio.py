@@ -2499,6 +2499,21 @@ class ArchiveSwapLinux(ArchiveSwap):
         fresh = self.make_aged_closed_job(created_us=self.FEB + 5, subject="fresh-job")
         ids = {}
         (self.outside / "m").mkdir()
+        fresh_bytes = (self.store / f"messages/{fresh}.post").read_bytes()
+
+        def read_back(stage):
+            # What a successful write stored, read by a fresh command before anything retries it.
+            if stage == "before-arch-copy":
+                self.assertEqual((self.store / f"archive/2025-02/{fresh}.post").read_bytes(), fresh_bytes)
+                shown = self.helio("show", fresh, me="os/userland")
+                self.assertEqual(shown.returncode, 0, shown.stderr)
+                self.assertIn(b"fresh-job", shown.stdout)
+            elif stage == "before-arch-seen":
+                self.assertEqual((self.store / f"archive/2025-02/{job}.seen.os+userland").read_bytes(), b"seen\n")
+            else:
+                logged = self.helio("log", "--all", me="os/main")
+                self.assertIn(f"landed abc1234".encode(), next((ln for ln in logged.stdout.splitlines() if ids["landing"].encode() in ln), b""))
+            self.assertEqual(self.helio("check", me=None).returncode, 0)
         cases = (
             ("before-arch-copy", ("archive",), None, lambda: (self.store / f"messages/{fresh}.post").is_file(),
              lambda: (self.store / f"archive/2025-02/{fresh}.post").is_file() and not (self.store / f"messages/{fresh}.post").exists()),
@@ -2533,6 +2548,7 @@ class ArchiveSwapLinux(ArchiveSwap):
                 self.assertIn(rc, (0, 3), err)
                 if rc == 0:
                     self.assertTrue(done(), f"{stage} reported success without its file in the archive")
+                    read_back(stage)
                 else:
                     self.assertTrue(live_kept(), "the live source was removed although its write was refused")
                 # A refused promotion leaves the job archived with its landed mark live, which the next archive run
@@ -2540,7 +2556,7 @@ class ArchiveSwapLinux(ArchiveSwap):
                 retry = self.helio("archive", me=None) if stage == "before-landed-promote" else self.helio(*command, me=me)
                 self.assertIn(retry.returncode, (0, 1), retry.stderr)
                 self.assertTrue(done(), f"the retry of {stage} did not finish")
-                self.assertEqual(self.helio("check", me=None).returncode, 0)
+                read_back(stage)
 
     def test_a_flush_never_waits_on_a_pipe_put_in_a_files_place(self):
         (self.store / "a").mkdir()
@@ -2646,8 +2662,9 @@ class ArchiveJunction(ArchiveSwap):
                 proc = self.paused("arch-held", "show", job, me="os/userland")
                 real = self.store / rel
                 try:
-                    with self.assertRaises(PermissionError):
+                    with self.assertRaises(PermissionError) as refused:
                         real.rename(real.with_name(real.name + ".moved"))
+                    self.assertEqual(refused.exception.winerror, 32, "the rename must fail on the hold's sharing, nothing else")
                 finally:
                     rc, out, err = self.resume(proc, "arch-held")
                 self.assertEqual(rc, 0, err)
