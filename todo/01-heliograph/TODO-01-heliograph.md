@@ -44,7 +44,7 @@ title: "TODO-01 -- Heliograph"
 | 7 | §7 | Projects kept apart in log and show | -- | [x] |
 | 8 | §8 | Mark for landed work | §2 | [x] |
 | 9 | §9 | Fixed marks around every shown message | §7 | [x] |
-| 10 | §10 | JSON writer and one reply per call | §3, §5, §6, §8, §9 | [ ] |
+| 10 | §10 | JSON writer and one reply per call | §3, §5, §6, §8, §9 | [x] |
 | 11 | §11 | Take the next job as a queue | §10, §22 | [ ] |
 | 12 | §12 | Expiry of seen heads-ups and findings | §3, §4 | [ ] |
 | 13 | §13 | Design and help that match the program | §11, §12, §14, §21, §23 | [ ] |
@@ -332,9 +332,12 @@ A script must not parse lines meant for people. This section builds the writer a
 - [x] Route every reply through one writer in `engine/helio.c`: `fail` and every partial-result path add `"error"` and `"code"` to the call's one value. Done when: a test runs each path that today prints and then fails (an inbox with a damaged job beside readable messages, a session announcement failing after a send, `show` failing to write its seen mark after printing) and the whole stdout is one JSON value, stderr is empty, and the exit code is the old one. Cheaper substitute: checking only the exit code.
 - [x] Refuse to acknowledge what was not printed: a failed write of the JSON reply exits 3 and writes no seen mark. Done when: a test with stdout closed early (`SIGPIPE` ignored, as `eebea74` does) leaves the message unseen for the next inbox.
 - [x] Give `help` and `hook` their JSON forms in `engine/helio.c`. Done when: `helio help --json` parses to the help text, `helio hook claude --json` gives `{"context": ...}` for messages, `null` for none and an error value for a damaged store, and the hook without `--json` prints what it printed before (byte-compared).
-- [ ] Commit: `output: one JSON reply per call`
+- [x] Commit: `output: one JSON reply per call`
 
 **Test checkpoint:** `python3 ../SDK/tools/app_build.py .` exits 0, and the tests fail with the escaping, the whole-call flag or the one-writer rule removed.
+
+> **Verified:** 2026-11-27 | §10 | 64889159168b9f027fcc3f951d38c7bca35afdb8
+> **Review:** `docs/reviews/d01-t01-s10.json`
 
 ## 11. Take the next job as a queue
 
