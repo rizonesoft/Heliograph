@@ -2705,6 +2705,11 @@ class JsonReading(Base):
         put(self.store / f"messages/{landed_bad}.landed.zz", "junk\n")
         row = next(m for m in self.rows(t + 7, "log", code=3)["messages"] if m["id"] == landed_bad)
         self.assertEqual((row["damaged"], row["state"], row["landed"]), (True, None, None))
+        v = self.rows(t + 7, "log", code=3)  # real damage gives the exit code and the error, not only the flag
+        self.assertEqual(v["code"], 3)
+        self.assertIsInstance(v["error"], str)
+        v = self.shown(t + 7, landed_bad, code=3)
+        self.assertEqual((v["damaged"], v["code"]), (True, 3))
 
     # item 4: the reader's own seen state
     def test_seen_is_the_readers_own_mark(self):
@@ -2819,9 +2824,8 @@ class JsonReading(Base):
         # outside the reader's view is refused as a missing one is
         refused = self.value(self.at(t + 5, "show", other, "--json", "--as", "os/userland"), 2)
         missing = self.value(self.at(t + 5, "show", "1-aaaaaaaa", "--json", "--as", "os/userland"), 2)
-        self.assertEqual((refused["error"], refused["code"]), ("there is no such message", 2))
-        self.assertEqual(missing["code"], 2)
-        self.assertNotIn("id", refused)
+        self.assertEqual(refused, missing)  # the whole decoded reply: a foreign id tells nothing a missing one does not
+        self.assertEqual(refused, {"error": "there is no such message", "code": 2})
         # an id live and archived at once appears once
         job = self.sent(t + 10, "ask", "os/userland", "both", "--as", "os/main")
         self.ok(t + 11, "take", job, "--as", "os/userland"); self.ok(t + 12, "done", job, "ok", "--as", "os/userland")
@@ -2834,6 +2838,127 @@ class JsonReading(Base):
         self.assertEqual([m["id"] for m in self.rows(t + 30)["messages"]], [mine])
         self.assertFalse(self.shown(t + 31, mine)["seen"])
         self.assertEqual(self.at(t + 32, "--json", "--as", "os/userland").returncode, 1)
+
+    # review finding 1: a job archived while its landed commits are read is skipped as the text path does
+    def test_a_job_archived_while_its_landed_commits_are_read_gives_no_row(self):
+        t = self.OLD + 40_000 * self.M
+        stay = self.sent(t, "tell", "os/userland", "stay-live", "--as", "os/main")
+        job = self.sent(t + 1, "ask", "os/userland", "vanish", "--as", "os/main")
+        self.ok(t + 2, "take", job, "--as", "os/userland", "--session", "s1")
+        self.ok(t + 3, "landed", job, "abcdef1", "--as", "os/userland", "--session", "s1")
+        env = {k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "ANTIGRAVITY_CONVERSATION_ID")}
+        proc = subprocess.Popen([str(RACER), "--pause-cli", "landed-array", str(self.store), "log", "--json", "--as", "os/userland", "--store", str(self.store)],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.store, env=env)
+        try:
+            for _ in range(300):
+                if (self.store / "paused.landed-array").exists():
+                    break
+                time.sleep(0.05)
+            self.assertTrue((self.store / "paused.landed-array").exists())
+            (self.store / f"messages/{job}.post").unlink()
+            (self.store / f"messages/{job}.landed.abcdef1").unlink()
+            put(self.store / "resume.landed-array", "go")
+            out, err = proc.communicate(timeout=30)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        self.assertEqual((proc.returncode, err), (0, b""), out)
+        v = json.loads(out)
+        self.assertEqual([m["id"] for m in v["messages"]], [stay])
+        self.assertNotIn("error", v)
+
+    # review finding 2: the cut never backs over bytes that are not part of a character begun before it
+    def test_the_body_cut_keeps_stray_continuation_bytes_out_of_the_way(self):
+        t = self.OLD + 41_000 * self.M
+        self.sent(t, "tell", "os/userland", "stray", "--as", "os/main", body=b"A" * 2000 + b"\x80" + b"B" * 10)
+        v = self.rows(t + 1)["messages"][0]
+        self.assertEqual((v["body_cut"], v["body"]), (True, "A" * 2000))
+        # a real character that begins before the cut is dropped whole
+        self.sent(t + 2, "tell", "os/apps", "real", "--as", "os/main", body=b"A" * 1999 + "€".encode() + b"B")
+        v = self.rows(t + 3, me="os/apps")["messages"][0]
+        self.assertEqual((v["body_cut"], v["body"]), (True, "A" * 1999))
+
+    # review finding 4: a seen mark held by the archive is read for a message still listed live
+    def test_seen_reads_the_archived_mark_of_a_recovered_live_post(self):
+        t = self.OLD + 42_000 * self.M
+        job = self.sent(t, "ask", "os/userland", "recovered", "--as", "os/main")
+        self.ok(t + 1, "take", job, "--as", "os/userland"); self.ok(t + 2, "done", job, "ok", "--as", "os/userland")
+        self.assertEqual(run(self.store, "archive", me=None).returncode, 0)
+        self.shown(t + 3, job)  # the archived mark
+        month = next((self.store / "archive").iterdir()).name
+        shutil.copy(self.store / f"archive/{month}/{job}.post", self.store / f"messages/{job}.post")
+        row = next(m for m in self.rows(t + 4, "log", "--all")["messages"] if m["id"] == job)
+        self.assertEqual((row["archived"], row["seen"]), (False, True))
+        self.assertTrue(self.shown(t + 5, job)["seen"])
+
+    # review finding 5: show gives the flags log and the inbox give
+    def test_show_gives_the_same_flags_as_log(self):
+        put(self.store / "helio.conf", "project: os\nsilent: 60\n")
+        t = self.OLD + 43_000 * self.M
+        job = self.sent(t, "ask", "os/userland", "taken", "--as", "os/main")
+        self.ok(t, "take", job, "--as", "os/userland", "--session", "u2")
+        late = t + 61 * self.M
+        in_log = next(m for m in self.rows(late, "log", me="os/main")["messages"] if m["id"] == job)
+        in_show = self.shown(late, job, me="os/main")
+        self.assertTrue(in_log["silent"])
+        self.assertEqual((in_show["overdue"], in_show["silent"], in_show["silent_target"]), (in_log["overdue"], True, None))
+        # an owner opening a silent target's alert: show says what the inbox said
+        alert = self.sent(t, "tell", "os/apps", "quiet", "--as", "other/sender", "--for-session", "s7")
+        v = self.shown(late, alert, me="os/owner", session="own-a")
+        self.assertEqual((v["silent"], v["silent_target"]), (True, "s7"))
+
+    # review finding 6: check always answers with ok and problems
+    def test_check_that_cannot_open_the_store_still_gives_ok_and_problems(self):
+        r = subprocess.run([str(PROGRAM), "check", "--json", "--store", str(self.store / "helio.conf")], capture_output=True, timeout=30, cwd=self.store)
+        v = self.value(r, 3)
+        self.assertFalse(v["ok"])
+        self.assertEqual(v["problems"], [v["error"]])
+        r = subprocess.run([str(PROGRAM), "check", "--json"], capture_output=True, timeout=30, cwd=self.store,
+                           env={k: x for k, x in os.environ.items() if k not in ("HELIO_STORE", "HELIO_DEFAULT_STORE", "HELIO_DEFAULT_STORE_HEX")})
+        v = self.value(r, 2)
+        self.assertFalse(v["ok"])
+        self.assertEqual(v["problems"], [v["error"]])
+
+    # review finding 7: an unreadable seen mark is damage in show as in log
+    def test_an_unreadable_seen_mark_is_damage_in_show_and_log(self):
+        t = self.OLD + 44_000 * self.M
+        note = self.sent(t, "tell", "os/userland", "marked", "--as", "os/main")
+        put(self.store / f"messages/{note}.seen.os+userland", "corrupt\n")
+        v = self.shown(t + 1, note, code=3)
+        self.assertEqual((v["code"], v["id"]), (3, note))
+        self.assertIsInstance(v["error"], str)
+        v = self.rows(t + 1, "log", code=3)
+        self.assertEqual(v["code"], 3)
+
+    # review finding 9: log --all reads the landed list of the archive listing, not the month again for every job
+    @unittest.skipIf(ON_WINDOWS, "counts opens through Linux inotify")
+    def test_log_all_does_not_list_the_archive_month_for_each_archived_job(self):
+        t = self.OLD + 45_000 * self.M
+
+        def landed_reads(count):
+            for n in range(count):
+                job = self.sent(t + n * 10 + count * 100, "ask", "os/userland", f"j{count}-{n}", "--as", "os/main")
+                base = t + n * 10 + count * 100
+                self.ok(base + 1, "take", job, "--as", "os/userland", "--session", "s1")
+                self.ok(base + 2, "landed", job, "abcdef1", "--as", "os/userland", "--session", "s1")
+                self.ok(base + 3, "done", job, "ok", "--as", "os/userland", "--session", "s1")
+            self.assertEqual(run(self.store, "archive", me=None).returncode, 0)
+            month = next((self.store / "archive").iterdir()).name
+            watch = OutsideWatch([self.store / "archive" / month])
+            try:
+                v = self.rows(t + 5000, "log", "--all")
+                found = watch.events()
+            finally:
+                watch.close()
+            self.assertTrue(all(m["landed"] == ["abcdef1"] for m in v["messages"]))
+            opens = sum(1 for mask, name in found if int(mask, 16) & 0x20 and name.endswith(".landed.abcdef1"))
+            return opens, len(v["messages"])
+
+        # Each landed mark is opened once, by the archive listing that already read it: a second read per job
+        # (and a listing of the month per job) would show here.
+        for count in (1, 6):
+            opens, archived = landed_reads(count)
+            self.assertEqual(opens, archived, (count, opens, archived))
 
     # item 8: check
     def test_check_has_one_problems_array(self):

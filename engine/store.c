@@ -1225,6 +1225,7 @@ static s_result landed_collect(store *s, const message *m, const job *now, bool 
     }
     commit_vec v = {0};
     s_result res = S_OK;
+    if (array && s->pause) s->pause(s->pause_user, "landed-array"); /* test pause: after the text path's read */
     bool read_arch = m->archived || (now && now->from_archive);
     if (read_arch) {
         const char *why = NULL;
@@ -1380,7 +1381,7 @@ s_result store_seen(store *s, const char *id, actor me) { return write_seen_ex(s
 
 s_result store_message_seen(store *s, const message *m, actor me, bool *seen_out) {
     s_result r = store_was_seen(s, m->id, me, false, 0, seen_out);
-    if (r != S_OK || *seen_out || !m->archived) return r;
+    if (r != S_OK || *seen_out) return r; /* the live mark is absent: the archive may hold it (moved meanwhile, or recovered) */
     text event = {0};
     seen_name_ex(&event, me, false, 0);
     if (event.failed) return text_free(&event), say(s, S_DAMAGED, "out of memory");

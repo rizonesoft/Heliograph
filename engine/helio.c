@@ -347,11 +347,28 @@ static int seen_of(store *s, const message *m, actor reader, bool *err) {
     return seen;
 }
 
-/* Fills the job-dependent parts of a row: the full landed list, and "damaged" when it cannot be read. */
-static void row_landed(store *s, row *r, text *landed) {
-    if (!is_job(r->m) || r->damaged || !r->now) return;
-    if (store_landed_array(s, r->m, r->now, landed) != S_OK || landed->failed) r->damaged = true;
-    else r->landed = landed->data;
+/* Fills the job-dependent parts of a row: the full landed list. S_REFUSED when the job was archived meanwhile (the
+   caller treats it as the text path does); S_DAMAGED, with the row marked damaged, when a landed mark cannot be read. */
+static s_result row_landed(store *s, row *r, text *landed) {
+    if (!is_job(r->m) || r->damaged || !r->now) return S_OK;
+    s_result lr = store_landed_array(s, r->m, r->now, landed);
+    if (lr == S_REFUSED) return lr;
+    if (lr != S_OK || landed->failed) return r->damaged = true, S_DAMAGED;
+    r->landed = landed->data;
+    return S_OK;
+}
+
+/* The commits of a comma-separated list (as archive_every gives it) as a JSON array of strings. */
+static void landed_array_of(text *out, const char *csv) {
+    add(out, "[");
+    for (const char *at = csv; *at;) {
+        size_t n = 0;
+        while (at[n] && at[n] != ',') n++;
+        if (at != csv) add(out, ",");
+        add(out, "\""), add_bytes(out, at, n), add(out, "\"");
+        at += n + (at[n] ? 1 : 0);
+    }
+    add(out, "]");
 }
 
 static void append_row(text *rows, const row *r) {
@@ -438,14 +455,21 @@ static void emit_log_row(listing *l, const text *one) {
     l->shown++;
 }
 
-/* A log row for --json, whole body and all its landed commits. */
-static void log_row(listing *l, store *s, const message *m, const line_info *info, bool job_ok) {
+/* A log row for --json, whole body and all its landed commits: from csv when the archive listing already read them
+   (csv_given; NULL then means they could not be read), else from the store. */
+static void log_row(listing *l, store *s, const message *m, const line_info *info, bool job_ok, bool csv_given, const char *csv) {
     bool err = false;
-    row r = {.m = m, .now = &info->now, .damaged = is_job(m) && (!job_ok || info->landed_bad), .overdue = job_ok && info->overdue,
+    row r = {.m = m, .now = &info->now, .damaged = is_job(m) && (!job_ok || info->landed_bad || (csv_given && !csv)), .overdue = job_ok && info->overdue,
              .silent = job_ok && info->silent, .seen = seen_of(s, m, l->reader, &err), .body_n = len(or_empty(m->body))};
     text landed = {0};
-    row_landed(s, &r, &landed);
-    if (err) l->damaged = true;
+    s_result lr = S_OK;
+    if (csv_given && csv && is_job(m) && job_ok) landed_array_of(&landed, csv), r.landed = landed.data;
+    else if (!csv_given) lr = row_landed(s, &r, &landed);
+    if (lr == S_REFUSED) { /* archived meanwhile: as the text path does, no row */
+        text_free(&landed);
+        return;
+    }
+    if (err || r.damaged) l->damaged = true;
     append_row(&l->rows, &r);
     if (l->rows.failed) l->write_err = true;
     text_free(&landed);
@@ -466,7 +490,7 @@ static bool into_log(store *s, const message *m, void *user) {
         return true;
     }
     if (r != S_OK) l->damaged = true;
-    if (l->json) log_row(l, s, m, &info, r == S_OK);
+    if (l->json) log_row(l, s, m, &info, r == S_OK, false, NULL);
     else emit_log_row(l, &one);
     text_free(&one);
     if (l->write_err) return false;
@@ -491,7 +515,7 @@ static bool into_log_archived(store *s, const message *m, const job *known, cons
         }
         if (r != S_OK) l->damaged = true;
     }
-    if (l->json) log_row(l, s, m, &info, r == S_OK);
+    if (l->json) log_row(l, s, m, &info, r == S_OK, is_job(m) && known, landed);
     else emit_log_row(l, &one);
     text_free(&one);
     return !l->write_err;
@@ -577,25 +601,37 @@ static bool into_inbox(store *s, const message *m, void *user) {
     size_t extra = (l->shown == 0 ? (sizeof(MARK_BEGIN) - 1) : 0) + (sizeof(MARK_END) - 1) + TRAILER_RESERVE;
     if (!l->all && (l->shown >= SHOW_MESSAGES || one.length + extra > l->budget || l->out.length > l->budget - one.length - extra)) l->held++;
     else {
-        if (l->shown == 0) add(&l->out, MARK_BEGIN);
-        add(&l->out, one.data ? one.data : ""), l->shown++;
+        text row_json = {0}, landed_json = {0};
         if (l->json) {
-            bool err = false;
             size_t body_n = len(or_empty(m->body));
             bool cut = !l->all && body_n > SHOW_BYTES;
             if (cut) {
-                body_n = SHOW_BYTES;
-                while (body_n && ((unsigned char)m->body[body_n] & 0xC0) == 0x80) body_n--; /* never inside a character */
+                /* Back over a character that began before the cut, never over stray continuation bytes. */
+                size_t k = body_n = SHOW_BYTES;
+                while (k && body_n - k < 3 && ((unsigned char)m->body[k] & 0xC0) == 0x80) k--;
+                unsigned char lead = (unsigned char)m->body[k];
+                size_t width = lead >= 0xF0 ? 4 : lead >= 0xE0 ? 3 : lead >= 0xC0 ? 2 : 1;
+                if (k < body_n && width > body_n - k) body_n = k;
             }
+            bool err = false;
             row r = {.m = m, .now = &now, .damaged = is_job(m) && !good, .overdue = overdue, .silent = silent, .cut = cut,
                      .silent_target = silent ? alert_for : NULL, .seen = seen_of(s, m, l->reader, &err), .body_n = body_n};
-            text landed_json = {0};
-            row_landed(s, &r, &landed_json);
+            s_result lr = row_landed(s, &r, &landed_json);
+            if (lr == S_REFUSED) { /* archived meanwhile: no row, as the text path */
+                text_free(&landed_json), text_free(&one);
+                return true;
+            }
             if (err || r.damaged) l->damaged = true;
-            append_row(&l->rows, &r);
-            if (l->rows.failed) l->out.failed = true;
-            text_free(&landed_json);
+            append_row(&row_json, &r);
         }
+        if (l->shown == 0) add(&l->out, MARK_BEGIN);
+        add(&l->out, one.data ? one.data : ""), l->shown++;
+        if (l->json) {
+            if (l->rows.length) add(&l->rows, ",");
+            add(&l->rows, row_json.data ? row_json.data : "");
+            if (row_json.failed || l->rows.failed) l->out.failed = true;
+        }
+        text_free(&row_json), text_free(&landed_json);
     }
     if (one.failed) l->out.failed = true;
     text_free(&one);
@@ -605,10 +641,12 @@ static bool into_inbox(store *s, const message *m, void *user) {
 static int finish(listing *l, size_t damaged) {
     sessions_cache_free(&l->sessions);
     if (l->json) {
-        json_list *f = fields();
-        json_key(f, "messages"), add(f->out, "["), add(f->out, l->rows.data ? l->rows.data : ""), add(f->out, "]");
-        if (l->with_held) json_put_number(f, "held", (uint64_t)l->held), json_put_bool(f, "more", l->held > 0);
         bool good = !l->out.failed && !l->rows.failed && !l->write_err;
+        if (good) { /* a failed buffer never reaches the reply */
+            json_list *f = fields();
+            json_key(f, "messages"), add(f->out, "["), add(f->out, l->rows.data ? l->rows.data : ""), add(f->out, "]");
+            if (l->with_held) json_put_number(f, "held", (uint64_t)l->held), json_put_bool(f, "more", l->held > 0);
+        }
         text_free(&l->out), text_free(&l->rows);
         if (!good) return fail("the output cannot be written", 3);
     } else if (!print(&l->out) || l->write_err) return fail("the output cannot be written", 3);
@@ -768,24 +806,46 @@ static int show(store *s, const char *id, actor me, const place *here, const opt
         }
         sessions_cache_free(&sc);
     }
-    bool was_archived = m.archived;
+    const char *late_why = NULL; /* damage known only after the row is built: exit 3 as log does */
     if (reply.on) {
-        /* The row as it stands before this call's own acknowledgment, with the whole body. */
-        bool err = false;
-        row r = {.m = &m, .now = &info.now, .damaged = is_job(&m) && (lr != S_OK || info.landed_bad), .overdue = lr == S_OK && info.overdue,
-                 .silent = lr == S_OK && info.silent, .seen = seen_of(s, &m, me, &err), .body_n = len(or_empty(m.body))};
+        /* The row as it stands before this call's own acknowledgment, with the whole body, and the flags log gives. */
+        bool err = false, overdue = lr == S_OK && info.overdue, silent = false;
+        if (lr == S_OK && is_job(&m)) {
+            session_cache sc = {0};
+            if (!watch_classify_job(s, here, &m, &info.now, p_now(), &sc, &overdue, &silent)) late_why = "the sessions cannot be read";
+            sessions_cache_free(&sc);
+        }
+        const char *target = NULL;
+        if (alert_outstanding) silent = true, target = m.for_session;
+        row r = {.m = &m, .now = &info.now, .damaged = is_job(&m) && (lr != S_OK || info.landed_bad), .overdue = overdue,
+                 .silent = silent, .silent_target = target, .seen = seen_of(s, &m, me, &err), .body_n = len(or_empty(m.body))};
+        if (err && !late_why) late_why = s->why;
         text landed = {0};
-        row_landed(s, &r, &landed);
-        if (err) fail(s->why, 0);
+        s_result rl = row_landed(s, &r, &landed);
+        if (rl == S_REFUSED) {
+            /* Archived since it was loaded: read the archived copy, as the text path does. */
+            message arch = {0};
+            if (archive_read_message(s, id, &arch) != S_OK) {
+                message_free(&arch), text_free(&landed), text_free(&out), message_free(&m);
+                return fail("it was archived", S_REFUSED);
+            }
+            message_free(&m);
+            m = arch, r.m = &m, r.body_n = len(or_empty(m.body)), r.seen = seen_of(s, &m, me, &err);
+            text_free(&landed);
+            landed = (text){0};
+            rl = row_landed(s, &r, &landed);
+        }
+        if (rl != S_OK && !late_why) late_why = "a landed mark of this job is damaged";
         json_message(fields(), &r);
         text_free(&landed);
     }
+    bool was_archived = m.archived;
     message_free(&m);
     if (reply.on && address_ok(o->me, false)) announce_best_effort(s, o, ""), *announced = true;
     if (reply.on) text_free(&out);
     else if (!print(&out)) return fail("the output cannot be written", 3);
     if (reply.fields.failed) return fail("the output cannot be written", 3);
-    int known = lr != S_OK ? fail("a step of this job is damaged", 3) : 0; /* known before the reply: inside it */
+    int known = lr != S_OK ? fail("a step of this job is damaged", 3) : late_why ? fail(late_why, 3) : 0; /* known before the reply: inside it */
     if (alert_err && reply.on) fail("the alert state cannot be read", 3); /* known too; the seen mark still follows */
     /* The reply goes before the seen mark, so a message is never marked seen when its reply was not written; a seen
        mark that then fails shows in the exit code alone. */
@@ -1144,6 +1204,12 @@ int helio_paused(int count, char **args, void (*pause)(void *user, const char *s
     options o;
     reply = (typeof(reply)){.on = json_flag(count, args), .key = "text"};
     int code = parse(&o, count, args) ? run(&o, pause, user) : fail(o.why, 2);
+    if (reply.on && o.count && same(o.words[0], "check") && reply.error && !reply.fields.length) {
+        /* check gives ok and problems on every path: a call that failed before it could look reports itself as the problem. */
+        json_list *f = fields();
+        reply.key = NULL, reply.own_problems = true;
+        json_put_bool(f, "ok", false), json_key(f, "problems"), add(f->out, "["), add(f->out, reply.problems.data ? reply.problems.data : ""), add(f->out, "]");
+    }
     if (reply.on && !reply_send() && code < 3) code = 3;
     text_free(&reply.body), text_free(&reply.warnings), text_free(&reply.problems), text_free(&reply.fields), p_free(reply.error);
     reply = (typeof(reply)){0};

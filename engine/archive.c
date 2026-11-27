@@ -2190,7 +2190,7 @@ size_t archive_every(store *s, char *const *emitted, size_t emitted_count,
                                 s_result lr2 = jr == S_OK ? format_arch_landed_events(s, month, id, &be.items[i].landed, &landed_t, &lwhy) : S_OK;
                                 if (jr == S_OK) {
                                     if (lr2 != S_OK) damaged++;
-                                    keep_going = each(s, &m, &known, lr2 == S_OK ? landed_t.data : NULL, user);
+                                    keep_going = each(s, &m, &known, lr2 == S_OK ? (landed_t.data ? landed_t.data : "") : NULL, user);
                                 } else {
                                     keep_going = each(s, &m, NULL, NULL, user);
                                     damaged++;
