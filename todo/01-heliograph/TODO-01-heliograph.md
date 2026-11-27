@@ -655,6 +655,10 @@ Filed 2026-11-27 from the `D01 T01 §18` and `§19` gate runs: 3 of 6 `python3 .
 
 ## 21. JSON for the inbox, log, show and check
 
+> **Started:** 2026-11-27T20:38:48Z
+
+**Corrected 2026-11-27 (validation against `engine/store.h`):** `due` is stored as microseconds (`message.due`), not as time text; the item writes it as a UTC time.
+
 Filed 2026-11-27 from the `D01 T01 §10` plan review (findings 2, 3, 4 for `check`, 8 for the job fields, 11). A script reading the inbox must see what a person sees, no more and no less, and learn what it did not get.
 
 **Phase:** 3
@@ -666,7 +670,7 @@ Filed 2026-11-27 from the `D01 T01 §10` plan review (findings 2, 3, 4 for `chec
 1. A message object. Done when: every stored field and the job fields read back as stored.
 2. The four reading commands. Done when: each returns exactly the rows a person would see and acknowledges the same way.
 
-- [ ] Write a message as `{"id", "time", "from", "to", "for_session", "repository", "kind", "about", "urgency", "re", "due", "subject", "body", "archived"}` in `engine/helio.c` (`due` the stored time text or `null`), and for a request or handoff add `"state"`, `"taker"` (the lane that took it, `null` when open or refused without a take), `"closed_by"` (the lane that ended it, or `null`), `"session"` and `"landed"` (every commit, normalized). Done when: a test reads each field equal to the stored post and steps, for open, taken, released, done, refused-without-take and archived jobs with three landed commits. Cheaper substitute: the inbox line as a string.
+- [ ] Write a message as `{"id", "time", "from", "to", "for_session", "repository", "kind", "about", "urgency", "re", "due", "subject", "body", "archived"}` in `engine/helio.c` (`due` the stored microseconds as a UTC time, `add_time`, or `null`), and for a request or handoff add `"state"`, `"taker"` (the lane that took it, `null` when open or refused without a take), `"closed_by"` (the lane that ended it, or `null`), `"session"` and `"landed"` (every commit, normalized). Done when: a test reads each field equal to the stored post and steps, for open, taken, released, done, refused-without-take and archived jobs with three landed commits. Cheaper substitute: the inbox line as a string.
 - [ ] Give the reader's state of a message that is not a job: `"seen"` (whether this reader marked it) in the inbox, `show` and `log`, and in the inbox `"overdue"` for a job and `"silent"` for a job whose taker stopped or a session-addressed heads-up whose target went silent (`"silent_target"` naming it). Done when: a target and an owner each see their own `seen` and `silent` before and after the target reads it.
 - [ ] Print the inbox as `{"messages": [...], "held": <count>, "more": <bool>}` under the same display budget and urgent-first order as the text inbox, a body over the budget cut with `"body_cut": true` and read whole with `show`, and `--all` without the budget. Done when: six waiting messages give the budgeted ones and `held` for the rest, one 16 KiB body comes back cut and whole through `show`, and an inbox with messages never exits 1.
 - [ ] Print `log` as `{"messages": [...]}` and `show` as one message through the same visibility and seen-mark paths as the text forms. Done when: with two projects in one store and two sessions in one lane, the exact ids returned match the text forms, a message outside the reader's view is refused the same as a missing one, an id live and archived at once appears once, and `show` marks it seen for the next inbox.
