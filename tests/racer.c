@@ -566,7 +566,8 @@ int racer(int count, char **args) {
         char *seen[64];
         expiry_life life[64];
         size_t ns = 0, nl = 0;
-        for (int i = 8; i < count && ns < 64 && nl < 64; i++) {
+        if (count - 8 > 64) return p_error("racer: at most 64 marks and heartbeats\n"), 2;
+        for (int i = 8; i < count; i++) {
             if (starts(args[i], "life:")) {
                 const char *at = args[i] + 5;
                 size_t n = 0;

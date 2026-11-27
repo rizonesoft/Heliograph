@@ -2816,6 +2816,53 @@ class Expiry(Base):
         self.archive_at(late + 5, 0)
         self.assertFalse(self.live(msg))
 
+    def test_a_lane_that_returns_while_the_archiver_waits_keeps_the_message(self):
+        msg = self.post_at(self.T0, "tell", "os/all", "everyone")
+        late = self.T0 + self.D30
+        self.assertEqual(self.at(late, "show", msg, me="os/apps").returncode, 0)
+        stage = "before-remove-post"
+        clean = {k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_SESSION")}
+        with subprocess.Popen(
+            [str(RACER), "--now", str(late), "--pause-cli", stage, str(self.store), "archive", "--store", str(self.store)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=self.store, env=clean,
+        ) as proc:
+            try:
+                Archive.wait_for(self, self.store / f"paused.{stage}")
+                # The same archiver decided before the pause; os/ui announces itself, then the archiver resumes.
+                self.assertEqual(self.at(late, "hello", "codex", me="os/ui").returncode, 0)
+                put(self.store / f"resume.{stage}", "go\n")
+                self.assertEqual(proc.wait(timeout=30), 1)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+        (self.store / f"paused.{stage}").unlink(missing_ok=True)
+        (self.store / f"resume.{stage}").unlink(missing_ok=True)
+        self.assertTrue(self.live(msg))
+        self.assertIn(msg, self.at(late + 1, me="os/ui").stdout.decode())
+        self.assertEqual(self.at(late + 1, "check").returncode, 0)
+
+    def test_a_post_put_back_beside_a_finished_move_is_moved_again_not_held(self):
+        # A keyed retry killed after it published leaves a live post whose marks are all in the archive.
+        msg = self.post_at(self.T0, "tell", "os/apps", "put back", "--key", "k-back")
+        late = self.T0 + self.D30
+        self.assertEqual(self.at(late, "show", msg, me="os/apps").returncode, 0)
+        post = (self.store / f"messages/{msg}.post").read_bytes()
+        self.archive_at(late, 0)
+        put(self.store / f"messages/{msg}.post", post.decode())
+        summary = self.summary_of(late + self.DAY)
+        self.assertIn(self.at(late + self.DAY, me="os/apps").returncode, (0, 1))
+        self.assertEqual(self.held_part(summary.read_text()), (0, []))
+        self.assertFalse(self.live(msg))  # the same first inbox of the day moved it again
+        self.assertEqual(self.at(late + self.DAY, "check").returncode, 0)
+
+    def test_every_held_id_is_in_the_summary(self):
+        ids = [self.post_at(self.T0 + i, "tell", "os/apps", f"held {i}") for i in range(101)]
+        first = self.T0 + self.D30 + self.DAY
+        self.assertEqual(self.at(first, me="os/ui").returncode, 1)
+        count, listed = self.held_part(self.summary_of(first).read_text())
+        self.assertEqual((count, sorted(listed)), (101, sorted(ids)))
+        self.assertNotIn("and more", self.summary_of(first).read_text().split("## Held unseen")[1])
+
     def test_a_read_and_a_keyed_retry_racing_the_move_lose_nothing(self):
         msg = self.post_at(self.T0, "tell", "os/apps", "raced", "--key", "k-race")
         late = self.T0 + self.D30
@@ -2839,7 +2886,7 @@ class Expiry(Base):
                     proc.kill()
         (self.store / f"paused.{stage}").unlink(missing_ok=True)
         (self.store / f"resume.{stage}").unlink(missing_ok=True)
-        self.archive_at(late + 1)  # sweeps the late mark if the first run's batch scan did not
+        # The first run's own sweep after the removal moved the late mark: nothing is run again before looking.
         self.assertEqual(list((self.store / "messages").glob(f"{msg}.*")), [])
         arch = self.store / f"archive/{self.month(msg)}"
         self.assertEqual((arch / f"{msg}.{self.mark('os/apps')}").read_bytes(), b"seen\n")

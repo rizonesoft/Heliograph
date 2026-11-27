@@ -58,11 +58,11 @@ Legend: ✅ works · 📋 planned
 | Codex and Antigravity | ✅ | They run `helio` between sections of an unattended run |
 | Due times, overlap warnings | ✅ | Shown by the inbox and by `helio working` |
 | Daily summary | ✅ | Written by the first inbox or hook of the day |
-| Archive by month, expiry | ✅ | `helio archive` and the first inbox of the day move closed jobs, and seen heads-ups, findings and answers, 30 days on; an unseen one stays and is counted in the daily summary |
+| Archive by month, expiry | ✅ | Closed jobs and seen notes move after 30 days; unseen ones stay, counted daily |
 | Silent takers, messages for one session | ✅ | `helio hello`, `silent:` reporting, and `--for-session` targeting |
 | Projects kept apart in log and show | ✅ | `may_see` scopes `log`, `show`, `answer`, and job commands to your project |
 | Mark for landed work | ✅ | `helio landed <id> <commit>` links a commit without closing the job |
-| Fixed marks around shown messages | ✅ | `inbox`, `log`, `show`, and `hook` wrap every message line behind a bar between fixed marks |
+| Fixed marks around shown messages | ✅ | `inbox`, `log`, `show` and `hook` put each line between fixed marks |
 | JSON, taking the next job as a queue | 📋 | [§10 and §11](todo/01-heliograph/TODO-01-heliograph.md) |
 
 ## Quick start
@@ -124,7 +124,7 @@ helio: it is already taken
 | `helio take`, `release`, `done`, `refuse` `<id>` | Moves a job on |
 | `helio landed <id> <commit>` | Links a commit (7 to 64 hex digits) to a job without closing it |
 | `helio working <paths>` | Says what I touch, and warns when someone else touches it |
-| `helio log`, `check`, `help` | Shows your project's messages (`log --all` with no lane outside a configured repository shows every project), examines the store, or lists every option |
+| `helio log`, `check`, `help` | Your project's messages (`log --all` outside a repo: all), the store check, help |
 
 Exit codes: 0 done, 1 nothing, 2 refused, 3 something failed or is damaged, and what was asked may have happened. Send with `--key` to repeat a send safely.
 

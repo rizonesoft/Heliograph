@@ -365,7 +365,7 @@ s_result watch_summary(store *s, const place *here) {
         unsigned counts[PARTS] = {0}, damaged = 0;
         uint64_t now = p_now();
         session_cache sc = {0};
-        bool liveness_err = false;
+        bool liveness_err = false, held_err = false;
         for (size_t i = 0; i < s->count; i++) {
             size_t n = len(s->names[i]);
             if (n <= 5 || !same(s->names[i] + n - 5, ".post")) continue;
@@ -400,22 +400,25 @@ s_result watch_summary(store *s, const place *here) {
                 }
             } else {
                 bool held = false;
-                if (!summary_held(s, i, &m, now, &held)) liveness_err = true;
+                if (!summary_held(s, i, &m, now, &held)) held_err = true;
                 else if (held) {
+                    /* Every held id is listed, the first 100 in full: there is no other place that names them. */
                     job none = {0};
-                    add_summary_item(&parts[HELD], &counts[HELD], &m, &none);
+                    if (counts[HELD] < 100) add_summary_item(&parts[HELD], &counts[HELD], &m, &none);
+                    else counts[HELD]++, add(&parts[HELD], "- "), add(&parts[HELD], m.id), add(&parts[HELD], "\n");
                 }
             }
             message_free(&m);
             p_free(id);
         }
         sessions_cache_free(&sc);
-        if (liveness_err) {
+        if (liveness_err || held_err) {
             /* Do not freeze an incomplete daily summary when session or threshold reads failed:
                return S_NOTHING (deferred) so the caller prints a diagnostic, retries on the next
                call once the transient fault clears, and lets the caller's own inbox decide its exit code. */
             for (int i = 0; i < PARTS; i++) text_free(&parts[i]);
-            s->why = "the summary was deferred: session or threshold could not be read";
+            s->why = liveness_err ? "the summary was deferred: session or threshold could not be read"
+                                  : "the summary was deferred: a seen mark or the sessions could not be read for a held message";
             p_free(there), text_free(&day), text_free(&folder), text_free(&path), text_free(&unique);
             return S_NOTHING;
         } else {
@@ -423,7 +426,7 @@ s_result watch_summary(store *s, const place *here) {
             for (int i = 0; i < PARTS; i++) {
                 add(&out, "\n## "), add(&out, titles[i]), add(&out, ": "), add_number(&out, counts[i], 0), add(&out, "\n\n");
                 if (parts[i].data) add(&out, parts[i].data);
-                if (counts[i] > 100) add(&out, "- and more: helio log\n");
+                if (counts[i] > 100 && i != HELD) add(&out, "- and more: helio log\n");
                 if (parts[i].failed) out.failed = true;
                 text_free(&parts[i]);
             }

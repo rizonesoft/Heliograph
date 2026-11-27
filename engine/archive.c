@@ -778,8 +778,66 @@ static bool life_each(void *user, const session_info *info) {
     return true;
 }
 
-s_result archive_expiry_of(store *s, const message *m, char *const *seen, size_t seen_count, uint64_t now, expiry *out) {
+typedef struct {
+    const char *id;
+    size_t id_n;
+    str_list marks;
+} arch_marks;
+
+static bool collect_arch_mark(void *user, const char *name) {
+    arch_marks *a = user;
+    for (size_t i = 0; i < a->id_n; i++)
+        if (name[i] != a->id[i]) return true;
+    if (name[a->id_n] != '.' || !starts(name + a->id_n + 1, "seen.")) return true;
+    const char *ev = name + a->id_n + 1;
+    return list_push(&a->marks, ev, len(ev)) || (a->marks.failed = true, false);
+}
+
+/* The seen marks already in the archive for a message whose post was copied there: an unfinished move, a finished
+   one whose post a killed keyed retry put back, or one moved while a summary read it. Each is read and checked. */
+static s_result archived_marks(const char *folder, const char *id, str_list *out) {
+    char month[8];
+    if (!archive_month(id, month)) return S_DAMAGED;
+    store tmp = {.folder = folder};
+    message am = {0};
+    s_result mr = archive_read_message(&tmp, id, &am);
+    message_free(&am);
+    if (mr != S_OK) return mr;
+    arch_marks a = {.id = id, .id_n = len(id)};
+    p_result lr = arch_list(folder, month, collect_arch_mark, &a, NULL);
+    bool ok = lr == P_OK && !a.marks.failed;
+    for (size_t i = 0; ok && i < a.marks.count; i++) {
+        arch_at at = {0};
+        arch_at_of(&at, folder, month, id, a.marks.items[i]);
+        char *data = NULL;
+        size_t length = 0;
+        p_result rr = at.name.failed ? P_FAILED : arch_read(&at, MOST_FILE, &data, &length);
+        arch_at_free(&at);
+        ok = rr == P_OK && store_valid_seen_event(a.marks.items[i]) && length == len(ARCHIVE_SEEN) && same(data, ARCHIVE_SEEN);
+        p_free(data);
+        if (ok) ok = list_push(out, a.marks.items[i], len(a.marks.items[i]));
+    }
+    list_free(&a.marks);
+    return ok ? S_OK : S_DAMAGED;
+}
+
+s_result archive_expiry_of(store *s, const message *m, char *const *seen_live, size_t live_count, uint64_t now, expiry *out) {
     *out = EXPIRY_NOT_YET;
+    char *const *seen = seen_live;
+    size_t seen_count = live_count;
+    str_list all = {0};
+    if (archive_expiry(m, seen_live, live_count, NULL, 0, now) != EXPIRY_NOT_YET) {
+        /* When a copy of the post is in the archive, so may be some marks. A mark leaves the live store only after
+           its archive copy is durable, so the live marks and then the archived ones miss none. */
+        for (size_t i = 0; i < live_count; i++) list_push(&all, seen_live[i], len(seen_live[i]));
+        s_result ar = all.failed ? S_DAMAGED : archived_marks(s->folder, m->id, &all);
+        if (ar == S_DAMAGED) {
+            list_free(&all);
+            s->why = "a seen mark in the archive cannot be read";
+            return S_DAMAGED;
+        }
+        seen = all.items, seen_count = all.count;
+    }
     size_t to_n = len(m->to);
     bool to_all = to_n > 4 && same(m->to + to_n - 4, "/all");
     life_list l = {.repository = m->repository ? m->repository : ""};
@@ -789,12 +847,14 @@ s_result archive_expiry_of(store *s, const message *m, char *const *seen, size_t
         if (r == P_MISSING) l.count = 0;
         else if (r != P_OK || l.failed) {
             p_free(l.items);
+            list_free(&all);
             s->why = "the sessions cannot be read, so who should see it is not known";
             return S_DAMAGED;
         }
     }
     *out = archive_expiry(m, seen, seen_count, l.items, l.count, now);
     p_free(l.items);
+    list_free(&all);
     return S_OK;
 }
 
@@ -830,13 +890,14 @@ static s_result move_non_job(const char *folder, batch_item *it, const message *
     store tmp = {.folder = folder};
     expiry e = EXPIRY_NOT_YET;
     s_result er = archive_expiry_of(&tmp, m, present.items, present.count, now, &e);
-    list_free(&present);
-    if (er != S_OK) {
+    if (er != S_OK || e != EXPIRY_READY) {
+        list_free(&present);
+        if (er == S_OK) return S_NOTHING;
         add_report(report, it->id, tmp.why);
         return S_DAMAGED;
     }
-    if (e != EXPIRY_READY) return S_NOTHING;
     if (!ensure_archive_month(folder, it->month)) {
+        list_free(&present);
         add_report(report, it->id, "archive folder cannot be created");
         return S_DAMAGED;
     }
@@ -846,28 +907,37 @@ static s_result move_non_job(const char *folder, batch_item *it, const message *
     s_result cr = dst_post.name.failed ? (why = "out of memory", S_DAMAGED) : copy_durable(post_path, &dst_post, &why);
     arch_at_free(&dst_post);
     if (cr == S_DAMAGED) {
+        list_free(&present);
         add_report(report, it->id, why);
         return S_DAMAGED;
     }
     if (pause) pause(pause_user, "after-copy-post");
-    for (size_t i = 0; i < it->seen.count; i++) {
+    for (size_t i = 0; i < present.count; i++) {
         text ssrc = {0};
         arch_at sdst = {0};
-        live_path(folder, &ssrc, it->id, it->seen.items[i]);
-        arch_at_of(&sdst, folder, it->month, it->id, it->seen.items[i]);
+        live_path(folder, &ssrc, it->id, present.items[i]);
+        arch_at_of(&sdst, folder, it->month, it->id, present.items[i]);
         if (pause) pause(pause_user, "before-copy-seen");
-        char *probe = NULL;
-        size_t plen = 0;
-        p_result pr = ssrc.failed ? P_FAILED : p_read(ssrc.data, MOST_FILE, &probe, &plen);
-        p_free(probe);
-        s_result sr = pr == P_MISSING ? S_OK : ssrc.failed || sdst.name.failed ? (why = "out of memory", S_DAMAGED) : copy_durable(ssrc.data, &sdst, &why);
+        /* A mark that vanished meanwhile was moved by a peer archiver: copy_durable finds its copy (S_NOTHING). */
+        s_result sr = ssrc.failed || sdst.name.failed ? (why = "out of memory", S_DAMAGED) : copy_durable(ssrc.data, &sdst, &why);
         text_free(&ssrc), arch_at_free(&sdst);
         if (sr == S_DAMAGED) {
+            list_free(&present);
             add_report(report, it->id, why);
             return S_DAMAGED;
         }
     }
     if (pause) pause(pause_user, "before-remove-post");
+    /* The decision is final only at the removal: read who should see it once more, so a lane that announced itself
+       while the copies were made keeps the post live (the copy beside it is an unfinished move). The heartbeats are
+       the last thing read before the post goes; there is no lock, so this read is the point the move takes effect. */
+    er = archive_expiry_of(&tmp, m, present.items, present.count, now, &e);
+    list_free(&present);
+    if (er != S_OK) {
+        add_report(report, it->id, tmp.why);
+        return S_DAMAGED;
+    }
+    if (e != EXPIRY_READY) return S_NOTHING;
     p_result rm_post = remove_post_exclusive(post_path);
     if (rm_post != P_OK && rm_post != P_MISSING) {
         add_report(report, it->id, "the post could not be removed");
