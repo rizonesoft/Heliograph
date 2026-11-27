@@ -3106,6 +3106,7 @@ class JsonChanges(JsonCalls):
         v = self.jcall("answer", asked, "the answer", body="yes", me="os/userland")
         post = self.post_fields(v["id"])
         self.assertEqual((post["kind"], post["re"], post["from"], post["to"]), ("answer", asked, "os/userland", "os/main"))
+        self.assertTrue((self.store / f"messages/{v['id']}.post").read_text().endswith("\n\nyes"))
         # the migrated section 10 case: a send whose session announcement fails afterwards
         sessions = self.store / "sessions"
         shutil.rmtree(sessions, ignore_errors=True)
@@ -3295,8 +3296,11 @@ class JsonChanges(JsonCalls):
         self.assertEqual(v, {"lane": "os/apps", "paths": ["ui/draw.c", "docs/a.md", "src/"], "overlaps": []})
         self.assertEqual(working("userland", "lib/x.c")["overlaps"], [])
         v = working("main", "ui/ docs/a.md lib/x.c")
-        # one entry for each other lane: the more specific path where a directory matches (ui/ against ui/draw.c)
-        self.assertEqual(sorted((e["lane"], e["path"]) for e in v["overlaps"]), [("os/apps", "ui/draw.c"), ("os/userland", "lib/x.c")])
+        # one entry for each other lane and matching path: the more specific path where a directory matches
+        # (ui/ against ui/draw.c), every match and not only the first
+        self.assertEqual(sorted((e["lane"], e["path"]) for e in v["overlaps"]),
+                         [("os/apps", "docs/a.md"), ("os/apps", "ui/draw.c"), ("os/userland", "lib/x.c")])
+        self.assertEqual(len(v["overlaps"]), 3)
         # the declaration is the stored one, and the peer was told once, repeats included
         self.assertEqual((self.store / "working/os+main").read_text().split("\n")[1], "ui/ docs/a.md lib/x.c")
         working("main", "ui/ docs/a.md lib/x.c")
@@ -3331,6 +3335,126 @@ class JsonChanges(JsonCalls):
         self.assertEqual((self.store / "working/os+main").read_text().split("\n")[1], "ui/x.c")
         # the peer was not told
         self.assertEqual(len([p for p in (self.store / "messages").iterdir() if p.name.endswith(".post")]), 2)
+
+    # review finding 1: an archived chain that cannot be read is damage
+    def test_a_change_on_an_archived_job_with_a_damaged_chain_is_exit_3(self):
+        t = self.OLD + 60_000 * self.M
+        job = self.sent(t, "ask", "os/userland", "archived damage", "--as", "os/main")
+        self.ok(t + 1, "take", job, "--as", "os/userland"); self.ok(t + 2, "done", job, "ok", "--as", "os/userland")
+        self.assertEqual(run(self.store, "archive", me=None).returncode, 0)
+        month = next((self.store / "archive").iterdir()).name
+        put(self.store / f"archive/{month}/{job}.link.0000", "corrupt\n")
+        v = self.jcall("release", job, me="os/userland", code=3)
+        self.assertEqual(set(v), {"error", "code"})
+        self.assertEqual(run(self.store, "release", job, me="os/userland").returncode, 3)
+
+    # review finding 5: every refusal after the state was read carries it
+    def test_a_refusal_at_the_note_or_over_an_archived_copy_carries_the_state(self):
+        t = self.OLD + 61_000 * self.M
+        job = self.sent(t, "ask", "os/userland", "note", "--as", "os/main")
+        self.jcall("take", job, me="os/userland", now=t + 1)
+        v = self.jcall("done", job, "x" * 1001, me="os/userland", code=2, now=t + 2)
+        self.assertEqual(v["state"], "taken")
+        self.assertEqual(self.shown(t + 3, job)["state"], "taken")  # nothing was written
+        self.jcall("done", job, "ok", me="os/userland", now=t + 3)
+        self.assertEqual(run(self.store, "archive", me=None).returncode, 0)
+        month = next((self.store / "archive").iterdir()).name
+        shutil.copy(self.store / f"archive/{month}/{job}.post", self.store / f"messages/{job}.post")  # live post, archived steps
+        v = self.jcall("release", job, me="os/userland", code=2, now=t + 4)
+        self.assertEqual((v["state"], v["error"]), ("done", "it was archived"))
+
+    # review finding 8: the reply is read back from the step this call published
+    def test_a_step_that_cannot_be_read_back_is_damage(self):
+        t = self.OLD + 62_000 * self.M
+        job = self.sent(t, "ask", "os/userland", "readback", "--as", "os/main")
+        proc = self.paused("after-write", "take", job, "--json", "--as", "os/userland")
+        try:
+            self.wait_paused("after-write")
+            put(self.store / f"messages/{job}.link.0000", "corrupt\n")
+            out, err = self.resume("after-write", proc)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        self.assertEqual((proc.returncode, err), (3, b""))
+        v = json.loads(out)
+        self.assertEqual(set(v), {"error", "code"})
+        self.assertEqual(v["code"], 3)
+
+    # review findings 2, 8 and 13: working
+    def test_a_declaration_whose_flush_fails_is_still_in_the_reply(self):
+        self.jcall("working", "ui/", me="os/apps")
+        env = {k: v for k, v in os.environ.items() if k not in self.CLEAN}
+        r = subprocess.run([str(RACER), "--fail-write-flush-cli", "working", "ui/x.c", "--json", "--store", str(self.store), "--as", "os/main"],
+                           capture_output=True, timeout=30, cwd=self.store, env=env)
+        v = self.value(r, 3)
+        self.assertEqual((v["lane"], v["paths"], v["code"]), ("os/main", ["ui/x.c"], 3))
+        self.assertEqual((self.store / "working/os+main").read_text().split("\n")[1], "ui/x.c")
+
+    def test_working_reports_the_declaration_the_store_holds_and_text_mode_reads_nothing_back(self):
+        self.jcall("working", "src/", me="os/apps")
+        for flag in ("--json", None):
+            put(self.store / "working/os+main", "")  # reset
+            (self.store / "working/os+main").unlink()
+            args = [str(RACER), "--pause-cli", "working-written", str(self.store), "working", "ui/ lib/", *([flag] if flag else []), "--store", str(self.store), "--as", "os/main"]
+            env = {k: v for k, v in os.environ.items() if k not in self.CLEAN}
+            proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.store, env=env)
+            try:
+                self.wait_paused("working-written")
+                put(self.store / "working/os+main", f"{int(time.time() * 1_000_000)}\nsrc/\n")  # another session of the lane replaced it
+                out, err = self.resume("working-written", proc)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+            self.assertEqual((proc.returncode, err), (0, b""))
+            if flag:
+                v = json.loads(out)
+                self.assertEqual((v["paths"], v["overlaps"]), (["src/"], [{"lane": "os/apps", "path": "src/"}]))
+            else:
+                self.assertEqual(out, b"")  # text mode says what it declared: no overlap, and nothing was read back
+
+    # review finding 6: hello gives the record this call wrote
+    def test_hello_gives_this_calls_record_not_a_later_writers(self):
+        proc = self.paused("after-hello", "hello", "codex", "--json", "--as", "os/apps", "--session", "s1")
+        try:
+            self.wait_paused("after-hello")
+            self.assertEqual(self.helio("hello", "claude", "--session", "s1", me="os/apps").returncode, 0)
+            out, err = self.resume("after-hello", proc)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        self.assertEqual((proc.returncode, err), (0, b""))
+        self.assertEqual(json.loads(out), {"lane": "os/apps", "agent": "codex", "repository": "", "session": "s1"})
+
+    # review finding 4: the folder as an absolute path by the rules of the system
+    def test_init_folder_is_resolved_by_the_rules_of_the_system(self):
+        def absolute(cwd, folder):
+            return subprocess.run([str(RACER), "--absolute", cwd, folder], capture_output=True, timeout=30)
+
+        for cwd, folder, want in (
+                ("/work/here", "store", "/work/here/store"), ("/work/here", "./a/./b/", "/work/here/a/./b"), ("/work/here", "/abs/store/", "/abs/store"),
+                ("/work/here", ".", "/work/here"), ("/work/here", "a:b", "/work/here/a:b"), ("/work/here", "\\x", "/work/here/\\x"),
+                ("C:\\work", "store", "C:\\work\\store"), ("C:\\work", "D:\\x\\y", "D:\\x\\y"), ("C:\\work", "D:/x", "D:/x"),
+                ("C:\\work", "\\x", "C:\\x"), ("C:\\work\\deep", "/x/y", "C:/x/y"[:2] + "/x/y"), ("C:\\work", "\\\\srv\\share\\s", "\\\\srv\\share\\s"),
+                ("C:\\work", "C:rel", "C:\\work\\rel"), ("c:\\work", "C:rel", "c:\\work\\rel"), ("\\\\srv\\share\\w", "\\x", "\\\\srv\\share\\x"),
+                ("C:\\work", "store\\", "C:\\work\\store"), ("C:\\work", ".\\a", "C:\\work\\a"), ("C:\\", "x", "C:\\x")):
+            r = absolute(cwd, folder)
+            self.assertEqual((r.returncode, r.stdout.decode().rstrip("\n")), (0, want), (cwd, folder, r.stderr))
+        for cwd, folder in (("C:\\work", "D:rel"), ("\\\\srv\\share\\w", "D:rel")):
+            r = absolute(cwd, folder)
+            self.assertEqual((r.returncode, r.stdout), (2, b""), (cwd, folder))
+        # a refused init gives exit 2 and no store: here a relative drive folder cannot occur on this host
+        r = subprocess.run([str(PROGRAM), "init", "--json", "--store", "elsewhere2"], capture_output=True, timeout=30, cwd=self.store)
+        self.assertEqual(self.value(r, 0), {"store": str(self.store / "elsewhere2")})
+
+    # review finding 9: a refusal while the words are read has the command's shape
+    def test_a_refusal_while_reading_the_words_has_the_commands_shape(self):
+        for words in (("take", "--bad"), ("--bad", "show"), ("tell", "--bad"), ("--bad",)):
+            v = self.jcall(*words, me="os/main", code=2)
+            self.assertEqual(set(v), {"error", "code"}, words)
+        self.assertEqual(set(self.jcall("archive", "--bad", me=None, code=2)), {"archived", "problems", "error", "code"})
+        self.assertEqual(set(self.jcall("check", "--bad", me=None, code=2)), {"ok", "problems", "error", "code"})
+        v = self.value(self.helio("help", "--bad", "--json", me=None), 2)
+        self.assertEqual(set(v), {"help", "error", "code"})
 
     # item 7: archive
     def test_archive_reports_what_this_call_moved(self):

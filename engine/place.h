@@ -54,7 +54,8 @@ p_result place_silent_us(const store *s, const place *here, const char *project,
 void place_owner(const place *p, const char *path, text *to);
 
 bool place_parse_session(const char *data, size_t length, session_info *out);
-s_result place_hello(store *s, const char *lane, const char *agent, const char *repository, const char *session);
+/* written, when given, is the record this call wrote (as read back from disk when it was verified). */
+s_result place_hello(store *s, const char *lane, const char *agent, const char *repository, const char *session, session_info *written);
 s_result place_session(store *s, const char *lane, const char *session, session_info *out);
 s_result place_session_repo(store *s, const char *lane, const char *session, const char *repository, session_info *out);
 /* The session's last sign of life in one repository, or in any when repository is empty. */
@@ -68,3 +69,5 @@ s_result place_busy(store *s, const char *project, const char *repository, const
 
 /* Root prefix length of an absolute path; sets *win_out when Windows separators apply. */
 size_t place_path_root_len(const char *path, bool *win_out);
+
+s_result place_absolute(text *out, const char *cwd, const char *folder, const char **why);

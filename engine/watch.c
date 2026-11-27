@@ -215,6 +215,40 @@ static bool meet(const char *a, size_t n, const char *b, size_t m) {
     return n == m || (n < m ? b[n] : a[m]) == '/';
 }
 
+/* Whether the newline-ended lines of list hold the n bytes at path as one of them. */
+static bool listed(const text *list, const char *path, size_t n) {
+    for (size_t at = 0; list->data && at < list->length;) {
+        size_t end = at;
+        while (end < list->length && list->data[end] != '\n') end++;
+        bool eq = end - at == n;
+        for (size_t i = 0; eq && i < n; i++) eq = list->data[at + i] == path[i];
+        if (eq) return true;
+        at = end + 1;
+    }
+    return false;
+}
+
+/* Every pair of a path of a and a path of b that meet, as the more specific of the two and once for each path, as
+   entries {"lane", "path"} appended to out (an array body). */
+static void overlap_entries(const char *a, const char *b, const char *lane, text *out) {
+    const char *from, *other;
+    size_t n, m;
+    text given = {0};
+    for (const char *at = a; (at = word(at, &from, &n)), n;)
+        for (const char *bt = b; (bt = word(bt, &other, &m)), m;) {
+            if (!meet(from, n, other, m)) continue;
+            const char *path = n > m ? from : other;
+            size_t k = n > m ? n : m;
+            if (listed(&given, path, k)) continue;
+            add_bytes(&given, path, k), add(&given, "\n");
+            if (out->length) add(out, ",");
+            json_list entry = json_object(out);
+            json_put_text(&entry, "lane", lane), json_put_bytes(&entry, "path", path, k);
+            json_object_end(&entry);
+        }
+    text_free(&given);
+}
+
 static bool overlap(const char *a, const char *b, text *which) {
     const char *from, *other;
     size_t n, m;
@@ -245,13 +279,8 @@ static bool other_lane(void *user, const char *name) {
         const char *at = data;
         for (; *at >= '0' && *at <= '9'; at++) when = when * 10 + (uint64_t)(*at - '0');
         if (*at == '\n' && when + 4ull * 3600 * 1000000 > l->now && overlap(l->paths, at + 1, &which)) {
-            add(l->said, them.data), add(l->said, " is also working on "), add(l->said, which.data ? which.data : "?"), add(l->said, "\n");
-            if (l->out) {
-                if (l->out->overlaps.length) add(&l->out->overlaps, ",");
-                json_list entry = json_object(&l->out->overlaps);
-                json_put_text(&entry, "lane", them.data), json_put_text(&entry, "path", which.data ? which.data : "?");
-                json_object_end(&entry);
-            }
+            if (l->said) add(l->said, them.data), add(l->said, " is also working on "), add(l->said, which.data ? which.data : "?"), add(l->said, "\n");
+            if (l->out) overlap_entries(l->paths, at + 1, them.data, &l->out->overlaps);
             add(&key, "overlap "), add_number(&key, l->now / 86400000000ull, 0), add(&key, " ");
             uint64_t hash = 14695981039346656037ull; /* a key is short and a path need not be */
             for (const char *c = which.data ? which.data : ""; *c; c++) hash = (hash ^ (unsigned char)*c) * 1099511628211ull;
@@ -283,21 +312,45 @@ s_result watch_working(store *s, const place *p, const char *me, const char *pat
         for (const char *c = me; *c; c++) add_bytes(&path, *c == '/' ? "+" : c, 1);
         add_number(&data, p_now(), 0), add(&data, "\n"), add(&data, line.data ? line.data : ""), add(&data, "\n"), add_number(&unique, p_tick(), 0);
         bool full = unspelled.failed || line.failed || folder.failed || path.failed || data.failed || unique.failed;
-        if (full || p_folder(folder.data) != P_OK || p_write(path.data, data.data, data.length, true, unique.data) != P_OK)
-            s->why = "the store cannot be written", result = S_DAMAGED;
+        p_result wrote = full || p_folder(folder.data) != P_OK ? P_FAILED : p_write(path.data, data.data, data.length, true, unique.data);
+        text stored = {0};
+        const char *declared = line.data ? line.data : "";
+        if (wrote == P_OK && s->pause) s->pause(s->pause_user, "working-written"); /* test pause: the file may change now */
+        if (wrote != P_OK && wrote != P_UNFLUSHED) s->why = "the store cannot be written", result = S_DAMAGED;
         else {
-            if (out) {
-                out->stored = true;
-                json_list a = json_array(&out->paths);
-                const char *from;
-                size_t n;
-                for (const char *at = line.data ? line.data : ""; (at = word(at, &from, &n)), n;) json_key(&a, NULL), json_string(&out->paths, from, n);
-                json_array_end(&a);
+            if (out) { /* for --json, what the store holds: the declaration just written, read back */
+                char *back = NULL;
+                size_t back_length = 0;
+                p_result rr = p_read(path.data, MOST_PATHS + 64, &back, &back_length);
+                const char *at = back;
+                while (rr == P_OK && *at >= '0' && *at <= '9') at++;
+                const char *end = rr == P_OK && *at == '\n' ? at + 1 : at;
+                while (rr == P_OK && *end && *end != '\n') end++;
+                if (rr != P_OK || *at != '\n' || at == back) s->why = "the declaration cannot be read back", result = S_DAMAGED;
+                else {
+                    add_bytes(&stored, at + 1, (size_t)(end - at - 1));
+                    const char *tail = end;
+                    if (stored.failed || *tail != '\n') s->why = "the declaration cannot be read back", result = S_DAMAGED;
+                    else {
+                        declared = stored.data ? stored.data : "";
+                        out->stored = true;
+                        json_list a = json_array(&out->paths);
+                        const char *from;
+                        size_t k;
+                        for (const char *w = declared; (w = word(w, &from, &k)), k;) json_key(&a, NULL), json_string(&out->paths, from, k);
+                        json_array_end(&a);
+                    }
+                }
+                p_free(back);
             }
-            look l = {s, p->project, me, line.data ? line.data : "", p_now(), said, S_OK, out};
-            if (p_list(folder.data, other_lane, &l) != P_OK) s->why = "the store cannot be read", result = S_DAMAGED;
-            else result = l.result;
+            if (result == S_OK) {
+                look l = {s, p->project, me, declared, p_now(), said, S_OK, out};
+                if (p_list(folder.data, other_lane, &l) != P_OK) s->why = "the store cannot be read", result = S_DAMAGED;
+                else result = l.result;
+                if (result == S_OK && wrote == P_UNFLUSHED) s->why = "the declaration was stored, but its folder could not be flushed", result = S_DAMAGED;
+            }
         }
+        text_free(&stored);
     }
     text_free(&line), text_free(&folder), text_free(&path), text_free(&data), text_free(&unique), text_free(&unspelled);
     return result;

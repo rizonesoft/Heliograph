@@ -813,8 +813,7 @@ s_result store_post(store *s, const message *m, const char *key, text *id) {
 /* Adds one link. S_NOTHING when someone else made that link first. */
 /* Writes the next step. With after, the job as that very step leaves it: the written text applied by store_apply_step,
    the replay's own rules, never a second copy of them. */
-static s_result add_link(store *s, const char *id, const job *now, actor me, const char *state, const char *note, bool *published,
-                         const message *m, job *after) {
+static s_result add_link(store *s, const char *id, const job *now, actor me, const char *state, const char *note, bool *published) {
     if (published) *published = false;
     if (now->links >= MOST_LINKS - 2 && !same(state, "done") && !same(state, "refused")) return say(s, S_REFUSED, "this job changed hands too often: close it and ask again");
     if (!session_ok(me.session)) return say(s, S_REFUSED, "the session name is invalid or too long");
@@ -831,13 +830,6 @@ static s_result add_link(store *s, const char *id, const job *now, actor me, con
         add(&out, "\nstate: "), add(&out, state), add(&out, "\nnote: "), add(&out, line.data ? line.data : ""), add(&out, "\nend: yes\n");
         bool full = out.failed || line.failed || name.failed;
         result = full ? say(s, S_DAMAGED, "out of memory") : make_ex(s, id, name.data, out.data, published);
-        if (result == S_OK && after && m) {
-            char *step = copy(out.data, out.length);
-            *after = *now;
-            if (!step || !store_apply_step(m, after, step)) result = say(s, S_DAMAGED, "the step written cannot be read back");
-            else after->links = now->links + 1; /* the replay counts the steps it applies */
-            p_free(step);
-        }
     }
     text_free(&out), text_free(&line), text_free(&name);
     return result;
@@ -882,6 +874,31 @@ static const char *objection(const message *m, const job *now, actor me, change 
     }
 }
 
+/* The job after the step this call published: that step is read back from its file and applied as a replay applies
+   it, so the reply describes what the store holds and not what was meant to be written. */
+static s_result read_back_step(store *s, const message *m, const job *now, job_change *jc) {
+    text name = {0};
+    link_name(&name, now->links);
+    char *data = NULL;
+    s_result r = name.failed ? say(s, S_DAMAGED, "out of memory") : event_of(s, m->id, name.data, &data);
+    text_free(&name);
+    if (r == S_NOTHING) {
+        s_result live = live_post(s, m->id);
+        return live == S_REFUSED ? say(s, S_REFUSED, "it was archived") : live != S_OK ? live : say(s, S_DAMAGED, "the step written cannot be found");
+    }
+    if (r != S_OK) {
+        p_free(data);
+        return r;
+    }
+    job after = *now;
+    bool ok = store_apply_step(m, &after, data);
+    p_free(data);
+    if (!ok) return say(s, S_DAMAGED, "the step written cannot be read back");
+    after.links = now->links + 1; /* the replay counts the steps it applies */
+    jc->has_job = true, jc->now = after;
+    return S_OK;
+}
+
 static s_result change_job(store *s, const char *id, actor me, change what, const char *note, job_change *jc) {
     static const char *const states[] = {"taken", "released", "done", "refused"};
     if (jc) *jc = (job_change){0};
@@ -897,15 +914,28 @@ static s_result change_job(store *s, const char *id, actor me, change what, cons
         result = say(s, S_REFUSED, "it was archived");
         job archived = {0};
         const char *why = s->why;
-        if (jc && is_job(&m) && store_job(s, &m, &archived) == S_OK) jc->has_job = true, jc->now = archived;
-        s->why = why;
+        s_result jr = is_job(&m) ? store_job(s, &m, &archived) : S_NOTHING;
+        if (jr == S_DAMAGED) result = jr; /* an archived chain that cannot be read is damage, not a refusal */
+        else {
+            if (jr == S_OK && jc) jc->has_job = true, jc->now = archived;
+            s->why = why;
+        }
     } else if (!is_job(&m)) result = say(s, S_REFUSED, "only a request or a handoff can be taken");
     if (result == S_OK) {
         /* Refuse if an archived terminal copy already exists; fail closed on archive I/O or parse errors (S_DAMAGED);
            allow ordinary in-progress archival (S_REFUSED = valid archived post without terminal links yet) to proceed. */
         s_result ar = archive_has_terminal_job(s->folder, id, NULL);
-        if (ar == S_OK) result = say(s, S_REFUSED, "it was archived");
-        else if (ar == S_DAMAGED) result = say(s, S_DAMAGED, "an archived job cannot be read");
+        if (ar == S_OK) {
+            result = say(s, S_REFUSED, "it was archived");
+            job closed = {0};
+            const char *why = s->why;
+            s_result jr = store_job(s, &m, &closed);
+            if (jr == S_DAMAGED) result = jr;
+            else {
+                if (jr == S_OK && jc) jc->has_job = true, jc->now = closed;
+                s->why = why;
+            }
+        } else if (ar == S_DAMAGED) result = say(s, S_DAMAGED, "an archived job cannot be read");
     }
     unsigned before = MOST_LINKS + 1;
     while (result == S_OK) {
@@ -923,8 +953,8 @@ static s_result change_job(store *s, const char *id, actor me, change what, cons
         } else {
             if (s->pause) s->pause(s->pause_user, "write");
             bool published = false;
-            job after = {0};
-            result = add_link(s, id, &now, me, states[what], note, &published, &m, jc ? &after : NULL);
+            result = add_link(s, id, &now, me, states[what], note, &published);
+            if (!published && result == S_REFUSED && jc) jc->has_job = true, jc->now = now; /* refused before the write: as it stands */
             if (published) {
                 if (s->pause) s->pause(s->pause_user, "after-write");
                 const char *write_why = s->why;
@@ -947,7 +977,7 @@ static s_result change_job(store *s, const char *id, actor me, change what, cons
                     s->why = write_why;
                 }
             }
-            if (result == S_OK && jc) jc->has_job = true, jc->now = after;
+            if (result == S_OK && jc) result = read_back_step(s, &m, &now, jc);
         }
         if (result != S_NOTHING) break;
         result = S_OK; /* the chain grew: decide again from the new end */

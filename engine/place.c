@@ -610,7 +610,7 @@ static p_result read_best_generation(const store *s, const char *base, bool *any
    p_create_excl. On P_EXISTS another writer won that slot, so we re-read the latest generation,
    merge monotonically, and retry. After publishing, the superseded generation is removed
    best-effort. */
-static s_result publish_session_key(store *s, const char *base, const char *ag, uint64_t order_floor, const char *rp, const char *ss) {
+static s_result publish_session_key(store *s, const char *base, const char *ag, uint64_t order_floor, const char *rp, const char *ss, session_info *written) {
     if (s->pause) s->pause(s->pause_user, "hello-write");
 
     for (int attempt = 0; attempt < MOST_CAS_ATTEMPTS; attempt++) {
@@ -680,6 +680,7 @@ static s_result publish_session_key(store *s, const char *base, const char *ag, 
                 text_free(&empty_sweep);
             }
             text_free(&next_path);
+            if (written) *written = chk_info; /* the generation this call wrote, as the verification read it back */
             if (cr == P_UNFLUSHED) return s->why = "the session was written, but its folder could not be flushed", S_DAMAGED;
             return S_OK;
         }
@@ -690,7 +691,8 @@ static s_result publish_session_key(store *s, const char *base, const char *ag, 
     return s->why = "the session cannot be announced", S_DAMAGED;
 }
 
-s_result place_hello(store *s, const char *lane, const char *agent, const char *repository, const char *session) {
+s_result place_hello(store *s, const char *lane, const char *agent, const char *repository, const char *session, session_info *written) {
+    if (written) *written = (session_info){0};
     if (!lane || !address_ok(lane, false)) return s->why = "say who you are: --as project/lane or HELIO_AS", S_REFUSED;
     if (!session_ok(session)) return s->why = "the session name is invalid or too long", S_REFUSED;
     if (repository && *repository && !repo_ok(repository)) return s->why = "the repository name is invalid or too long", S_REFUSED;
@@ -723,7 +725,8 @@ s_result place_hello(store *s, const char *lane, const char *agent, const char *
         }
         if (nr == S_OK) order_floor = named.order;
     }
-    s_result r = publish_session_key(s, base.data, ag, order_floor, rp, ss);
+    s_result r = publish_session_key(s, base.data, ag, order_floor, rp, ss, written);
+    if (written && r == S_OK) copy_str(written->lane, sizeof written->lane, lane);
     text_free(&base);
     return r;
 }
@@ -1145,4 +1148,42 @@ s_result place_busy(store *s, const char *project, const char *repository, const
     if (r != P_OK) return s->why = "the sessions folder cannot be read", S_DAMAGED;
     *busy = l.busy;
     return S_OK;
+}
+
+/* The folder as an absolute path from the working folder cwd, by the rules of the system cwd belongs to (a drive or a
+   share says Windows). Linux: only a leading "/" is rooted. Windows: "D:\x" and "\\srv\share" are rooted; "\x" takes the
+   drive (or share) of cwd; "D:x" is resolved against the working folder of drive D, which is known only when cwd is
+   on D, and is otherwise refused (S_REFUSED, why says so) rather than turned into a path that opens elsewhere. */
+s_result place_absolute(text *out, const char *cwd, const char *folder, const char **why) {
+    bool win = false;
+    size_t root = place_path_root_len(cwd, &win);
+    if (!root) return *why = "the working folder is not an absolute path", S_DAMAGED;
+    const char sep = win ? '\\' : '/';
+    bool letter = win && ((folder[0] >= 'A' && folder[0] <= 'Z') || (folder[0] >= 'a' && folder[0] <= 'z')) && folder[1] == ':';
+    bool rooted = win ? (letter && is_sep_for(folder[2], true)) || (is_sep_for(folder[0], true) && is_sep_for(folder[1], true)) : folder[0] == '/';
+    if (rooted) add(out, folder);
+    else if (win && letter) {
+        bool here = ((cwd[0] >= 'A' && cwd[0] <= 'Z') || (cwd[0] >= 'a' && cwd[0] <= 'z')) && cwd[1] == ':' && ascii_eq_ci(cwd[0], folder[0]);
+        if (!here) return *why = "that folder is relative to the working folder of another drive: give its full path", S_REFUSED;
+        add(out, cwd);
+        if (!is_sep_for(cwd[len(cwd) - 1], win)) add_bytes(out, &sep, 1);
+        add(out, folder + 2);
+    } else if (win && is_sep_for(folder[0], true)) {
+        size_t keep = root;
+        while (keep > 2 && is_sep_for(cwd[keep - 1], true)) keep--; /* "C:" or "\\srv\share" */
+        add_bytes(out, cwd, keep), add(out, folder);
+    } else {
+        add(out, cwd);
+        if (!is_sep_for(cwd[len(cwd) - 1], win)) add_bytes(out, &sep, 1);
+        for (const char *c = folder; *c == '.' && is_sep_for(c[1], win);) folder = c += 2; /* a leading ./ adds nothing */
+        if (!same(folder, ".")) add(out, folder);
+    }
+    size_t floor = place_path_root_len(out->data ? out->data : "", NULL);
+    for (;;) { /* no trailing separator and no trailing "." step, never cutting into the root */
+        size_t n = out->length;
+        if (n > floor && is_sep_for(out->data[n - 1], win)) out->data[--out->length] = 0;
+        else if (n > floor + 1 && out->data[n - 1] == '.' && is_sep_for(out->data[n - 2], win)) out->length -= 2, out->data[out->length] = 0;
+        else break;
+    }
+    return out->failed ? (*why = "out of memory", S_DAMAGED) : S_OK;
 }

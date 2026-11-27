@@ -283,6 +283,8 @@ static s_result line_silent_ex(text *out, store *s, const message *m, const plac
     return jr;
 }
 
+static const char *const STATE_NAMES[] = {"open", "taken", "done", "refused"}; /* indexed by job_state */
+
 /* One message as the JSON reading commands give it: the stored fields, the job's (null when it has none, or when
    its steps cannot be read: "damaged" says so and nothing is guessed), and what this reader and the clock add. */
 typedef struct {
@@ -307,7 +309,6 @@ static void add_due(text *out, uint64_t us) {
 }
 
 static void json_message(json_list *o, const row *r) {
-    static const char *const states[] = {"open", "taken", "done", "refused"};
     const message *m = r->m;
     json_put_text(o, "id", or_empty(m->id)), json_put_text(o, "time", or_empty(m->time));
     json_put_text(o, "from", or_empty(m->from)), json_put_text(o, "to", or_empty(m->to));
@@ -322,7 +323,7 @@ static void json_message(json_list *o, const row *r) {
     if (is_job(m)) {
         const job *j = r->now;
         bool known = j && !r->damaged;
-        json_put_text(o, "state", known ? states[j->state] : NULL);
+        json_put_text(o, "state", known ? STATE_NAMES[j->state] : NULL);
         json_put_text(o, "taker", known && *j->taker ? j->taker : NULL);
         json_put_text(o, "closed_by", known && *j->closer ? j->closer : NULL);
         json_put_text(o, "session", known && *j->taker ? j->taker_session : NULL);
@@ -877,8 +878,6 @@ maybe_ack_alert:
     return 0;
 }
 
-static const char *const STATE_NAMES[] = {"open", "taken", "done", "refused"};
-
 /* The reply of a landed mark: the normalized commit and every commit on the job as the store holds them now, live and
    archived, read afresh (a mark written by this call is not in the listing the store was opened with). */
 static int landed_reply(const char *folder, const char *id, const char *commit) {
@@ -940,7 +939,7 @@ static bool agent_ok(const char *agent) {
 
 static s_result announce_session(store *s, const options *o, const char *agent) {
     const char *repo = o->here.found ? o->here.repository : "";
-    return place_hello(s, o->me, agent, repo, o->session);
+    return place_hello(s, o->me, agent, repo, o->session, NULL);
 }
 
 static void announce_best_effort(store *s, const options *o, const char *agent) {
@@ -1028,27 +1027,6 @@ static bool fail_wsl_store(const char *folder) {
     return true;
 }
 
-/* The folder as an absolute path, so a script can open the same store from anywhere. */
-static bool absolute_folder(text *out, const char *folder) {
-    bool rooted = folder[0] == '/' || folder[0] == '\\' || (folder[0] && folder[1] == ':');
-    if (!rooted) {
-        char *here = NULL;
-        if (p_cwd(&here) != P_OK || !here) return false;
-        /* The working folder says which system this is: a drive or a UNC share is Windows, joined with a backslash. */
-        bool windows = (here[0] && here[1] == ':') || (here[0] == '\\' && here[1] == '\\');
-        add(out, here), add(out, windows ? "\\" : "/"), p_free(here);
-        for (const char *c = folder; *c == '.' && (c[1] == '/' || c[1] == '\\');) folder = c += 2; /* a leading ./ adds nothing */
-    }
-    if (!same(folder, ".")) add(out, folder);
-    for (;;) { /* no trailing separator and no trailing "/." step */
-        size_t n = out->length;
-        if (n > 1 && (out->data[n - 1] == '/' || out->data[n - 1] == '\\')) out->data[--out->length] = 0;
-        else if (n > 2 && out->data[n - 1] == '.' && (out->data[n - 2] == '/' || out->data[n - 2] == '\\')) out->length -= 2, out->data[out->length] = 0;
-        else break;
-    }
-    return !out->failed;
-}
-
 static int init(const char *folder, bool from_default) {
     text at = {0};
     p_result result = p_folder(folder);
@@ -1057,10 +1035,15 @@ static int init(const char *folder, bool from_default) {
     text_free(&at);
     if (result == P_OK) {
         if (reply.on) {
+            /* The folder as an absolute path, so a script can open the same store from anywhere. */
             text abs = {0};
-            if (!absolute_folder(&abs, folder)) {
+            char *here = NULL;
+            const char *why = "the store cannot be made";
+            s_result ar = p_cwd(&here) == P_OK && here ? place_absolute(&abs, here, folder, &why) : S_DAMAGED;
+            p_free(here);
+            if (ar != S_OK) {
                 text_free(&abs);
-                return fail("the store cannot be made", 3);
+                return fail(why, ar == S_REFUSED ? 2 : 3);
             }
             json_put_text(fields(), "store", abs.data);
             text_free(&abs);
@@ -1235,15 +1218,17 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
     case 10: {
         text said = {0};
         working_out declared = {0};
-        result = watch_working(&s, &o->here, o->me, o->words[1], &said, &declared);
+        result = watch_working(&s, &o->here, o->me, o->words[1], reply.on ? NULL : &said, reply.on ? &declared : NULL);
         if (reply.on) {
-            text_free(&said);
             if (declared.stored) { /* the stored declaration and the overlaps found, also when a notification then failed */
-                json_list *f = fields();
-                json_put_text(f, "lane", o->me);
-                json_key(f, "paths"), add(f->out, declared.paths.data ? declared.paths.data : "[]");
-                json_key(f, "overlaps"), add(f->out, "["), add(f->out, declared.overlaps.data ? declared.overlaps.data : ""), add(f->out, "]");
-                if (declared.paths.failed || declared.overlaps.failed) result = S_DAMAGED, s.why = "out of memory";
+                if (declared.paths.failed || declared.overlaps.failed) { /* a failed buffer never reaches the reply */
+                    result = S_DAMAGED, s.why = "out of memory";
+                } else {
+                    json_list *f = fields();
+                    json_put_text(f, "lane", o->me);
+                    json_key(f, "paths"), add(f->out, declared.paths.data ? declared.paths.data : "[]");
+                    json_key(f, "overlaps"), add(f->out, "["), add(f->out, declared.overlaps.data ? declared.overlaps.data : ""), add(f->out, "]");
+                }
             }
         } else print(&said);
         text_free(&declared.paths), text_free(&declared.overlaps);
@@ -1260,21 +1245,19 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
         code = result == S_OK ? post(&s, o, post_kinds[which - 11], dest, repo, "") : fail(s.why, result);
         break;
     }
-    case 15:
-        result = announce_session(&s, o, o->words[1]);
+    case 15: {
+        /* With --json the reply is the record this call wrote, as the write verified it, never a concurrent writer's. */
+        session_info record = {0};
+        result = place_hello(&s, o->me, o->words[1], o->here.found ? o->here.repository : "", o->session, reply.on ? &record : NULL);
+        if (s.pause) s.pause(s.pause_user, "after-hello"); /* test pause: a peer may announce now; the reply must stay this call's */
         if (result == S_OK && reply.on) {
-            /* The record this call wrote, read back for the lane, repository and session it names. */
-            session_info record = {0};
-            const char *repo = o->here.found ? o->here.repository : "";
-            s_result rr = place_session_repo(&s, o->me, o->session, repo, &record);
-            if (rr == S_OK) {
-                json_list *f = fields();
-                json_put_text(f, "lane", record.lane), json_put_text(f, "agent", record.agent);
-                json_put_text(f, "repository", record.repository), json_put_text(f, "session", record.session);
-            } else result = rr == S_NOTHING ? (s.why = "the session record cannot be found", S_DAMAGED) : rr;
+            json_list *f = fields();
+            json_put_text(f, "lane", record.lane), json_put_text(f, "agent", record.agent);
+            json_put_text(f, "repository", record.repository), json_put_text(f, "session", record.session);
         }
         code = result == S_OK ? 0 : fail(s.why, result);
         break;
+    }
     case 16:
         result = store_landed(&s, o->words[1], o->words[2], me);
         code = result == S_OK ? 0 : fail(s.why, result);
@@ -1282,8 +1265,9 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
         break;
     default:
         job_change changed = {0};
-        result = which == 4 ? store_take(&s, o->words[1], me, &changed) : which == 5 ? store_release(&s, o->words[1], me, &changed)
-                                                                                    : store_end(&s, o->words[1], me, which == 6, note, &changed);
+        job_change *wanted = reply.on ? &changed : NULL; /* the read-back is for --json only */
+        result = which == 4 ? store_take(&s, o->words[1], me, wanted) : which == 5 ? store_release(&s, o->words[1], me, wanted)
+                                                                                  : store_end(&s, o->words[1], me, which == 6, note, wanted);
         if (reply.on && changed.has_job) {
             json_list *f = fields();
             if (result == S_OK) { /* the job after the step this call wrote */
@@ -1311,9 +1295,35 @@ static bool json_flag(int count, char **args) {
     return false;
 }
 
+/* The command word of a call, found before the words are read in full, so that a refusal while reading them already
+   has the command's shape: the first word that is not an option or an option's value ("inbox" when there is none). */
+static const char *command_word(int count, char **args) {
+    static const char *const valued[] = {"--as", "--session", "--for-session", "--key", "--due", "--about", "--store"};
+    for (int i = 1; i < count; i++) {
+        bool takes = false;
+        for (size_t k = 0; k < sizeof valued / sizeof *valued; k++) takes = takes || same(args[i], valued[k]);
+        if (takes) i++;
+        else if (!starts(args[i], "--")) return args[i];
+    }
+    return "inbox";
+}
+
+/* The key of the one value of a call to this command before its own shape is known: help and the hook have theirs,
+   the commands with fields of their own none, any other word the plain text. */
+static const char *reply_key_for(const char *command) {
+    static const char *const structured[] = {"inbox", "log", "check", "show", "take", "release", "done", "refuse", "landed", "hello",
+                                             "init", "working", "archive", "ask", "hand", "tell", "find", "answer"};
+    if (same(command, "help")) return "help";
+    if (same(command, "hook")) return "context";
+    for (size_t i = 0; i < sizeof structured / sizeof *structured; i++)
+        if (same(command, structured[i])) return NULL;
+    return "text";
+}
+
 int helio_paused(int count, char **args, void (*pause)(void *user, const char *stage), void *user) {
     options o;
     reply = (typeof(reply)){.on = json_flag(count, args), .key = "text"};
+    if (reply.on) reply.key = reply_key_for(command_word(count, args));
     int code = parse(&o, count, args) ? run(&o, pause, user) : fail(o.why, 2);
     bool archiving = o.count && same(o.words[0], "archive");
     if (reply.on && o.count && (archiving || same(o.words[0], "check")) && reply.error && !reply.fields.length) {

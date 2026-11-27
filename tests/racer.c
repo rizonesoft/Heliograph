@@ -272,6 +272,23 @@ int racer(int count, char **args) {
         text_free(&out);
         return good ? 0 : 3;
     }
+    /* --absolute <working folder> <folder>: the folder as an absolute path from that working folder (exit 2, and the
+       reason on standard error, when it cannot be resolved), so Windows rules are tested on any host. */
+    if (count >= 4 && same(args[1], "--absolute")) {
+        text out = {0};
+        const char *why = NULL;
+        s_result r = place_absolute(&out, args[2], args[3], &why);
+        if (r != S_OK) {
+            p_error(why ? why : "failed");
+            p_error("\n");
+            text_free(&out);
+            return r == S_REFUSED ? 2 : 3;
+        }
+        add(&out, "\n");
+        bool good = !out.failed && p_print(out.data);
+        text_free(&out);
+        return good ? 0 : 3;
+    }
     /* --json-escape: the JSON string of the bytes on stdin, and a newline. */
     if (count >= 2 && same(args[1], "--json-escape")) {
         char *in = NULL;
