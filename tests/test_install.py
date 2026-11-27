@@ -5565,6 +5565,31 @@ class TestWinLaunch(unittest.TestCase):
                     else:
                         self.assertEqual(rc, 1)
 
+    # The direct Windows launches of this file that change state and so start once, each with what it does. Every
+    # other launch through win_start is a probe, a read, a cleanup or a fixture step with a stable name.
+    SINGLE_START = {
+        "check_win_foreign": "checks the foreign files survived, then deletes them",
+        "bad_marker_helper": "plants a damaged phase marker",
+        "crash_helper": "crashes a Windows install at a boundary",
+        "plant_win_foreign": "plants foreign temporary files",
+    }
+
+    def test_every_fixture_launch_declares_its_retry_by_what_it_does(self):
+        import ast
+        src = Path(__file__).read_text(encoding="utf-8")
+        calls = [n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "win_start"
+                 and not (n.args and isinstance(n.args[0], ast.Name))]
+        self.assertGreaterEqual(len(calls), 17)
+        found = set()
+        for call in calls:
+            argv = ast.get_source_segment(src, call.args[0])
+            declared = next(k.value.value for k in call.keywords if k.arg == "repeatable")
+            once = [name for name in self.SINGLE_START if name in argv]
+            found.update(once)
+            with self.subTest(line=call.lineno):
+                self.assertEqual(declared, not once, f"line {call.lineno}: {argv[:80]}")
+        self.assertEqual(found, set(self.SINGLE_START), "a single-start step listed here is no longer launched")
+
     def test_the_launcher_ships_with_the_installer(self):
         with tempfile.TemporaryDirectory() as tmp:
             tools = Path(tmp) / "tools"
