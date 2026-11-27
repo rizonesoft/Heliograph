@@ -877,6 +877,33 @@ maybe_ack_alert:
     return 0;
 }
 
+static const char *const STATE_NAMES[] = {"open", "taken", "done", "refused"};
+
+/* The reply of a landed mark: the normalized commit and every commit on the job as the store holds them now, live and
+   archived, read afresh (a mark written by this call is not in the listing the store was opened with). */
+static int landed_reply(const char *folder, const char *id, const char *commit) {
+    char norm[65];
+    if (!store_normalize_commit(commit, norm)) return fail("a commit must be 7 to 64 hexadecimal digits", 2);
+    json_list *f = fields();
+    json_put_text(f, "id", id), json_put_text(f, "commit", norm);
+    store fresh;
+    text array = {0};
+    bool good = false;
+    if (store_open(&fresh, folder) == S_OK) {
+        message m = {0};
+        job now = {0};
+        if (store_message(&fresh, id, &m) == S_OK) {
+            good = store_job(&fresh, &m, &now) == S_OK && store_landed_array(&fresh, &m, &now, &array) == S_OK && !array.failed;
+            message_free(&m);
+        }
+    }
+    store_close(&fresh);
+    json_key(f, "landed");
+    add(f->out, good ? array.data : "null");
+    text_free(&array);
+    return good ? 0 : fail("the commits on the job cannot be read", 3);
+}
+
 static int post(store *s, options *o, const char *kind, const char *to, const char *repository, const char *re) {
     char *body = NULL;
     size_t length = 0;
@@ -897,6 +924,11 @@ static int post(store *s, options *o, const char *kind, const char *to, const ch
     if (result != S_OK) {
         text_free(&id);
         return fail(s->why, result);
+    }
+    if (reply.on) {
+        json_put_text(fields(), "id", id.data);
+        text_free(&id);
+        return 0;
     }
     add(&id, "\n");
     return print(&id) ? 0 : fail("it was sent, but its id cannot be written", 3);
@@ -996,13 +1028,43 @@ static bool fail_wsl_store(const char *folder) {
     return true;
 }
 
+/* The folder as an absolute path, so a script can open the same store from anywhere. */
+static bool absolute_folder(text *out, const char *folder) {
+    bool rooted = folder[0] == '/' || folder[0] == '\\' || (folder[0] && folder[1] == ':');
+    if (!rooted) {
+        char *here = NULL;
+        if (p_cwd(&here) != P_OK || !here) return false;
+        add(out, here), add(out, "/"), p_free(here);
+        for (const char *c = folder; *c == '.' && c[1] == '/';) folder = c += 2; /* a leading ./ adds nothing */
+    }
+    if (!same(folder, ".")) add(out, folder);
+    for (;;) { /* no trailing separator and no trailing "/." step */
+        size_t n = out->length;
+        if (n > 1 && (out->data[n - 1] == '/' || out->data[n - 1] == '\\')) out->data[--out->length] = 0;
+        else if (n > 2 && out->data[n - 1] == '.' && out->data[n - 2] == '/') out->length -= 2, out->data[out->length] = 0;
+        else break;
+    }
+    return !out->failed;
+}
+
 static int init(const char *folder, bool from_default) {
     text at = {0};
     p_result result = p_folder(folder);
     add(&at, folder), add(&at, "/messages");
     if (result == P_OK) result = at.failed ? P_FAILED : p_folder(at.data);
     text_free(&at);
-    if (result == P_OK) return 0;
+    if (result == P_OK) {
+        if (reply.on) {
+            text abs = {0};
+            if (!absolute_folder(&abs, folder)) {
+                text_free(&abs);
+                return fail("the store cannot be made", 3);
+            }
+            json_put_text(fields(), "store", abs.data);
+            text_free(&abs);
+        }
+        return 0;
+    }
     if (from_default && fail_wsl_store(folder)) return 3;
     return fail("the store cannot be made", 3);
 }
@@ -1010,7 +1072,10 @@ static int init(const char *folder, bool from_default) {
 static int run(options *o, void (*pause)(void *user, const char *stage), void *pause_user) {
     archive_pauses(pause, pause_user);
     const char *command = o->count ? o->words[0] : "inbox";
-    if (same(command, "inbox") || same(command, "log") || same(command, "check") || same(command, "show")) reply.key = NULL;
+    static const char *const structured[] = {"inbox", "log", "check", "show", "take", "release", "done", "refuse", "landed", "hello",
+                                             "init", "working", "archive", "ask", "hand", "tell", "find", "answer"};
+    for (size_t i = 0; i < sizeof structured / sizeof *structured; i++)
+        if (same(command, structured[i])) reply.key = NULL;
     if (same(command, "help")) {
         if (o->for_session_flag) return fail("--for-session is only for sending a message", 2);
         reply.key = "help";
@@ -1044,14 +1109,26 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
         size_t moved = 0;
         text report = {0};
         s_result ar = archive_store(o->folder, 0, &moved, &report, pause, pause_user);
-        if (report.length && !report.failed) {
-            if (reply.on) fail(report.data, 0); /* a warning inside the reply, never a line on stderr */
-            else p_error(report.data);
-        }
+        if (reply.on) {
+            /* One authoritative problems array, an entry for each line of the report, and the posts this call moved. */
+            json_list *f = fields();
+            reply.own_problems = true;
+            json_put_number(f, "archived", (uint64_t)moved);
+            json_key(f, "problems");
+            json_list a = json_array(f->out);
+            for (const char *at = report.data ? report.data : ""; *at;) {
+                size_t n = 0;
+                while (at[n] && at[n] != '\n') n++;
+                if (n) json_key(&a, NULL), json_string(f->out, at, n);
+                at += n + (at[n] ? 1 : 0);
+            }
+            json_array_end(&a);
+        } else if (report.length && !report.failed) p_error(report.data);
         text_free(&report);
         int rc;
         if (ar == S_DAMAGED) rc = fail("archive stopped with errors", 3);
         else if (ar == S_NOTHING) rc = 1;
+        else if (reply.on) rc = 0;
         else {
             text out = {0};
             add_number(&out, (uint64_t)moved, 0), add(&out, " archived\n");
@@ -1155,8 +1232,19 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
     }
     case 10: {
         text said = {0};
-        result = watch_working(&s, &o->here, o->me, o->words[1], &said);
-        print(&said);
+        working_out declared = {0};
+        result = watch_working(&s, &o->here, o->me, o->words[1], &said, &declared);
+        if (reply.on) {
+            text_free(&said);
+            if (declared.stored) { /* the stored declaration and the overlaps found, also when a notification then failed */
+                json_list *f = fields();
+                json_put_text(f, "lane", o->me);
+                json_key(f, "paths"), add(f->out, declared.paths.data ? declared.paths.data : "[]");
+                json_key(f, "overlaps"), add(f->out, "["), add(f->out, declared.overlaps.data ? declared.overlaps.data : ""), add(f->out, "]");
+                if (declared.paths.failed || declared.overlaps.failed) result = S_DAMAGED, s.why = "out of memory";
+            }
+        } else print(&said);
+        text_free(&declared.paths), text_free(&declared.overlaps);
         code = result == S_OK ? 0 : fail(s.why, result);
         break;
     }
@@ -1172,15 +1260,36 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
     }
     case 15:
         result = announce_session(&s, o, o->words[1]);
+        if (result == S_OK && reply.on) {
+            /* The record this call wrote, read back for the lane, repository and session it names. */
+            session_info record = {0};
+            const char *repo = o->here.found ? o->here.repository : "";
+            s_result rr = place_session_repo(&s, o->me, o->session, repo, &record);
+            if (rr == S_OK) {
+                json_list *f = fields();
+                json_put_text(f, "lane", record.lane), json_put_text(f, "agent", record.agent);
+                json_put_text(f, "repository", record.repository), json_put_text(f, "session", record.session);
+            } else result = rr == S_NOTHING ? (s.why = "the session record cannot be found", S_DAMAGED) : rr;
+        }
         code = result == S_OK ? 0 : fail(s.why, result);
         break;
     case 16:
         result = store_landed(&s, o->words[1], o->words[2], me);
         code = result == S_OK ? 0 : fail(s.why, result);
+        if (result == S_OK && reply.on) code = landed_reply(o->folder, o->words[1], o->words[2]);
         break;
     default:
-        result = which == 4 ? store_take(&s, o->words[1], me) : which == 5 ? store_release(&s, o->words[1], me)
-                                                                           : store_end(&s, o->words[1], me, which == 6, note);
+        job_change changed = {0};
+        result = which == 4 ? store_take(&s, o->words[1], me, &changed) : which == 5 ? store_release(&s, o->words[1], me, &changed)
+                                                                                    : store_end(&s, o->words[1], me, which == 6, note, &changed);
+        if (reply.on && changed.has_job) {
+            json_list *f = fields();
+            if (result == S_OK) { /* the job after the step this call wrote */
+                json_put_text(f, "id", o->words[1]), json_put_text(f, "state", STATE_NAMES[changed.now.state]);
+                json_put_text(f, "taker", *changed.now.taker ? changed.now.taker : NULL);
+                json_put_text(f, "closed_by", *changed.now.closer ? changed.now.closer : NULL);
+            } else json_put_text(f, "state", STATE_NAMES[changed.now.state]); /* refused: the state as it stands */
+        }
         code = result == S_OK ? 0 : fail(s.why, result);
     }
     if (!announce_first && !announced && which != 8 && which != 15 && address_ok(o->me, false)) announce_best_effort(&s, o, "");
@@ -1204,11 +1313,14 @@ int helio_paused(int count, char **args, void (*pause)(void *user, const char *s
     options o;
     reply = (typeof(reply)){.on = json_flag(count, args), .key = "text"};
     int code = parse(&o, count, args) ? run(&o, pause, user) : fail(o.why, 2);
-    if (reply.on && o.count && same(o.words[0], "check") && reply.error && !reply.fields.length) {
-        /* check gives ok and problems on every path: a call that failed before it could look reports itself as the problem. */
+    bool archiving = o.count && same(o.words[0], "archive");
+    if (reply.on && o.count && (archiving || same(o.words[0], "check")) && reply.error && !reply.fields.length) {
+        /* check and archive give their problems on every path: a call that failed before it could look reports itself as the problem. */
         json_list *f = fields();
         reply.key = NULL, reply.own_problems = true;
-        json_put_bool(f, "ok", false), json_key(f, "problems"), add(f->out, "["), add(f->out, reply.problems.data ? reply.problems.data : ""), add(f->out, "]");
+        if (archiving) json_put_number(f, "archived", 0);
+        else json_put_bool(f, "ok", false);
+        json_key(f, "problems"), add(f->out, "["), add(f->out, reply.problems.data ? reply.problems.data : ""), add(f->out, "]");
     }
     if (reply.on && !reply_send() && code < 3) code = 3;
     text_free(&reply.body), text_free(&reply.warnings), text_free(&reply.problems), text_free(&reply.fields), p_free(reply.error);

@@ -1,3 +1,4 @@
+#include "json.h"
 #include "watch.h"
 #include "archive.h"
 
@@ -223,7 +224,7 @@ static bool overlap(const char *a, const char *b, text *which) {
     return false;
 }
 
-typedef struct { store *s; const char *project, *me, *paths; uint64_t now; text *said; s_result result; } look;
+typedef struct { store *s; const char *project, *me, *paths; uint64_t now; text *said; s_result result; working_out *out; } look;
 
 static bool other_lane(void *user, const char *name) {
     look *l = user;
@@ -245,6 +246,12 @@ static bool other_lane(void *user, const char *name) {
         for (; *at >= '0' && *at <= '9'; at++) when = when * 10 + (uint64_t)(*at - '0');
         if (*at == '\n' && when + 4ull * 3600 * 1000000 > l->now && overlap(l->paths, at + 1, &which)) {
             add(l->said, them.data), add(l->said, " is also working on "), add(l->said, which.data ? which.data : "?"), add(l->said, "\n");
+            if (l->out) {
+                if (l->out->overlaps.length) add(&l->out->overlaps, ",");
+                json_list entry = json_object(&l->out->overlaps);
+                json_put_text(&entry, "lane", them.data), json_put_text(&entry, "path", which.data ? which.data : "?");
+                json_object_end(&entry);
+            }
             add(&key, "overlap "), add_number(&key, l->now / 86400000000ull, 0), add(&key, " ");
             uint64_t hash = 14695981039346656037ull; /* a key is short and a path need not be */
             for (const char *c = which.data ? which.data : ""; *c; c++) hash = (hash ^ (unsigned char)*c) * 1099511628211ull;
@@ -261,7 +268,7 @@ static bool other_lane(void *user, const char *name) {
     return true;
 }
 
-s_result watch_working(store *s, const place *p, const char *me, const char *paths, text *said) {
+s_result watch_working(store *s, const place *p, const char *me, const char *paths, text *said, working_out *out) {
     if (!p->found) return s->why = "there is no helio.conf here, so the paths have no project", S_REFUSED;
     text line = {0}, folder = {0}, path = {0}, data = {0}, unique = {0}, unspelled = {0};
     clean(&unspelled, paths, true);
@@ -279,7 +286,15 @@ s_result watch_working(store *s, const place *p, const char *me, const char *pat
         if (full || p_folder(folder.data) != P_OK || p_write(path.data, data.data, data.length, true, unique.data) != P_OK)
             s->why = "the store cannot be written", result = S_DAMAGED;
         else {
-            look l = {s, p->project, me, line.data ? line.data : "", p_now(), said, S_OK};
+            if (out) {
+                out->stored = true;
+                json_list a = json_array(&out->paths);
+                const char *from;
+                size_t n;
+                for (const char *at = line.data ? line.data : ""; (at = word(at, &from, &n)), n;) json_key(&a, NULL), json_string(&out->paths, from, n);
+                json_array_end(&a);
+            }
+            look l = {s, p->project, me, line.data ? line.data : "", p_now(), said, S_OK, out};
             if (p_list(folder.data, other_lane, &l) != P_OK) s->why = "the store cannot be read", result = S_DAMAGED;
             else result = l.result;
         }

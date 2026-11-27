@@ -52,9 +52,16 @@ void message_free(message *m);
 
 /* With a key, sending the same again gives the first message and no second one. */
 s_result store_post(store *s, const message *m, const char *key, text *id);
-s_result store_take(store *s, const char *id, actor me);
-s_result store_release(store *s, const char *id, actor me);
-s_result store_end(store *s, const char *id, actor me, bool done, const char *note);
+/* What a job change tells its caller: the job as it is after the step this call wrote (a later step of a peer is not
+   described), or, when the change was refused, as it stands. has_job is false when no job was read (an id the caller
+   cannot see, a message that is not a job, a chain that cannot be read). jc may be NULL. */
+typedef struct job_change {
+    bool has_job;
+    job now;
+} job_change;
+s_result store_take(store *s, const char *id, actor me, job_change *jc);
+s_result store_release(store *s, const char *id, actor me, job_change *jc);
+s_result store_end(store *s, const char *id, actor me, bool done, const char *note, job_change *jc);
 s_result store_landed(store *s, const char *id, const char *commit, actor me);
 bool store_normalize_commit(const char *in, char out[65]); /* 7..64 hex digits -> lowercase */
 bool store_valid_landed_event(const char *ev);             /* landed.<7..64 lowercase hex> */

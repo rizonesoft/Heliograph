@@ -811,7 +811,10 @@ s_result store_post(store *s, const message *m, const char *key, text *id) {
 }
 
 /* Adds one link. S_NOTHING when someone else made that link first. */
-static s_result add_link(store *s, const char *id, const job *now, actor me, const char *state, const char *note, bool *published) {
+/* Writes the next step. With after, the job as that very step leaves it: the written text applied by store_apply_step,
+   the replay's own rules, never a second copy of them. */
+static s_result add_link(store *s, const char *id, const job *now, actor me, const char *state, const char *note, bool *published,
+                         const message *m, job *after) {
     if (published) *published = false;
     if (now->links >= MOST_LINKS - 2 && !same(state, "done") && !same(state, "refused")) return say(s, S_REFUSED, "this job changed hands too often: close it and ask again");
     if (!session_ok(me.session)) return say(s, S_REFUSED, "the session name is invalid or too long");
@@ -828,6 +831,13 @@ static s_result add_link(store *s, const char *id, const job *now, actor me, con
         add(&out, "\nstate: "), add(&out, state), add(&out, "\nnote: "), add(&out, line.data ? line.data : ""), add(&out, "\nend: yes\n");
         bool full = out.failed || line.failed || name.failed;
         result = full ? say(s, S_DAMAGED, "out of memory") : make_ex(s, id, name.data, out.data, published);
+        if (result == S_OK && after && m) {
+            char *step = copy(out.data, out.length);
+            *after = *now;
+            if (!step || !store_apply_step(m, after, step)) result = say(s, S_DAMAGED, "the step written cannot be read back");
+            else after->links = now->links + 1; /* the replay counts the steps it applies */
+            p_free(step);
+        }
     }
     text_free(&out), text_free(&line), text_free(&name);
     return result;
@@ -872,8 +882,9 @@ static const char *objection(const message *m, const job *now, actor me, change 
     }
 }
 
-static s_result change_job(store *s, const char *id, actor me, change what, const char *note) {
+static s_result change_job(store *s, const char *id, actor me, change what, const char *note, job_change *jc) {
     static const char *const states[] = {"taken", "released", "done", "refused"};
+    if (jc) *jc = (job_change){0};
     if (!address_ok(me.lane, false)) return say(s, S_REFUSED, "say who you are: --as project/lane");
     message m;
     s_result result = store_message(s, id, &m);
@@ -882,8 +893,13 @@ static s_result change_job(store *s, const char *id, actor me, change what, cons
         message_free(&m);
         return say(s, S_REFUSED, "there is no such message");
     }
-    if (m.archived) result = say(s, S_REFUSED, "it was archived");
-    else if (!is_job(&m)) result = say(s, S_REFUSED, "only a request or a handoff can be taken");
+    if (m.archived) {
+        result = say(s, S_REFUSED, "it was archived");
+        job archived = {0};
+        const char *why = s->why;
+        if (jc && is_job(&m) && store_job(s, &m, &archived) == S_OK) jc->has_job = true, jc->now = archived;
+        s->why = why;
+    } else if (!is_job(&m)) result = say(s, S_REFUSED, "only a request or a handoff can be taken");
     if (result == S_OK) {
         /* Refuse if an archived terminal copy already exists; fail closed on archive I/O or parse errors (S_DAMAGED);
            allow ordinary in-progress archival (S_REFUSED = valid archived post without terminal links yet) to proceed. */
@@ -903,10 +919,12 @@ static s_result change_job(store *s, const char *id, actor me, change what, cons
         const char *why = objection(&m, &now, me, what);
         if (why) {
             result = say(s, S_REFUSED, why);
+            if (jc) jc->has_job = true, jc->now = now;
         } else {
             if (s->pause) s->pause(s->pause_user, "write");
             bool published = false;
-            result = add_link(s, id, &now, me, states[what], note, &published);
+            job after = {0};
+            result = add_link(s, id, &now, me, states[what], note, &published, &m, jc ? &after : NULL);
             if (published) {
                 if (s->pause) s->pause(s->pause_user, "after-write");
                 const char *write_why = s->why;
@@ -929,6 +947,7 @@ static s_result change_job(store *s, const char *id, actor me, change what, cons
                     s->why = write_why;
                 }
             }
+            if (result == S_OK && jc) jc->has_job = true, jc->now = after;
         }
         if (result != S_NOTHING) break;
         result = S_OK; /* the chain grew: decide again from the new end */
@@ -937,9 +956,11 @@ static s_result change_job(store *s, const char *id, actor me, change what, cons
     return result;
 }
 
-s_result store_take(store *s, const char *id, actor me) { return change_job(s, id, me, TAKE, ""); }
-s_result store_release(store *s, const char *id, actor me) { return change_job(s, id, me, RELEASE, ""); }
-s_result store_end(store *s, const char *id, actor me, bool done, const char *note) { return change_job(s, id, me, done ? FINISH : REFUSE, note); }
+s_result store_take(store *s, const char *id, actor me, job_change *jc) { return change_job(s, id, me, TAKE, "", jc); }
+s_result store_release(store *s, const char *id, actor me, job_change *jc) { return change_job(s, id, me, RELEASE, "", jc); }
+s_result store_end(store *s, const char *id, actor me, bool done, const char *note, job_change *jc) {
+    return change_job(s, id, me, done ? FINISH : REFUSE, note, jc);
+}
 
 bool store_normalize_commit(const char *in, char out[65]) {
     if (!in || !out) return false;

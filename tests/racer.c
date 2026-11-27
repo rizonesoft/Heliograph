@@ -134,7 +134,7 @@ static int run_pause(int count, char **args) {
         if (r == S_OK) r = store_job(&s, &m, &now);
         message_free(&m);
     } else if (same(op, "take")) {
-        r = store_take(&s, id, (actor){.lane = lane, .session = ""});
+        r = store_take(&s, id, (actor){.lane = lane, .session = ""}, NULL);
     } else if (same(op, "seen")) {
         r = store_seen(&s, id, (actor){.lane = lane, .session = ""});
     } else {
@@ -643,7 +643,7 @@ int racer(int count, char **args) {
     store s = {.folder = args[1]};
     int won = 0;
     for (int i = 3; i < count; i++) {
-        s_result result = store_take(&s, args[i], (actor){.lane = args[2], .session = ""});
+        s_result result = store_take(&s, args[i], (actor){.lane = args[2], .session = ""}, NULL);
         if (result == S_OK) won++;
         else if (result != S_REFUSED) {
             p_error("racer: take "), p_error(args[i]), p_error(result == S_NOTHING ? ": nothing: " : ": damaged: ");

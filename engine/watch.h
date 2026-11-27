@@ -28,7 +28,16 @@ void sessions_cache_free(session_cache *c);
 
 /* Records what this lane is touching; adds a line to said and tells the other
    lane for each one of the same project that touches the same within 4 hours. */
-s_result watch_working(store *s, const place *p, const char *me, const char *paths, text *said);
+/* What a declaration reads back as for --json: the stored paths as a JSON array of normalized paths, and one
+   {"lane", "path"} entry for each other lane of the project working on an overlapping path (the more specific one
+   for a directory match). Filled once the declaration is stored, also when the notification or the read of a peer
+   then fails; stored says so. */
+typedef struct working_out {
+    text paths, overlaps;
+    bool stored;
+} working_out;
+
+s_result watch_working(store *s, const place *p, const char *me, const char *paths, text *said, working_out *out);
 
 bool is_overdue(const message *m, const job *now);
 
