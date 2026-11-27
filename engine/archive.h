@@ -17,6 +17,9 @@ s_result archive_read_job(store *s, const message *m, job *out);
 /* Persists a seen mark directly to archive/<YYYY-MM>/<id>.<seen_event>. */
 s_result archive_write_seen(store *s, const char *id, const char *seen_event);
 
+/* Whether archive/<YYYY-MM>/<id>.<seen_event> is there: S_OK with *seen_out set, S_DAMAGED when the mark is not valid. */
+s_result archive_was_seen(store *s, const char *id, const char *seen_event, bool *seen_out);
+
 /* Checks archive/<YYYY-MM>/<id>.landed.<commit>. Returns S_OK (valid), S_NOTHING (missing), or S_DAMAGED. */
 s_result archive_read_landed_one(const char *folder, const char *id, const char *commit);
 

@@ -509,6 +509,9 @@ bool store_apply_step(const message *m, job *now, char *data) {
     while (good && step < 4 && !same(what, states[step])) step++;
     if (!good || step == 4 || objection(m, now, (actor){.lane = by, .session = session, .repository = repo}, (change)step)) return false;
     now->state = after[step];
+    if (step == 0) copy_to(now->taker, by), copy_to(now->taker_session, session);
+    else if (step == 1) copy_to(now->taker, ""), copy_to(now->taker_session, "");
+    else copy_to(now->closer, by);
     bool open = now->state == OPEN;
     copy_to(now->by, open ? "" : by), copy_to(now->session, open ? "" : session);
     copy_to(now->repository, open ? "" : nz(m->repository));
@@ -1215,8 +1218,11 @@ static void format_commit_vec(const commit_vec *v, bool compact, text *out) {
     }
 }
 
-s_result store_landed_commits(store *s, const message *m, const job *now, bool compact, text *out) {
-    if (!m || !is_job(m)) return S_OK;
+static s_result landed_collect(store *s, const message *m, const job *now, bool compact, bool array, text *out) {
+    if (!m || !is_job(m)) {
+        if (array) add(out, "[]");
+        return S_OK;
+    }
     commit_vec v = {0};
     s_result res = S_OK;
     bool read_arch = m->archived || (now && now->from_archive);
@@ -1299,12 +1305,28 @@ s_result store_landed_commits(store *s, const message *m, const job *now, bool c
         text_free(&prefix), text_free(&bare);
     }
     if (v.failed) res = say(s, S_DAMAGED, "out of memory");
-    if (res == S_OK && v.count > 0) {
+    if (res == S_OK && array) {
+        add(out, "[");
+        for (size_t i = 0; i < v.count; i++) {
+            if (i) add(out, ",");
+            add(out, "\""), add(out, v.items[i]), add(out, "\"");
+        }
+        add(out, "]");
+        if (out->failed) res = say(s, S_DAMAGED, "out of memory");
+    } else if (res == S_OK && v.count > 0) {
         format_commit_vec(&v, compact, out);
         if (out->failed) res = say(s, S_DAMAGED, "out of memory");
     }
     commit_vec_free(&v);
     return res;
+}
+
+s_result store_landed_commits(store *s, const message *m, const job *now, bool compact, text *out) {
+    return landed_collect(s, m, now, compact, false, out);
+}
+
+s_result store_landed_array(store *s, const message *m, const job *now, text *out) {
+    return landed_collect(s, m, now, false, true, out);
 }
 
 static s_result write_seen_ex(store *s, const char *id, actor me, bool alert, unsigned alert_links) {
@@ -1355,6 +1377,17 @@ static s_result write_seen_ex(store *s, const char *id, actor me, bool alert, un
 }
 
 s_result store_seen(store *s, const char *id, actor me) { return write_seen_ex(s, id, me, false, 0); }
+
+s_result store_message_seen(store *s, const message *m, actor me, bool *seen_out) {
+    s_result r = store_was_seen(s, m->id, me, false, 0, seen_out);
+    if (r != S_OK || *seen_out || !m->archived) return r;
+    text event = {0};
+    seen_name_ex(&event, me, false, 0);
+    if (event.failed) return text_free(&event), say(s, S_DAMAGED, "out of memory");
+    r = archive_was_seen(s, m->id, event.data, seen_out);
+    text_free(&event);
+    return r;
+}
 
 s_result store_seen_archived(store *s, const char *id, actor me) {
     if (!address_ok(nz(me.lane), false)) return say(s, S_REFUSED, "say who you are: --as project/lane");

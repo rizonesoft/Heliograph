@@ -35,6 +35,8 @@ typedef struct job {
     job_state state;
     unsigned links;
     char by[72], session[72], repository[40]; /* the taker (or who closed it), and scoped repo if any */
+    char taker[72], taker_session[72];        /* who holds the take in force (a release clears it); empty when none */
+    char closer[72];                          /* the lane of the done or refuse step; empty while the job is not closed */
     uint64_t when;                            /* of the last step */
     bool from_archive;                        /* true when replayed from archive/<YYYY-MM>/ */
 } job;
@@ -58,7 +60,11 @@ bool store_normalize_commit(const char *in, char out[65]); /* 7..64 hex digits -
 bool store_valid_landed_event(const char *ev);             /* landed.<7..64 lowercase hex> */
 bool store_valid_landed_payload(const char *data, size_t length, const char *commit);
 s_result store_landed_commits(store *s, const message *m, const job *now, bool compact, text *out);
+/* Every normalized landed commit as a JSON array of strings ("[]" for none), never shortened. */
+s_result store_landed_array(store *s, const message *m, const job *now, text *out);
 s_result store_seen(store *s, const char *id, actor me);
+/* Whether me's own seen mark is there: live, and for an archived message the archive too. */
+s_result store_message_seen(store *s, const message *m, actor me, bool *seen_out);
 s_result store_seen_archived(store *s, const char *id, actor me);
 s_result store_seen_alert(store *s, const char *id, const char *owner_lane, unsigned alert_links);
 bool owns(const char *lane, const message *m);      /* the owner of a project on either side */

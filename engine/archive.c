@@ -1777,6 +1777,33 @@ s_result archive_write_seen(store *s, const char *id, const char *seen_event) {
     return S_DAMAGED;
 }
 
+s_result archive_was_seen(store *s, const char *id, const char *seen_event, bool *seen_out) {
+    *seen_out = false;
+    char month[8];
+    if (!valid_id(id) || !archive_month(id, month)) return S_OK;
+    s_result dirs = check_arch_dirs(s->folder, month);
+    if (dirs == S_NOTHING) return S_OK;
+    if (dirs != S_OK) {
+        s->why = "the archive folder is not a real directory";
+        return S_DAMAGED;
+    }
+    arch_at at = {0};
+    arch_at_of(&at, s->folder, month, id, seen_event);
+    char *data = NULL;
+    size_t length = 0;
+    p_result r = at.name.failed ? P_FAILED : arch_read(&at, MOST_FILE, &data, &length);
+    arch_at_free(&at);
+    if (r == P_MISSING) return S_OK;
+    bool ok = r == P_OK && length == len(ARCHIVE_SEEN) && same(data, ARCHIVE_SEEN);
+    p_free(data);
+    if (!ok) {
+        s->why = "a seen mark is damaged";
+        return S_DAMAGED;
+    }
+    *seen_out = true;
+    return S_OK;
+}
+
 static bool valid_month_name(const char *name) {
     if (len(name) != 7 || name[4] != '-') return false;
     for (int i = 0; i < 7; i++)

@@ -40,8 +40,10 @@ typedef struct options {
    warnings it gave go beside it, and reply_send writes the whole once. After that nothing more is written. */
 static struct {
     bool on, sent, has_body, damaged;
-    const char *key; /* "text", "help" or "context" */
-    text body, warnings, problems;
+    const char *key; /* "text", "help" or "context"; NULL when the command gives fields of its own (inbox, log, show, check) */
+    text body, warnings, problems, fields;
+    json_list members; /* the members of those fields, in fields */
+    bool own_problems; /* the command gave its own "problems" (check) */
     unsigned problem_count;
     char *error;
     int code;
@@ -66,6 +68,12 @@ static int fail(const char *why, int code) {
     return code;
 }
 
+/* The members a structured command adds to its one value. */
+static json_list *fields(void) {
+    if (!reply.members.out) reply.members = (json_list){&reply.fields, true};
+    return &reply.members;
+}
+
 /* Writes text, or with --json gathers it for the reply. */
 static bool emit(const char *data) {
     if (!reply.on) return p_print(data);
@@ -85,17 +93,19 @@ static bool reply_send(void) {
     reply.sent = true;
     text out = {0};
     json_list o = json_object(&out);
-    if (reply.has_body && reply.body.length) json_put_bytes(&o, reply.key, reply.body.data, reply.body.length);
+    if (!reply.key) {
+        if (reply.fields.length) add(&out, reply.fields.data), o.first = false;
+    } else if (reply.has_body && reply.body.length) json_put_bytes(&o, reply.key, reply.body.data, reply.body.length);
     else json_put_null(&o, reply.key);
-    bool hook = same(reply.key, "context"); /* the hook never fails a session: a problem is damage, never an error code */
+    bool hook = reply.key && same(reply.key, "context"); /* the hook never fails a session: a problem is damage, never an error code */
     if (reply.damaged || (hook && reply.error)) json_put_bool(&o, "damaged", true);
     if (reply.warnings.length) json_key(&o, "warnings"), add(&out, "["), add(&out, reply.warnings.data), add(&out, "]");
     if (reply.error && !hook) json_put_text(&o, "error", reply.error), json_put_number(&o, "code", (uint64_t)reply.code);
-    if (reply.problem_count > 1 || (hook && reply.problem_count))
+    if (!reply.own_problems && (reply.problem_count > 1 || (hook && reply.problem_count)))
         json_key(&o, "problems"), add(&out, "["), add(&out, reply.problems.data), add(&out, "]");
     json_object_end(&o);
     add(&out, "\n");
-    bool good = !out.failed && !reply.body.failed && !reply.warnings.failed && !reply.problems.failed && p_print(out.data);
+    bool good = !out.failed && !reply.body.failed && !reply.warnings.failed && !reply.problems.failed && !reply.fields.failed && p_print(out.data);
     text_free(&out);
     return good;
 }
@@ -237,8 +247,14 @@ static void format_line(text *out, const message *m, const job *now, bool good, 
     add(out, ": "), clean(out, m->subject, true), add(out, "\n");
 }
 
+/* What a line shows beyond the message, for the JSON row of the same message. */
+typedef struct {
+    job now;
+    bool overdue, silent, landed_bad;
+} line_info;
+
 /* S_REFUSED when archived concurrently; S_DAMAGED when the job's chain or landed mark is damaged. */
-static s_result line_silent_ex(text *out, store *s, const message *m, const place *here, uint64_t clock_now, session_cache *sc, bool *sess_err, job *job_out) {
+static s_result line_silent_ex(text *out, store *s, const message *m, const place *here, uint64_t clock_now, session_cache *sc, bool *sess_err, line_info *info) {
     s_result jr = S_OK;
     job now = {0};
     text landed = {0};
@@ -255,19 +271,94 @@ static s_result line_silent_ex(text *out, store *s, const message *m, const plac
                 return S_REFUSED;
             }
             if (lr != S_OK) {
+                if (info) info->landed_bad = true;
                 if (sess_err) *sess_err = true;
                 else jr = lr;
             }
         }
     }
-    if (job_out) *job_out = now;
+    if (info) info->now = now, info->overdue = overdue, info->silent = silent;
     format_line(out, m, &now, jr == S_OK, overdue, silent, landed.data);
     text_free(&landed);
     return jr;
 }
 
-static s_result line_silent(text *out, store *s, const message *m, const place *here, uint64_t clock_now, session_cache *sc, bool *sess_err) {
-    return line_silent_ex(out, s, m, here, clock_now, sc, sess_err, NULL);
+/* One message as the JSON reading commands give it: the stored fields, the job's (null when it has none, or when
+   its steps cannot be read: "damaged" says so and nothing is guessed), and what this reader and the clock add. */
+typedef struct {
+    const message *m;
+    const job *now;      /* the replayed job, or NULL for a message that is not a job or a job that is damaged */
+    bool damaged, overdue, silent, cut;
+    const char *silent_target;
+    int seen;            /* 1 seen, 0 not seen, -1 for no reader (null) */
+    const char *landed;  /* a JSON array, or NULL */
+    size_t body_n;       /* bytes of the body given */
+} row;
+
+static const char *or_empty(const char *s) { return s ? s : ""; }
+
+/* "2027-01-15T08:00:00.000001Z": the stored microseconds, none lost. */
+static void add_due(text *out, uint64_t us) {
+    text t = {0};
+    add_time(&t, us);
+    if (t.failed || t.length < 2) out->failed = true;
+    else add_bytes(out, t.data, t.length - 1), add(out, "."), add_number(out, us % 1000000, 6), add(out, "Z");
+    text_free(&t);
+}
+
+static void json_message(json_list *o, const row *r) {
+    static const char *const states[] = {"open", "taken", "done", "refused"};
+    const message *m = r->m;
+    json_put_text(o, "id", or_empty(m->id)), json_put_text(o, "time", or_empty(m->time));
+    json_put_text(o, "from", or_empty(m->from)), json_put_text(o, "to", or_empty(m->to));
+    json_put_text(o, "for_session", or_empty(m->for_session)), json_put_text(o, "repository", or_empty(m->repository));
+    json_put_text(o, "kind", or_empty(m->kind)), json_put_text(o, "about", or_empty(m->about));
+    json_put_text(o, "urgency", or_empty(m->urgency)), json_put_text(o, "re", or_empty(m->re));
+    if (m->due) json_key(o, "due"), add(o->out, "\""), add_due(o->out, m->due), add(o->out, "\"");
+    else json_put_null(o, "due");
+    json_put_text(o, "subject", or_empty(m->subject));
+    json_put_bytes(o, "body", or_empty(m->body), r->body_n), json_put_bool(o, "body_cut", r->cut);
+    json_put_bool(o, "archived", m->archived);
+    if (is_job(m)) {
+        const job *j = r->now;
+        bool known = j && !r->damaged;
+        json_put_text(o, "state", known ? states[j->state] : NULL);
+        json_put_text(o, "taker", known && *j->taker ? j->taker : NULL);
+        json_put_text(o, "closed_by", known && *j->closer ? j->closer : NULL);
+        json_put_text(o, "session", known && *j->taker ? j->taker_session : NULL);
+        json_key(o, "landed");
+        if (known && r->landed) add(o->out, r->landed);
+        else add(o->out, "null");
+        json_put_bool(o, "damaged", !known);
+    }
+    json_key(o, "seen");
+    add(o->out, r->seen < 0 ? "null" : r->seen ? "true" : "false");
+    json_put_bool(o, "overdue", r->overdue), json_put_bool(o, "silent", r->silent);
+    json_put_text(o, "silent_target", r->silent_target);
+}
+
+/* This reader's own seen mark: its session's when it names one, the lane's when not, the archived mark for an
+   archived message. -1 (null) for a call with no reader; *err when the mark cannot be read. */
+static int seen_of(store *s, const message *m, actor reader, bool *err) {
+    if (!reader.lane || !*reader.lane || !address_ok(reader.lane, false) || !session_ok(reader.session ? reader.session : "")) return -1;
+    bool seen = false;
+    actor who = {.lane = reader.lane, .session = reader.session ? reader.session : ""};
+    if (store_message_seen(s, m, who, &seen) != S_OK) return *err = true, -1;
+    return seen;
+}
+
+/* Fills the job-dependent parts of a row: the full landed list, and "damaged" when it cannot be read. */
+static void row_landed(store *s, row *r, text *landed) {
+    if (!is_job(r->m) || r->damaged || !r->now) return;
+    if (store_landed_array(s, r->m, r->now, landed) != S_OK || landed->failed) r->damaged = true;
+    else r->landed = landed->data;
+}
+
+static void append_row(text *rows, const row *r) {
+    if (rows->length) add(rows, ",");
+    json_list o = json_object(rows);
+    json_message(&o, r);
+    json_object_end(&o);
 }
 
 /* Calls each for every message, oldest first; stops early if each returns false. A damaged one is counted. */
@@ -300,6 +391,9 @@ typedef struct {
     int shown, held;
     size_t budget;
     bool all, scoped, opened, damaged, write_err;
+    bool json, with_held; /* with --json: the rows are gathered in rows, and the inbox adds its count */
+    text rows;
+    actor reader;         /* who reads, apart from whose view the listing is limited to */
     char **emitted;
     size_t emitted_count, emitted_cap;
 } listing;
@@ -344,20 +438,36 @@ static void emit_log_row(listing *l, const text *one) {
     l->shown++;
 }
 
+/* A log row for --json, whole body and all its landed commits. */
+static void log_row(listing *l, store *s, const message *m, const line_info *info, bool job_ok) {
+    bool err = false;
+    row r = {.m = m, .now = &info->now, .damaged = is_job(m) && (!job_ok || info->landed_bad), .overdue = job_ok && info->overdue,
+             .silent = job_ok && info->silent, .seen = seen_of(s, m, l->reader, &err), .body_n = len(or_empty(m->body))};
+    text landed = {0};
+    row_landed(s, &r, &landed);
+    if (err) l->damaged = true;
+    append_row(&l->rows, &r);
+    if (l->rows.failed) l->write_err = true;
+    text_free(&landed);
+    l->shown++;
+}
+
 static bool into_log(store *s, const message *m, void *user) {
     listing *l = user;
     if (l->write_err) return false;
     if (!log_visible(m, l)) return true;
     text one = {0};
     bool sess_err = false;
-    s_result r = line_silent(&one, s, m, l->here, l->clock_now, &l->sessions, &sess_err);
+    line_info info = {0};
+    s_result r = line_silent_ex(&one, s, m, l->here, l->clock_now, &l->sessions, &sess_err, &info);
     if (sess_err) l->damaged = true;
     if (r == S_REFUSED) {
         text_free(&one);
         return true;
     }
     if (r != S_OK) l->damaged = true;
-    emit_log_row(l, &one);
+    if (l->json) log_row(l, s, m, &info, r == S_OK);
+    else emit_log_row(l, &one);
     text_free(&one);
     if (l->write_err) return false;
     record_emitted(l, m->id);
@@ -369,17 +479,20 @@ static bool into_log_archived(store *s, const message *m, const job *known, cons
     if (l->write_err) return false;
     text one = {0};
     s_result r = S_OK;
+    line_info info = {0};
     if (is_job(m) && known) {
         format_line(&one, m, known, true, false, false, landed);
+        info.now = *known;
     } else {
-        r = line_silent(&one, s, m, l->here, l->clock_now, NULL, NULL);
+        r = line_silent_ex(&one, s, m, l->here, l->clock_now, NULL, NULL, &info);
         if (r == S_REFUSED) {
             text_free(&one);
             return true;
         }
         if (r != S_OK) l->damaged = true;
     }
-    emit_log_row(l, &one);
+    if (l->json) log_row(l, s, m, &info, r == S_OK);
+    else emit_log_row(l, &one);
     text_free(&one);
     return !l->write_err;
 }
@@ -394,6 +507,7 @@ static bool into_inbox(store *s, const message *m, void *user) {
     bool mine = is_for(m, l->me);
     bool report_to = is_job(m) && (same(m->from, l->me.lane) || owns(l->me.lane, m)); /* overdue or silent jobs go to sender and owner */
     bool owner_alert = targeted && !mine && dest_owns(l->me.lane, m);
+    const char *alert_for = NULL; /* the silent session an owner is told of */
     if (!mine && !report_to && !owner_alert) return true;
     if (!is_job(m)) {
         if (mine) {
@@ -413,6 +527,7 @@ static bool into_inbox(store *s, const message *m, void *user) {
                 return true;
             }
             if (!silent) return true;
+            alert_for = m->for_session;
         }
     } else {
         s_result jr = store_job(s, m, &now);
@@ -439,6 +554,7 @@ static bool into_inbox(store *s, const message *m, void *user) {
                     else if (sess_silent) {
                         silent = true;
                         show_owner_alert = true;
+                        alert_for = m->for_session;
                     }
                 }
             }
@@ -463,6 +579,23 @@ static bool into_inbox(store *s, const message *m, void *user) {
     else {
         if (l->shown == 0) add(&l->out, MARK_BEGIN);
         add(&l->out, one.data ? one.data : ""), l->shown++;
+        if (l->json) {
+            bool err = false;
+            size_t body_n = len(or_empty(m->body));
+            bool cut = !l->all && body_n > SHOW_BYTES;
+            if (cut) {
+                body_n = SHOW_BYTES;
+                while (body_n && ((unsigned char)m->body[body_n] & 0xC0) == 0x80) body_n--; /* never inside a character */
+            }
+            row r = {.m = m, .now = &now, .damaged = is_job(m) && !good, .overdue = overdue, .silent = silent, .cut = cut,
+                     .silent_target = silent ? alert_for : NULL, .seen = seen_of(s, m, l->reader, &err), .body_n = body_n};
+            text landed_json = {0};
+            row_landed(s, &r, &landed_json);
+            if (err || r.damaged) l->damaged = true;
+            append_row(&l->rows, &r);
+            if (l->rows.failed) l->out.failed = true;
+            text_free(&landed_json);
+        }
     }
     if (one.failed) l->out.failed = true;
     text_free(&one);
@@ -471,7 +604,14 @@ static bool into_inbox(store *s, const message *m, void *user) {
 
 static int finish(listing *l, size_t damaged) {
     sessions_cache_free(&l->sessions);
-    if (!print(&l->out) || l->write_err) return fail("the output cannot be written", 3);
+    if (l->json) {
+        json_list *f = fields();
+        json_key(f, "messages"), add(f->out, "["), add(f->out, l->rows.data ? l->rows.data : ""), add(f->out, "]");
+        if (l->with_held) json_put_number(f, "held", (uint64_t)l->held), json_put_bool(f, "more", l->held > 0);
+        bool good = !l->out.failed && !l->rows.failed && !l->write_err;
+        text_free(&l->out), text_free(&l->rows);
+        if (!good) return fail("the output cannot be written", 3);
+    } else if (!print(&l->out) || l->write_err) return fail("the output cannot be written", 3);
     if (damaged || l->damaged) return fail("something here is damaged: see helio check", 3);
     return l->shown ? 0 : 1;
 }
@@ -493,11 +633,12 @@ static size_t fill_inbox(store *s, listing *l) {
 }
 
 static int inbox(store *s, actor me, const place *here, bool all) {
-    listing l = {.me = me, .here = here, .all = all, .budget = all ? 0 : SHOW_BYTES};
+    listing l = {.me = me, .here = here, .all = all, .budget = all ? 0 : SHOW_BYTES, .json = reply.on, .with_held = true, .reader = me};
     return finish(&l, fill_inbox(s, &l));
 }
 
-static int whole_log(store *s, const char *me, const place *here, bool all) {
+static int whole_log(store *s, actor reader, const place *here, bool all) {
+    const char *me = reader.lane ? reader.lane : "";
     text scope = {0};
     const char *scope_lane = NULL;
     if (*me) {
@@ -510,7 +651,7 @@ static int whole_log(store *s, const char *me, const place *here, bool all) {
         }
         scope_lane = scope.data;
     }
-    listing l = {.me = {.lane = scope_lane ? scope_lane : "", .session = ""}, .here = here, .clock_now = p_now(), .all = all, .scoped = scope_lane != NULL};
+    listing l = {.me = {.lane = scope_lane ? scope_lane : "", .session = ""}, .here = here, .clock_now = p_now(), .all = all, .scoped = scope_lane != NULL, .json = reply.on, .reader = reader};
     size_t damaged = every(s, into_log, &l);
     if (all && !l.write_err) damaged += archive_every(s, l.emitted, l.emitted_count, log_visible, into_log_archived, &l);
     if (l.opened && !l.write_err && !emit(MARK_END)) l.write_err = true;
@@ -523,7 +664,24 @@ static int whole_log(store *s, const char *me, const place *here, bool all) {
 static int check(store *s) {
     text report = {0};
     s_result result = store_check(s, &report);
-    if (!print(&report)) return fail("the output cannot be written", 3);
+    if (reply.on) {
+        /* One authoritative problems array: every live and archive problem, one per line of the report. */
+        json_list *f = fields();
+        reply.own_problems = true;
+        json_put_bool(f, "ok", result == S_OK);
+        json_key(f, "problems");
+        json_list a = json_array(f->out);
+        for (const char *at = report.data ? report.data : ""; *at;) {
+            size_t n = 0;
+            while (at[n] && at[n] != '\n') n++;
+            json_key(&a, NULL), json_string(f->out, at, n);
+            at += n + (at[n] ? 1 : 0);
+        }
+        json_array_end(&a);
+        bool good = !report.failed;
+        text_free(&report);
+        if (!good) return fail("the output cannot be written", 3);
+    } else if (!print(&report)) return fail("the output cannot be written", 3);
     return result == S_OK ? 0 : fail(s->why, result);
 }
 
@@ -537,7 +695,7 @@ static int show(store *s, const char *id, actor me, const place *here, const opt
     if (result != S_OK) return fail(s->why, result);
     text out = {0}, body = {0};
     s_result lr = S_OK;
-    job shown_job = {0};
+    line_info info = {0};
     for (int pass = 0; pass < 2; pass++) {
         if (!may_see(&m, me.lane)) {
             text_free(&out);
@@ -546,7 +704,7 @@ static int show(store *s, const char *id, actor me, const place *here, const opt
         }
         text_free(&out);
         add(&out, MARK_BEGIN);
-        lr = line_silent_ex(&out, s, &m, NULL, 0, NULL, NULL, &shown_job);
+        lr = line_silent_ex(&out, s, &m, NULL, 0, NULL, NULL, &info);
         if (lr == S_REFUSED && !m.archived && pass == 0) {
             /* If a real archiver moved the job between store_message and store_job, fall back to the archive copy;
                if no archive copy exists (e.g. simulated unlink), preserve §1's S_REFUSED exit 2. */
@@ -598,22 +756,35 @@ static int show(store *s, const char *id, actor me, const place *here, const opt
                 else if (sess_silent)
                     alert_outstanding = true;
             }
-        } else if (shown_job.state == OPEN) {
+        } else if (info.now.state == OPEN) {
             bool sess_silent = false;
-            uint64_t since = shown_job.links > 0 ? shown_job.when : message_time(&m);
+            uint64_t since = info.now.links > 0 ? info.now.when : message_time(&m);
             if (!watch_classify_session_silent(s, here, &m, since, now_us, &sc, &sess_silent))
                 alert_err = true;
             else if (sess_silent) {
                 alert_outstanding = true;
-                alert_links = shown_job.links;
+                alert_links = info.now.links;
             }
         }
         sessions_cache_free(&sc);
     }
     bool was_archived = m.archived;
+    if (reply.on) {
+        /* The row as it stands before this call's own acknowledgment, with the whole body. */
+        bool err = false;
+        row r = {.m = &m, .now = &info.now, .damaged = is_job(&m) && (lr != S_OK || info.landed_bad), .overdue = lr == S_OK && info.overdue,
+                 .silent = lr == S_OK && info.silent, .seen = seen_of(s, &m, me, &err), .body_n = len(or_empty(m.body))};
+        text landed = {0};
+        row_landed(s, &r, &landed);
+        if (err) fail(s->why, 0);
+        json_message(fields(), &r);
+        text_free(&landed);
+    }
     message_free(&m);
     if (reply.on && address_ok(o->me, false)) announce_best_effort(s, o, ""), *announced = true;
-    if (!print(&out)) return fail("the output cannot be written", 3);
+    if (reply.on) text_free(&out);
+    else if (!print(&out)) return fail("the output cannot be written", 3);
+    if (reply.fields.failed) return fail("the output cannot be written", 3);
     int known = lr != S_OK ? fail("a step of this job is damaged", 3) : 0; /* known before the reply: inside it */
     if (alert_err && reply.on) fail("the alert state cannot be read", 3); /* known too; the seen mark still follows */
     /* The reply goes before the seen mark, so a message is never marked seen when its reply was not written; a seen
@@ -779,6 +950,7 @@ static int init(const char *folder, bool from_default) {
 static int run(options *o, void (*pause)(void *user, const char *stage), void *pause_user) {
     archive_pauses(pause, pause_user);
     const char *command = o->count ? o->words[0] : "inbox";
+    if (same(command, "inbox") || same(command, "log") || same(command, "check") || same(command, "show")) reply.key = NULL;
     if (same(command, "help")) {
         if (o->for_session_flag) return fail("--for-session is only for sending a message", 2);
         reply.key = "help";
@@ -905,7 +1077,7 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
     s_result result;
     switch (which) {
     case 0: code = inbox(&s, me, &o->here, o->all); if (summary_err || daily_err) code = 3; break;
-    case 1: code = whole_log(&s, o->me, &o->here, o->all); break;
+    case 1: code = whole_log(&s, (actor){.lane = o->me, .session = o->session}, &o->here, o->all); break;
     case 2: code = check(&s); break;
     case 3: code = show(&s, o->words[1], me, &o->here, o, &announced); break;
     case 8: code = hook(&s, o, me); break;
@@ -973,7 +1145,7 @@ int helio_paused(int count, char **args, void (*pause)(void *user, const char *s
     reply = (typeof(reply)){.on = json_flag(count, args), .key = "text"};
     int code = parse(&o, count, args) ? run(&o, pause, user) : fail(o.why, 2);
     if (reply.on && !reply_send() && code < 3) code = 3;
-    text_free(&reply.body), text_free(&reply.warnings), text_free(&reply.problems), p_free(reply.error);
+    text_free(&reply.body), text_free(&reply.warnings), text_free(&reply.problems), text_free(&reply.fields), p_free(reply.error);
     reply = (typeof(reply)){0};
     archive_pauses(NULL, NULL); /* the pause belongs to this call only */
     p_free(o.me_env), p_free(o.folder_env), p_free(o.default_env), p_free(o.session_env);

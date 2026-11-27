@@ -2423,7 +2423,7 @@ class JsonReply(Base):
                 self.assertEqual(v["code"], 2)
                 self.assertIsInstance(v["error"], str)
         v = self.one(self.helio("--json", "show", sent, me="os/userland"), 0)
-        self.assertIn("flagged", v["text"])
+        self.assertEqual(v["subject"], "flagged")
         # --about takes a value, so a literal --json there is the paths and the reply is text.
         r = self.helio("tell", "os/all", "about-json", "--about", "--json", me="os/main", body="b")
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -2440,7 +2440,7 @@ class JsonReply(Base):
         bad_job = self.send(subject="damaged-job")
         put(self.store / f"messages/{bad_job}.link.0000", "corrupt\n")
         v = self.one(self.helio("--json", me="os/userland"), 3)
-        self.assertIn("readable", v["text"])
+        self.assertIn("readable", [m["subject"] for m in v["messages"]])
         self.assertEqual(v["code"], 3)
         self.assertEqual(v["problems"][0], v["error"])  # the damaged job also stops the daily archive: two problems
         # A send whose session announcement fails afterwards: the id, and the failure as a warning. A file where the
@@ -2460,7 +2460,7 @@ class JsonReply(Base):
         (self.store / f"messages/{good}.seen.os+userland").mkdir()
         r = self.helio("show", good, "--json", me="os/userland")
         v = self.one(r, 3)
-        self.assertIn("readable", v["text"])
+        self.assertEqual(v["subject"], "readable")
         # A step that show finds damaged before it writes its reply is inside the reply.
         v = self.one(self.helio("show", bad_job, "--json", me="os/userland"), 3)
         self.assertEqual(v["code"], 3)
@@ -2481,7 +2481,7 @@ class JsonReply(Base):
             sessions.unlink()
         self.assertEqual(text_mode.returncode, 3)
         self.assertIn(b"the alert state cannot be read", text_mode.stderr)
-        self.assertIn("for one session", v["text"])
+        self.assertEqual(v["subject"], "for one session")
         self.assertEqual((v["error"], v["code"]), ("the alert state cannot be read", 3))
         self.assertTrue(v["warnings"], v)
 
@@ -2494,7 +2494,7 @@ class JsonReply(Base):
         shutil.rmtree(self.store / "summary", ignore_errors=True)
         put(self.store / "summary", "not a folder\n")
         v = self.one(self.helio("--json", me="os/userland"), 3)
-        self.assertIn("readable", v["text"])
+        self.assertIn("readable", [m["subject"] for m in v["messages"]])
         self.assertEqual(v["code"], 3)
         self.assertGreaterEqual(len(v["problems"]), 2, v)
         self.assertEqual(v["problems"][0], v["error"])
@@ -2545,6 +2545,317 @@ class JsonReply(Base):
         v = self.one(self.helio("hook", "claude", "--json", me="os/userland"), 0)
         self.assertTrue(v["damaged"])
         self.assertIn(b"damaged", self.helio("hook", "claude", me="os/userland").stdout)
+
+
+class JsonReading(Base):
+    """D01 T01 §21: the inbox, log, show and check give structured fields, the rows a person would see, no more."""
+
+    OLD = 1_700_000_000_000_000  # 2023-11-14, so that closed jobs are old enough to archive
+    M = 60_000_000
+
+    def at(self, us, *args, body=b"", cwd=None):
+        env = {k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "ANTIGRAVITY_CONVERSATION_ID")}
+        return subprocess.run([str(RACER), "--now", str(us), *args, "--store", str(self.store)], input=body, capture_output=True,
+                              timeout=30, cwd=cwd or self.store, env=env)
+
+    def sent(self, us, *args, body=b"b"):
+        r = self.at(us, *args, body=body)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout.decode().strip()
+
+    def ok(self, us, *args):
+        r = self.at(us, *args)
+        self.assertEqual(r.returncode, 0, (args, r.stderr, r.stdout))
+
+    def value(self, r, code, pairs=False):
+        self.assertEqual((r.returncode, r.stderr), (code, b""), r.stdout)
+        out = r.stdout.decode("utf-8")
+        self.assertTrue(out.endswith("\n") and "\n" not in out[:-1], out)
+
+        def no_duplicates(items):
+            keys = [k for k, _ in items]
+            self.assertEqual(len(keys), len(set(keys)), keys)
+            return dict(items)
+
+        return json.loads(out[:-1], object_pairs_hook=no_duplicates)
+
+    def shown(self, us, mid, me="os/userland", session=None, code=0):
+        extra = ["--session", session] if session else []
+        return self.value(self.at(us, "show", mid, "--json", "--as", me, *extra), code)
+
+    def rows(self, us, *args, me="os/userland", session=None, code=0):
+        extra = ["--session", session] if session else []
+        return self.value(self.at(us, *args, "--json", "--as", me, *extra), code)
+
+    def text_ids(self, us, *args, me="os/userland", session=None):
+        extra = ["--session", session] if session else []
+        out = self.at(us, *args, "--as", me, *extra).stdout.decode()
+        return [ln.split()[1] for ln in out.splitlines() if ln.startswith("| ")]
+
+    def post_fields(self, mid, root="messages"):
+        head = (self.store / f"{root}/{mid}.post").read_text().split("\n\n")[0]
+        return dict(ln.split(": ", 1) for ln in head.splitlines())
+
+    # item 1: the replay keeps taker, taker's session and closer apart
+    def test_the_replay_keeps_taker_taker_session_and_closer_apart(self):
+        t = self.OLD
+        cases = {}
+
+        def job(name, to="os/userland"):
+            cases[name] = self.sent(t, "ask", to, name, "--as", "os/main")
+            return cases[name]
+
+        job("open")
+        j = job("taken"); self.ok(t + 1, "take", j, "--as", "os/userland", "--session", "s1")
+        j = job("released"); self.ok(t + 1, "take", j, "--as", "os/userland", "--session", "s1"); self.ok(t + 2, "release", j, "--as", "os/userland", "--session", "s1")
+        j = job("done"); self.ok(t + 1, "take", j, "--as", "os/userland", "--session", "s1"); self.ok(t + 2, "done", j, "ok", "--as", "os/userland", "--session", "s1")
+        j = job("refused_without_take"); self.ok(t + 1, "refuse", j, "no", "--as", "os/userland", "--session", "s1")
+        j = job("other_refuser", "os/all"); self.ok(t + 1, "take", j, "--as", "os/apps", "--session", "s9"); self.ok(t + 2, "release", j, "--as", "os/apps", "--session", "s9")
+        self.ok(t + 3, "refuse", j, "no", "--as", "os/userland")
+        j = job("unnamed_taker"); self.ok(t + 1, "take", j, "--as", "os/userland"); self.ok(t + 2, "done", j, "ok", "--as", "os/userland", "--session", "s2")
+        want = {"open": ("open", None, None, None), "taken": ("taken", "os/userland", "s1", None),
+                "released": ("open", None, None, None), "done": ("done", "os/userland", "s1", "os/userland"),
+                "refused_without_take": ("refused", None, None, "os/userland"), "other_refuser": ("refused", None, None, "os/userland"),
+                "unnamed_taker": ("done", "os/userland", "", "os/userland")}
+
+        def check(archived):
+            for name, mid in cases.items():
+                if archived and want[name][0] in ("open", "taken"):
+                    continue
+                v = self.shown(t + 10, mid)
+                self.assertEqual((v["state"], v["taker"], v["session"], v["closed_by"]), want[name], (name, archived))
+                self.assertEqual(v["archived"], archived)
+
+        check(False)
+        self.assertEqual(run(self.store, "archive", me=None).returncode, 0)
+        self.assertTrue(list((self.store / "archive").glob("*/*.post")))
+        check(True)
+        for row in self.rows(t + 10, "log", "--all")["messages"]:
+            name = row["subject"]
+            self.assertEqual((row["state"], row["taker"], row["session"], row["closed_by"]), want[name], name)
+
+    # item 2: a message reads back as stored
+    def test_a_message_reads_back_every_stored_field(self):
+        t = self.OLD + 123_456  # a fractional second
+        mid = self.sent(t, "ask", "os/userland", "Subject, with é", "--as", "os/main", "--about", "src/a.c src/b.c", "--due", "5", "--now",
+                        "--for-session", "s1", body="line one\n\"quoted\" €".encode())
+        self.ok(t + 1, "take", mid, "--as", "os/userland", "--session", "s1")
+        for commit in ("ABCDEF1", "0123456789abcdef", "fedcba9876"):
+            self.ok(t + 2, "landed", mid, commit, "--as", "os/userland", "--session", "s1")
+        post = self.post_fields(mid)
+        # the answer to a request carries `re`
+        ans = self.sent(t + 3, "answer", mid, "Answer", "--as", "os/userland")
+        due = t + 5 * self.M
+        expected_due = "%s.%06dZ" % (time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(due // 1_000_000)), due % 1_000_000)
+        landed = ["0123456789abcdef", "abcdef1", "fedcba9876"]
+
+        def check(v):
+            self.assertEqual({k: v[k] for k in ("id", "time", "from", "to", "kind", "about", "urgency", "subject")},
+                             {"id": mid, "time": post["time"], "from": "os/main", "to": "os/userland", "kind": "request",
+                              "about": "src/a.c src/b.c", "urgency": "now", "subject": "Subject, with é"})
+            self.assertEqual((v["for_session"], v["repository"], v["re"], v["due"], v["archived"]), ("s1", "", "", expected_due, False))
+            self.assertEqual(v["body"], "line one\n\"quoted\" €")
+            self.assertEqual((v["state"], v["taker"], v["closed_by"], v["session"], v["landed"]), ("taken", "os/userland", None, "s1", landed))
+
+        check(self.shown(t + 10, mid))
+        self.assertEqual(self.text_ids(t + 10, "--all", session="s1"), [mid])
+        check(next(m for m in self.rows(t + 10, "--all", session="s1")["messages"] if m["id"] == mid))
+        check(next(m for m in self.rows(t + 10, "log", "--all", session="s1")["messages"] if m["id"] == mid))
+        # the default inbox gives every commit as an array, though its text line shows two and a remainder
+        row = next(m for m in self.rows(t + 10, session="s1")["messages"] if m["id"] == mid)
+        self.assertEqual(row["landed"], landed)
+        self.assertIn("(+1 more)", self.at(t + 10, "--as", "os/userland", "--session", "s1").stdout.decode())
+        # a message with no deadline, and the answer's `re`
+        v = self.shown(t + 10, ans, me="os/main")
+        self.assertEqual((v["re"], v["due"], v["kind"]), (mid, None, "answer"))
+        self.assertNotIn("landed", v)
+        # archived: the same fields from the archive
+        self.ok(t + 20, "done", mid, "ok", "--as", "os/userland", "--session", "s1")
+        self.assertEqual(run(self.store, "archive", me=None).returncode, 0)
+        v = self.shown(t + 30, mid)
+        self.assertEqual((v["archived"], v["state"], v["landed"], v["due"], v["closed_by"]), (True, "done", landed, expected_due, "os/userland"))
+        v = next(m for m in self.rows(t + 30, "log", "--all")["messages"] if m["id"] == mid)
+        self.assertEqual((v["archived"], v["landed"], v["due"]), (True, landed, expected_due))
+
+    # item 3: a damaged job is marked, never guessed open
+    def test_a_damaged_job_has_nothing_guessed(self):
+        t = self.OLD
+        good = self.sent(t, "tell", "os/userland", "readable", "--as", "os/main")
+        bad = self.sent(t + 1, "ask", "os/userland", "damaged-job", "--as", "os/main")
+        put(self.store / f"messages/{bad}.link.0000", "corrupt\n")
+        nulls = {"state": None, "taker": None, "closed_by": None, "session": None, "landed": None}
+        for name, fetch in (("inbox", lambda: self.rows(t + 5, code=3)["messages"]),
+                            ("log", lambda: self.rows(t + 5, "log", code=3)["messages"])):
+            with self.subTest(name):
+                v = {m["id"]: m for m in fetch()}
+                self.assertEqual(sorted(v), sorted([good, bad]))
+                self.assertEqual(v[good]["subject"], "readable")
+                self.assertNotIn("state", v[good])
+                self.assertEqual({k: v[bad][k] for k in nulls}, nulls)
+                self.assertTrue(v[bad]["damaged"])
+        v = self.rows(t + 5, code=3)
+        self.assertEqual(v["code"], 3)
+        self.assertIsInstance(v["error"], str)
+        v = self.shown(t + 5, bad, code=3)
+        self.assertEqual({k: v[k] for k in nulls}, nulls)
+        self.assertEqual((v["damaged"], v["code"], v["id"]), (True, 3, bad))
+        self.assertEqual(self.shown(t + 5, good)["subject"], "readable")
+        # a landed mark that cannot be read damages its job the same way
+        landed_bad = self.sent(t + 6, "ask", "os/apps", "bad-landed", "--as", "os/main")
+        put(self.store / f"messages/{landed_bad}.landed.zz", "junk\n")
+        row = next(m for m in self.rows(t + 7, "log", code=3)["messages"] if m["id"] == landed_bad)
+        self.assertEqual((row["damaged"], row["state"], row["landed"]), (True, None, None))
+
+    # item 4: the reader's own seen state
+    def test_seen_is_the_readers_own_mark(self):
+        t = self.OLD
+        note = self.sent(t, "tell", "os/userland", "note", "--as", "os/main")
+        self.ok(t + 1, "show", note, "--as", "os/userland", "--session", "s1")
+
+        def seen(args, **kw):
+            return {m["id"]: m["seen"] for m in self.rows(t + 5, *args, **kw)["messages"]}[note]
+
+        self.assertEqual((seen(("log",), session="s1"), seen(("log",), session="s2")), (True, False))
+        # the lane's own mark, when no session is named
+        self.assertFalse(seen(("log",)))
+        # no reader at all: log --all outside a checkout and without --as
+        with tempfile.TemporaryDirectory() as elsewhere:
+            v = self.value(self.at(t + 5, "log", "--all", "--json", cwd=elsewhere), 0)
+        self.assertIsNone({m["id"]: m["seen"] for m in v["messages"]}[note])
+        # an archived message: show gives the state before its own acknowledgment, then every read says true
+        job = self.sent(t + 6, "ask", "os/userland", "archived", "--as", "os/main")
+        self.ok(t + 7, "take", job, "--as", "os/userland"); self.ok(t + 8, "done", job, "ok", "--as", "os/userland")
+        self.assertEqual(run(self.store, "archive", me=None).returncode, 0)
+        self.assertFalse((self.store / f"messages/{job}.post").exists())
+        self.assertFalse(self.shown(t + 9, job)["seen"])
+        self.assertTrue(self.shown(t + 10, job)["seen"])
+        self.assertTrue({m["id"]: m["seen"] for m in self.rows(t + 11, "log", "--all")["messages"]}[job])
+        # an owner's alert mark is not `seen`: the owner opening a silent target's alert first leaves the target unread
+        put(self.store / "helio.conf", "project: os\nsilent: 60\n")
+        t2 = self.OLD + 1000 * self.M
+        alert = self.sent(t2, "tell", "os/apps", "quiet", "--as", "other/sender", "--for-session", "s7")
+        late = t2 + 70 * self.M
+        row = self.rows(late, session="own-a", me="os/owner")["messages"]
+        self.assertEqual([(m["id"], m["silent"], m["silent_target"], m["seen"]) for m in row], [(alert, True, "s7", False)])
+        self.assertFalse(self.shown(late + 1, alert, me="os/owner", session="own-a")["seen"])
+        self.assertTrue((self.store / f"messages/{alert}.seen.os+owner~alert").exists())
+        self.assertEqual(self.at(late + 2, "--as", "os/owner", "--json").returncode, 1)  # the owner's row is gone
+        target = {m["id"]: m["seen"] for m in self.rows(late + 3, "log", me="os/apps", session="s7")["messages"]}
+        self.assertFalse(target[alert])
+
+    # item 5: each cause of the warnings
+    def test_overdue_and_silent_flags_for_each_cause_and_recipient(self):
+        put(self.store / "helio.conf", "project: os\nsilent: 60\n")
+        t = self.OLD + 5000 * self.M
+        M = self.M
+
+        def flags(us, me, session=None):
+            return {m["subject"]: (m["overdue"], m["silent"], m["silent_target"]) for m in self.rows(us, me=me, session=session)["messages"]}
+
+        due = self.sent(t, "ask", "os/userland", "due", "--as", "os/main", "--due", "10")
+        self.assertEqual(flags(t + 20 * M, "os/main")["due"], (True, False, None))        # sender: overdue
+        self.assertEqual(flags(t + 20 * M, "os/owner")["due"], (True, False, None))       # owner: overdue
+        self.assertEqual(flags(t + 20 * M, "os/userland", "u1")["due"], (True, False, None))  # recipient
+        self.assertEqual(flags(t + 5 * M, "os/userland", "u1")["due"], (False, False, None))  # live control
+        taken = self.sent(t, "ask", "os/userland", "taken", "--as", "os/main")
+        self.ok(t, "take", taken, "--as", "os/userland", "--session", "u2")
+        self.assertEqual(flags(t + 61 * M, "os/main")["taken"], (False, True, None))      # a silent taker, to the sender
+        self.assertEqual(flags(t + 61 * M, "os/owner")["taken"], (False, True, None))     # and to the owner
+        self.assertEqual(flags(t + 30 * M, "os/main").get("taken"), None)                 # not yet silent: not shown to the sender
+        # a heads-up and an open job for one session that went quiet: told to the owner, naming the session
+        note = self.sent(t, "tell", "os/apps", "note", "--as", "other/sender", "--for-session", "s1")
+        open_job = self.sent(t, "ask", "os/apps", "open", "--as", "other/sender", "--for-session", "s1")
+        self.ok(t + 50 * M, "hello", "codex", "--as", "os/apps", "--session", "s1")
+        self.assertEqual(flags(t + 61 * M, "os/owner"), {"due": (True, False, None), "taken": (False, True, None)})  # the live session's control
+        late = flags(t + 111 * M, "os/owner")
+        self.assertEqual((late["note"], late["open"]), ((False, True, "s1"), (False, True, "s1")))
+        self.assertEqual(flags(t + 111 * M, "os/apps", "s1")["note"], (False, False, None))  # the target itself
+        # after a release the silence is measured from the release
+        self.ok(t + 120 * M, "take", open_job, "--as", "os/apps", "--session", "s1")
+        self.ok(t + 130 * M, "release", open_job, "--as", "os/apps", "--session", "s1")
+        self.assertNotIn("open", flags(t + 160 * M, "os/owner"))
+        self.assertEqual(flags(t + 191 * M, "os/owner")["open"], (False, True, "s1"))
+
+    # item 6: the inbox budget
+    def test_the_inbox_keeps_the_text_rows_held_and_cut_bodies(self):
+        t = self.OLD + 9000 * self.M
+        order = []
+        for n, urgency in enumerate(["--whenever", "--whenever", "--now", "--now", "", "", ""]):
+            args = ["tell", "os/userland", f"m{n}", "--as", "os/main"] + ([urgency] if urgency else [])
+            order.append(self.sent(t + n, *args, body=("€" * 5461).encode() if n == 4 else b"b"))
+        text_ids = self.text_ids(t + 50)
+        v = self.rows(t + 50)
+        self.assertEqual([m["id"] for m in v["messages"]], text_ids)
+        self.assertEqual([m["urgency"] for m in v["messages"]], ["now", "now", "next", "next", "next"])
+        trailer = self.at(t + 50, "--as", "os/userland").stdout.decode().splitlines()[-1]
+        self.assertEqual(trailer, f"and {v['held']} more: helio --all")
+        self.assertEqual((v["held"], v["more"]), (2, True))
+        full = "€" * 5461
+        big = next(m for m in v["messages"] if m["subject"] == "m4")
+        self.assertTrue(big["body_cut"])
+        self.assertTrue(full.startswith(big["body"]) and 1997 <= len(big["body"].encode()) <= 2000, len(big["body"].encode()))
+        self.assertEqual(len(big["body"].encode()) % 3, 0)
+        self.assertTrue(all(not m["body_cut"] for m in v["messages"] if m is not big))
+        everything = self.rows(t + 50, "--all")
+        self.assertEqual([m["id"] for m in everything["messages"]], self.text_ids(t + 50, "--all"))
+        self.assertEqual((everything["held"], everything["more"], len(everything["messages"])), (0, False, 7))
+        self.assertEqual(next(m for m in everything["messages"] if m["subject"] == "m4")["body"], full)
+        self.assertEqual(self.shown(t + 50, big["id"])["body"], full)
+        # nothing for me: the empty inbox
+        r = self.at(t + 50, "--json", "--as", "os/apps")
+        self.assertEqual(self.value(r, 1), {"messages": [], "held": 0, "more": False})
+
+    # item 7: log and show through the visibility and seen-mark paths of the text forms
+    def test_log_and_show_see_what_the_text_forms_see(self):
+        t = self.OLD + 20_000 * self.M
+        put(self.store / "helio.conf", "project: os\n")
+        mine = self.sent(t, "tell", "os/userland", "mine", "--as", "os/main")
+        other = self.sent(t + 1, "tell", "other/main", "theirs", "--as", "other/sender")
+        for me in ("os/userland", "os/main", "other/main"):
+            for session in (None, "s1"):
+                ids = [m["id"] for m in self.rows(t + 5, "log", me=me, session=session)["messages"]]
+                self.assertEqual(ids, self.text_ids(t + 5, "log", me=me, session=session), (me, session))
+        self.assertEqual([m["id"] for m in self.rows(t + 5, "log", me="os/userland")["messages"]], [mine])
+        # outside the reader's view is refused as a missing one is
+        refused = self.value(self.at(t + 5, "show", other, "--json", "--as", "os/userland"), 2)
+        missing = self.value(self.at(t + 5, "show", "1-aaaaaaaa", "--json", "--as", "os/userland"), 2)
+        self.assertEqual((refused["error"], refused["code"]), ("there is no such message", 2))
+        self.assertEqual(missing["code"], 2)
+        self.assertNotIn("id", refused)
+        # an id live and archived at once appears once
+        job = self.sent(t + 10, "ask", "os/userland", "both", "--as", "os/main")
+        self.ok(t + 11, "take", job, "--as", "os/userland"); self.ok(t + 12, "done", job, "ok", "--as", "os/userland")
+        self.assertEqual(run(self.store, "archive", me=None).returncode, 0)
+        month = next((self.store / "archive").iterdir()).name
+        shutil.copy(self.store / f"archive/{month}/{job}.post", self.store / f"messages/{job}.post")
+        ids = [m["id"] for m in self.rows(t + 20, "log", "--all")["messages"]]
+        self.assertEqual(ids.count(job), 1, ids)
+        # show marks a heads-up seen for the next inbox
+        self.assertEqual([m["id"] for m in self.rows(t + 30)["messages"]], [mine])
+        self.assertFalse(self.shown(t + 31, mine)["seen"])
+        self.assertEqual(self.at(t + 32, "--json", "--as", "os/userland").returncode, 1)
+
+    # item 8: check
+    def test_check_has_one_problems_array(self):
+        t = self.OLD + 30_000 * self.M
+        clean = self.at(t, "check", "--json")
+        self.assertEqual((clean.returncode, clean.stdout, clean.stderr), (0, b'{"ok":true,"problems":[]}\n', b""))
+        done = self.sent(t, "ask", "os/userland", "to archive", "--as", "os/main")
+        self.ok(t + 1, "take", done, "--as", "os/userland"); self.ok(t + 2, "done", done, "ok", "--as", "os/userland")
+        self.assertEqual(run(self.store, "archive", me=None).returncode, 0)
+        month = next((self.store / "archive").iterdir()).name
+        live = self.sent(t + 3, "ask", "os/userland", "live damage", "--as", "os/main")
+        put(self.store / f"messages/{live}.link.0000", "corrupt\n")
+        put(self.store / f"archive/{month}/{done}.seen.os+userland", "corrupt\n")
+        r = self.at(t + 4, "check", "--json")
+        v = self.value(r, 3)
+        self.assertFalse(v["ok"])
+        self.assertEqual((v["code"], v["error"]), (3, "the store has damage"))
+        self.assertTrue(any(p.startswith(f"{live}.link.0000") or live in p for p in v["problems"]), v["problems"])
+        self.assertTrue(any(p.startswith(f"archive/{month}/{done}.seen") for p in v["problems"]), v["problems"])
+        self.assertEqual(len(v["problems"]), len(set(v["problems"])))
+        text_report = self.at(t + 4, "check")
+        self.assertEqual(v["problems"], [ln for ln in text_report.stdout.decode().splitlines() if ln])
 
 
 class OutsideWatch:
@@ -4483,7 +4794,7 @@ class SessionTargeting(Base):
             self.assertTrue((self.store / f"messages/{job}.seen.os+owner~alert").exists(), flag)
             if flag:
                 v = json.loads(r.stdout)
-                self.assertIn("Owner targeted", v["text"])
+                self.assertEqual(v["subject"], "Owner targeted")
                 self.assertEqual(r.stderr, b"")
 
     def test_silent_targeted_session_owner_escalation_and_ack(self):
