@@ -180,7 +180,9 @@ int racer(int count, char **args) {
        <folder> present and absent, so a test knows the folder really came and went while it looked. */
     if (count >= 6 && same(args[1], "--terminal-loop")) {
         unsigned long rounds = 0;
-        for (const char *p = args[4]; *p >= '0' && *p <= '9'; p++) rounds = rounds * 10 + (unsigned long)(*p - '0');
+        const char *p = args[4];
+        for (; *p >= '0' && *p <= '9'; p++) rounds = rounds * 10 + (unsigned long)(*p - '0');
+        if (*p || !rounds) return 104;
         uint64_t present = 0, absent = 0;
         for (unsigned long i = 0; i < rounds; i++) {
             p_result seen = p_real_dir(args[5]);

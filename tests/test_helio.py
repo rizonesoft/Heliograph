@@ -246,6 +246,8 @@ class Jobs(Base):
                 if len(list(self.store.glob("ready.*"))) == len(racers):
                     break
                 time.sleep(0.1)
+            else:
+                self.fail(f"only {len(list(self.store.glob('ready.*')))} of {len(racers)} racers got ready")
             put((self.store / "go"), "x")
             won = [p.wait(60) for p in started]
         finally:
@@ -1858,10 +1860,12 @@ class Archive(Base):
             subprocess.Popen([lin_racer, str(st), "os/lin-taker", *take_ids], stdin=subprocess.DEVNULL),
         ]
         try:
-            for _ in range(300):
+            for _ in range(600):
                 if len(list(st.glob("ready.*"))) == len(procs):
                     break
                 time.sleep(0.05)
+            else:
+                self.fail(f"only {len(list(st.glob('ready.*')))} of {len(procs)} racers got ready")
             put(st / "go", "x")
             arch_win_out, arch_win_err = procs[0].communicate(timeout=240)
             arch_lin_out, arch_lin_err = procs[1].communicate(timeout=240)
