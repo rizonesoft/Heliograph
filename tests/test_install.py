@@ -4657,7 +4657,7 @@ class TestPhaseInstaller(unittest.TestCase):
                             on_verify=fail_verify,
                         )
                 self.assertEqual(ctx.exception.code, 3)
-                self.assertIn("after_win_install", seen_boundaries, "must publish C on Windows before rolling back")
+                self.assertIn("after_win_install", seen_boundaries, f"must publish C on Windows before rolling back (stopped by: {ctx.exception})")
                 self.assertTrue(verify_called, "must reach planted live verification fault after publication")
                 self.assertIn("planted live verification fault", str(ctx.exception))
 
