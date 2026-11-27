@@ -28,7 +28,7 @@ Sections: 3 | Checklist items: 19
 
 ### Phase 2: The right reader
 
-Sections: 9 | Checklist items: 50
+Sections: 9 | Checklist items: 52
 
 | Status | Reference   | Deliverable                                             | Needs               | Items |
 | ------ | ----------- | ------------------------------------------------------- | ------------------- | ----- |
@@ -40,7 +40,7 @@ Sections: 9 | Checklist items: 50
 | [x]    | D01 T01 §9  | Fixed marks around every shown message                  | none                | 4     |
 | [x]    | D01 T01 §14 | Unowned paths kept to their repository                  | none                | 8     |
 | [x]    | D01 T01 §18 | Session tie and listing tests held to their result      | none                | 5     |
-| [ ]    | D01 T01 §19 | Archive paths opened without following a swapped folder | wsl-windows-interop | 8     |
+| [ ]    | D01 T01 §19 | Archive paths opened without following a swapped folder | wsl-windows-interop | 10    |
 
 ### Phase 3: Scripts and queues
 
@@ -55,4 +55,4 @@ Sections: 4 | Checklist items: 19
 
 Progress: 14/19 verified sections, 3 ready to run now.
 
-Checklist: 85/112 items completed (includes Commit items).
+Checklist: 85/114 items completed (includes Commit items).
