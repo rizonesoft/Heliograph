@@ -323,8 +323,9 @@ int racer(int count, char **args) {
         uint64_t v = 0;
         for (const char *p = args[2]; *p >= '0' && *p <= '9'; p++) v = v * 10 + (uint64_t)(*p - '0');
         plat_now_override = v;
-        /* --now <us> --pause-cli ...: a cut at a pause under the fixed clock. */
-        if (same(args[3], "--pause-cli")) return racer(count - 2, args + 2);
+        /* --now <us> --pause-cli ... or --fail-*-cli ...: that racer option under the fixed clock. */
+        if (same(args[3], "--pause-cli") || (starts(args[3], "--fail-") && len(args[3]) > 10 && same(args[3] + len(args[3]) - 4, "-cli")))
+            return racer(count - 2, args + 2);
         return helio(count - 2, args + 2);
     }
     if (count >= 4 && same(args[1], "--max-names")) {

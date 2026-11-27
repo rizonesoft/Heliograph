@@ -2784,7 +2784,7 @@ class Expiry(Base):
 
     def test_a_move_cut_at_every_pause_is_finished_by_the_next_run(self):
         late = self.T0 + self.D30
-        for n, stage in enumerate(("before-copy-post", "after-copy-post", "before-copy-seen", "before-remove-post", "after-remove-post", "before-remove-seen", "after-remove-seen")):
+        for n, stage in enumerate(("before-copy-post", "after-copy-post", "before-copy-seen", "before-remove-post", "before-unlink-post", "after-remove-post", "before-remove-seen", "after-remove-seen")):
             with self.subTest(stage=stage):
                 msg = self.post_at(self.T0 + n, "tell", "os/apps", f"cut {stage}")
                 self.assertEqual(self.at(late, "show", msg, me="os/apps").returncode, 0)
@@ -2800,19 +2800,24 @@ class Expiry(Base):
                 self.assertEqual(self.at(late + n, "check").returncode, 0, stage)
 
     def test_a_lane_that_returns_after_the_copy_keeps_the_message(self):
-        msg = self.post_at(self.T0, "tell", "os/all", "everyone")
-        late = self.T0 + self.D30
+        for n, stage in enumerate(("after-copy-post", "before-unlink-post")):
+            with self.subTest(stage=stage):
+                self.returning_after_a_cut(stage, self.T0 + n * (self.D30 + self.DAY), f"os/ui{n}")
+
+    def returning_after_a_cut(self, stage, t0, lane):
+        msg = self.post_at(t0, "tell", "os/all", f"everyone {stage}")
+        late = t0 + self.D30
         self.assertEqual(self.at(late, "show", msg, me="os/apps").returncode, 0)
-        self.cut(late, "after-copy-post")
+        self.cut(late, stage)
         self.assertTrue((self.store / f"archive/{self.month(msg)}/{msg}.post").exists())
         self.assertTrue(self.live(msg))
-        # os/ui announces itself before the retry: the copy is not proof, the decision is made again.
-        self.assertEqual(self.at(late + 1, "hello", "codex", me="os/ui").returncode, 0)
+        # A lane announces itself before the retry: the copy is not proof, the decision is made again.
+        self.assertEqual(self.at(late + 1, "hello", "codex", me=lane).returncode, 0)
         self.archive_at(late + 2, 1)
         self.assertTrue(self.live(msg))
-        self.assertIn(msg, self.at(late + 3, me="os/ui").stdout.decode())
+        self.assertIn(msg, self.at(late + 3, me=lane).stdout.decode())
         self.assertEqual(self.at(late + 3, "check").returncode, 0)
-        self.assertEqual(self.at(late + 4, "show", msg, me="os/ui").returncode, 0)
+        self.assertEqual(self.at(late + 4, "show", msg, me=lane).returncode, 0)
         self.archive_at(late + 5, 0)
         self.assertFalse(self.live(msg))
 
@@ -2841,33 +2846,55 @@ class Expiry(Base):
         self.assertIn(msg, self.at(late + 1, me="os/ui").stdout.decode())
         self.assertEqual(self.at(late + 1, "check").returncode, 0)
 
-    def test_a_lane_that_returns_just_before_the_removal_gets_the_post_back(self):
-        msg = self.post_at(self.T0, "tell", "os/all", "everyone")
-        late = self.T0 + self.D30
-        self.assertEqual(self.at(late, "show", msg, me="os/apps").returncode, 0)
-        post = (self.store / f"messages/{msg}.post").read_bytes()
-        stage = "before-unlink-post"  # after the last read before the removal
+    def paused_archive(self, now_us, stage, during):
+        """Runs archive paused at stage, calls during() while it waits, resumes it and returns its exit code."""
         clean = {k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_SESSION")}
         with subprocess.Popen(
-            [str(RACER), "--now", str(late), "--pause-cli", stage, str(self.store), "archive", "--store", str(self.store)],
+            [str(RACER), "--now", str(now_us), "--pause-cli", stage, str(self.store), "archive", "--store", str(self.store)],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=self.store, env=clean,
         ) as proc:
             try:
                 Archive.wait_for(self, self.store / f"paused.{stage}")
-                self.assertEqual(self.at(late, "hello", "codex", me="os/ui").returncode, 0)
+                during()
                 put(self.store / f"resume.{stage}", "go\n")
-                self.assertEqual(proc.wait(timeout=30), 1)
+                code = proc.wait(timeout=30)
             finally:
                 if proc.poll() is None:
                     proc.kill()
         (self.store / f"paused.{stage}").unlink(missing_ok=True)
         (self.store / f"resume.{stage}").unlink(missing_ok=True)
-        self.assertEqual((self.store / f"messages/{msg}.post").read_bytes(), post)
-        self.assertIn(msg, self.at(late + 1, me="os/ui").stdout.decode())
-        self.assertEqual(self.at(late + 1, "check").returncode, 0)
-        self.assertEqual(self.at(late + 2, "show", msg, me="os/ui").returncode, 0)
-        self.archive_at(late + 3, 0)
-        self.assertFalse(self.live(msg))
+        return code
+
+    def assert_moved_for_good(self, msg, files, now_us, late_lane):
+        arch = self.store / f"archive/{self.month(msg)}"
+        for name, data in files.items():
+            self.assertEqual((arch / name).read_bytes(), data, name)
+        self.assertEqual(list((self.store / "messages").glob(f"{msg}.*")), [])
+        self.assertNotIn(msg, self.at(now_us, me=late_lane).stdout.decode())
+        self.assertIn(msg, self.at(now_us, "log", "--all", me=late_lane).stdout.decode())
+        shown = self.at(now_us, "show", msg, me=late_lane)
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        self.assertEqual(self.at(now_us, "check").returncode, 0)
+
+    def test_a_lane_that_announces_itself_inside_the_last_listing_is_after_the_cutoff(self):
+        msg = self.post_at(self.T0, "tell", "os/all", "everyone")
+        late = self.T0 + self.D30
+        self.assertEqual(self.at(late, "show", msg, me="os/apps").returncode, 0)
+        files = {f.name: f.read_bytes() for f in (self.store / "messages").glob(f"{msg}.*")}
+        # The archiver has listed sessions/ for its last read before the removal; os/ui announces itself now.
+        code = self.paused_archive(late, "sessions-after-list", lambda: self.assertEqual(self.at(late, "hello", "codex", me="os/ui").returncode, 0))
+        self.assertEqual(code, 0)
+        self.assert_moved_for_good(msg, files, late + 1, "os/ui")
+
+    def test_a_heartbeat_after_the_removal_leaves_the_move_final(self):
+        msg = self.post_at(self.T0, "tell", "os/all", "everyone")
+        late = self.T0 + self.D30
+        self.assertEqual(self.at(late, "show", msg, me="os/apps").returncode, 0)
+        files = {f.name: f.read_bytes() for f in (self.store / "messages").glob(f"{msg}.*")}
+        code = self.paused_archive(late, "after-remove-post", lambda: self.assertEqual(self.at(late, "hello", "codex", me="os/ui").returncode, 0))
+        self.assertEqual(code, 0)
+        self.archive_at(late + 1, 1)  # the next run finds nothing to do and puts nothing back
+        self.assert_moved_for_good(msg, files, late + 2, "os/ui")
 
     def test_an_unread_broadcast_with_an_unreadable_audience_defers_the_summary(self):
         self.assertEqual(self.at(self.T0 + 1, "hello", "codex", me="os/ui").returncode, 0)
@@ -2886,6 +2913,35 @@ class Expiry(Base):
             record.write_bytes(good)
         self.assertIn(self.at(first + 1, me="os/apps").returncode, (0, 1))
         self.assertEqual(self.held_part(self.summary_of(first).read_text()), (1, [msg]))
+
+    def test_a_damaged_mark_of_an_old_message_defers_the_summary(self):
+        msg = self.post_at(self.T0, "tell", "os/apps", "marked badly")
+        mark = self.store / f"messages/{msg}.{self.mark('os/apps')}"
+        put(mark, "nope\n")
+        first = self.T0 + self.D30 + self.DAY
+        inbox = self.at(first, me="os/ui")
+        self.assertIn(b"the summary was deferred", inbox.stderr)
+        self.assertFalse(self.summary_of(first).exists())
+        r = self.archive_at(first, 3)
+        self.assertIn(msg, (r.stdout + r.stderr).decode())
+        self.assertTrue(self.live(msg))
+        mark.unlink()  # repaired: os/apps has not read it
+        self.assertIn(self.at(first + 1, me="os/ui").returncode, (0, 1))
+        self.assertEqual(self.held_part(self.summary_of(first).read_text()), (1, [msg]))
+
+    def test_a_failed_flush_of_an_archive_copy_changes_nothing_live(self):
+        msg = self.post_at(self.T0, "tell", "os/apps", "flush")
+        late = self.T0 + self.D30
+        self.assertEqual(self.at(late, "show", msg, me="os/apps").returncode, 0)
+        files = {f.name: f.read_bytes() for f in (self.store / "messages").glob(f"{msg}.*")}
+        r = self.at(late, "--fail-sync-cli", "archive")
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        self.assertIn(msg, (r.stdout + r.stderr).decode())
+        self.assertEqual({f.name: f.read_bytes() for f in (self.store / "messages").glob(f"{msg}.*")}, files)
+        self.archive_at(late + 1, 0)
+        for name, data in files.items():
+            self.assertEqual((self.store / f"archive/{self.month(msg)}/{name}").read_bytes(), data)
+        self.assertEqual(list((self.store / "messages").glob(f"{msg}.*")), [])
 
     def test_a_post_put_back_beside_a_finished_move_is_moved_again_not_held(self):
         # A keyed retry killed after it published leaves a live post whose marks are all in the archive.
@@ -2973,6 +3029,15 @@ class Expiry(Base):
         r = self.archive_at(late + 1, 3)
         self.assertIn(msg, (r.stdout + r.stderr).decode())
         self.assertTrue(step.exists())
+        step.unlink()
+        landed = self.store / f"messages/{msg}.landed.{'a' * 40}"
+        put(landed, "commit: " + "a" * 40 + "\n")
+        chk = self.at(late + 2, "check")
+        self.assertEqual(chk.returncode, 3, chk.stdout + chk.stderr)
+        self.assertIn(msg, (chk.stdout + chk.stderr).decode())
+        r = self.archive_at(late + 2, 3)
+        self.assertIn(msg, (r.stdout + r.stderr).decode())
+        self.assertTrue(landed.exists())
 
     def summary_of(self, now_us):
         day = time.strftime("%Y-%m-%d", time.gmtime(now_us / 1_000_000))
