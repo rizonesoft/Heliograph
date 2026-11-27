@@ -46,15 +46,6 @@
         "--all"
       ],
       "timeout_seconds": 60
-    },
-    {
-      "name": "build",
-      "command": [
-        "python3",
-        "../SDK/tools/app_build.py",
-        "."
-      ],
-      "timeout_seconds": 900
     }
   ],
   "runners": {
