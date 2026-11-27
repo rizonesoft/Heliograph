@@ -514,6 +514,8 @@ When a phase is closed and everything is tested, the program that the sessions u
 
 ## 18. Session tie and listing tests held to their result
 
+> **Started:** 2026-11-27T08:20:00Z
+
 Filed 2026-11-26 from the last reconciliation of `D01 T01 §14` (`docs/reviews/01-heliograph/D01-T01-s14.md`, gaps 25 and 40, both P3). §14 breaks an exact tie between two named agents (same agent order, same agent time) on the repository name, but its regression forces only equal agent orders, so removing that last tie-break leaves the test passing whenever the two naming times differ. The one-row listing assertion parses the racer's output without checking its exit code, so a listing that prints the expected row and then fails would pass.
 
 **Phase:** 2
@@ -525,7 +527,8 @@ Filed 2026-11-26 from the last reconciliation of `D01 T01 §14` (`docs/reviews/0
 1. Force an exact tie in `tests/test_helio.py` and assert its winner. Done when: removing the repository-name tie-break in `merge_record` of `engine/place.c` makes it fail.
 2. Check the listing's exit code. Done when: a listing that fails after printing is refused by the test.
 
-- [ ] Write two records for one named session in `tests/test_helio.py` (`RepositoryRouting`), one per repository, with equal `order:`, `agent-order:` and `agent-time:` and different agents, then read the session with `--read-session`. Done when: the agent and repository of the repository name that sorts last are read, the same after the two keys are written in the other order, and the same after a refresh that names no agent in each repository. Cheaper substitute: equal agent orders alone.
+- [ ] Write one record per repository for one named session in `tests/test_helio.py` (`RepositoryRouting`), with equal `time:`, `order:`, `agent-order:` and `agent-time:` and a different agent each, then read the session with `--read-session`. Do it for more than one set of repository names (two names and three names, one set whose last-sorting name is created first), so no directory listing order can pick the right record by luck. Done when: the agent and repository of the repository name that sorts last are read, the same after the keys are written in the other order, and after a refresh that names no agent in each repository the agent is still that one. Cheaper substitute: equal agent orders alone.
+  **Corrected 2026-11-27:** said equal `order:`, `agent-order:` and `agent-time:` only and "the same after a refresh" for both fields. The repository tie-break in `merge_record` (`engine/place.c`) is reached only when `time:` ties too, and a refresh writes `order:` one past the highest (`publish_session_key`), so its repository is the latest by design; only the agent (kept by agent order and agent time) must hold. One name pair alone can pass without the tie-break when the folder lists the winning key first.
 - [ ] Prove the case is held by the tie-break: build with the repository-name comparison removed from `merge_record` and `name_order` of `engine/place.c` and run the case. Done when: it fails there and passes on the section's commit, both results in the commit body.
 - [ ] Check the exit code of `--list-sessions` before its rows are parsed in `test_a_merged_session_never_lends_another_keys_time_to_a_repository` of `tests/test_helio.py`. Done when: the test asserts exit 0 and fails when the racer is made to return 3 after printing.
 - [ ] Commit: `tests: an exact agent tie and the session listing are held to their result`
