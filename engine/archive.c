@@ -900,6 +900,30 @@ static s_result relist_live_marks(const char *folder, const char *id, str_list *
     return ok ? S_OK : S_DAMAGED;
 }
 
+/* The decision just before the removal. For a broadcast the heartbeats are listed first and the marks read after,
+   live then archived: a read acknowledged before the listing is always seen, and the listing is the cutoff. A lane
+   message has no listing; its marks only grow, so the marks read first still hold. */
+static s_result last_decision(store *s, const message *m, const str_list *first, uint64_t now, expiry *out) {
+    size_t to_n = len(m->to);
+    if (!(to_n > 4 && same(m->to + to_n - 4, "/all"))) return archive_expiry_of(s, m, first->items, first->count, now, out);
+    life_list l = {.repository = m->repository ? m->repository : ""};
+    p_result lr = *l.repository ? place_lane_sessions_repo(s, NULL, l.repository, life_each, &l) : place_each_session(s, life_each, &l);
+    if (lr == P_MISSING) l.count = 0;
+    else if (lr != P_OK || l.failed) {
+        p_free(l.items);
+        s->why = "the sessions cannot be read, so who should see it is not known";
+        return S_DAMAGED;
+    }
+    str_list marks = {0};
+    s_result r = relist_live_marks(s->folder, m->id, &marks);
+    if (r == S_OK) r = archived_marks(s->folder, m->id, &marks) == S_DAMAGED ? S_DAMAGED : S_OK;
+    if (r == S_OK) *out = archive_expiry(m, marks.items, marks.count, l.items, l.count, now);
+    else s->why = "a seen mark cannot be read";
+    list_free(&marks);
+    p_free(l.items);
+    return r;
+}
+
 /* Moves a heads-up, finding or answer that is ready: its seen marks are read and checked, who should see it is
    decided again from them and the heartbeats on every attempt, then the post and the marks are copied before the
    post is removed. An archived copy beside the live post is an unfinished move and stays while it is held. */
@@ -974,16 +998,7 @@ static s_result move_non_job(const char *folder, batch_item *it, const message *
        is not in it is after the cutoff (D01 T01 §12), and nothing is put back after the removal. The copy beside a
        live post is an unfinished move, decided again by the next run. */
     store last = {.folder = folder, .pause = pause, .pause_user = pause_user}; /* its listing pauses at sessions-after-list */
-    er = archive_expiry_of(&last, m, present.items, present.count, now, &e);
-    if (er == S_OK && e == EXPIRY_HELD) {
-        /* The audience grew since the first read: someone may have read it meanwhile, so its marks are read again and
-           it is decided once more; that listing is then the last one. New marks reach the archive in the tail sweep. */
-        str_list again = {0};
-        er = relist_live_marks(folder, it->id, &again);
-        if (er == S_OK) er = archive_expiry_of(&tmp, m, again.items, again.count, now, &e);
-        if (er != S_OK) last.why = er == S_DAMAGED && !tmp.why ? "a seen mark cannot be read" : tmp.why;
-        list_free(&again);
-    }
+    er = last_decision(&last, m, &present, now, &e);
     tmp.why = last.why;
     if (er != S_OK || e != EXPIRY_READY) {
         list_free(&present);

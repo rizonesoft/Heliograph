@@ -2913,6 +2913,44 @@ class Expiry(Base):
         self.assertEqual(list((self.store / "messages").glob(f"{msg}.*")), [])
         self.assertTrue((self.store / f"archive/{self.month(msg)}/{msg}.{self.mark('os/ui')}").exists())
 
+    def test_a_lane_that_announces_itself_after_the_last_listing_is_after_the_cutoff(self):
+        msg = self.post_at(self.T0, "tell", "os/all", "everyone")
+        late = self.T0 + self.D30
+        self.assertEqual(self.at(late, "show", msg, me="os/apps").returncode, 0)
+        files = {f.name: f.read_bytes() for f in (self.store / "messages").glob(f"{msg}.*")}
+        code = self.paused_archive(late, "before-unlink-post", lambda: self.assertEqual(self.at(late, "hello", "codex", me="os/ui").returncode, 0))
+        self.assertEqual(code, 0)
+        self.assert_moved_for_good(msg, files, late + 1, "os/ui")
+
+    def test_a_read_inside_the_last_listing_by_a_listed_lane_is_counted(self):
+        # os/ui announces itself before the last listing and reads while that listing is held: the marks are read
+        # after the listing, so the read is counted and the same run moves the message.
+        msg = self.post_at(self.T0, "tell", "os/all", "everyone")
+        late = self.T0 + self.D30
+        self.assertEqual(self.at(late, "show", msg, me="os/apps").returncode, 0)
+        clean = {k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_SESSION")}
+        stages = "before-remove-post,sessions-after-list"
+        with subprocess.Popen(
+            [str(RACER), "--now", str(late), "--pause-cli", stages, str(self.store), "archive", "--store", str(self.store)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=self.store, env=clean,
+        ) as proc:
+            try:
+                Archive.wait_for(self, self.store / "paused.before-remove-post")
+                self.assertEqual(self.at(late, "hello", "codex", me="os/ui").returncode, 0)
+                put(self.store / "resume.before-remove-post", "go\n")
+                Archive.wait_for(self, self.store / "paused.sessions-after-list")
+                self.assertEqual(self.at(late, "show", msg, me="os/ui").returncode, 0)
+                put(self.store / "resume.sessions-after-list", "go\n")
+                self.assertEqual(proc.wait(timeout=30), 0)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+        for stage in stages.split(","):
+            (self.store / f"paused.{stage}").unlink(missing_ok=True)
+            (self.store / f"resume.{stage}").unlink(missing_ok=True)
+        self.assertEqual(list((self.store / "messages").glob(f"{msg}.*")), [])
+        self.assertTrue((self.store / f"archive/{self.month(msg)}/{msg}.{self.mark('os/ui')}").exists())
+
     def test_a_heartbeat_after_the_removal_leaves_the_move_final(self):
         msg = self.post_at(self.T0, "tell", "os/all", "everyone")
         late = self.T0 + self.D30
@@ -3033,7 +3071,8 @@ class Expiry(Base):
         chk = self.at(late, "check")
         self.assertEqual(chk.returncode, 3)
         self.assertIn(orphan, (chk.stdout + chk.stderr).decode())
-        self.assertEqual(self.archive_at(late, 3).returncode, 3)
+        r = self.archive_at(late, 3)
+        self.assertIn(orphan, (r.stdout + r.stderr).decode())
         (self.store / f"messages/{orphan}.{self.mark('os/apps')}").unlink()
 
         # A damaged seen mark is damage and no decision: the message stays live.
