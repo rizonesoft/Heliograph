@@ -53,7 +53,7 @@ title: "TODO-01 -- Heliograph"
 | 16 | §16 | Installer for Windows sessions | §15 | [x] |
 | 17 | §17 | Installed program replaced after a tested phase | §15, §16 | [x] |
 | 18 | §18 | Session tie and listing tests held to their result | §14 | [x] |
-| 19 | §19 | Archive paths opened without following a swapped folder | §3 | [ ] |
+| 19 | §19 | Archive paths opened without following a swapped folder | §3 | [x] |
 | 20 | §20 | Windows launches from WSL that survive an interop timeout | §17 | [ ] |
 
 ## 1. Steps that notice an archived job
@@ -576,9 +576,12 @@ Filed 2026-11-27 from the Astra review round 2 of `b9388b0` (P2, pre-existing, r
   **Corrected 2026-11-27:** said each test "fails on the parent commit", which has none of the pauses and would only time out (plan review finding 6); the read test now requires the original message (exit 0) instead of "or exits 3", which could not show the planted post was never read; root listings and `seen` are covered (findings 2 and 4); the `p_dir_same` item added earlier today is struck, out of scope under **Scope** (finding 1).
 - [x] Prove the Windows hold on a local NTFS store (the store in the Windows temporary folder): a junction already in place of `archive/` or `archive/<month>/`, and a file symlink in place of the post, are refused; a rename of the held folder attempted while a command is paused gets a sharing violation, the command resumes and exits 0, and the rename succeeds after it ends. Done when: these tests pass on Windows through `prove.py` run on the committed candidate and on `windows-latest` in the `Build` run of that same pushed commit.
   **Corrected 2026-11-27:** said "through `prove.py` with a junction in place of `archive/`"; `prove.py` runs Windows against the WSL disk, where a junction cannot be made, and builds only committed work, so the tests use an NTFS temporary store and run after the commit (findings 5 and 7).
-- [ ] Commit: `archive: a folder swapped after its check is never followed`
+- [x] Commit: `archive: a folder swapped after its check is never followed`
 
 **Test checkpoint:** `python3 ../SDK/tools/app_build.py .` exits 0 on the section's commit; each swap test fails with the held opens replaced by path opens; `python3 ../SDK/tools/prove.py .` prints `proved on Windows` for that commit and its `Build` run is green on both hosts.
+
+> **Verified:** 2026-11-27 | §19 | 4116baf0aaeb58a5fbfcdb669150c3922f7e362a
+> **Review:** `docs/reviews/d01-t01-s19.json`
 
 ## 20. Windows launches from WSL that survive an interop timeout
 

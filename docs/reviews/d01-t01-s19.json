@@ -1,0 +1,89 @@
+{
+  "ref": "D01 T01 \u00a719",
+  "title": "Archive paths opened without following a swapped folder",
+  "implementation_sha": "4116baf0aaeb58a5fbfcdb669150c3922f7e362a",
+  "date": "2026-11-27",
+  "reviews": [
+    {
+      "round": 1,
+      "report": "docs/reviews/01-heliograph/D01-T01-s19.md",
+      "verdict": "fixed"
+    }
+  ],
+  "checks": [
+    "python3 ../SDK/tools/app_build.py . -> BUILD_EXIT=0, Ran 137 tests, OK (skipped=8) on 4116baf0aaeb58a5fbfcdb669150c3922f7e362a",
+    "python3 ../SDK/tools/prove.py . -> proved on Windows: Heliograph 4116baf, Ran 137 tests OK (skipped=29)",
+    "GitHub Actions Build 45987597405 -> success on ubuntu-latest and windows-latest at 4116baf0aaeb58a5fbfcdb669150c3922f7e362a"
+  ],
+  "completion": {
+    "report": "docs/reviews/01-heliograph/D01-T01-s19.md",
+    "verdict": "reconciled",
+    "candidate": "4116baf0aaeb58a5fbfcdb669150c3922f7e362a",
+    "reviewer": "astra",
+    "model": "gpt-6.2-astra",
+    "filed": []
+  },
+  "rounds_spent": 1,
+  "round_cap": 33,
+  "plan": {
+    "report": "docs/reviews/01-heliograph/D01-T01-s19.md",
+    "candidate": "e0920313f9f75d62adc397d96833dcbbb56d548d",
+    "reviewer": "astra",
+    "model": "gpt-6.2-astra",
+    "effort": "medium",
+    "lenses": [
+      "plan"
+    ]
+  },
+  "schedule_sha": "e0920313f9f75d62adc397d96833dcbbb56d548d",
+  "schedule": {
+    "policy": "three-pass",
+    "pass_cap": 33,
+    "blocking": [
+      "P1",
+      "P2"
+    ],
+    "plan": {
+      "effort": "medium",
+      "lenses": [
+        "plan"
+      ]
+    },
+    "rounds": [
+      {
+        "effort": "medium",
+        "lenses": [
+          "adversarial",
+          "integration",
+          "source-defect",
+          "consistency",
+          "quality",
+          "optimization",
+          "design"
+        ]
+      }
+    ],
+    "completion": {
+      "effort": "low",
+      "lenses": [
+        "plan-delivery",
+        "record"
+      ]
+    },
+    "reconciliation": {
+      "effort": "low",
+      "lenses": [
+        "adversarial",
+        "integration",
+        "plan-delivery",
+        "record"
+      ]
+    },
+    "lenses": {
+      "thread-safety": "Which state is reached from two threads (UI, worker, callback, timer) without one lock or atomic owning it, and which lock order, wait, cancellation or teardown can deadlock or run after its owner is gone?",
+      "memory-safety": "Which pointer, reference, view, handle or iterator can outlive what it refers to, and which size, index or cast is trusted unchecked?"
+    }
+  },
+  "passes_spent": 5,
+  "pass_cap": 33
+}
