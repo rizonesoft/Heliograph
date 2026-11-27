@@ -20,8 +20,10 @@ p_result p_remove(const char *path);
 p_result p_claim_remove(const char *path, const char *unique);
 p_result p_sync(const char *path);
 p_result p_folder(const char *path);
-/* True iff path exists and is a real directory (never a symlink or reparse point). */
-bool p_is_real_dir(const char *path);
+/* One look at path: P_OK when it is a real directory (never a symlink or reparse point), P_MISSING when
+   nothing is there, P_FAILED when something else is there or it cannot be looked at. One call, so a folder
+   another program creates meanwhile is never mistaken for one that is not a real directory. */
+p_result p_real_dir(const char *path);
 /* Current working directory as newly allocated UTF-8 string, or P_FAILED. */
 p_result p_cwd(char **path_out);
 p_result p_list(const char *path, bool (*each)(void *user, const char *name), void *user);

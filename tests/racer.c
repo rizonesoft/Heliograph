@@ -174,6 +174,15 @@ static bool print_one_session(void *user, const session_info *info) {
 
 int racer(int count, char **args) {
     if (count >= 3 && same(args[1], "--remove")) return (int)p_remove(args[2]);
+    /* --terminal-loop <store> <id> <rounds>: asks whether <id> has an archived terminal copy <rounds> times;
+       exit 9 the first time the answer is damage, 0 when it never is. */
+    if (count >= 5 && same(args[1], "--terminal-loop")) {
+        unsigned long rounds = 0;
+        for (const char *p = args[4]; *p >= '0' && *p <= '9'; p++) rounds = rounds * 10 + (unsigned long)(*p - '0');
+        for (unsigned long i = 0; i < rounds; i++)
+            if (archive_has_terminal_job(args[2], args[3], NULL) == S_DAMAGED) return 9;
+        return 0;
+    }
     if (count >= 4 && same(args[1], "--read-session")) {
         store s = {.folder = args[2]};
         const char *lane = args[3];
@@ -499,7 +508,11 @@ int racer(int count, char **args) {
     for (int i = 3; i < count; i++) {
         s_result result = store_take(&s, args[i], (actor){.lane = args[2], .session = ""});
         if (result == S_OK) won++;
-        else if (result != S_REFUSED) return 102;
+        else if (result != S_REFUSED) {
+            p_error("racer: take "), p_error(args[i]), p_error(result == S_NOTHING ? ": nothing: " : ": damaged: ");
+            p_error(s.why ? s.why : "(no reason)"), p_error("\n");
+            return 102;
+        }
     }
     return won;
 }

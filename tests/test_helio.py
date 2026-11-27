@@ -1838,7 +1838,10 @@ class Archive(Base):
         win_store = subprocess.run(["wslpath", "-w", str(st)], capture_output=True, text=True, check=True, timeout=30).stdout.strip()
         win_racer = str(BUILD / "racer.exe")
         lin_racer = str(RACER)
-        # 2 archivers (limit=1 per round: Windows 300 rounds + Linux 1000 rounds, moving all 1,000 distinct eligible jobs),
+        # 2 archivers (limit=1 per round: Windows 100 rounds + Linux 900 rounds, moving all 1,000 distinct eligible jobs).
+        # Both walk the same sorted ids and the local Linux one is far faster, so with more than 900 rounds it can archive
+        # everything before the Windows walk over \\wsl.localhost reaches a job; capped at 900 it always leaves exactly 100
+        # for Windows, so every round of each side moves one job and both sides really race.
         # 2 concurrent readers (Windows min 200 + Linux min 800 = 1,000+ rounds running until BOTH archivers finish,
         # checking ALL 20 live controls, 100% of ALL 1,000 eligible IDs, and full parsed readability of a rotating
         # window of 10 eligible IDs on EVERY SINGLE ROUND), and 2 racing takers (Windows + Linux).
@@ -1846,7 +1849,7 @@ class Archive(Base):
         take_ids = old_ids[::25] + live_ids
         procs = [
             subprocess.Popen([win_racer, "--archive-loop", win_store, "100"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
-            subprocess.Popen([lin_racer, "--archive-loop", str(st), "1200"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
+            subprocess.Popen([lin_racer, "--archive-loop", str(st), "900"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
             subprocess.Popen([win_racer, "--read-loop", win_store, "100", str(len(live_ids)), *live_ids], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
             subprocess.Popen([lin_racer, "--read-loop", str(st), "900", str(len(live_ids)), *live_ids], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
             subprocess.Popen([win_racer, win_store, "os/win-taker", *take_ids[::-1]], stdin=subprocess.DEVNULL),
@@ -1885,7 +1888,7 @@ class Archive(Base):
         lin_moved = int(arch_lin_out.decode().strip())
         self.assertGreater(win_moved, 0, f"Windows archiver moved 0 jobs (lin={lin_moved})")
         self.assertGreater(lin_moved, 0, f"Linux archiver moved 0 jobs (win={win_moved})")
-        self.assertEqual(win_moved + lin_moved, 1000, (win_moved, lin_moved))
+        self.assertEqual((win_moved, lin_moved), (100, 900))
         self.assertEqual(read_win_rc, 0, read_win_err)
         self.assertEqual(read_lin_rc, 0, read_lin_err)
         # Every live control job taken exactly once (per-job check, not aggregate!) and zero eligible old jobs taken!
@@ -1904,6 +1907,30 @@ class Archive(Base):
             self.assertIn("state: taken\n", (arch_dir / f"{oid}.link.0000").read_text(), oid)
             self.assertIn("state: done\n", (arch_dir / f"{oid}.link.0001").read_text(), oid)
         self.assertEqual(run(st, "check", me=None).returncode, 0)
+
+    def test_archive_folder_created_meanwhile_is_never_damage(self):
+        # The first archiver creates archive/ while a taker asks whether a live job was archived. A folder that
+        # appears between two looks once read as "not a real directory", so the take failed as damaged.
+        import threading
+
+        st = self.store
+        live = self.send(to="os/all", subject="live")
+        arch = st / "archive"
+        stop = threading.Event()
+
+        def flip():
+            while not stop.is_set():
+                arch.mkdir()
+                arch.rmdir()
+
+        flipper = threading.Thread(target=flip)
+        flipper.start()
+        try:
+            r = subprocess.run([str(RACER), "--terminal-loop", str(st), live, "300000"], stdin=subprocess.DEVNULL, capture_output=True, timeout=120)
+        finally:
+            stop.set()
+            flipper.join(timeout=30)
+        self.assertEqual(r.returncode, 0, "a folder created meanwhile was reported as damage")
 
     def test_archived_show_seen_answer_and_chain_replay(self):
         # Multi-step jobs: (1) taken -> released -> taken by another session -> done; (2) taken -> refused.

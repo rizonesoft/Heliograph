@@ -77,20 +77,10 @@ static s_result check_arch_dirs(const char *folder, const char *month) {
         text_free(&a), text_free(&m);
         return S_DAMAGED;
     }
-    if (!p_is_real_dir(a.data)) {
-        uint64_t mt = 0;
-        p_result mr = p_file_mtime(a.data, &mt);
-        text_free(&a), text_free(&m);
-        return mr == P_MISSING ? S_NOTHING : S_DAMAGED;
-    }
-    if (!p_is_real_dir(m.data)) {
-        uint64_t mt = 0;
-        p_result mr = p_file_mtime(m.data, &mt);
-        text_free(&a), text_free(&m);
-        return mr == P_MISSING ? S_NOTHING : S_DAMAGED;
-    }
+    p_result ar = p_real_dir(a.data);
+    p_result mr = ar == P_OK ? p_real_dir(m.data) : ar;
     text_free(&a), text_free(&m);
-    return S_OK;
+    return mr == P_OK ? S_OK : mr == P_MISSING ? S_NOTHING : S_DAMAGED;
 }
 
 s_result archive_read_message(store *s, const char *id, message *out) {
@@ -1685,7 +1675,7 @@ size_t archive_every(store *s, char *const *emitted, size_t emitted_count,
         const char *month = ml.months.items[mi];
         text mdir = {0};
         arch_dir(s->folder, month, &mdir);
-        if (mdir.failed || !p_is_real_dir(mdir.data)) {
+        if (mdir.failed || p_real_dir(mdir.data) != P_OK) {
             damaged++;
             text_free(&mdir);
             continue;
@@ -1931,7 +1921,7 @@ s_result archive_check(store *s, text *report) {
         const char *month = ml.months.items[mi];
         text mdir = {0};
         arch_dir(s->folder, month, &mdir);
-        if (mdir.failed || !p_is_real_dir(mdir.data)) {
+        if (mdir.failed || p_real_dir(mdir.data) != P_OK) {
             report_arch(report, month, "", "archive month is not a real directory");
             all = S_DAMAGED;
             text_free(&mdir);

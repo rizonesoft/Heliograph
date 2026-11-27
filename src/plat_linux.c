@@ -233,9 +233,10 @@ p_result p_folder(const char *path) {
     return errno == EEXIST ? P_FAILED : why();
 }
 
-bool p_is_real_dir(const char *path) {
+p_result p_real_dir(const char *path) {
     struct stat info;
-    return !lstat(path, &info) && S_ISDIR(info.st_mode);
+    if (lstat(path, &info)) return errno == ENOENT ? P_MISSING : P_FAILED;
+    return S_ISDIR(info.st_mode) ? P_OK : P_FAILED;
 }
 
 p_result p_cwd(char **path_out) {

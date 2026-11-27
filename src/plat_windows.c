@@ -337,12 +337,14 @@ p_result p_folder(const char *path) {
     return settle_win_ex(path, true) && sync_dir_win(path, true) ? P_OK : P_FAILED;
 }
 
-bool p_is_real_dir(const char *path) {
+p_result p_real_dir(const char *path) {
     wchar_t *wide = im_wide(path);
-    if (!wide) return false;
+    if (!wide) return P_FAILED;
     DWORD attrs = GetFileAttributesW(wide);
+    DWORD err = attrs == INVALID_FILE_ATTRIBUTES ? GetLastError() : 0;
     im_free(wide);
-    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) && !(attrs & FILE_ATTRIBUTE_REPARSE_POINT);
+    if (attrs == INVALID_FILE_ATTRIBUTES) return err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND ? P_MISSING : P_FAILED;
+    return (attrs & FILE_ATTRIBUTE_DIRECTORY) && !(attrs & FILE_ATTRIBUTE_REPARSE_POINT) ? P_OK : P_FAILED;
 }
 
 p_result p_cwd(char **path_out) {
