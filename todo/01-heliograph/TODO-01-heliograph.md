@@ -362,7 +362,11 @@ The Gemini driver's queue is `helio take --kind request --lane neon-a --json`. I
 
 ## 12. Expiry of seen heads-ups and findings
 
+> **Started:** 2026-11-27T18:10:04Z
+
 Seen heads-ups, findings and answers stay in the working store for ever. They leave it 30 days after they were sent, once all who should see them have.
+
+**Corrected 2026-11-27 (validation against `engine/archive.c`, `engine/place.c`, `engine/watch.c`):** the section named only the decision. The archiver has no path for a message that is not a job: `copy_and_unlink_post` returns at `!is_job`, and its crash recovery and `archive_is_clean_remnant` read `archive_has_terminal_job`, which calls an archived heads-up damage, so a move cut short would leave a store `helio check` calls damaged. The items below add the move, its recovery and its check. Two facts changed the rules: a session record keeps only its newest heartbeat (`place_session_repo_when`), so "a sign of life in those 30 days" is read as a heartbeat at or after the message was sent, which never lets a lane that came back late lose a message it has not seen; and seen marks are per session (`seen.<lane>` or `seen.<lane>+<hash>`), so a lane has seen a message when any of its marks exists, and a message for one session needs that session's mark. A lane's owner alert mark (`~alert`) is not the reader seeing it. A message for `project/all` that no lane has seen is unseen, never expired by an empty audience. Already true and kept: archived non-job messages are read by `show`, answered, found by a keyed repeat (`store_post` reads `archive_read_message`), listed by `log --all` (`archive_every`) and checked (`archive_check`), all from `D01 T01 §3`.
 
 **Phase:** 3
 **Needs:** none
@@ -370,12 +374,15 @@ Seen heads-ups, findings and answers stay in the working store for ever. They le
 
 **Build order:**
 
-1. Decide expiry in `engine/archive.c`. Done when: it is a pure function of the message, its marks, the sessions and the clock.
-2. Cover it in `tests/test_helio.py`. Done when: an unseen message never expires.
+1. Decide expiry in `engine/archive.c`. Done when: it is a pure function of the message, its seen marks, the sessions and the clock.
+2. Move, recover and check an expired message in `engine/archive.c` and `engine/store.c`. Done when: a cut at every pause leaves a store `helio check` passes and the next run finishes.
+3. Count what is held in `engine/watch.c` and cover it all in `tests/test_helio.py`. Done when: an unseen message never expires.
 
-- [ ] Archive a seen message for one lane after 30 days in `engine/archive.c` (design, "Not goals"). Done when: the day before it stays and the day after it moves. Cheaper substitute: age alone.
-- [ ] Keep a message for `project/all` in `engine/archive.c` until every lane with a sign of life in those 30 days has seen it. Done when: one unseeing live lane holds it. Cheaper substitute: the first reader ends it.
-- [ ] Keep an unseen message in `engine/archive.c` and count it in the summary of `engine/watch.c` after 30 days. Done when: it is in the summary and still in the inbox. Cheaper substitute: deleting it.
+- [ ] Write `archive_expiry` in `engine/archive.c` (declared in `engine/archive.h`): from a message that is not a job, the names of its seen marks, the sessions and the clock it returns not yet (under 30 days since the id's time), held (someone who should see it has not) or ready (design, "Not goals"). Done when: a racer entry point in `tests/racer.c` gives the three answers for fixtures of a lane message, a one-session message and a `project/all` message, with no store open. Cheaper substitute: age alone.
+- [ ] Hold a `project/all` message in `archive_expiry` until every other lane of the project with a heartbeat at or after its sending (in its repository when it names one) has seen it, and while no lane has. Done when: one unseeing live lane holds it, a lane with no heartbeat since does not, and an unseen one is held. Cheaper substitute: the first reader ends it.
+- [ ] Move a ready message in `copy_and_unlink_post` of `engine/archive.c`: validate its seen marks, copy the post and every seen mark durably, remove the post, then sweep late seen marks, as a closed job is moved. Done when: the day before 30 days it stays and the day after it is in `archive/<year-month>/` byte for byte and gone from `messages`, and `show`, `answer` and a keyed repeat still find it. Cheaper substitute: deleting it.
+- [ ] Recognize an archived non-job post as a finished move in `engine/archive.c` (`archive_has_closed`, used by the recovery branch of `copy_and_unlink_post`, `sweep_item_tail` and `archive_is_clean_remnant`), keeping `archive_has_terminal_job` for jobs. Done when: a kill at each pause of the move leaves `helio check` exit 0 and the next `helio archive` finishes it, and a live seen mark with no post and no archived copy is still named damage. Cheaper substitute: treating any orphan mark as clean.
+- [ ] Keep an unseen message and count it in `watch_summary` of `engine/watch.c` with `archive_expiry`: a `Held unseen` section lists messages over 30 days that are held. Done when: it is in the day's summary and still in the inbox of the lane that has not seen it. Cheaper substitute: deleting it.
 - [ ] Commit: `archive: seen messages expire`
 
 **Test checkpoint:** `python3 ../SDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
