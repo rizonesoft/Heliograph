@@ -304,11 +304,20 @@ A linked commit marks a job landed and closes nothing. The engine starts no prog
 
 ## 10. JSON output on every command
 
+> **Started:** 2026-11-27T13:40:00Z
+
 A script must not parse lines meant for people. `--json` prints one JSON value, and an error is one too. `summary` becomes a command that prints the day's counts.
 
 **Phase:** 3
 **Needs:** none
 **Surface:** no
+
+**Contract (Corrected 2026-11-27):** the section named no JSON shape and listed `send`, which the program spells `ask`, `hand`, `tell`, `find` and `answer` (`engine/helio.c` command table). With `--json` a command prints exactly one JSON value and a newline on stdout, and nothing on stderr; exit codes stay 0 done, 1 nothing, 2 refused, 3 damaged (design, "Commands"). Text is UTF-8, a byte sequence that is not UTF-8 becomes U+FFFD, and the engine still uses no floating point or system call (`AGENTS.md`). The shapes:
+- a message: `{"id", "time", "from", "to", "for_session", "repository", "kind", "about", "urgency", "re", "due", "subject", "body", "archived"}` with the stored values (`due` as the stored time text, or `null`), plus, for a request or handoff, `"state"` (`"open"`, `"taken"`, `"done"`, `"refused"`), `"taker"`, `"session"` and `"landed"` (a list of commits), and in the inbox `"overdue"` and `"silent"` (booleans);
+- `helio` (inbox) and `log`: `{"messages": [<message>...]}`; `show`: `<message>`; `check`: `{"ok": <bool>, "problems": [<text>...]}`;
+- `ask`, `hand`, `tell`, `find`, `answer`: `{"id": <id>}`; `take`, `release`, `done`, `refuse`: `{"id": <id>, "state": <state>}`; `landed`: `{"id": <id>, "commit": <commit>}`; `hello`: `{"agent": <agent>, "session": <session>}`; `working`: `{"lane": <lane>, "paths": [<path>...]}`; `archive`: `{"archived": <count>, "problems": [<text>...]}`; `init`: `{"store": <folder>}`; `summary`: `{"day", "at", "overdue", "silent", "open", "taken", "done", "refused", "damaged"}` with the counts of `summary/<day>.md`;
+- an error: `{"error": <text>, "code": <exit code>}`.
+`hook` keeps the Claude hook's own output and `help` stays text: neither is a script's interface.
 
 **Build order:**
 
@@ -316,8 +325,8 @@ A script must not parse lines meant for people. `--json` prints one JSON value, 
 2. Use it in `engine/helio.c`. Done when: every command in the table has a JSON test.
 
 - [ ] Escape text in `engine/json.c` and replace bytes that are not UTF-8. Done when: Python's `json` reads random bytes of 10000 messages. Cheaper substitute: copying bytes.
-- [ ] Print inbox, log, show and check in `engine/helio.c` with every field of the message, its state and its taker (design, "Commands"). Done when: each field equals the stored one. Cheaper substitute: the line as a string.
-- [ ] Print the id or the new state for send, take, release, done, refuse, landed, hello, working, archive and init in `engine/helio.c`. Done when: each is read in `tests/test_helio.py`. Cheaper substitute: no output.
+- [ ] Print inbox, log, show and check in `engine/helio.c` with every field of the message, its state and its taker, in the shapes above (design, "Commands"). Done when: each field equals the stored one. Cheaper substitute: the line as a string.
+- [ ] Print the id or the new state for ask, hand, tell, find, answer, take, release, done, refuse, landed, hello, working, archive and init in `engine/helio.c`, in the shapes above. Done when: each is read in `tests/test_helio.py`. Cheaper substitute: no output.
 - [ ] Add `summary` to the commands in `engine/helio.c`, as text and as JSON from `engine/watch.c`. Done when: its counts equal the file's. Cheaper substitute: the path of the file.
 - [ ] Print an error as `{"error": ..., "code": ...}` in `fail` of `engine/helio.c`. Done when: exit codes are unchanged for 0, 1, 2 and 3. Cheaper substitute: text on an error.
 - [ ] Commit: `output: JSON on every command`
