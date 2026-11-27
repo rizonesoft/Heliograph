@@ -858,6 +858,48 @@ s_result archive_expiry_of(store *s, const message *m, char *const *seen_live, s
     return S_OK;
 }
 
+typedef struct {
+    const char *id;
+    size_t id_n;
+    str_list marks;
+} live_marks_ctx;
+
+static bool collect_live_mark(void *user, const char *name) {
+    live_marks_ctx *c = user;
+    for (size_t i = 0; i < c->id_n; i++)
+        if (name[i] != c->id[i]) return true;
+    if (name[c->id_n] != '.' || !starts(name + c->id_n + 1, "seen.")) return true;
+    size_t n = len(name);
+    if (n > 5 && same(name + n - 5, ".part")) return true;
+    const char *ev = name + c->id_n + 1;
+    return list_push(&c->marks, ev, len(ev)) || (c->marks.failed = true, false);
+}
+
+/* The live seen marks of one message as they are now, each read and checked: for the last decision when the
+   audience grew since the first, so a read acknowledged meanwhile is not missed. */
+static s_result relist_live_marks(const char *folder, const char *id, str_list *out) {
+    text dir = {0};
+    add(&dir, folder), add(&dir, "/messages");
+    live_marks_ctx c = {.id = id, .id_n = len(id)};
+    p_result lr = dir.failed ? P_FAILED : p_list(dir.data, collect_live_mark, &c);
+    text_free(&dir);
+    bool ok = lr == P_OK && !c.marks.failed;
+    for (size_t i = 0; ok && i < c.marks.count; i++) {
+        text sp = {0};
+        live_path(folder, &sp, id, c.marks.items[i]);
+        char *sd = NULL;
+        size_t sl = 0;
+        p_result sr = sp.failed ? P_FAILED : p_read(sp.data, MOST_FILE, &sd, &sl);
+        text_free(&sp);
+        if (sr == P_MISSING) continue;
+        ok = sr == P_OK && store_valid_seen_event(c.marks.items[i]) && sl == len(ARCHIVE_SEEN) && same(sd, ARCHIVE_SEEN);
+        p_free(sd);
+        if (ok) ok = list_push(out, c.marks.items[i], len(c.marks.items[i]));
+    }
+    list_free(&c.marks);
+    return ok ? S_OK : S_DAMAGED;
+}
+
 /* Moves a heads-up, finding or answer that is ready: its seen marks are read and checked, who should see it is
    decided again from them and the heartbeats on every attempt, then the post and the marks are copied before the
    post is removed. An archived copy beside the live post is an unfinished move and stays while it is held. */
@@ -933,6 +975,15 @@ static s_result move_non_job(const char *folder, batch_item *it, const message *
        live post is an unfinished move, decided again by the next run. */
     store last = {.folder = folder, .pause = pause, .pause_user = pause_user}; /* its listing pauses at sessions-after-list */
     er = archive_expiry_of(&last, m, present.items, present.count, now, &e);
+    if (er == S_OK && e == EXPIRY_HELD) {
+        /* The audience grew since the first read: someone may have read it meanwhile, so its marks are read again and
+           it is decided once more; that listing is then the last one. New marks reach the archive in the tail sweep. */
+        str_list again = {0};
+        er = relist_live_marks(folder, it->id, &again);
+        if (er == S_OK) er = archive_expiry_of(&tmp, m, again.items, again.count, now, &e);
+        if (er != S_OK) last.why = er == S_DAMAGED && !tmp.why ? "a seen mark cannot be read" : tmp.why;
+        list_free(&again);
+    }
     tmp.why = last.why;
     if (er != S_OK || e != EXPIRY_READY) {
         list_free(&present);

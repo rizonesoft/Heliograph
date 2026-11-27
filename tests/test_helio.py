@@ -2870,7 +2870,9 @@ class Expiry(Base):
         for name, data in files.items():
             self.assertEqual((arch / name).read_bytes(), data, name)
         self.assertEqual(list((self.store / "messages").glob(f"{msg}.*")), [])
-        self.assertNotIn(msg, self.at(now_us, me=late_lane).stdout.decode())
+        inbox = self.at(now_us, me=late_lane)
+        self.assertIn(inbox.returncode, (0, 1), inbox.stderr)
+        self.assertNotIn(msg, inbox.stdout.decode())
         self.assertIn(msg, self.at(now_us, "log", "--all", me=late_lane).stdout.decode())
         shown = self.at(now_us, "show", msg, me=late_lane)
         self.assertEqual(shown.returncode, 0, shown.stderr)
@@ -2885,6 +2887,31 @@ class Expiry(Base):
         code = self.paused_archive(late, "sessions-after-list", lambda: self.assertEqual(self.at(late, "hello", "codex", me="os/ui").returncode, 0))
         self.assertEqual(code, 0)
         self.assert_moved_for_good(msg, files, late + 1, "os/ui")
+
+    def test_a_listed_lane_is_counted_by_the_record_the_listing_reads(self):
+        # os/ui's record is from before the sending; it announces itself while the last listing reads: the listing
+        # reads its new record, so it holds the message (the safe side) until it has read it.
+        self.assertEqual(self.at(self.T0 - self.DAY, "hello", "codex", me="os/ui").returncode, 0)
+        msg = self.post_at(self.T0, "tell", "os/all", "everyone")
+        late = self.T0 + self.D30
+        self.assertEqual(self.at(late, "show", msg, me="os/apps").returncode, 0)
+        code = self.paused_archive(late, "sessions-after-list", lambda: self.assertEqual(self.at(late, "hello", "codex", me="os/ui").returncode, 0))
+        self.assertEqual(code, 1)
+        self.assertTrue(self.live(msg))
+        self.assertIn(msg, self.at(late + 1, me="os/ui").stdout.decode())
+
+    def test_a_read_acknowledged_before_the_last_listing_is_counted(self):
+        msg = self.post_at(self.T0, "tell", "os/all", "everyone")
+        late = self.T0 + self.D30
+        self.assertEqual(self.at(late, "show", msg, me="os/apps").returncode, 0)
+
+        def returns_and_reads():
+            self.assertEqual(self.at(late, "hello", "codex", me="os/ui").returncode, 0)
+            self.assertEqual(self.at(late, "show", msg, me="os/ui").returncode, 0)
+
+        self.assertEqual(self.paused_archive(late, "before-remove-post", returns_and_reads), 0)
+        self.assertEqual(list((self.store / "messages").glob(f"{msg}.*")), [])
+        self.assertTrue((self.store / f"archive/{self.month(msg)}/{msg}.{self.mark('os/ui')}").exists())
 
     def test_a_heartbeat_after_the_removal_leaves_the_move_final(self):
         msg = self.post_at(self.T0, "tell", "os/all", "everyone")
