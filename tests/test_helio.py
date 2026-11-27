@@ -1841,16 +1841,17 @@ class Archive(Base):
         # 2 archivers (limit=1 per round: Windows 100 rounds + Linux 900 rounds, moving all 1,000 distinct eligible jobs).
         # Both walk the same sorted ids and the local Linux one is far faster, so with more than 900 rounds it can archive
         # everything before the Windows walk over \\wsl.localhost reaches a job; capped at 900 it always leaves exactly 100
-        # for Windows, so every round of each side moves one job. Linux holds after 450 moves until Windows has moved
-        # one (Windows writes win-moved), so both archivers are proven to move jobs while the other is still running.
+        # for Windows, so every round of each side moves one job. Each side writes a mark after its first move and holds
+        # partway (Windows at 50, Linux at 450) until the other's mark is there, so neither can run all its moves before
+        # the other starts: both archivers are proven to move jobs while the other is still running.
         # 2 concurrent readers (Windows min 100 + Linux min 900 = 1,000+ rounds running until BOTH archivers finish,
         # checking ALL 20 live controls, 100% of ALL 1,000 eligible IDs, and full parsed readability of a rotating
         # window of 10 eligible IDs on EVERY SINGLE ROUND), and 2 racing takers (Windows + Linux).
         put(st / "watch_old.txt", "\n".join(old_ids) + "\n")
         take_ids = old_ids[::25] + live_ids
         procs = [
-            subprocess.Popen([win_racer, "--archive-loop", win_store, "100", win_store + "\\win-moved"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
-            subprocess.Popen([lin_racer, "--archive-loop", str(st), "900", "-", "450", str(st / "win-moved")], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
+            subprocess.Popen([win_racer, "--archive-loop", win_store, "100", win_store + "\\win-moved", "50", win_store + "\\lin-moved"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
+            subprocess.Popen([lin_racer, "--archive-loop", str(st), "900", str(st / "lin-moved"), "450", str(st / "win-moved")], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
             subprocess.Popen([win_racer, "--read-loop", win_store, "100", str(len(live_ids)), *live_ids], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
             subprocess.Popen([lin_racer, "--read-loop", str(st), "900", str(len(live_ids)), *live_ids], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
             subprocess.Popen([win_racer, win_store, "os/win-taker", *take_ids[::-1]], stdin=subprocess.DEVNULL),
@@ -1918,14 +1919,13 @@ class Archive(Base):
         live = self.send(to="os/all", subject="live")
         arch = st / "archive"
         stop = threading.Event()
-        flips, errors = [0], []
+        errors = []
 
         def flip():
             try:
                 while not stop.is_set():
                     arch.mkdir()
                     arch.rmdir()
-                    flips[0] += 1
             except OSError as e:
                 errors.append(e)
 
@@ -1937,8 +1937,9 @@ class Archive(Base):
             stop.set()
             flipper.join(timeout=30)
         self.assertEqual(errors, [])
-        self.assertGreater(flips[0], 1000, "the folder must really come and go while the racer looks")
         self.assertEqual(r.returncode, 0, "a folder created meanwhile was reported as damage")
+        present, absent = map(int, r.stdout.split())
+        self.assertGreater(min(present, absent), 100, "the folder must really come and go while the racer looks")
 
     def test_archived_show_seen_answer_and_chain_replay(self):
         # Multi-step jobs: (1) taken -> released -> taken by another session -> done; (2) taken -> refused.

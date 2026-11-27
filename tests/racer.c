@@ -175,12 +175,25 @@ static bool print_one_session(void *user, const session_info *info) {
 int racer(int count, char **args) {
     if (count >= 3 && same(args[1], "--remove")) return (int)p_remove(args[2]);
     /* --terminal-loop <store> <id> <rounds>: asks whether <id> has an archived terminal copy <rounds> times;
-       exit 9 the first time the answer is damage, 0 when it never is. */
+       exit 9 the first time the answer is damage, 0 when it never is, printing how many times it found
+       archive/ present and absent, so a test knows the folder really came and went while it looked. */
     if (count >= 5 && same(args[1], "--terminal-loop")) {
         unsigned long rounds = 0;
         for (const char *p = args[4]; *p >= '0' && *p <= '9'; p++) rounds = rounds * 10 + (unsigned long)(*p - '0');
-        for (unsigned long i = 0; i < rounds; i++)
-            if (archive_has_terminal_job(args[2], args[3], NULL) == S_DAMAGED) return 9;
+        text arch = {0};
+        add(&arch, args[2]), add(&arch, "/archive");
+        if (arch.failed) return 100;
+        uint64_t present = 0, absent = 0;
+        for (unsigned long i = 0; i < rounds; i++) {
+            p_result seen = p_real_dir(arch.data);
+            present += seen == P_OK, absent += seen == P_MISSING;
+            if (archive_has_terminal_job(args[2], args[3], NULL) == S_DAMAGED) return text_free(&arch), 9;
+        }
+        text_free(&arch);
+        text out = {0};
+        add_number(&out, present, 0), add(&out, " "), add_number(&out, absent, 0), add(&out, "\n");
+        if (!out.failed) p_print(out.data);
+        text_free(&out);
         return 0;
     }
     if (count >= 4 && same(args[1], "--read-session")) {
