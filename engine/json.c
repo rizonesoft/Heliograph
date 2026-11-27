@@ -47,10 +47,7 @@ void json_string(text *out, const char *s, size_t n) {
         unsigned char c = p[i];
         if (c == '"') add_bytes(out, "\\\"", 2), i++;
         else if (c == '\\') add_bytes(out, "\\\\", 2), i++;
-        else if (c == '\n') add_bytes(out, "\\n", 2), i++;
-        else if (c == '\r') add_bytes(out, "\\r", 2), i++;
-        else if (c == '\t') add_bytes(out, "\\t", 2), i++;
-        else if (c < 0x20 || c == 0x7f) {
+        else if (c < 0x20 || c == 0x7f) { /* every control character as \u00XX, newline and tab too */
             char esc[6] = {'\\', 'u', '0', '0', HEX[c >> 4], HEX[c & 15]};
             add_bytes(out, esc, 6), i++;
         } else {

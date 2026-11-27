@@ -41,7 +41,8 @@ typedef struct options {
 static struct {
     bool on, sent, has_body, damaged;
     const char *key; /* "text", "help" or "context" */
-    text body, warnings;
+    text body, warnings, problems;
+    unsigned problem_count;
     char *error;
     int code;
 } reply;
@@ -51,8 +52,10 @@ static int fail(const char *why, int code) {
         if (!reply.sent && code == 0) {
             if (reply.warnings.length) add(&reply.warnings, ",");
             json_text(&reply.warnings, why ? why : "it failed");
-        } else if (!reply.sent && !reply.error) {
-            reply.error = copy(why ? why : "it failed", len(why ? why : "it failed")), reply.code = code;
+        } else if (!reply.sent) {
+            if (!reply.error) reply.error = copy(why ? why : "it failed", len(why ? why : "it failed")), reply.code = code;
+            if (reply.problems.length) add(&reply.problems, ",");
+            json_text(&reply.problems, why ? why : "it failed"), reply.problem_count++;
         }
         return code;
     }
@@ -84,12 +87,15 @@ static bool reply_send(void) {
     json_list o = json_object(&out);
     if (reply.has_body && reply.body.length) json_put_bytes(&o, reply.key, reply.body.data, reply.body.length);
     else json_put_null(&o, reply.key);
-    if (reply.damaged) json_put_bool(&o, "damaged", true);
+    bool hook = same(reply.key, "context"); /* the hook never fails a session: a problem is damage, never an error code */
+    if (reply.damaged || (hook && reply.error)) json_put_bool(&o, "damaged", true);
     if (reply.warnings.length) json_key(&o, "warnings"), add(&out, "["), add(&out, reply.warnings.data), add(&out, "]");
-    if (reply.error) json_put_text(&o, "error", reply.error), json_put_number(&o, "code", (uint64_t)reply.code);
+    if (reply.error && !hook) json_put_text(&o, "error", reply.error), json_put_number(&o, "code", (uint64_t)reply.code);
+    if (reply.problem_count > 1 || (hook && reply.problem_count))
+        json_key(&o, "problems"), add(&out, "["), add(&out, reply.problems.data), add(&out, "]");
     json_object_end(&o);
     add(&out, "\n");
-    bool good = !out.failed && !reply.body.failed && !reply.warnings.failed && p_print(out.data);
+    bool good = !out.failed && !reply.body.failed && !reply.warnings.failed && !reply.problems.failed && p_print(out.data);
     text_free(&out);
     return good;
 }
@@ -612,10 +618,11 @@ static int show(store *s, const char *id, actor me, const place *here) {
     bool was_archived = m.archived;
     message_free(&m);
     if (!print(&out)) return fail("the output cannot be written", 3);
+    int known = lr != S_OK ? fail("a step of this job is damaged", 3) : 0; /* known before the reply: inside it */
     /* The reply goes before the seen mark, so a message is never marked seen when its reply was not written; a seen
        mark that then fails shows in the exit code alone. */
     if (!reply_send()) return 3;
-    if (lr != S_OK) return fail("a step of this job is damaged", 3);
+    if (known) return known;
     if (mine) {
         if (was_archived) {
             if ((result = store_seen_archived(s, id, me)) != S_OK) return fail(s->why, result);
@@ -968,7 +975,7 @@ int helio_paused(int count, char **args, void (*pause)(void *user, const char *s
     reply = (typeof(reply)){.on = json_flag(count, args), .key = "text"};
     int code = parse(&o, count, args) ? run(&o, pause, user) : fail(o.why, 2);
     if (reply.on && !reply_send() && code < 3) code = 3;
-    text_free(&reply.body), text_free(&reply.warnings), p_free(reply.error);
+    text_free(&reply.body), text_free(&reply.warnings), text_free(&reply.problems), p_free(reply.error);
     reply = (typeof(reply)){0};
     archive_pauses(NULL, NULL); /* the pause belongs to this call only */
     p_free(o.me_env), p_free(o.folder_env), p_free(o.default_env), p_free(o.session_env);

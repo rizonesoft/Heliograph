@@ -2,6 +2,7 @@
 import hashlib
 import os
 import platform
+import shutil
 import subprocess
 import tempfile
 import time
@@ -2387,6 +2388,10 @@ class JsonWriter(unittest.TestCase):
                 self.assertEqual(have, want)
                 self.assertEqual(have, raw.decode("utf-8", errors="replace"))
 
+    def test_every_control_character_is_written_as_u00xx(self):
+        r = subprocess.run([str(RACER), "--json-escape"], input=b"a\tb\nc\rd\x01", capture_output=True, timeout=30)
+        self.assertEqual(r.stdout, b'"a\\u0009b\\u000ac\\u000dd\\u0001"\n')
+
     def test_random_bytes_read_back_as_python_reads_them(self):
         import random
         rng = random.Random(10)
@@ -2405,8 +2410,9 @@ class JsonReply(Base):
         import json
         self.assertEqual((r.returncode, r.stderr), (code, b""), r.stdout)
         out = r.stdout.decode("utf-8")
-        self.assertTrue(out.endswith("\n") and out.count("\n") == 1 + out[:-1].count("\n"), out)
-        return json.loads(out)  # one value: json.loads refuses a second
+        # One line: the writer escapes every newline, so the value is all of stdout but its one final newline.
+        self.assertTrue(out.endswith("\n") and "\n" not in out[:-1], out)
+        return json.loads(out[:-1])  # one value: json.loads refuses a second
 
     def test_the_flag_is_found_anywhere_but_never_as_an_options_value(self):
         sent = self.send("tell", to="os/all", subject="flagged")
@@ -2435,27 +2441,54 @@ class JsonReply(Base):
         v = self.one(self.helio("--json", me="os/userland"), 3)
         self.assertIn("readable", v["text"])
         self.assertEqual(v["code"], 3)
-        if ON_WINDOWS:
-            return  # the folder permissions that make the next two writes fail are Linux's
-        # A send whose session announcement fails afterwards: the id, and the failure as a warning.
+        self.assertEqual(v["problems"][0], v["error"])  # the damaged job also stops the daily archive: two problems
+        # A send whose session announcement fails afterwards: the id, and the failure as a warning. A file where the
+        # sessions folder belongs makes the announcement fail on every system, for every user.
         sessions = self.store / "sessions"
-        sessions.mkdir(exist_ok=True)
-        os.chmod(sessions, 0o500)
+        if sessions.exists():
+            shutil.rmtree(sessions)
+        put(sessions, "not a folder\n")
         try:
             v = self.one(self.helio("tell", "os/all", "warned", "--json", "--session", "s1", me="os/main", body="b"), 0)
         finally:
-            os.chmod(sessions, 0o700)
+            sessions.unlink()
         self.assertRegex(v["text"], r"^\d+-[0-9a-f]+\n$")
         self.assertTrue(v["warnings"], v)
-        # show writes its reply, then the seen mark: a seen mark that fails shows in the exit code alone.
-        os.chmod(self.store / "messages", 0o500)
-        try:
-            r = self.helio("show", good, "--json", me="os/userland")
-        finally:
-            os.chmod(self.store / "messages", 0o700)
-        self.assertNotEqual(r.returncode, 0)
-        v = self.one(r, r.returncode)
+        # show writes its reply, then the seen mark: a folder where the seen mark belongs makes it fail, and that
+        # shows in the exit code alone, 3 as in text mode.
+        (self.store / f"messages/{good}.seen.os+userland").mkdir()
+        r = self.helio("show", good, "--json", me="os/userland")
+        v = self.one(r, 3)
         self.assertIn("readable", v["text"])
+        # A step that show finds damaged before it writes its reply is inside the reply.
+        v = self.one(self.helio("show", bad_job, "--json", me="os/userland"), 3)
+        self.assertEqual(v["code"], 3)
+        self.assertIn("damaged", v["error"])
+
+    def test_every_problem_of_one_call_is_in_its_reply(self):
+        # The first inbox of the day writes the daily summary: a file where its folder belongs makes that fail, and a
+        # damaged job beside a readable message is a second problem of the same call.
+        self.send("tell", to="os/userland", subject="readable")
+        bad_job = self.send(subject="damaged-job")
+        put(self.store / f"messages/{bad_job}.link.0000", "corrupt\n")
+        shutil.rmtree(self.store / "summary", ignore_errors=True)
+        put(self.store / "summary", "not a folder\n")
+        v = self.one(self.helio("--json", me="os/userland"), 3)
+        self.assertIn("readable", v["text"])
+        self.assertEqual(v["code"], 3)
+        self.assertGreaterEqual(len(v["problems"]), 2, v)
+        self.assertEqual(v["problems"][0], v["error"])
+
+    def test_the_hook_reports_damage_never_an_error_code(self):
+        self.send("tell", to="os/userland", subject="healthy")
+        shutil.rmtree(self.store / "summary", ignore_errors=True)
+        put(self.store / "summary", "not a folder\n")
+        v = self.one(self.helio("hook", "claude", "--json", me="os/userland"), 0)
+        self.assertIn("healthy", v["context"])
+        self.assertTrue(v["damaged"])
+        self.assertNotIn("code", v)
+        self.assertNotIn("error", v)
+        self.assertTrue(v["problems"])
 
     def test_a_reply_that_cannot_be_written_acknowledges_nothing(self):
         sent = self.send("tell", to="os/userland", subject="unread")
