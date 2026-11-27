@@ -2668,10 +2668,22 @@ class JsonReading(Base):
         self.ok(t + 1, "take", ids["unnamed_taker"], "--as", "os/userland"), self.ok(t + 2, "done", ids["unnamed_taker"], "ok", "--as", "os/userland", "--session", "s2")
         ids["repository"] = self.sent(t + 1, "ask", "path:docs/x.md", "in repo-a", "--as", "os/main", cwd=repo)
         self.assertEqual(self.post_fields(ids["repository"])["repository"], "repo-a")
+        # Every job key of every history, so no field can be left out of the comparison (the class, not a case).
+        jobs = {"open": ("open", None, None, None), "taken": ("taken", "os/userland", None, "s1"),
+                "released": ("open", None, None, None), "done": ("done", "os/userland", "os/userland", ""),
+                "refused": ("refused", None, "os/userland", None), "other_refuser": ("refused", None, "os/userland", None),
+                "unnamed_taker": ("done", "os/userland", "os/userland", ""), "repository": ("open", None, None, None)}
+
+        def assert_whole_row(v, name, archived, root="messages"):
+            self.assert_row_is_the_post(v, ids[name], root)
+            state, taker, closed_by, session = jobs[name]
+            want = {"state": state, "taker": taker, "closed_by": closed_by, "session": session, "landed": [], "damaged": False, "archived": archived}
+            self.assertEqual({k: v[k] for k in want}, want, name)
+
+        log = {m["id"]: m for m in self.rows(t + 10, "log", "--all")["messages"]}
         for name, mid in ids.items():
-            v = self.shown(t + 10, mid)
-            self.assert_row_is_the_post(v, mid)
-            self.assertEqual(v["archived"], False, name)
+            assert_whole_row(self.shown(t + 10, mid), name, False)
+            assert_whole_row(log[mid], name, False)
         self.assertEqual(self.shown(t + 10, ids["repository"])["repository"], "repo-a")
         # The list commands carry it too: the inbox of a lane working in repo-a, and log --all.
         inbox = self.value(self.at(t + 10, "--json", "--as", "os/dev1", cwd=repo), 0)
@@ -2682,12 +2694,12 @@ class JsonReading(Base):
             self.assertEqual(row["repository"], "repo-a")
         # Archived, the closed ones (open, taken and released jobs are never archived, D01 T01 §2) read the same.
         self.assertEqual(run(self.store, "archive", me=None).returncode, 0)
+        log = {m["id"]: m for m in self.rows(t + 10, "log", "--all")["messages"]}
         for name in ("done", "refused", "other_refuser", "unnamed_taker"):
             mid = ids[name]
-            month = next((self.store / "archive").glob(f"*/{mid}.post")).parent
-            v = self.shown(t + 10, mid)
-            self.assert_row_is_the_post(v, mid, root=f"archive/{month.name}")
-            self.assertEqual(v["archived"], True, name)
+            root = "archive/" + next((self.store / "archive").glob(f"*/{mid}.post")).parent.name
+            assert_whole_row(self.shown(t + 10, mid), name, True, root)
+            assert_whole_row(log[mid], name, True, root)
 
     # item 2: a message reads back as stored
     def test_a_message_reads_back_every_stored_field(self):
