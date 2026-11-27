@@ -1,5 +1,6 @@
 """Messages are not lost, a job has one taker, and Windows and Linux share one store."""
 import hashlib
+import json
 import os
 import platform
 import shutil
@@ -3893,6 +3894,33 @@ class SessionTargeting(Base):
         self.assertEqual(run(deep_store, "show", jid, "--session", sess1, me=addr).returncode, 3)
         put(arch_seen, "seen\n")
         self.assertEqual(run(deep_store, "check", me=None).returncode, 0)
+
+    def test_json_show_by_the_silent_target_acknowledges_as_text_does(self):
+        # The output flag never changes what show stores: a silent owner session opening its own targeted job writes
+        # the lane-wide ~alert with and without --json, because the alert check reads the session as it was before
+        # this call announced it.
+        M = 60_000_000
+        base_us = 1_800_000_000_000_000
+        put(self.store / "helio.conf", "project: os\nsilent: 60\n")
+        clean_env = {k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "ANTIGRAVITY_CONVERSATION_ID")}
+
+        def rc_at(now_us, *args, body=b""):
+            return subprocess.run(
+                [str(RACER), "--now", str(now_us), *args, "--store", str(self.store)],
+                input=body, capture_output=True, timeout=30, cwd=self.store, env=clean_env,
+            )
+
+        for n, flag in enumerate(([], ["--json"])):
+            t = base_us + n * 1000 * M
+            session = f"s-own{n}"
+            job = rc_at(t, "ask", "os/owner", "Owner targeted", "--as", "os/main", "--for-session", session, body=b"ot").stdout.decode().strip()
+            r = rc_at(t + 65 * M, "show", job, *flag, "--as", "os/owner", "--session", session)
+            self.assertEqual(r.returncode, 0, (flag, r.stdout, r.stderr))
+            self.assertTrue((self.store / f"messages/{job}.seen.os+owner~alert").exists(), flag)
+            if flag:
+                v = json.loads(r.stdout)
+                self.assertIn("Owner targeted", v["text"])
+                self.assertEqual(r.stderr, b"")
 
     def test_silent_targeted_session_owner_escalation_and_ack(self):
         M = 60_000_000

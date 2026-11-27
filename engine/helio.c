@@ -536,7 +536,11 @@ static int check(store *s) {
     return result == S_OK ? 0 : fail(s->why, result);
 }
 
-static int show(store *s, const char *id, actor me, const place *here) {
+static void announce_best_effort(store *s, const options *o, const char *agent);
+
+/* With --json, *announced says show announced the session itself: after its alert check, which must read the
+   session as it was before this call, and before its reply, which must carry the announcement's warning. */
+static int show(store *s, const char *id, actor me, const place *here, const options *o, bool *announced) {
     message m = {0};
     s_result result = store_message(s, id, &m);
     if (result != S_OK) return fail(s->why, result);
@@ -617,6 +621,7 @@ static int show(store *s, const char *id, actor me, const place *here) {
     }
     bool was_archived = m.archived;
     message_free(&m);
+    if (reply.on && address_ok(o->me, false)) announce_best_effort(s, o, ""), *announced = true;
     if (!print(&out)) return fail("the output cannot be written", 3);
     int known = lr != S_OK ? fail("a step of this job is damaged", 3) : 0; /* known before the reply: inside it */
     if (alert_err && reply.on) fail("the alert state cannot be read", 3); /* known too; the seen mark still follows */
@@ -882,8 +887,7 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
     s.pause_user = pause_user;
     if (o->here.found && place_record_silent(&s, &o->here) != P_OK)
         fail("the project's silent threshold could not be saved", 0);
-    /* With --json, show announces first too: its reply goes before its seen mark, so a warning after it would be lost. */
-    bool announce_first = which == 0 || which == 1 || (which == 3 && reply.on);
+    bool announce_first = which == 0 || which == 1, announced = false;
     if (announce_first && address_ok(o->me, false)) announce_best_effort(&s, o, "");
     else if (which == 8) announce_best_effort(&s, o, "claude");
     bool summary_err = false;
@@ -912,7 +916,7 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
     case 0: code = inbox(&s, me, &o->here, o->all); if (summary_err || daily_err) code = 3; break;
     case 1: code = whole_log(&s, o->me, &o->here, o->all); break;
     case 2: code = check(&s); break;
-    case 3: code = show(&s, o->words[1], me, &o->here); break;
+    case 3: code = show(&s, o->words[1], me, &o->here, o, &announced); break;
     case 8: code = hook(&s, o, me); break;
     case 9: {
         message m;
@@ -956,7 +960,7 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
                                                                            : store_end(&s, o->words[1], me, which == 6, note);
         code = result == S_OK ? 0 : fail(s.why, result);
     }
-    if (!announce_first && which != 8 && which != 15 && address_ok(o->me, false)) announce_best_effort(&s, o, "");
+    if (!announce_first && !announced && which != 8 && which != 15 && address_ok(o->me, false)) announce_best_effort(&s, o, "");
     store_close(&s);
     return code;
 }
