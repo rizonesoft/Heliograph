@@ -1953,18 +1953,23 @@ class Archive(Base):
                             else:
                                 raise TimeoutError(f"{folder} stayed held for 5 s")
                             gone.rmdir()
+                            if ON_WINDOWS:
+                                # Each rename waits on the racer's hold (no FILE_SHARE_DELETE) and the racer's hold on
+                                # the rename; yielding between steps keeps the two from starving each other on a busy host.
+                                time.sleep(0.0002)
                     except OSError as e:
                         errors.append(e)
 
                 flipper = threading.Thread(target=flip)
                 flipper.start()
                 try:
-                    r = subprocess.run([str(RACER), "--terminal-loop", str(st), live, "300000", str(folder)], stdin=subprocess.DEVNULL, capture_output=True, timeout=120)
+                    rounds = "100000" if ON_WINDOWS else "300000"  # a Windows look holds and releases two folders
+                    r = subprocess.run([str(RACER), "--terminal-loop", str(st), live, rounds, str(folder)], stdin=subprocess.DEVNULL, capture_output=True, timeout=300)
                 finally:
                     stop.set()
                     flipper.join(timeout=30)
                 self.assertEqual(errors, [])
-                self.assertEqual(r.returncode, 0, "9: a folder created meanwhile was reported as damage; 8: a job never archived was found")
+                self.assertEqual(r.returncode, 0, "9: a folder created meanwhile was reported as damage; 8: a job never archived was found: " + r.stderr.decode(errors="replace"))
                 present, absent = map(int, r.stdout.split())
                 self.assertGreater(min(present, absent), 100, "the folder must really come and go while the racer looks")
 

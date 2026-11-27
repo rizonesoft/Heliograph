@@ -14,6 +14,7 @@ bool plat_fail_write_flush = false;
 bool plat_fail_sync = false;
 uint64_t plat_now_override = 0;
 void (*plat_pause)(const char *stage) = NULL; /* called between steps of a platform call, for a test to act */
+unsigned long plat_last_hold_error = 0; /* the Windows error of the last refused folder hold, for a test to report */
 #endif
 
 void *p_alloc(size_t bytes) { return im_alloc(bytes); }
@@ -454,11 +455,20 @@ static p_result hold_folder(const char *path, HANDLE *out) {
     }
     if (h == INVALID_HANDLE_VALUE) {
         im_free(wide);
+#ifdef HELIO_TEST_HOOKS
+        if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND) plat_last_hold_error = err;
+#endif
         return err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND ? P_MISSING : P_FAILED;
     }
     DWORD attrs = GetFileAttributesW(wide); /* the held folder: its name cannot change while h is open */
+#ifdef HELIO_TEST_HOOKS
+    DWORD aerr = attrs == INVALID_FILE_ATTRIBUTES ? GetLastError() : 0;
+#endif
     im_free(wide);
     if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_DIRECTORY) || (attrs & FILE_ATTRIBUTE_REPARSE_POINT)) {
+#ifdef HELIO_TEST_HOOKS
+        plat_last_hold_error = aerr ? aerr : 0x10000u | (attrs & 0xffffu);
+#endif
         CloseHandle(h);
         return P_FAILED;
     }

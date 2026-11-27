@@ -69,6 +69,7 @@ bool plat_fail_write_flush = false;
 bool plat_fail_sync = false;
 uint64_t plat_now_override = 0;
 void (*plat_pause)(const char *stage) = NULL; /* called between steps of a platform call, for a test to act */
+unsigned long plat_last_hold_error = 0; /* the errno of the last refused folder hold, for a test to report */
 #endif
 /* Flushes the folder that holds path: the held folder itself when dir is one, else path's parent. */
 static bool settle_at(int dir, const char *path) {
@@ -308,7 +309,12 @@ p_result p_dir_open(const char *root, const char *rel, p_dir **out) {
         int next = openat(at, part, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
         int err = errno;
         close(at);
-        if (next < 0) return err == ENOENT ? P_MISSING : P_FAILED; /* ELOOP or ENOTDIR: a link or not a folder */
+        if (next < 0) {
+#ifdef HELIO_TEST_HOOKS
+            if (err != ENOENT) plat_last_hold_error = (unsigned long)err;
+#endif
+            return err == ENOENT ? P_MISSING : P_FAILED; /* ELOOP or ENOTDIR: a link or not a folder */
+        }
         at = next;
         p += n;
         if (*p == '/') p++;

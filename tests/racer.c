@@ -17,6 +17,7 @@ extern bool plat_fail_write_flush;
 extern bool plat_fail_sync;
 extern uint64_t plat_now_override;
 extern void (*plat_pause)(const char *stage);
+extern unsigned long plat_last_hold_error;
 extern size_t store_max_names;
 #endif
 
@@ -234,7 +235,14 @@ int racer(int count, char **args) {
             p_result seen = p_real_dir(args[5]);
             present += seen == P_OK, absent += seen == P_MISSING;
             s_result got = archive_has_terminal_job(args[2], args[3], NULL);
-            if (got == S_DAMAGED) return 9;
+            if (got == S_DAMAGED) {
+                text why = {0};
+                add(&why, "racer: damage in round "), add_number(&why, i, 0), add(&why, ", last refused hold error "),
+                    add_number(&why, plat_last_hold_error, 0), add(&why, "\n");
+                if (!why.failed) p_error(why.data);
+                text_free(&why);
+                return 9;
+            }
             if (got != S_NOTHING) return 8;
         }
         text out = {0};
