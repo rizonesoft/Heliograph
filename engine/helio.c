@@ -1034,14 +1034,16 @@ static bool absolute_folder(text *out, const char *folder) {
     if (!rooted) {
         char *here = NULL;
         if (p_cwd(&here) != P_OK || !here) return false;
-        add(out, here), add(out, "/"), p_free(here);
-        for (const char *c = folder; *c == '.' && c[1] == '/';) folder = c += 2; /* a leading ./ adds nothing */
+        /* The working folder says which system this is: a drive or a UNC share is Windows, joined with a backslash. */
+        bool windows = (here[0] && here[1] == ':') || (here[0] == '\\' && here[1] == '\\');
+        add(out, here), add(out, windows ? "\\" : "/"), p_free(here);
+        for (const char *c = folder; *c == '.' && (c[1] == '/' || c[1] == '\\');) folder = c += 2; /* a leading ./ adds nothing */
     }
     if (!same(folder, ".")) add(out, folder);
     for (;;) { /* no trailing separator and no trailing "/." step */
         size_t n = out->length;
         if (n > 1 && (out->data[n - 1] == '/' || out->data[n - 1] == '\\')) out->data[--out->length] = 0;
-        else if (n > 2 && out->data[n - 1] == '.' && out->data[n - 2] == '/') out->length -= 2, out->data[out->length] = 0;
+        else if (n > 2 && out->data[n - 1] == '.' && (out->data[n - 2] == '/' || out->data[n - 2] == '\\')) out->length -= 2, out->data[out->length] = 0;
         else break;
     }
     return !out->failed;
