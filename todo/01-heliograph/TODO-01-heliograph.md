@@ -58,6 +58,7 @@ title: "TODO-01 -- Heliograph"
 | 21 | §21 | JSON for the inbox, log, show and check | §10 | [ ] |
 | 22 | §22 | JSON for sending, job changes, archive and working | §10 | [ ] |
 | 23 | §23 | Summary command read from the day's snapshot | §10 | [ ] |
+| 24 | §24 | Folder holds that outlast a busy Windows host | -- | [ ] |
 
 ## 1. Steps that notice an archived job
 
@@ -717,6 +718,27 @@ Filed 2026-11-27 from the `D01 T01 §10` plan review (findings 5 for the overlap
 - [ ] Commit: `summary: the day's snapshot as a command`
 
 **Test checkpoint:** `python3 ../SDK/tools/app_build.py .` exits 0 and the tests fail when `summary` recounts the store instead of reading the file.
+
+## 24. Folder holds that outlast a busy Windows host
+
+Filed 2026-11-27 from the CI status read after `D01 T01 §12`: `Archive.test_archive_folder_created_meanwhile_is_never_damage` in `tests/test_helio.py` failed on `windows-latest` in runs 45968137029 (`ba04e6e`), 45980481541 (`e4d12ba`) and 46056710133 (`ed48458`), about one run in ten, each with `racer: damage in round N, last refused hold error 32`. `passing_win` in `src/plat_windows.c` retries a sharing, lock or access-denied refusal 50 times 4 ms apart, so a folder held a little over 200 ms by another process (the test's renamer, or an indexer or antivirus on a real host) reads as damage. The bound belongs in time, not in a count of tries.
+
+**Phase:** 3
+**Needs:** wsl-windows-interop
+**Surface:** no
+
+**Build order:**
+
+1. Bound the retry by time in `src/plat_windows.c`. Done when: a hold refused for 500 ms succeeds and one refused for 3 s fails with its error.
+2. Prove it on Windows in `tests/test_helio.py`. Done when: the flaky test passes 20 runs in a row on the Windows prove.
+
+- [ ] Replace the attempt count in `passing_win` of `src/plat_windows.c` with a budget of 2 s measured by `GetTickCount64` from the first refusal, sleeping 4 ms between tries, for `ERROR_SHARING_VIOLATION`, `ERROR_LOCK_VIOLATION` and `ERROR_ACCESS_DENIED` only. Done when: every caller of `passing_win` passes its own start time and no caller loops past 2 s. Cheaper substitute: raising the count.
+- [ ] Add a racer entry point in `tests/racer.c` that holds a folder open without `FILE_SHARE_DELETE` for a given number of milliseconds. Done when: `tests/test_helio.py` holds a store folder 500 ms and a concurrent `helio take` of a live job exits 0, and holds it 3 s and the take exits 3 naming the hold. Cheaper substitute: only rerunning the flaky test.
+- [ ] Print the number of refused tries beside `plat_last_hold_error` in the `--terminal-loop` damage message of `tests/racer.c`. Done when: a failure names both the error and how long it was refused.
+- [ ] Run `Archive.test_archive_folder_created_meanwhile_is_never_damage` 20 times in a row on Windows through `python3 ../SDK/tools/prove.py .`. Done when: 20 of 20 pass, quoted in the commit body.
+- [ ] Commit: `plat: a folder hold waits out a busy Windows host`
+
+**Test checkpoint:** `python3 ../SDK/tools/prove.py .` exits 0 and the 500 ms hold test fails when `passing_win` is put back to 50 tries.
 
 ## Verification
 
