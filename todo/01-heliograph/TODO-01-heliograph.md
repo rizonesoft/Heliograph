@@ -45,7 +45,7 @@ title: "TODO-01 -- Heliograph"
 | 8 | §8 | Mark for landed work | §2 | [x] |
 | 9 | §9 | Fixed marks around every shown message | §7 | [x] |
 | 10 | §10 | JSON writer and one reply per call | §3, §5, §6, §8, §9 | [x] |
-| 11 | §11 | Take the next job as a queue | §10, §22 | [ ] |
+| 11 | §11 | Take the next job as a queue | §10, §22 | [x] |
 | 12 | §12 | Expiry of seen heads-ups and findings | §3, §4 | [x] |
 | 13 | §13 | Design and help that match the program | §11, §12, §14, §21, §23 | [ ] |
 | 14 | §14 | Unowned paths kept to their repository | §4, §6 | [x] |
@@ -365,9 +365,12 @@ The Gemini driver's queue is `helio take --kind request --lane neon-a --json`. I
 - [x] Give an empty queue exit 1 and `null` with `--json` (stdout exactly `null` and a newline, stderr empty); a warning of the call (a failed session announcement) turns it into `{"id": null, "warnings": [...]}`, still one value. Teach the reply writer in `engine/helio.c` a top-level `null`. Done when: a drained queue gives exactly `null\n` and exit 1, and with the announcement failing it gives the object with the warning and exit 1.
 - [x] Race 8 queue drivers (`take --kind request --lane ...`) from Windows and WSL over one store of 100 jobs in `tests/test_helio.py`. Done when: both systems took at least one, the returned ids are the 100 seeded exactly once, and each persisted take names the driver that returned it. Cheaper substitute: one system, or ids handed to each racer in advance.
 - [x] Declare the need `heliograph-queue` in `app.json`: the OS Neon driver uses `helio take` in place of its own queue folder (design, "Limits"). Done when: it is on main in the form `AGENTS.md` gives. Cheaper substitute: editing the OS repository.
-- [ ] Commit: `jobs: take the next one`
+- [x] Commit: `jobs: take the next one`
 
 **Test checkpoint:** `python3 ../SDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
+
+> **Verified:** 2026-11-28 | §11 | 21669c7fdccd6e2479b7da7b557a5ca80961a684
+> **Review:** `docs/reviews/d01-t01-s11.json`
 
 ## 12. Expiry of seen heads-ups and findings
 
