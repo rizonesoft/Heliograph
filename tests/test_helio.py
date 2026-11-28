@@ -3938,7 +3938,14 @@ class JobQueue(JsonCalls):
             self.assertEqual(rc, len(out.split()), (lane, rc, err))
             took[lane] = out.decode().split()
         every = [i for ids in took.values() for i in ids]
-        self.assertEqual(sorted(every), sorted(seeded))  # each of the 100 exactly once
+        if sorted(every) != sorted(seeded):  # say what went wrong: a job taken twice is the design's own failure
+            import collections
+            dup = [i for i, c in collections.Counter(every).items() if c > 1]
+            missing = sorted(set(seeded) - set(every))
+            steps = {i: sorted(p.name for p in (self.store / "messages").glob(f"{i}.link.*")) for i in dup + missing}
+            errs = {lane: err.decode(errors="replace")[-300:] for (_, _, lane), (_, err, _) in zip(drivers, results) if err}
+            self.fail(f"taken twice {dup}, never taken {missing}, per driver {({k: len(v) for k, v in took.items()})}, "
+                      f"steps {steps}, stderr {errs}")
         self.assertTrue(any(took[f"w{n}"] for n in range(4)), took)  # both systems took work
         self.assertTrue(any(took[f"l{n}"] for n in range(4)), took)
         for lane, ids in took.items():
