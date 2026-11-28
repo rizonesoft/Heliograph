@@ -987,9 +987,12 @@ static s_result change_job(store *s, const char *id, actor me, change what, cons
         message arch = {0};
         const char *why = s->why;
         job held = {0};
-        if (archive_read_message(s, id, &arch) == S_OK && store_job(s, &arch, &held) == S_OK) jc->has_job = true, jc->now = held;
+        s_result ar = archive_read_message(s, id, &arch);
+        s_result jr = ar == S_OK ? store_job(s, &arch, &held) : ar;
         message_free(&arch);
-        s->why = why;
+        if (jr == S_OK) jc->has_job = true, jc->now = held, s->why = why;
+        else if (jr == S_DAMAGED) result = S_DAMAGED; /* an archived chain that cannot be read is damage, as on the branch above */
+        else s->why = why;
     }
     message_free(&m);
     return result;

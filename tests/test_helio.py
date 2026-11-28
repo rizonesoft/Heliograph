@@ -3475,6 +3475,28 @@ class JsonChanges(JsonCalls):
         self.assertEqual((proc.returncode, err), (2, b""))
         self.assertEqual(json.loads(out), {"state": "done", "error": "it was archived", "code": 2})
 
+    def test_a_job_archived_by_a_peer_with_a_damaged_chain_is_damage(self):
+        # Reconciliation 1: the archived chain read after a lost race that cannot be read is exit 3, not a refusal.
+        t = self.OLD + 64_000 * self.M
+        job = self.sent(t, "ask", "os/userland", "lost race, damaged", "--as", "os/main")
+        self.ok(t + 1, "take", job, "--as", "os/userland")
+        env = {k: v for k, v in os.environ.items() if k not in self.CLEAN}
+        proc = subprocess.Popen([str(RACER), "--now", str(t + 2), "--pause-cli", "after-write", str(self.store), "done", job, "ok", "--json",
+                                 "--as", "os/userland", "--store", str(self.store)],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.store, env=env)
+        try:
+            self.wait_paused("after-write")
+            self.assertEqual(run(self.store, "archive", me=None).returncode, 0)
+            step = next((self.store / "archive").glob(f"*/{job}.link.0000"))
+            put(step, "damaged\n")
+            out, err = self.resume("after-write", proc)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        self.assertEqual((proc.returncode, err), (3, b""))
+        v = json.loads(out)
+        self.assertEqual((v["code"], "state" in v), (3, False))
+
     # completion review gap 2: a refused init makes nothing
     def test_an_init_that_cannot_resolve_its_folder_makes_nothing(self):
         env = {k: v for k, v in os.environ.items() if k not in self.CLEAN}
