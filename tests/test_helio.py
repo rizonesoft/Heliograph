@@ -8272,30 +8272,22 @@ class DocsMatchProgram(Base):
 
     @staticmethod
     def find_bash():
-        """A real bash: Git Bash on Windows (never the WSL launcher in System32), the one on PATH elsewhere."""
+        """A real bash: on Windows the Git Bash of the git on PATH (never the WSL launcher), the bash on PATH elsewhere."""
         if not ON_WINDOWS:
             return shutil.which("bash")
-        # Git Bash is the one with cygpath: the system-wide and per-user installs, the one beside git, then PATH, each
-        # accepted only if it really is Git Bash (the WSL launcher in System32 has no cygpath).
-        candidates = [Path(r"C:\Program Files\Git\bin\bash.exe"),
-                      Path(os.environ.get("LOCALAPPDATA", "")) / "Programs/Git/bin/bash.exe"]
-        for folder in os.environ.get("PATH", "").split(os.pathsep):  # every git and every bash on PATH, not the first
-            if folder:
-                if (Path(folder) / "git.exe").is_file():  # a Git install: git.exe in Git\cmd, its bash in Git\bin
-                    candidates.append(Path(folder).parent / "bin/bash.exe")
-                candidates.append(Path(folder) / "bash.exe")
-        tried = set()
-        for candidate in candidates:
-            key = str(candidate).lower()
-            if key in tried or not candidate.is_file():
-                continue
-            tried.add(key)
-            try:  # one that cannot start, or starts too slowly, is passed over for the next
-                probe = subprocess.run([str(candidate), "-c", "command -v cygpath"], capture_output=True, timeout=30)
-            except (OSError, subprocess.TimeoutExpired):
-                continue
-            if probe.returncode == 0 and probe.stdout.strip():
-                return str(candidate)
+        # Git says where it is installed, so nothing outside that install is started: `git --exec-path` is
+        # <Git>\mingw64\libexec\git-core (or <Git>\libexec\git-core), and Git Bash is <Git>\bin\bash.exe.
+        git = shutil.which("git")
+        if not git:
+            return None
+        try:
+            exec_path = subprocess.run([git, "--exec-path"], capture_output=True, text=True, timeout=30).stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        for root in Path(exec_path).parents:
+            bash = root / "bin" / "bash.exe"
+            if (root / "cmd" / "git.exe").is_file() and bash.is_file():
+                return str(bash)
         return None
 
     def test_the_readme_walkthrough_is_a_real_run(self):
