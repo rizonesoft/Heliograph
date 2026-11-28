@@ -57,6 +57,22 @@ def run_at(folder, now_us, *arguments, me=None, body=b"", cwd=None, racer=(), ex
     return subprocess.run(command, input=body, capture_output=True, timeout=60, cwd=cwd or folder, env=clean)
 
 
+SNAPSHOT_TITLES = ("Overdue", "Silent", "Open", "Taken", "Done in the last day", "Refused in the last day", "Held unseen", "Overlaps")
+
+
+def snapshot_bytes(day, at, parts, damaged=0):
+    """The format-2 snapshot of a day, as the writer lays it out: parts maps a title to (count, listed rows), each row
+    a full line without its newline; a part counted past 100 rows, other than Held unseen, ends with its "and more" row."""
+    text = f"# Heliograph {day}\n\nAs it stood at {at}.\nFormat: 2\n"
+    for title in SNAPSHOT_TITLES:
+        count, rows = parts.get(title, (0, []))
+        text += f"\n## {title}: {count}\n\n" + "".join(f"{row}\n" for row in rows)
+        if count > 100 and title != "Held unseen":
+            text += "- and more: helio log\n"
+    text += f"\nDamaged: {damaged}" + (". See helio check." if damaged else "") + "\n\nEnd of summary.\n"
+    return text.encode()
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -7892,6 +7908,12 @@ class DaySummary(Base):
         shown = self.summary(now)
         self.assertEqual(shown.returncode, 0, shown.stderr)
         self.assertGreaterEqual(shown.stdout.decode().count("\n| - "), count)
+        # The bytes the production writer saved are the bytes the builder gives for this store: the first 100 held
+        # messages in full, every other one by its id. The both-systems test reads the builder's output.
+        ids = [f"{self.T0 + i:016d}-a{i:05x}" for i in range(count)]
+        rows = [f"- {i} os/main to os/apps: held" for i in ids[:100]] + [f"- {i}" for i in ids[100:]]
+        day, at = self.stamp(now)[:10], self.stamp(now)
+        self.assertEqual(self.file(now).read_bytes(), snapshot_bytes(day, at, {"Held unseen": (count, rows)}))
 
     def test_an_empty_inherited_identity_is_a_lane_and_summary_is_refused(self):
         repo = self.store / "checkout"
@@ -7984,12 +8006,7 @@ class DaySummary(Base):
         held = 45_000
         ids = [f"{self.T0 + i:016d}-a{i:05x}" for i in range(held)]
         day, at = self.stamp(now)[:10], self.stamp(now)
-        text = f"# Heliograph {day}\n\nAs it stood at {at}.\nFormat: 2\n"
-        for title in self.TITLES:
-            text += f"\n## {title}: {held if title == 'Held unseen' else 0}\n\n"
-            if title == "Held unseen":
-                text += "".join(f"- {i}\n" for i in ids)
-        text += "\nDamaged: 0\n\nEnd of summary.\n"
+        text = snapshot_bytes(day, at, {"Held unseen": (held, [f"- {i}" for i in ids])}).decode()
         self.assertGreater(len(text), 1 << 20)
         (self.store / "summary").mkdir(exist_ok=True)
         put(self.file(now), text)
