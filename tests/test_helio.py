@@ -73,6 +73,22 @@ def snapshot_bytes(day, at, parts, damaged=0):
     return text.encode()
 
 
+# One fixed snapshot for the two large-file tests: 42,000 held heads-ups with fixed ids, senders, recipients and
+# subjects, saved at a fixed instant. On Linux the production writer makes the file from these messages and it must equal
+# SNAPSHOT_BYTES; on both systems the reader reads SNAPSHOT_BYTES, so Windows reads bytes the writer is proven to make.
+SNAPSHOT_SENT = 1_800_000_000_000_000  # 2027-01-15T08:00:00Z
+SNAPSHOT_NOW = SNAPSHOT_SENT + 31 * 86_400_000_000
+SNAPSHOT_HELD = [(f"{SNAPSHOT_SENT + i:016d}-a{i:05x}", ("os/main", "os/ui")[i % 2], ("os/apps", "os/userland")[i % 2], f"held {i}")
+                 for i in range(42_000)]
+
+
+def snapshot_fixture_bytes():
+    day = time.strftime("%Y-%m-%d", time.gmtime(SNAPSHOT_NOW / 1_000_000))
+    at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(SNAPSHOT_NOW / 1_000_000))
+    rows = [f"- {i} {frm} to {to}: {subject}" for i, frm, to, subject in SNAPSHOT_HELD[:100]] + [f"- {i}" for i, *_ in SNAPSHOT_HELD[100:]]
+    return snapshot_bytes(day, at, {"Held unseen": (len(SNAPSHOT_HELD), rows)})
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -7895,25 +7911,18 @@ class DaySummary(Base):
     def test_a_snapshot_of_a_full_store_over_a_megabyte_reads_back(self):
         put(self.store / "helio.conf", "project: os\n")
         (self.store / "messages").mkdir(exist_ok=True)
-        body = "id: {id}\ntime: 2027-01-15T08:00:00Z\nfrom: os/main\nto: os/apps\nkind: headsup\nabout: \nurgency: next\nre: \ndue: \nlength: 2\nsubject: held\n\nb\n"
-        count = 42_000
-        for i in range(count):
-            mid = f"{self.T0 + i:016d}-a{i:05x}"
-            put(self.store / f"messages/{mid}.post", body.replace("{id}", mid))
-        now = self.T0 + 31 * self.DAY
-        r = self.summary(now, "--json")
+        for mid, frm, to, subject in SNAPSHOT_HELD:
+            post = f"id: {mid}\ntime: 2027-01-15T08:00:00Z\nfrom: {frm}\nto: {to}\nkind: headsup\nabout: \nurgency: next\nre: \ndue: \nlength: 2\nsubject: {subject}\n\nb\n"
+            put(self.store / f"messages/{mid}.post", post)
+        r = self.summary(SNAPSHOT_NOW, "--json")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(json.loads(r.stdout)["held_unseen"], count)
-        self.assertGreater(self.file(now).stat().st_size, 1 << 20)
-        shown = self.summary(now)
+        self.assertEqual(json.loads(r.stdout)["held_unseen"], len(SNAPSHOT_HELD))
+        saved = self.file(SNAPSHOT_NOW).read_bytes()
+        self.assertGreater(len(saved), 1 << 20)
+        self.assertEqual(saved, snapshot_fixture_bytes())  # the writer's bytes are the fixture's, byte for byte
+        shown = self.summary(SNAPSHOT_NOW)
         self.assertEqual(shown.returncode, 0, shown.stderr)
-        self.assertGreaterEqual(shown.stdout.decode().count("\n| - "), count)
-        # The bytes the production writer saved are the bytes the builder gives for this store: the first 100 held
-        # messages in full, every other one by its id. The both-systems test reads the builder's output.
-        ids = [f"{self.T0 + i:016d}-a{i:05x}" for i in range(count)]
-        rows = [f"- {i} os/main to os/apps: held" for i in ids[:100]] + [f"- {i}" for i in ids[100:]]
-        day, at = self.stamp(now)[:10], self.stamp(now)
-        self.assertEqual(self.file(now).read_bytes(), snapshot_bytes(day, at, {"Held unseen": (count, rows)}))
+        self.assertGreaterEqual(shown.stdout.decode().count("\n| - "), len(SNAPSHOT_HELD))
 
     def test_an_empty_inherited_identity_is_a_lane_and_summary_is_refused(self):
         repo = self.store / "checkout"
@@ -8002,23 +8011,20 @@ class DaySummary(Base):
         self.assertEqual(self.values(now + 1)["overlaps"], 1)
 
     def test_a_written_snapshot_of_over_a_megabyte_reads_in_both_modes_on_both_systems(self):
-        now = self.day(3) + 10 * self.HOUR
-        held = 45_000
-        ids = [f"{self.T0 + i:016d}-a{i:05x}" for i in range(held)]
-        day, at = self.stamp(now)[:10], self.stamp(now)
-        text = snapshot_bytes(day, at, {"Held unseen": (held, [f"- {i}" for i in ids])}).decode()
+        now = SNAPSHOT_NOW
+        text = snapshot_fixture_bytes()
         self.assertGreater(len(text), 1 << 20)
         (self.store / "summary").mkdir(exist_ok=True)
-        put(self.file(now), text)
+        self.file(now).write_bytes(text)
         r = self.summary(now, "--json")
         self.assertEqual(r.returncode, 0, r.stderr)
-        expected = {"day": day, "at": at, "format": 2, "overdue": 0, "silent": 0, "open": 0, "taken": 0, "done": 0, "refused": 0,
-                    "held_unseen": held, "overlaps": 0, "damaged": 0}
+        expected = {"day": self.stamp(now)[:10], "at": self.stamp(now), "format": 2, "overdue": 0, "silent": 0, "open": 0, "taken": 0,
+                    "done": 0, "refused": 0, "held_unseen": len(SNAPSHOT_HELD), "overlaps": 0, "damaged": 0}
         self.assertEqual(json.loads(r.stdout), expected)
         shown = self.summary(now)
         self.assertEqual(shown.returncode, 0, shown.stderr)
         inner, _ = unframe(self, shown.stdout.decode())
-        self.assertEqual(inner, text.split("\n")[:-1])
+        self.assertEqual(inner, text.decode().split("\n")[:-1])
 
     def test_a_working_declaration_cut_short_defers_the_day(self):
         now = self.day(0) + 10 * self.HOUR
