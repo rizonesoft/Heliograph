@@ -494,8 +494,9 @@ static bool summary_overlaps(const store *s, uint64_t now, text *rows, unsigned 
         if (got == P_OK) {
             uint64_t when = 0;
             const char *at = data;
-            for (; *at >= '0' && *at <= '9'; at++) when = when * 10 + (uint64_t)(*at - '0');
-            if (*at == '\n' && when + 4ull * 3600 * 1000000 > now) {
+            for (; *at >= '0' && *at <= '9' && at - data < 19; at++) when = when * 10 + (uint64_t)(*at - '0');
+            if (at == data || *at != '\n') ok = false; /* a timestamp cut short or not a number: unreadable, never a smaller number */
+            else if (when <= now && when + 4ull * 3600 * 1000000 > now) { /* live at the instant: written by then, within its four hours */
                 size_t n = 0;
                 while (at[1 + n] && at[1 + n] != '\n') n++;
                 if (at[1 + n] != '\n') ok = false; /* the path line is cut short: as unreadable as a failed read */

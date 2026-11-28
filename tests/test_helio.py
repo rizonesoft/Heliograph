@@ -7955,6 +7955,54 @@ class DaySummary(Base):
         put(self.file(self.day(0)), legacy.replace("# Heliograph 2027-01-15\n\nAs it stood at 2027-01-16T00:00:01Z.\n", "# Heliograph 2027-01-15\n\nAs it stood at 2027-01-16T00:00:01Z.\nFormat: 2\n") + "\n## Overlaps: 0\n\n\nDamaged: 0\n\nEnd of summary.\n")
         self.assertEqual(self.at(self.day(0) + self.HOUR, "summary").returncode, 3)
 
+    def test_a_declaration_dated_after_the_instant_is_not_live_at_it(self):
+        now = self.day(0) + 10 * self.HOUR
+        self.declare("os/apps", "ui", now - self.HOUR)
+        self.declare("os/main", "ui", now + 1)  # a clock stepped back, or published while the snapshot ran
+        self.assertEqual(self.values(now)["overlaps"], 0)
+        self.declare("os/main", "ui", now)  # written at the instant: live
+        self.assertEqual(self.values(now + self.DAY)["overlaps"], 0)  # a day on, both are gone
+        now = self.day(2) + 10 * self.HOUR
+        self.declare("os/apps", "ui", now - self.HOUR)
+        self.declare("os/main", "ui", now)
+        self.assertEqual(self.values(now)["overlaps"], 1)
+
+    def test_a_declaration_cut_inside_its_timestamp_defers_the_day(self):
+        now = self.day(0) + 10 * self.HOUR
+        self.declare("os/apps", "ui", now - self.HOUR)
+        stamp = str(now - self.HOUR)
+        for cut in ("", stamp[:1], stamp[:5], stamp[:-1], stamp, "x" + stamp + "\nui\n"):
+            put(self.store / "working/os+main", cut)
+            r = self.summary(now, "--json")
+            self.assertEqual((r.returncode, json.loads(r.stdout).get("deferred")), (1, True), (cut, r.stdout, r.stderr))
+            self.assertFalse(self.file(now).exists(), cut)
+        put(self.store / "working/os+main", f"{stamp}\nui\n")
+        self.assertEqual(self.values(now + 1)["overlaps"], 1)
+
+    def test_a_written_snapshot_of_over_a_megabyte_reads_in_both_modes_on_both_systems(self):
+        now = self.day(3) + 10 * self.HOUR
+        held = 45_000
+        ids = [f"{self.T0 + i:016d}-a{i:05x}" for i in range(held)]
+        day, at = self.stamp(now)[:10], self.stamp(now)
+        text = f"# Heliograph {day}\n\nAs it stood at {at}.\nFormat: 2\n"
+        for title in self.TITLES:
+            text += f"\n## {title}: {held if title == 'Held unseen' else 0}\n\n"
+            if title == "Held unseen":
+                text += "".join(f"- {i}\n" for i in ids)
+        text += "\nDamaged: 0\n\nEnd of summary.\n"
+        self.assertGreater(len(text), 1 << 20)
+        (self.store / "summary").mkdir(exist_ok=True)
+        put(self.file(now), text)
+        r = self.summary(now, "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        expected = {"day": day, "at": at, "format": 2, "overdue": 0, "silent": 0, "open": 0, "taken": 0, "done": 0, "refused": 0,
+                    "held_unseen": held, "overlaps": 0, "damaged": 0}
+        self.assertEqual(json.loads(r.stdout), expected)
+        shown = self.summary(now)
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        inner, _ = unframe(self, shown.stdout.decode())
+        self.assertEqual(inner, text.split("\n")[:-1])
+
     def test_a_working_declaration_cut_short_defers_the_day(self):
         now = self.day(0) + 10 * self.HOUR
         self.declare("os/apps", "ui", now - self.HOUR)
