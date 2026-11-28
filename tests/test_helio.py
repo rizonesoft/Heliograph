@@ -8106,10 +8106,21 @@ class DocsMatchProgram(Base):
         words = signature.split()[1:]
         return "inbox" if not words or words[0].startswith("--") else words[0]
 
+    def usage_table(self):
+        """The program's own table of commands: name -> (least, most, [usage lines]), read from engine/helio.c."""
+        source = (ROOT / "engine/helio.c").read_text(encoding="utf-8")
+        table = source[source.index("static const command_spec commands[] = {"):source.index("enum { COMMAND_COUNT")]
+        found = {}
+        for name, least, most, usage in re.findall(r'\{"(\w+)", (\d+), (\d+), \{((?:"[^"]*"(?:, )?)+)\}', table):
+            found[name] = (int(least), int(most), re.findall(r'"([^"]*)"', usage))
+        return found
+
     def dispatcher(self):
         source = (ROOT / "engine/helio.c").read_text(encoding="utf-8")
         body = source[source.index("static int run(options"):]
-        return set(re.findall(r'\{"(\w+)", \d+, \d+\}', body)) | set(re.findall(r'same\(command, "(\w+)"\)', body))
+        names = set(self.usage_table())
+        self.assertTrue(set(re.findall(r'same\(command, "(\w+)"\)', body)) <= names)  # a command the code names is in the table
+        return names
 
     def help_signatures(self):
         text = self.helio("help", me=None).stdout.decode()
@@ -8163,19 +8174,29 @@ class DocsMatchProgram(Base):
         for where in forms:
             for other in forms:
                 self.assertEqual((where, other, sorted(forms[where] - forms[other])), (where, other, []))
-        # and each command's words, from the dispatcher's table: the forms cover every count of words it accepts
-        source = (ROOT / "engine/helio.c").read_text(encoding="utf-8")
-        table = {name: (int(least), int(most)) for name, least, most in re.findall(r'\{"(\w+)", (\d+), (\d+)\}', source)}
+        # the program's own usage lines: help prints them, README and design carry exactly them, and each fits its entry's counts
+        table = self.usage_table()
+        program = [" ".join(u.split()) for _, _, usages in table.values() for u in usages]
         for where, signatures in named.items():
-            covered = {}
-            for sig in signatures:
-                bare = re.sub(r"\[--lane <lane>\]|--kind <[^>]*>|--as <[^>]*>", "", " ".join(sig.split()))
-                words = [w for w in bare.split()[1:] if w not in ("[options]", "<", "body")]
-                needed = sum(1 for w in words if not w.startswith("["))
-                counts = covered.setdefault(self.word_of(sig), set())
-                counts.update(range(needed, len(words) + 1))
-            for name, (least, most) in table.items():
-                self.assertEqual((where, name, sorted(covered.get(name, ()))), (where, name, list(range(least, most + 1))))
+            self.assertEqual((where, sorted(" ".join(s.split()) for s in signatures)), (where, sorted(program)))
+
+        def counts(usage):
+            bare = re.sub(r"\[--lane <lane>\]|--kind <[^>]*>|--as <[^>]*>", "", usage)
+            words = [w for w in bare.split()[1:] if w not in ("[options]", "<", "body")]
+            return set(range(sum(1 for w in words if not w.startswith("[")), len(words) + 1))
+
+        for name, (least, most, usages) in table.items():
+            covered = set()
+            for usage in usages:
+                self.assertTrue(counts(usage) <= set(range(least, most + 1)), usage)
+                covered |= counts(usage)
+            self.assertEqual((name, sorted(covered)), (name, list(range(least, most + 1))))
+
+    def test_a_command_with_more_words_than_its_entry_allows_is_refused(self):
+        for name, (least, most, _) in self.usage_table().items():
+            if name in ("help", "init", "archive", "log", "check", "summary"):
+                r = self.helio(name, *["extra"] * (most - least + 1), me=None if name == "summary" else "os/a")
+                self.assertEqual(r.returncode, 2, (name, r.stdout, r.stderr))
 
     def test_every_option_the_program_parses_is_documented_where_it_belongs(self):
         source = (ROOT / "engine/helio.c").read_text(encoding="utf-8")
@@ -8265,33 +8286,42 @@ class DocsMatchProgram(Base):
 
         ids = {}
         with tempfile.TemporaryDirectory() as store, tempfile.TemporaryDirectory() as neutral:
-            # before any command runs: every store the walkthrough names lies inside the test's own temporary home
             home = Path(store).resolve()
-            for command, _ in steps:
-                words = shlex.split(command.partition("| ")[2] or command)
-                values = [w.partition("=")[2] for w in words if w.startswith("HELIO_STORE=") or w.startswith("export HELIO_STORE=")]
-                if words[:1] == ["export"]:
-                    values += [w.partition("=")[2] for w in words[1:]]
-                values += [words[i + 1] for i, w in enumerate(words[:-1]) if w == "--store"]
-                for value in values:
-                    resolved = Path(store + value[1:] if value.startswith("~") else value).resolve()
-                    self.assertTrue(resolved == home or home in resolved.parents, f"{value} lies outside the test's home")
+
+            def inside(value):
+                resolved = Path(value).resolve()
+                return resolved == home or home in resolved.parents
+
+            # Each command is parsed once, as the shell reads it (quotes, and a # comment dropped); that one parse is checked
+            # and then run. Nothing runs until every store the walkthrough names lies inside the test's own temporary home.
+            parsed = []
             for command, shown in steps:
-                if command.startswith("export "):
-                    name, _, value = command[len("export "):].partition("=")
-                    env[name] = value.replace("~", store, 1) if value.startswith("~") else value  # as written, ~ is the test's home
-                    continue
-                body = ""
+                body, text = "", command
                 piped = re.match(r'echo "(.*)" \| (helio .*)$', command)
                 if piped:
-                    body, command = piped.group(1) + "\n", piped.group(2)
-                words = shlex.split(command)
-                self.assertEqual(words[0], "helio", command)
-                args = words[1:]
+                    body, text = piped.group(1) + "\n", piped.group(2)
+                words = shlex.split(text, comments=True)
+                if words[0] == "export":
+                    assignments = {}
+                    for word in words[1:]:
+                        name, _, value = word.partition("=")
+                        assignments[name] = store + value[1:] if value.startswith("~") else value  # ~ is the test's home
+                        self.assertTrue(inside(assignments[name]), f"{command}: {name} lies outside the test's home")
+                    parsed.append((assignments, None, body, shown))
+                else:
+                    self.assertEqual(words[0], "helio", command)
+                    for i, word in enumerate(words[:-1]):
+                        if word == "--store":
+                            self.assertTrue(inside(words[i + 1]), f"{command}: the store lies outside the test's home")
+                    parsed.append((None, words[1:], body, shown))
+            for assignments, args, body, shown in parsed:
+                if assignments is not None:
+                    env.update(assignments)
+                    continue
                 args = [ids.get(a, a) for a in args]
                 r = subprocess.run([str(PROGRAM), *args], input=body.encode(), capture_output=True, timeout=60, cwd=neutral, env=env)
                 actual = r.stdout.decode() + r.stderr.decode()
-                self.assertEqual(normal(actual), normal("\n".join(shown)), command)
+                self.assertEqual(normal(actual), normal("\n".join(shown)), " ".join(args))
                 if len(shown) == 1 and re.fullmatch(ident, shown[0]):
                     ids[shown[0]] = actual.strip()
 

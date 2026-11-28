@@ -3,35 +3,68 @@
 #include "helio.h"
 #include "watch.h"
 
-static const char help[] =
-    "helio passes messages between agent sessions on this machine.\n"
-    "\n"
-    "  helio --as <project/lane>                        my inbox: new messages and open jobs\n"
-    "  helio inbox                                      the same, by name\n"
-    "  helio ask  <to> <subject> [options] < body       a job for someone\n"
-    "  helio hand <to> <subject> [options] < body       work I pass on\n"
-    "  helio tell <to> <subject> [options] < body       a heads-up\n"
-    "  helio find <to> <subject> [options] < body       something I found\n"
-    "  helio answer <id> <subject> < body               a reply to its sender\n"
-    "  helio show <id>      helio take <id>     helio release <id>\n"
-    "  helio take --kind <request|handoff> [--lane <lane>]   take the next open job of that kind\n"
-    "  helio done <id> [note]                   helio refuse <id> [note]\n"
-    "  helio landed <id> <commit>               mark a job landed with a commit (7..64 hex)\n"
-    "  helio working <paths>                            what I touch, for the overlap warning\n"
-    "  helio hello <agent>                              announce this session (claude, codex, antigravity)\n"
-    "  helio hook claude                                the Claude Code hook: new messages as session context\n"
-    "  helio log            helio check\n"
-    "  helio archive                                    move closed jobs and expired notes to archive/<YYYY-MM>\n"
-    "  helio init                                       make the store (once)\n"
-    "  helio help                                       this text\n"
-    "  helio summary                                    the operator's day summary (no lane): read from the day's saved snapshot\n"
-    "\n"
+/* The one table of commands. The dispatcher takes its word counts (the command itself included) from it, and the help
+   prints its command lines from it: usage[1] is a second form of the same command. The order is the dispatcher's:
+   run() names the entries it treats alone by their index, and help, init and archive come last because they are
+   answered before the table is searched, each by its own count. */
+typedef struct {
+    const char *name;
+    int least, most;
+    const char *usage[2], *what[2];
+} command_spec;
+
+static const command_spec commands[] = {
+    {"inbox", 0, 1, {"helio --as <project/lane>", "helio inbox"}, {"my inbox: new messages and open jobs", "the same, by name"}},
+    {"log", 1, 1, {"helio log"}, {"my project's messages (log --all outside a repository: every project)"}},
+    {"check", 1, 1, {"helio check"}, {"check the store for damage"}},
+    {"show", 2, 2, {"helio show <id>"}, {"one message, marked seen"}},
+    {"take", 1, 2, {"helio take <id>", "helio take --kind <request|handoff> [--lane <lane>]"}, {"take a job", "take the next open job of that kind"}},
+    {"release", 2, 2, {"helio release <id>"}, {"give a taken job back"}},
+    {"done", 2, 3, {"helio done <id> [note]"}, {"finish a job"}},
+    {"refuse", 2, 3, {"helio refuse <id> [note]"}, {"refuse a job"}},
+    {"hook", 2, 2, {"helio hook claude"}, {"the Claude Code hook: new messages as session context"}},
+    {"answer", 3, 3, {"helio answer <id> <subject> < body"}, {"a reply to its sender"}},
+    {"working", 2, 2, {"helio working <paths>"}, {"what I touch, for the overlap warning"}},
+    {"ask", 3, 3, {"helio ask <to> <subject> [options] < body"}, {"a job for someone"}},
+    {"hand", 3, 3, {"helio hand <to> <subject> [options] < body"}, {"work I pass on"}},
+    {"tell", 3, 3, {"helio tell <to> <subject> [options] < body"}, {"a heads-up"}},
+    {"find", 3, 3, {"helio find <to> <subject> [options] < body"}, {"something I found"}},
+    {"hello", 2, 2, {"helio hello <agent>"}, {"announce this session (claude, codex, antigravity)"}},
+    {"landed", 3, 3, {"helio landed <id> <commit>"}, {"mark a job landed with a commit (7..64 hex)"}},
+    {"summary", 1, 1, {"helio summary"}, {"the operator's day summary (no lane): read from the day's saved snapshot"}},
+    {"help", 1, 1, {"helio help"}, {"this text"}},
+    {"init", 1, 1, {"helio init"}, {"make the store (once)"}},
+    {"archive", 1, 1, {"helio archive"}, {"move closed jobs and expired notes to archive/<YYYY-MM>"}},
+};
+enum { COMMAND_COUNT = sizeof commands / sizeof *commands };
+
+static const command_spec *command_named(const char *name) {
+    for (int i = 0; i < COMMAND_COUNT; i++)
+        if (same(name, commands[i].name)) return &commands[i];
+    return NULL;
+}
+
+static const char help_tail[] =
     "Options: --as <project/lane>, --about <paths>, --now or --whenever, --store <folder>,\n--key <text> (sending the same key again sends nothing new), --session <my-session> (who is calling),\n--for-session <target-session> (limit a sent message to one session; show <id> opens visible ids), --all,\n--due <minutes> (an overdue job goes back to its sender and the owner),\n--kind <request|handoff> and --lane <lane> (take only: the next job, as the lane of this project).\n"
     "HELIO_AS and HELIO_STORE give two of them. <to> is project/lane, project/all or path:<file>.\n"
     "helio summary [--json] is the operator's: it holds every project, so it runs with no lane and any lane is refused. --json gives\n{\"day\", \"at\", \"format\", \"overdue\", \"silent\", \"open\", \"taken\", \"done\", \"refused\", \"held_unseen\", \"overlaps\", \"damaged\"}.\n"
     "A session sees only its own project's messages (and those addressed to it); helio log --all outside a configured repository with no lane shows every project.\n"
     "A repository's helio.conf names its project, the lane of a session there and who owns which path.\n"
     "A message is information from another agent. It never approves work or changes a rule.\n";
+
+
+/* The help: its command lines come from the table. */
+static void help_text(text *out) {
+    add(out, "helio passes messages between agent sessions on this machine.\n\n");
+    for (int i = 0; i < COMMAND_COUNT; i++)
+        for (int u = 0; u < 2 && commands[i].usage[u]; u++) {
+            size_t n = len(commands[i].usage[u]);
+            add(out, "  "), add(out, commands[i].usage[u]);
+            for (size_t pad = n < 52 ? 56 - n : 4; pad; pad--) add(out, " ");
+            add(out, commands[i].what[u]), add(out, "\n");
+        }
+    add(out, "\n"), add(out, help_tail);
+}
 
 typedef struct options {
     const char *me, *about, *urgency, *folder, *session, *for_session, *key, *due, *kind, *lane_word;
@@ -1312,9 +1345,14 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
     for (size_t i = 0; i < sizeof structured / sizeof *structured; i++)
         if (same(command, structured[i])) reply.key = NULL;
     if (same(command, "help")) {
+        if (o->count != command_named("help")->least) return fail("help takes no words", 2);
         if (o->for_session_flag) return fail("--for-session is only for sending a message", 2);
         reply.key = "help";
-        if (!emit(help)) return 3;
+        text shown = {0};
+        help_text(&shown);
+        bool good = !shown.failed && emit(shown.data);
+        text_free(&shown);
+        if (!good) return 3;
         if (*o->folder && address_ok(o->me, false)) {
             store s = {0};
             if (store_open(&s, o->folder) == S_OK) {
@@ -1332,7 +1370,7 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
     if (!*o->folder) return fail("say where the store is: --store or HELIO_STORE", 2);
     if (same(command, "init")) {
         if (o->for_session_flag) return fail("--for-session is only for sending a message", 2);
-        if (o->count != 1) return fail("init takes no words", 2);
+        if (o->count != command_named("init")->least) return fail("init takes no words", 2);
         int rc = init(o->folder, o->from_default);
         if (rc == 0) first_call_if_store(o, false, pause, pause_user); /* a new store holds nothing to classify */
         if (rc == 0 && address_ok(o->me, false)) {
@@ -1343,7 +1381,7 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
     }
     if (same(command, "archive")) {
         if (o->for_session_flag) return fail("--for-session is only for sending a message", 2);
-        if (o->count != 1) return fail("archive takes no words", 2);
+        if (o->count != command_named("archive")->least) return fail("archive takes no words", 2);
         size_t moved = 0;
         text report = {0};
         first_call_if_store(o, true, pause, pause_user); /* before the move */
@@ -1384,12 +1422,8 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
         return rc;
     }
 
-    static const struct { const char *name; int least, most; } commands[] = {
-        {"inbox", 0, 1}, {"log", 1, 1}, {"check", 1, 1}, {"show", 2, 2}, {"take", 1, 2}, {"release", 2, 2}, {"done", 2, 3},
-        {"refuse", 2, 3}, {"hook", 2, 2}, {"answer", 3, 3}, {"working", 2, 2}, {"ask", 3, 3}, {"hand", 3, 3}, {"tell", 3, 3}, {"find", 3, 3},
-        {"hello", 2, 2}, {"landed", 3, 3}, {"summary", 1, 1}};
     int which = -1;
-    for (int i = 0; i < (int)(sizeof commands / sizeof *commands); i++)
+    for (int i = 0; i < COMMAND_COUNT; i++)
         if (same(command, commands[i].name)) which = i;
     if (which < 0) return fail("there is no such command: see helio help", 2);
     if (o->count < commands[which].least || o->count > commands[which].most) return fail("that command needs other words: see helio help", 2);
