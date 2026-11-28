@@ -3639,7 +3639,11 @@ class JobQueue(JsonCalls):
         send("H", t + 50, "ask", "os/neon-a", "H now", "--as", "os/main", "--now")
         send("I", t + 1, "ask", "os/neon-a", "I whenever", "--as", "os/main", "--whenever")
         send("K", t + 40, "ask", "os/neon-a", "K newer", "--as", "os/main")
+        send("L", t + 3, "ask", "os/neon-a", "L incoming", "--as", "other/main")  # from another project, addressed to the worker's lane
         send("J", t + 20, "hand", "os/neon-a", "J handoff", "--as", "os/main")
+        send("J2", t + 9, "hand", "os/neon-a", "J2 older next", "--as", "os/main")
+        send("J3", t + 30, "hand", "os/neon-a", "J3 now", "--as", "os/main", "--now")
+        send("J4", t + 4, "hand", "os/neon-a", "J4 whenever", "--as", "os/main", "--whenever")
         send("T", t + 21, "tell", "os/neon-a", "T headsup", "--as", "os/main")
         self.assertIn("repository: repo-a\n", (self.store / f"messages/{ids['G']}.post").read_text())
         # A is taken and released by someone else's step: its send time still puts it before the newer K
@@ -3656,12 +3660,12 @@ class JobQueue(JsonCalls):
                     return got
                 got.append(by_id[self.value(r, 0)["id"]])
 
-        self.assertEqual(drain(), ["H", "B", "A", "K", "I"])
-        for name in ("C", "D", "E", "F", "G", "J", "T"):  # ineligible: chains untouched
+        self.assertEqual(drain(), ["H", "L", "B", "A", "K", "I"])  # L: another project's request addressed to this lane
+        for name in ("C", "D", "E", "F", "G", "T"):  # ineligible (D and E are another project's, not addressed to this lane): chains untouched
             self.assertEqual(sorted(p.name for p in (self.store / "messages").glob(f"{ids[name]}.link.*")), chains[name], name)
         # what is left of the queue reveals nothing
         self.assertEqual(self.queue(now=t + 300).stdout, b"null\n")
-        self.assertEqual(drain(kind="handoff"), ["J"])
+        self.assertEqual(drain(kind="handoff"), ["J3", "J2", "J", "J4"])  # three urgencies, two send times in one
         self.assertEqual(drain(session="sX"), ["F"])
         self.assertEqual(drain(cwd=repo_a), ["G"])
 
@@ -3773,10 +3777,12 @@ class JobQueue(JsonCalls):
     # review round 1
     def test_an_unreadable_older_post_stops_the_queue_before_claiming(self):
         t = self.OLD + 76_000 * self.M
-        put(self.store / f"messages/{t - 1000}-aaaaaa.post", "garbage\n")  # older and more urgent, but cannot be read
+        bad = f"{t - 1000}-aaaaaa"
+        put(self.store / f"messages/{bad}.post", "garbage\n")  # older and more urgent, but cannot be read
         job = self.sent(t, "ask", "os/all", "later", "--as", "os/main")
         v = self.value(self.queue(now=t + 1), 3)
         self.assertEqual(v["code"], 3)
+        self.assertIn(bad, v["error"])  # the unreadable post is named by its file name
         self.assertEqual(list((self.store / "messages").glob(f"{job}.link.*")), [])
 
     def test_a_refusal_after_this_calls_step_was_published_is_not_a_lost_race(self):

@@ -391,7 +391,7 @@ static void append_row(text *rows, const row *r) {
 }
 
 /* Calls each for every message, oldest first; stops early if each returns false. A damaged one is counted. */
-static size_t every(store *s, bool (*each)(store *s, const message *m, void *user), void *user) {
+static size_t every_named(store *s, bool (*each)(store *s, const message *m, void *user), void *user, char **first_unreadable) {
     size_t damaged = 0;
     for (size_t i = 0; i < s->count; i++) {
         size_t n = len(s->names[i]);
@@ -401,12 +401,19 @@ static size_t every(store *s, bool (*each)(store *s, const message *m, void *use
         s_result mr = id ? store_message_live(s, id, &m) : S_DAMAGED;
         bool keep_going = true;
         if (mr == S_OK) keep_going = each(s, &m, user);
-        else if (!(mr == S_REFUSED && same(s->why, "there is no such message"))) damaged++;
+        else if (!(mr == S_REFUSED && same(s->why, "there is no such message"))) {
+            if (!damaged && first_unreadable && id) *first_unreadable = copy(id, len(id)); /* named by its file name */
+            damaged++;
+        }
         message_free(&m);
         p_free(id);
         if (!keep_going) break;
     }
     return damaged;
+}
+
+static size_t every(store *s, bool (*each)(store *s, const message *m, void *user), void *user) {
+    return every_named(s, each, user, NULL);
 }
 
 enum { SHOW_MESSAGES = 5, SHOW_BYTES = 2000 };
@@ -975,11 +982,16 @@ static bool before(const candidate *a, const candidate *b) {
    another) lets it try the next; damage or any other refusal stops, naming the job, and claims nothing more. */
 static int take_next(store *s, const options *o, actor me) {
     queue q = {.kind = o->kind, .me = me};
-    size_t unreadable = every(s, collect_candidate, &q);
+    char *unreadable_id = NULL;
+    size_t unreadable = every_named(s, collect_candidate, &q, &unreadable_id);
     int code = 1;
     if (q.failed) code = fail("out of memory", 3);
-    else if (unreadable) /* a post that cannot be read leaves the order unknown: nothing is claimed */
-        code = fail("something here is damaged: see helio check", 3);
+    else if (unreadable) { /* a post that cannot be read leaves the order unknown: nothing is claimed */
+        text why = {0};
+        add(&why, "a message cannot be read: "), add(&why, unreadable_id ? unreadable_id : "?");
+        code = fail(why.failed ? "a message cannot be read" : why.data, 3);
+        text_free(&why);
+    }
     else if (q.damaged_id) {
         text why = {0};
         add(&why, q.damaged_why ? q.damaged_why : "a job cannot be read"), add(&why, ": "), add(&why, q.damaged_id);
@@ -1021,6 +1033,7 @@ static int take_next(store *s, const options *o, actor me) {
     for (size_t i = 0; i < q.count; i++) p_free(q.items[i].id);
     p_free(q.items);
     p_free(q.damaged_id);
+    p_free(unreadable_id);
     return code;
 }
 
