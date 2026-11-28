@@ -54,10 +54,10 @@ Sections: 8 | Checklist items: 61
 | [x]    | D01 T01 §21 | JSON for the inbox, log, show and check            | none                | 10    |
 | [x]    | D01 T01 §22 | JSON for sending, job changes, archive and working | none                | 8     |
 | [x]    | D01 T01 §11 | Take the next job as a queue                       | none                | 9     |
-| [ ]    | D01 T01 §23 | Summary command read from the day's snapshot       | none                | 10    |
+| [x]    | D01 T01 §23 | Summary command read from the day's snapshot       | none                | 10    |
 | [ ]    | D01 T01 §13 | Design and help that match the program             | none                | 4     |
 | [ ]    | D01 T01 §24 | Folder holds that outlast a busy Windows host      | wsl-windows-interop | 5     |
 
-Progress: 21/24 verified sections, 2 ready to run now.
+Progress: 22/24 verified sections, 2 ready to run now.
 
-Checklist: 154/164 items completed (includes Commit items).
+Checklist: 155/164 items completed (includes Commit items).

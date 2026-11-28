@@ -57,7 +57,7 @@ title: "TODO-01 -- Heliograph"
 | 20 | §20 | Windows launches from WSL that survive an interop timeout | §17 | [x] |
 | 21 | §21 | JSON for the inbox, log, show and check | §10 | [x] |
 | 22 | §22 | JSON for sending, job changes, archive and working | §10, §21 | [x] |
-| 23 | §23 | Summary command read from the day's snapshot | §10 | [ ] |
+| 23 | §23 | Summary command read from the day's snapshot | §10 | [x] |
 | 24 | §24 | Folder holds that outlast a busy Windows host | -- | [ ] |
 
 ## 1. Steps that notice an archived job
@@ -758,9 +758,12 @@ Filed 2026-11-27 from the `D01 T01 §10` plan review (findings 5 for the overlap
 - [x] Report a day whose snapshot was deferred as exit 1 `{"day", "deferred": true}` (text: the reason on stderr), keeping no file, so a later call that day writes it; a read, write or flush failure is exit 3 with the error and the file actually left on disk is handled by the next call. Done when: a deferral by an unreadable seen mark and one by a liveness failure each give that value and no file, and a repaired retry the same day writes and reads it; a failed write and a failed flush each give exit 3, and the next call reads or rewrites the file correctly.
 - [x] Read a snapshot of up to the store's largest (every held id of a full store, `MOST_NAMES` names) in `engine/helio.c` and `engine/watch.c` with one bound shared by writer and reader. Done when: a writer-made snapshot over 1 MiB of held ids reads back in both modes.
 - [x] List `summary` and its JSON in the help of `engine/helio.c` and the command reference in `README.md`, saying it is the operator's. Done when: both name it.
-- [ ] Commit: `summary: the day's snapshot as a command`
+- [x] Commit: `summary: the day's snapshot as a command`
 
 **Test checkpoint:** `python3 ../SDK/tools/app_build.py .` exits 0 and the tests fail when `summary` recounts the store instead of reading the file.
+
+> **Verified:** 2026-11-28 | §23 | 324ac41f32d715dc096d341f8eea0598ac63a822
+> **Review:** `docs/reviews/d01-t01-s23.json`
 
 ## 24. Folder holds that outlast a busy Windows host
 
