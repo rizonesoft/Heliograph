@@ -8273,10 +8273,23 @@ class DocsMatchProgram(Base):
     @staticmethod
     def find_bash():
         """A real bash: Git Bash on Windows (never the WSL launcher in System32), the one on PATH elsewhere."""
-        if ON_WINDOWS:
-            git = Path(r"C:\Program Files\Git\bin\bash.exe")
-            return str(git) if git.exists() else shutil.which("bash")
-        return shutil.which("bash")
+        if not ON_WINDOWS:
+            return shutil.which("bash")
+        # Git Bash is the one with cygpath: the system-wide and per-user installs, the one beside git, then PATH, each
+        # accepted only if it really is Git Bash (the WSL launcher in System32 has no cygpath).
+        candidates = [Path(r"C:\Program Files\Git\bin\bash.exe"),
+                      Path(os.environ.get("LOCALAPPDATA", "")) / "Programs/Git/bin/bash.exe"]
+        git = shutil.which("git")
+        if git:
+            candidates.append(Path(git).resolve().parent.parent / "bin/bash.exe")
+        if shutil.which("bash"):
+            candidates.append(Path(shutil.which("bash")))
+        for candidate in candidates:
+            if candidate.is_file():
+                probe = subprocess.run([str(candidate), "-c", "command -v cygpath"], capture_output=True, timeout=30)
+                if probe.returncode == 0 and probe.stdout.strip():
+                    return str(candidate)
+        return None
 
     def test_the_readme_walkthrough_is_a_real_run(self):
         bash_program = self.find_bash()
