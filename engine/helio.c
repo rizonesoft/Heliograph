@@ -1200,21 +1200,43 @@ static int init(const char *folder, bool from_default) {
     return fail("the store cannot be made", 3);
 }
 
-/* The path of the snapshot of a day, read whole with the one bound the writer keeps. */
+/* The snapshot of a day, read whole with the one bound the writer keeps, through the held summary folder. */
 static p_result read_snapshot(const char *folder, const char *day, char **data, size_t *length) {
-    text path = {0};
-    add(&path, folder), add(&path, "/summary/"), add(&path, day), add(&path, ".md");
-    p_result got = path.failed ? P_FAILED : p_read(path.data, MOST_SUMMARY, data, length);
-    text_free(&path);
-    return got;
+    return watch_summary_file(folder, day, MOST_SUMMARY, data, length);
+}
+
+/* The first call of the UTC day that opens the store saves the day's snapshot, before its own change and before it
+   announces itself. A failure to save it is a warning for any command, and for the inbox and the hook (hard) an error
+   code too: true then. */
+static bool first_call_snapshot(store *s, const place *here, bool hard) {
+    char day[11];
+    s_result sr = watch_summary(s, here, p_now(), day);
+    if (sr == S_NOTHING) fail(s->why, 0); /* deferred on transient liveness error; the caller's own command decides its exit code */
+    else if (sr != S_OK && hard) {
+        fail(s->why, 3); /* the inbox is shown all the same */
+        return true;
+    } else if (sr != S_OK) fail(s->why, 0); /* any other command goes on: a day's summary is not its work */
+    return false;
+}
+
+/* A call that opens the store only to announce itself (help, init, archive) still saves the day's snapshot first. */
+static void first_call_if_store(const options *o, bool record, void (*pause)(void *user, const char *stage), void *pause_user) {
+    store s = {0};
+    if (store_open(&s, o->folder) == S_OK) {
+        s.pause = pause, s.pause_user = pause_user;
+        if (record && o->here.found) place_record_silent(&s, &o->here);
+        first_call_snapshot(&s, &o->here, false);
+    }
+    store_close(&s);
 }
 
 /* helio summary: the operator's command. The day's saved snapshot is read before the live store is opened; the store
    is opened only when there is none yet, to write it, and what is returned is the file on disk, whoever wrote it. */
 static int summary_command(options *o, void (*pause)(void *user, const char *stage), void *pause_user) {
     char day[11] = {0};
+    uint64_t now = p_now(); /* one instant: the day looked up is the day written */
     text today = {0};
-    add_time(&today, p_now());
+    add_time(&today, now);
     if (today.failed || today.length < 10) return text_free(&today), fail("out of memory", 3);
     for (int i = 0; i < 10; i++) day[i] = today.data[i];
     text_free(&today);
@@ -1230,7 +1252,7 @@ static int summary_command(options *o, void (*pause)(void *user, const char *sta
         }
         s.pause = pause, s.pause_user = pause_user;
         if (o->here.found && place_record_silent(&s, &o->here) != P_OK) fail("the project's silent threshold could not be saved", 0);
-        s_result sr = watch_summary(&s, &o->here, day);
+        s_result sr = watch_summary(&s, &o->here, now, day);
         const char *why = s.why;
         store_close(&s);
         if (sr == S_NOTHING) { /* deferred: no file is kept, so a later call of the day writes it */
@@ -1292,6 +1314,8 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
             store s = {0};
             if (store_open(&s, o->folder) == S_OK) {
                 s.pause = pause, s.pause_user = pause_user;
+                if (o->here.found) place_record_silent(&s, &o->here);
+                first_call_snapshot(&s, &o->here, false);
                 announce_best_effort(&s, o, "");
                 store_close(&s);
             } else {
@@ -1305,6 +1329,7 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
         if (o->for_session_flag) return fail("--for-session is only for sending a message", 2);
         if (o->count != 1) return fail("init takes no words", 2);
         int rc = init(o->folder, o->from_default);
+        if (rc == 0) first_call_if_store(o, false, pause, pause_user); /* a new store holds nothing to classify */
         if (rc == 0 && address_ok(o->me, false)) {
             store s = {.folder = o->folder, .pause = pause, .pause_user = pause_user};
             announce_best_effort(&s, o, "");
@@ -1316,6 +1341,7 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
         if (o->count != 1) return fail("archive takes no words", 2);
         size_t moved = 0;
         text report = {0};
+        first_call_if_store(o, true, pause, pause_user); /* before the move */
         s_result ar = archive_store(o->folder, 0, &moved, &report, pause, pause_user);
         if (reply.on) {
             /* One authoritative problems array, an entry for each line of the report, and the posts this call moved. */
@@ -1379,7 +1405,7 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
         if (!is_send) return fail("--for-session is only for sending a message", 2);
         if (!*o->for_session || !session_ok(o->for_session)) return fail("the target session name is invalid or too long", 2);
     }
-    if (which == 17 && (o->me_flag || *o->me)) return fail("summary is the operator's command: it takes no lane", 2);
+    if (which == 17 && (o->me_flag || o->me_env != NULL || *o->me)) return fail("summary is the operator's command: it takes no lane", 2);
     if (which != 1 && which != 2 && which != 17 && !address_ok(o->me, false)) return fail("say who you are: --as project/lane or HELIO_AS", 2);
     if (which == 1) {
         if ((o->me_flag || o->me_env != NULL) && !address_ok(o->me, false))
@@ -1410,20 +1436,12 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
     s.pause_user = pause_user;
     if (o->here.found && place_record_silent(&s, &o->here) != P_OK)
         fail("the project's silent threshold could not be saved", 0);
+    /* The first call of the UTC day writes the day's snapshot, whatever the command, before its own change and before it
+       announces itself (a returning taker's own sign of life must not erase its silence from the report). */
+    bool summary_err = first_call_snapshot(&s, &o->here, which == 0 || which == 8);
     bool announce_first = which == 0 || which == 1, announced = false;
     if (announce_first && address_ok(o->me, false)) announce_best_effort(&s, o, "");
     else if (which == 8) announce_best_effort(&s, o, "claude");
-    bool summary_err = false;
-    {
-        /* The first call of the UTC day writes the day's snapshot, whatever the command and before its own change. */
-        char day[11];
-        s_result sr = watch_summary(&s, &o->here, day);
-        if (sr == S_NOTHING) fail(s.why, 0); /* deferred on transient liveness error; caller's own inbox decides exit code */
-        else if (sr != S_OK && (which == 0 || which == 8)) {
-            fail(s.why, 3); /* the inbox is shown all the same */
-            summary_err = true;
-        } else if (sr != S_OK) fail(s.why, 0); /* any other command goes on: a day's summary is not its work */
-    }
     bool daily_err = false;
     if (which == 0 && !summary_err) {
         text drep = {0};

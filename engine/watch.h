@@ -67,12 +67,16 @@ bool watch_classify_session_silent(store *s, const place *here, const message *m
    bytes a line) and a megabyte for the parts that list their first 100 rows. */
 enum { MOST_SUMMARY = MOST_NAMES * 32 + (1 << 20), SUMMARY_PARTS = 8 };
 
-/* Writes summary/<day>.md once a day, UTC, when it is not there: one clock instant names the file, heads it and
-   classifies every row. day is the file's day (YYYY-MM-DD), whatever the result. S_OK when the file is there (made
-   now or by a call that was faster), S_NOTHING when a read the summary needs failed (the day is deferred and no file
-   is kept), S_DAMAGED when it cannot be written. Counts the pairs of lanes of one project whose live `working`
-   declarations share a path; posts no notice. */
-s_result watch_summary(store *s, const place *here, char day[11]);
+/* Writes summary/<day>.md once a day, UTC, when it is not there, through the held summary folder (a link is
+   refused): the instant now names the file, heads it and classifies every row; day is its day (YYYY-MM-DD). Whether
+   the file is there is asked of one byte, never a read of the whole. S_OK when the file is there (made now or by a call
+   that was faster), S_NOTHING when a read the summary needs failed (the day is deferred and no file is kept),
+   S_DAMAGED when it cannot be written. Counts the pairs of lanes of one project whose live `working` declarations
+   share a path; posts no notice. */
+s_result watch_summary(store *s, const place *here, uint64_t now, char day[11]);
+
+/* The file of a day, read through the held summary folder: P_MISSING when there is none, P_TOO_LARGE past most. */
+p_result watch_summary_file(const char *folder, const char *day, size_t most, char **data, size_t *length);
 
 /* What a snapshot file says, read once the whole file is checked. format is 2 for a file with a Format line and 1 for
    one of the earlier writer, which has no overlaps part (counts[7] is 0 and format says so). */

@@ -347,7 +347,9 @@ class Watching(Base):
     def test_what_cannot_be_read_is_not_taken_for_nothing(self):
         (self.store / "working/os+apps").mkdir(parents=True)
         self.assertEqual(self.helio("working", "ui", me="os/main").returncode, 3)
-        (self.store / f"summary/{time.strftime('%Y-%m-%d', time.gmtime())}.md").mkdir(parents=True)
+        for saved in (self.store / "summary").glob("*.md"):
+            saved.unlink()  # init was the day's first call and saved one: the inbox below is to be the first again
+        (self.store / f"summary/{time.strftime('%Y-%m-%d', time.gmtime())}.md").mkdir(parents=True, exist_ok=True)
         self.assertIn(b"summary cannot be written", self.helio(me="os/main").stderr)
 
     def test_old_work_is_not_an_overlap(self):
@@ -356,26 +358,26 @@ class Watching(Base):
         self.assertEqual(self.working("main", "ui"), [])
 
     def test_the_summary_is_written_once_a_day(self):
-        # Every change is made on another (fixed, later) day, so the first call of the real day is the inbox below; the
-        # changes stay "in the last day" of the real clock because they are later than it.
-        before = 1_800_000_000_000_000
-        def at(*args, **more):
-            result = run_at(self.store, before, *args, **more)
+        # Every change is made on one day and the inbox is the first call of the next, both on a controlled clock.
+        before = 1_800_043_200_000_000  # 2027-01-15T20:00:00Z
+        def at(now, *args, **more):
+            result = run_at(self.store, now, *args, **more)
             self.assertIn(result.returncode, (0, 1), result.stderr)
             return result.stdout.decode().strip()
-        open_job, taken, done, refused = (at("ask", "os/userland", n, me="os/main", body=b"b") for n in ("one", "two", "three", "four"))
+        open_job, taken, done, refused = (at(before, "ask", "os/userland", n, me="os/main", body=b"b") for n in ("one", "two", "three", "four"))
         for job in (taken, done):
-            at("take", job, me="os/userland")
-        at("done", done, me="os/userland")
-        at("refuse", refused, me="os/main")
-        self.helio(me="os/userland")
-        (summary,) = (self.store / "summary").glob(f"{time.strftime('%Y-%m-%d', time.gmtime())}.md")
+            at(before, "take", job, me="os/userland")
+        at(before, "done", done, me="os/userland")
+        at(before, "refuse", refused, me="os/main")
+        next_day = before + 6 * 3_600_000_000  # 2027-01-16T02:00:00Z: the next UTC day, the closed jobs still inside their day
+        at(next_day, me="os/userland")
+        summary = self.store / f"summary/{time.strftime('%Y-%m-%d', time.gmtime(next_day / 1_000_000))}.md"
         text = summary.read_text()
-        for part, job in (("Overdue: 0", None), ("Open: 1", open_job), ("Taken: 1", taken), ("Done in the last day: 1", done), ("Refused in the last day: 1", refused)):
+        for part, job in (("Overdue: 0", None), ("Open: 1", open_job), ("Silent: 1", taken), ("Done in the last day: 1", done), ("Refused in the last day: 1", refused)):
             body = text.split(f"## {part}\n")[1].split("## ")[0]
             self.assertTrue(job is None or job in body, (part, body))
-        self.send(subject="five")
-        self.helio(me="os/userland")
+        at(next_day + 1, "ask", "os/userland", "five", me="os/main", body=b"b")
+        at(next_day + 2, me="os/userland")
         self.assertEqual(summary.read_text(), text)
 
 class Places(Base):
@@ -4387,7 +4389,6 @@ class Expiry(Base):
             self.assertEqual((self.store / f"archive/{self.month(msg)}/{name}").read_bytes(), data)
         self.assertEqual(list((self.store / "messages").glob(f"{msg}.*")), [])
 
-    @unittest.skipIf(ON_WINDOWS, "counts opens through Linux inotify")
     def test_a_message_moved_while_the_snapshot_reads_it_is_not_held(self):
         # The archive is listed once per snapshot; a message archived after that listing, while its marks are read,
         # is still found seen (its vanished mark sends the snapshot to the archive), never counted as held.
@@ -5624,19 +5625,18 @@ class SilentTaker(unittest.TestCase):
             self.assertEqual(list((st / "summary").glob("*.md")) if (st / "summary").exists() else [], [])
             bad_a.rmdir(), bad_b.rmdir()
 
-            # 1b. Recovery: returning taker os/b (session sb) runs the day's first successful inbox:
-            # refreshes sb BEFORE summary! (j_ov_si is overdue+silent; j_pw is silent; j_ret is taken/alive.)
+            # 1b. Recovery: returning taker os/b (session sb) runs the day's first successful inbox. The snapshot is
+            # taken BEFORE its own sign of life, so the report keeps its silence (j_ov_si, j_pw and j_ret are all silent).
             self.assertEqual(rc_at(t_later, "inbox", "--as", "os/b", "--session", "sb").returncode, 0)
             sum_files = list((st / "summary").glob("*.md"))
             self.assertEqual(len(sum_files), 1)
             text = sum_files[0].read_text()
             self.assertIn("## Overdue: 1\n", text)
-            self.assertIn("## Silent: 2\n", text)
-            self.assertIn("## Taken: 1\n", text)
+            self.assertIn("## Silent: 3\n", text)
+            self.assertIn("## Taken: 0\n", text)
             self.assertIn(j_ov_si, text.split("## Overdue: 1")[1].split("## Silent:")[0])
-            self.assertIn(j_ov_si, text.split("## Silent: 2")[1].split("## Open:")[0])
-            self.assertIn(j_pw, text.split("## Silent: 2")[1].split("## Open:")[0])
-            self.assertIn(j_ret, text.split("## Taken: 1")[1].split("## Done")[0])
+            for job in (j_ov_si, j_pw, j_ret):
+                self.assertIn(job, text.split("## Silent: 3")[1].split("## Open:")[0])
 
             # 2. Corrupt/unreadable stored threshold file fails with exit 3 instead of silently falling back to 120m!
             put(st / "silent/os", "corrupt\n")
@@ -7499,6 +7499,11 @@ class DaySummary(Base):
     def summary(self, now, *args, **more):
         return self.at(now, "summary", *args, **more)
 
+    def post_at(self, now, command, to, subject, *more, me="os/main"):
+        r = self.at(now, command, to, subject, *more, me=me, body=b"body of " + subject.encode())
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout.decode().strip()
+
     def values(self, now):
         r = self.summary(now, "--json")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -7536,13 +7541,16 @@ class DaySummary(Base):
             r = subprocess.run(command, capture_output=True, timeout=60, cwd=self.store)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             return json.loads(r.stdout)
-        first = stepped(self.day(0) + 23 * self.HOUR + 59 * 60_000_000 + 59_000_000)
-        self.assertEqual(first["day"], first["at"][:10])
+        kept = set(f.name for f in (self.store / "summary").glob("*.md"))  # what init saved on the real day
+        start = self.day(0) + 23 * self.HOUR + 59 * 60_000_000 + 59_000_000
+        first = stepped(start)
+        # The day asked for is the day of the first reading, whatever later readings say.
+        self.assertEqual((first["day"], first["at"]), (self.stamp(start)[:10], self.stamp(start)))
         text = (self.store / f"summary/{first['day']}.md").read_text()
         self.assertTrue(text.startswith(f"# Heliograph {first['day']}\n\nAs it stood at {first['at']}.\n"), text)
         second = stepped(self.day(40))
-        self.assertNotEqual(second["day"], first["day"])
-        self.assertEqual(sorted(f.name for f in (self.store / "summary").glob("*.md")), sorted([first["day"] + ".md", second["day"] + ".md"]))
+        self.assertEqual(second["day"], self.stamp(self.day(40))[:10])
+        self.assertEqual(sorted(f.name for f in (self.store / "summary").glob("*.md") if f.name not in kept), sorted([first["day"] + ".md", second["day"] + ".md"]))
 
     def test_overlaps_count_pairs_of_lanes_of_one_project_at_the_snapshot_instant(self):
         cases = [
@@ -7884,6 +7892,105 @@ class DaySummary(Base):
         shown = self.summary(now)
         self.assertEqual(shown.returncode, 0, shown.stderr)
         self.assertGreaterEqual(shown.stdout.decode().count("\n| - "), count)
+
+    def test_an_empty_inherited_identity_is_a_lane_and_summary_is_refused(self):
+        repo = self.store / "checkout"
+        repo.mkdir()
+        put(repo / "helio.conf", "project: os\nlane: apps\n")
+        for cwd in (repo, self.store):
+            for mode in ((), ("--json",)):
+                r = self.summary(self.day(1), *mode, cwd=cwd, extra_env={"HELIO_AS": ""})
+                self.assertEqual(r.returncode, 2, (cwd, mode, r.stdout, r.stderr))
+                self.assertNotIn(b"Heliograph", r.stdout)
+
+    @unittest.skipIf(ON_WINDOWS, "needs symbolic links")
+    def test_a_linked_summary_folder_is_neither_read_nor_written(self):
+        outside = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, outside, True)
+        now = self.day(1) + self.HOUR
+        self.assertEqual(self.summary(now).returncode, 0)  # a real snapshot, for its text
+        text = self.file(now).read_bytes()
+        shutil.rmtree(self.store / "summary")
+        os.symlink(outside, self.store / "summary")
+        put(outside / self.file(now).name, text.decode())  # a perfect snapshot behind the link
+        for mode in ((), ("--json",)):
+            r = self.summary(now, *mode)
+            self.assertEqual(r.returncode, 3, (mode, r.stdout, r.stderr))
+            self.assertNotIn(b"Heliograph 20", r.stdout)
+        (outside / self.file(now).name).unlink()
+        r = self.at(now + 1, "ask", "os/all", "linked", me="os/main", body=b"b")  # the day's first call finds nothing it may write
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_the_snapshot_is_taken_before_the_first_call_signs_itself_of_life(self):
+        put(self.store / "helio.conf", "project: os\nsilent: 60\n")
+        job = self.ask(self.T0)
+        self.assertEqual(self.at(self.T0, "take", job, me="os/quiet", extra_env=None).returncode, 0)
+        now = self.day(1) + 10 * self.HOUR  # long past its hour: the taker returns and is the day's first call
+        self.assertIn(self.at(now, me="os/quiet").returncode, (0, 1))
+        counts = self.counts_in(self.file(now).read_text())
+        self.assertEqual((counts["silent"], counts["taken"]), (1, 0))
+
+    def test_help_archive_and_init_are_calls_that_save_the_snapshot_first(self):
+        now = self.day(1) + self.HOUR
+        self.assertEqual(self.at(now, "help", me="os/main").returncode, 0)
+        self.assertTrue(self.file(now).exists())
+        now = self.day(2) + self.HOUR
+        self.assertEqual(self.at(now, "archive").returncode, 1)
+        self.assertTrue(self.file(now).exists())
+        fresh = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, fresh, True)
+        self.assertEqual(run(fresh / "store", "init", me=None, cwd=fresh).returncode, 0)
+        self.assertEqual(len(list((fresh / "store/summary").glob("*.md"))), 1)
+
+    def test_a_legacy_snapshot_whose_day_and_instant_are_either_side_of_midnight_reads(self):
+        legacy = "# Heliograph 2027-01-15\n\nAs it stood at 2027-01-16T00:00:01Z.\n"
+        for i, title in enumerate(t for t in self.TITLES if t != "Overlaps"):
+            legacy += f"\n## {title}: {i}\n\n"
+        (self.store / "summary").mkdir(exist_ok=True)
+        put(self.file(self.day(0)), legacy)
+        for mode in ((), ("--json",)):
+            self.assertEqual(self.at(self.day(0) + self.HOUR, "summary", *mode).returncode, 0, mode)
+        # A file of the new format keeps one day for both.
+        put(self.file(self.day(0)), legacy.replace("# Heliograph 2027-01-15\n\nAs it stood at 2027-01-16T00:00:01Z.\n", "# Heliograph 2027-01-15\n\nAs it stood at 2027-01-16T00:00:01Z.\nFormat: 2\n") + "\n## Overlaps: 0\n\n\nDamaged: 0\n\nEnd of summary.\n")
+        self.assertEqual(self.at(self.day(0) + self.HOUR, "summary").returncode, 3)
+
+    def test_a_working_declaration_cut_short_defers_the_day(self):
+        now = self.day(0) + 10 * self.HOUR
+        self.declare("os/apps", "ui", now - self.HOUR)
+        put(self.store / "working/os+main", f"{now - self.HOUR}\nui")  # no newline after its path line
+        r = self.summary(now, "--json")
+        self.assertEqual((r.returncode, json.loads(r.stdout)["deferred"]), (1, True), r.stderr)
+        self.assertFalse(self.file(now).exists())
+        put(self.store / "working/os+main", f"{now - self.HOUR}\nui\n")
+        self.assertEqual(self.values(now + 1)["overlaps"], 1)
+
+    def test_a_snapshot_that_is_there_is_not_read_to_see_that_it_is_there(self):
+        now = self.day(1) + self.HOUR
+        (self.store / "summary").mkdir(exist_ok=True)
+        with open(self.file(now), "wb") as big:
+            big.truncate(20 * 1024 * 1024)  # past the largest a snapshot may be: reading it whole is refused
+        r = self.at(now, "ask", "os/all", "quiet", me="os/main", body=b"b")
+        self.assertEqual((r.returncode, r.stderr), (0, b""))
+
+    @unittest.skipIf(ON_WINDOWS, "counts opens through Linux inotify")
+    def test_a_failed_archive_listing_stops_the_scan_at_the_first_message(self):
+        seen = self.post_at(self.T0, "tell", "os/apps", "seen")
+        late = self.T0 + 30 * self.DAY
+        self.assertEqual(self.at(late, "show", seen, me="os/apps").returncode, 0)
+        self.assertEqual(self.at(late, "archive").returncode, 0)
+        for i in range(30):
+            self.post_at(self.T0 + 1 + i, "tell", "os/apps", f"held {i}")
+        os.symlink(self.store, self.store / "archive" / "2020-01")  # a month that cannot be held
+        watch = OutsideWatch([self.store / "archive"])
+        try:
+            r = self.summary(late + self.DAY, "--json")
+            found = watch.events()
+        finally:
+            watch.close()
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertFalse(self.file(late + self.DAY).exists())
+        self.assertLessEqual(len([1 for mask, name in found if int(mask, 16) & 0x20]), 12, found)
 
     def test_the_help_and_the_readme_name_summary_as_the_operators(self):
         helped = self.helio("help", me=None).stdout.decode()

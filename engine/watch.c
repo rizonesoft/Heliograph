@@ -498,8 +498,8 @@ static bool summary_overlaps(const store *s, uint64_t now, text *rows, unsigned 
             if (*at == '\n' && when + 4ull * 3600 * 1000000 > now) {
                 size_t n = 0;
                 while (at[1 + n] && at[1 + n] != '\n') n++;
-                d.items[i].paths = copy(at + 1, n);
-                if (!d.items[i].paths) ok = false;
+                if (at[1 + n] != '\n') ok = false; /* the path line is cut short: as unreadable as a failed read */
+                else if (!(d.items[i].paths = copy(at + 1, n))) ok = false;
             }
         }
         p_free(data);
@@ -531,20 +531,48 @@ static bool summary_overlaps(const store *s, uint64_t now, text *rows, unsigned 
 static const char *const SUMMARY_TITLES[SUMMARY_PARTS] = {"Overdue", "Silent", "Open", "Taken", "Done in the last day",
                                                            "Refused in the last day", "Held unseen", "Overlaps"};
 
-s_result watch_summary(store *s, const place *here, char day_out[11]) {
-    uint64_t now = p_now(); /* one instant names the file, heads it and classifies every row */
+/* The held folder summary/ under the store: a link or anything but a real folder is refused. make creates it. */
+static p_result summary_hold(const char *folder, bool make, p_dir **out) {
+    p_result r = p_dir_open(folder, "summary", out);
+    if (r != P_MISSING || !make) return r;
+    p_dir *root = NULL;
+    r = p_dir_open(folder, "", &root);
+    if (r == P_OK) r = p_dir_folder(root, "summary");
+    p_dir_close(root);
+    return r == P_OK ? p_dir_open(folder, "summary", out) : r;
+}
+
+static void summary_name(text *out, const char *day) {
+    add(out, day), add(out, ".md");
+}
+
+p_result watch_summary_file(const char *folder, const char *day, size_t most, char **data, size_t *length) {
+    p_dir *d = NULL;
+    p_result r = summary_hold(folder, false, &d);
+    if (r != P_OK) return r;
+    text name = {0};
+    summary_name(&name, day);
+    r = name.failed ? P_FAILED : p_dir_read(d, name.data, most, data, length);
+    text_free(&name);
+    p_dir_close(d);
+    return r;
+}
+
+s_result watch_summary(store *s, const place *here, uint64_t now, char day_out[11]) {
     text day = {0}, folder = {0}, path = {0}, unique = {0};
     add_time(&day, now);
     if (day.data) day.data[day.length = 10] = 0;
     for (int i = 0; i < 11; i++) day_out[i] = day.data && i <= (int)day.length ? day.data[i] : 0;
     add(&folder, s->folder), add(&folder, "/summary");
-    add(&path, folder.data ? folder.data : ""), add(&path, "/"), add(&path, day.data ? day.data : ""), add(&path, ".md");
+    summary_name(&path, day.data ? day.data : "");
     add_number(&unique, p_tick(), 0);
     bool full = day.failed || folder.failed || path.failed || unique.failed;
     char *there = NULL;
     size_t length;
     s_result result = S_OK;
-    p_result got = full ? P_FAILED : p_read(path.data, MOST_SUMMARY, &there, &length);
+    /* Whether the day's file is there is asked of one byte: a regular file bigger than that says P_TOO_LARGE. */
+    p_result got = full ? P_FAILED : watch_summary_file(s->folder, day.data, 1, &there, &length);
+    if (got == P_TOO_LARGE) got = P_OK;
     if (got != P_OK && got != P_MISSING) result = S_DAMAGED;
     else if (got == P_MISSING) {
         enum { PARTS = SUMMARY_PARTS, HELD = 6, OVERLAPS = 7 };
@@ -587,8 +615,13 @@ s_result watch_summary(store *s, const place *here, char day_out[11]) {
                 }
             } else {
                 bool held = false;
-                if (!summary_held(s, i, &m, now, &archived, &held)) held_err = true;
-                else if (held) {
+                if (!summary_held(s, i, &m, now, &archived, &held)) {
+                    held_err = true; /* the day defers: no more of the store is read for it */
+                    message_free(&m);
+                    p_free(id);
+                    break;
+                }
+                if (held) {
                     /* Every held id is listed, the first 100 in full: there is no other place that names them. */
                     job none = {0};
                     if (counts[HELD] < 100) add_summary_item(&parts[HELD], &counts[HELD], &m, &none);
@@ -625,7 +658,9 @@ s_result watch_summary(store *s, const place *here, char day_out[11]) {
             add(&out, "\n\nEnd of summary.\n");
             if (!out.failed && out.length > MOST_SUMMARY) out.failed = true; /* the reader would refuse it */
             if (s->pause) s->pause(s->pause_user, "summary-scanned"); /* test pause: the store may change, a peer may write first */
-            p_result wrote = out.failed || p_folder(folder.data) != P_OK ? P_FAILED : p_write(path.data, out.data, out.length, false, unique.data);
+            p_dir *hold = NULL;
+            p_result wrote = out.failed || summary_hold(s->folder, true, &hold) != P_OK ? P_FAILED : p_dir_write(hold, path.data, out.data, out.length, false, unique.data);
+            p_dir_close(hold);
             if (wrote != P_OK && wrote != P_EXISTS) result = S_DAMAGED;
             text_free(&out);
         }
@@ -693,11 +728,12 @@ bool watch_summary_read(const char *data, size_t length, summary_read *out) {
     if (!next_text(&c, &line, &n) || !line_starts(line, n, "As it stood at ") || n != 15 + 20 + 1 || line[n - 1] != '.') return false;
     for (int i = 0; i < 20; i++) out->at[i] = line[15 + i];
     if (!read_time(out->at, &t)) return false;
-    for (int i = 0; i < 10; i++) if (out->at[i] != out->day[i]) return false; /* the header and the rows share one day */
     lines mark = c;
     out->format = 1;
     if (next_text(&c, &line, &n) && line_is(line, n, "Format: 2")) out->format = 2;
-    else c = mark; /* a snapshot of the earlier writer: no format line */
+    else c = mark; /* a snapshot of the earlier writer: no format line, and its day and instant came from two readings of the clock */
+    if (out->format == 2)
+        for (int i = 0; i < 10; i++) if (out->at[i] != out->day[i]) return false; /* the header and the rows share one day */
     int parts = out->format == 2 ? SUMMARY_PARTS : SUMMARY_PARTS - 1;
     bool have_heading = false;
     for (int i = 0; i < parts; i++) {
