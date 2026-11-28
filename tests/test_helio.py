@@ -3770,6 +3770,80 @@ class JobQueue(JsonCalls):
         self.assertIsNone(v["id"])
         self.assertTrue(v["warnings"], v)
 
+    # review round 1
+    def test_an_unreadable_older_post_stops_the_queue_before_claiming(self):
+        t = self.OLD + 76_000 * self.M
+        put(self.store / f"messages/{t - 1000}-aaaaaa.post", "garbage\n")  # older and more urgent, but cannot be read
+        job = self.sent(t, "ask", "os/all", "later", "--as", "os/main")
+        v = self.value(self.queue(now=t + 1), 3)
+        self.assertEqual(v["code"], 3)
+        self.assertEqual(list((self.store / "messages").glob(f"{job}.link.*")), [])
+
+    def test_a_refusal_after_this_calls_step_was_published_is_not_a_lost_race(self):
+        t = self.OLD + 77_000 * self.M
+        first = self.sent(t, "ask", "os/all", "published", "--as", "os/main")
+        second = self.sent(t + 1, "ask", "os/all", "untouched", "--as", "os/main")
+        env = {k: v for k, v in os.environ.items() if k not in self.CLEAN}
+        proc = subprocess.Popen([str(RACER), "--now", str(t + 2), "--pause-cli", "after-write", str(self.store), "take", "--kind", "request", "--lane", "a", "--json", "--store", str(self.store)],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.store, env=env)
+        try:
+            self.wait_for_pause("after-write")
+            self.ok(t + 3, "done", first, "ok", "--as", "os/a")  # others close the job and archive it before the read-back
+            self.assertEqual(run(self.store, "archive", me=None).returncode, 0)
+            out, err = self.resume_pause("after-write", proc)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        self.assertEqual((proc.returncode, err), (2, b""))
+        v = json.loads(out)
+        self.assertEqual((v["code"], first in v["error"]), (2, True))
+        self.assertEqual(list((self.store / "messages").glob(f"{second}.link.*")), [])  # nothing more was claimed
+
+    def test_selectors_are_checked_before_any_command_runs(self):
+        t = self.OLD + 78_000 * self.M
+        closed = self.sent(t, "ask", "os/userland", "old", "--as", "os/main")
+        self.ok(t + 1, "take", closed, "--as", "os/userland"); self.ok(t + 2, "done", closed, "ok", "--as", "os/userland")
+        before = self.jobs_state()
+        for words in (("archive", "--kind", "request"), ("archive", "--lane", "x"), ("help", "--lane", "x"), ("check", "--kind", "request")):
+            r = run(self.store, *words, me=None)
+            self.assertEqual(r.returncode, 2, words)
+        self.assertEqual(self.jobs_state(), before)  # the archive did not run
+        fresh = self.store / "fresh"
+        r = run(self.store, "init", "--kind", "request", me=None, extra_env={"HELIO_STORE": str(fresh)})
+        self.assertEqual(r.returncode, 2)
+        self.assertFalse(fresh.exists())
+
+    def test_help_documents_the_queue_form(self):
+        out = self.helio("help", me=None).stdout
+        self.assertIn(b"helio take --kind <request|handoff> [--lane <lane>]", out)
+        self.assertIn(b"--lane <lane>", out)
+
+    def test_a_drained_queue_makes_no_attempt_on_taken_or_closed_jobs(self):
+        t = self.OLD + 79_000 * self.M
+        taken = self.sent(t, "ask", "os/all", "taken", "--as", "os/main")
+        closed = self.sent(t + 1, "ask", "os/all", "closed", "--as", "os/main")
+        self.ok(t + 2, "take", taken, "--as", "os/other1")
+        self.ok(t + 3, "take", closed, "--as", "os/other1"); self.ok(t + 4, "done", closed, "ok", "--as", "os/other1")
+        env = {k: v for k, v in os.environ.items() if k not in self.CLEAN}
+        proc = subprocess.Popen([str(RACER), "--pause-cli", "change", str(self.store), "take", "--kind", "request", "--lane", "a", "--json", "--store", str(self.store)],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.store, env=env)
+        try:
+            for _ in range(60):  # a change attempt would stop at the pause and write this marker
+                if proc.poll() is not None or (self.store / "paused.change").exists():
+                    break
+                time.sleep(0.1)
+            attempted = (self.store / "paused.change").exists()
+            if attempted:
+                put(self.store / "resume.change", "go")
+            out, err = proc.communicate(timeout=30)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            for name in ("paused.change", "resume.change"):
+                (self.store / name).unlink(missing_ok=True)
+        self.assertFalse(attempted)
+        self.assertEqual((proc.returncode, out, err), (1, b"null\n", b""))
+
     # item 7: eight drivers, from Windows and WSL, over one store
     @unittest.skipUnless(WSL, "needs WSL")
     def test_windows_and_linux_queue_drivers_take_each_job_once(self):
@@ -3778,10 +3852,11 @@ class JobQueue(JsonCalls):
         windows = subprocess.run(["wslpath", "-w", str(self.store)], capture_output=True, text=True, check=True, timeout=30).stdout.strip()
         drivers = [(str(BUILD / "racer.exe"), windows, f"w{n}") for n in range(4)] + [(str(RACER), str(self.store), f"l{n}") for n in range(4)]
         # The Linux drivers are far faster: they begin once Windows has taken a job, so that both systems contend for the rest.
-        started = [subprocess.Popen([program, "--queue", folder, lane, *(["after-first"] if program == str(RACER) else [])],
-                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.store)
-                   for program, folder, lane in drivers]
+        started = []
         try:
+            for program, folder, lane in drivers:  # started inside the protected block: a failed start still reaps the others
+                started.append(subprocess.Popen([program, "--queue", folder, lane, *(["after-first"] if program == str(RACER) else [])],
+                                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.store))
             for _ in range(300):
                 if len(list(self.store.glob("ready.*"))) == len(drivers):
                     break
@@ -3793,6 +3868,8 @@ class JobQueue(JsonCalls):
         finally:
             for p in started:
                 p.kill()
+            for p in started:
+                p.wait(timeout=30)
         took = {}
         for (program, folder, lane), (out, err, rc) in zip(drivers, results):
             self.assertEqual(rc, len(out.split()), (lane, rc, err))

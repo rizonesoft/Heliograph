@@ -58,6 +58,7 @@ s_result store_post(store *s, const message *m, const char *key, text *id);
 typedef struct job_change {
     bool has_job;
     job now;
+    bool published; /* this call's own step reached the store, whatever came after (a refusal then is not a lost race) */
 } job_change;
 s_result store_take(store *s, const char *id, actor me, job_change *jc);
 s_result store_release(store *s, const char *id, actor me, job_change *jc);

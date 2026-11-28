@@ -902,6 +902,7 @@ static s_result read_back_step(store *s, const message *m, const job *now, job_c
 static s_result change_job(store *s, const char *id, actor me, change what, const char *note, job_change *jc) {
     static const char *const states[] = {"taken", "released", "done", "refused"};
     if (jc) *jc = (job_change){0};
+    if (s->pause) s->pause(s->pause_user, "change"); /* test pause: an attempt to change a job is being made */
     if (!address_ok(me.lane, false)) return say(s, S_REFUSED, "say who you are: --as project/lane");
     message m;
     s_result result = store_message(s, id, &m);
@@ -955,6 +956,7 @@ static s_result change_job(store *s, const char *id, actor me, change what, cons
             bool published = false;
             result = add_link(s, id, &now, me, states[what], note, &published);
             if (!published && result == S_REFUSED && jc) jc->has_job = true, jc->now = now; /* refused before the write: as it stands */
+            if (published && jc) jc->published = true;
             if (published) {
                 if (s->pause) s->pause(s->pause_user, "after-write");
                 const char *write_why = s->why;

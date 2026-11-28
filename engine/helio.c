@@ -13,13 +13,14 @@ static const char help[] =
     "  helio find <to> <subject> [options] < body       something I found\n"
     "  helio answer <id> <subject> < body               a reply to its sender\n"
     "  helio show <id>      helio take <id>     helio release <id>\n"
+    "  helio take --kind <request|handoff> [--lane <lane>]   take the next open job of that kind\n"
     "  helio done <id> [note]                   helio refuse <id> [note]\n"
     "  helio landed <id> <commit>               mark a job landed with a commit (7..64 hex)\n"
     "  helio working <paths>                            what I touch, for the overlap warning\n"
     "  helio hello <agent>                              announce this session (claude, codex, antigravity)\n"
     "  helio log            helio check         helio archive       helio init\n"
     "\n"
-    "Options: --as <project/lane>, --about <paths>, --now or --whenever, --store <folder>,\n--key <text> (sending the same key again sends nothing new), --session <my-session> (who is calling),\n--for-session <target-session> (limit a sent message to one session; show <id> opens visible ids), --all,\n--due <minutes> (an overdue job goes back to its sender and the owner).\n"
+    "Options: --as <project/lane>, --about <paths>, --now or --whenever, --store <folder>,\n--key <text> (sending the same key again sends nothing new), --session <my-session> (who is calling),\n--for-session <target-session> (limit a sent message to one session; show <id> opens visible ids), --all,\n--due <minutes> (an overdue job goes back to its sender and the owner),\n--kind <request|handoff> and --lane <lane> (take only: the next job, as the lane of this project).\n"
     "HELIO_AS and HELIO_STORE give two of them. <to> is project/lane, project/all or path:<file>.\n"
     "A session sees only its own project's messages (and those addressed to it); helio log --all outside a configured repository with no lane shows every project.\n"
     "A repository's helio.conf names its project, the lane of a session there and who owns which path.\n"
@@ -934,12 +935,22 @@ typedef struct {
     candidate *items;
     size_t count, cap;
     bool failed;
+    char *damaged_id; /* the first eligible job whose chain cannot be read */
+    const char *damaged_why;
 } queue;
 
 static bool collect_candidate(store *s, const message *m, void *user) {
     (void)s;
     queue *q = user;
     if (!same(m->kind, q->kind) || !is_for(m, q->me)) return true; /* the rules of a direct take, with the whole actor */
+    job now = {0};
+    s_result jr = store_job(s, m, &now);
+    if (jr == S_REFUSED) return true; /* archived meanwhile */
+    if (jr != S_OK) {
+        if (!q->damaged_id) q->damaged_id = copy(m->id, len(m->id)), q->damaged_why = s->why;
+        return true;
+    }
+    if (now.state != OPEN) return true; /* only an open job is a candidate: a taken or closed one is passed over */
     if (q->count == q->cap) {
         size_t cap = q->cap ? q->cap * 2 : 64;
         candidate *next = p_alloc(cap * sizeof *next);
@@ -964,16 +975,24 @@ static bool before(const candidate *a, const candidate *b) {
    another) lets it try the next; damage or any other refusal stops, naming the job, and claims nothing more. */
 static int take_next(store *s, const options *o, actor me) {
     queue q = {.kind = o->kind, .me = me};
-    size_t unreadable = every(s, collect_candidate, &q); /* a post that cannot be read cannot be told eligible */
+    size_t unreadable = every(s, collect_candidate, &q);
     int code = 1;
     if (q.failed) code = fail("out of memory", 3);
-    for (size_t i = 1; !q.failed && i < q.count; i++) { /* insertion sort: no C library */
+    else if (unreadable) /* a post that cannot be read leaves the order unknown: nothing is claimed */
+        code = fail("something here is damaged: see helio check", 3);
+    else if (q.damaged_id) {
+        text why = {0};
+        add(&why, q.damaged_why ? q.damaged_why : "a job cannot be read"), add(&why, ": "), add(&why, q.damaged_id);
+        code = fail(why.failed ? "a job cannot be read" : why.data, 3);
+        text_free(&why);
+    }
+    for (size_t i = 1; code == 1 && i < q.count; i++) { /* insertion sort: no C library */
         candidate c = q.items[i];
         size_t at = i;
         for (; at > 0 && before(&c, &q.items[at - 1]); at--) q.items[at] = q.items[at - 1];
         q.items[at] = c;
     }
-    for (size_t i = 0; !q.failed && i < q.count; i++) {
+    for (size_t i = 0; code == 1 && i < q.count; i++) {
         job_change changed = {0};
         s_result r = store_take(s, q.items[i].id, me, &changed);
         if (r == S_OK) {
@@ -987,7 +1006,10 @@ static int take_next(store *s, const options *o, actor me) {
             code = 0;
             break;
         }
-        bool lost = r == S_REFUSED && ((changed.has_job && changed.now.state != OPEN) || same(s->why, "it was archived") || same(s->why, "there is no such message"));
+        /* A lost race: the job is no longer open (taken, closed or archived by another) and this call wrote nothing. A refusal
+           after this call's own step was published is never one: it stops, and claims nothing more. */
+        bool lost = !changed.published && r == S_REFUSED &&
+                    ((changed.has_job && changed.now.state != OPEN) || same(s->why, "it was archived") || same(s->why, "there is no such message"));
         if (lost) continue;
         text why = {0};
         add(&why, s->why ? s->why : "it failed"), add(&why, ": "), add(&why, q.items[i].id);
@@ -995,11 +1017,10 @@ static int take_next(store *s, const options *o, actor me) {
         text_free(&why);
         break;
     }
-    /* Nothing taken while a post could not be read: the queue may not be empty, so it is damage, as the inbox says. */
-    if (code == 1 && unreadable) code = fail("something here is damaged: see helio check", 3);
     if (code == 1 && reply.on) reply.queue_empty = true;
     for (size_t i = 0; i < q.count; i++) p_free(q.items[i].id);
     p_free(q.items);
+    p_free(q.damaged_id);
     return code;
 }
 
@@ -1167,6 +1188,11 @@ static int init(const char *folder, bool from_default) {
 static int run(options *o, void (*pause)(void *user, const char *stage), void *pause_user) {
     archive_pauses(pause, pause_user);
     const char *command = o->count ? o->words[0] : "inbox";
+    /* The selectors of the queue form belong to take alone, and are checked before any command runs. */
+    bool take_queue = same(command, "take") && o->count == 1;
+    if ((o->kind_flag || o->lane_flag) && !take_queue)
+        return fail(same(command, "take") ? "a job id cannot come with --kind or --lane" : "--kind and --lane are only for take", 2);
+    if (take_queue && o->kind_flag && !same(o->kind, "request") && !same(o->kind, "handoff")) return fail("--kind is request or handoff: only those are jobs", 2);
     static const char *const structured[] = {"inbox", "log", "check", "show", "take", "release", "done", "refuse", "landed", "hello",
                                              "init", "working", "archive", "ask", "hand", "tell", "find", "answer"};
     for (size_t i = 0; i < sizeof structured / sizeof *structured; i++)
@@ -1251,9 +1277,6 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
     if (o->count < commands[which].least || o->count > commands[which].most) return fail("that command needs other words: see helio help", 2);
     bool queue = which == 4 && o->count == 1; /* take --kind <kind> [--lane <lane>]: the next job, not a named one */
     if (queue && !o->kind_flag) return fail("take needs a job id, or --kind request or --kind handoff", 2);
-    if ((o->kind_flag || o->lane_flag) && !queue)
-        return fail(which == 4 ? "a job id cannot come with --kind or --lane" : "--kind and --lane are only for take", 2);
-    if (queue && !same(o->kind, "request") && !same(o->kind, "handoff")) return fail("--kind is request or handoff: only those are jobs", 2);
     if (queue && o->lane_flag) {
         /* The worker is the lane of the project of helio.conf; --lane wins over an inherited HELIO_AS, as --as does, and
            a --as naming another lane is a conflict. */
