@@ -1,0 +1,88 @@
+{
+  "ref": "D01 T01 \u00a722",
+  "title": "JSON for sending, job changes, archive and working",
+  "implementation_sha": "87c8e0547a06caf6e9c364bd6ac79bc0e031eb90",
+  "date": "2026-11-28",
+  "reviews": [
+    {
+      "round": 1,
+      "report": "docs/reviews/01-heliograph/D01-T01-s22.md",
+      "verdict": "fixed"
+    }
+  ],
+  "checks": [
+    "python3 ../SDK/tools/app_build.py . -> exit 0, Ran 221 tests, OK (skipped=8)",
+    "python3 ../SDK/tools/prove.py . -> exit 0, Ran 221 tests, OK (skipped=30), proved on Windows: Heliograph 87c8e05"
+  ],
+  "completion": {
+    "report": "docs/reviews/01-heliograph/D01-T01-s22.md",
+    "verdict": "reconciled",
+    "candidate": "87c8e0547a06caf6e9c364bd6ac79bc0e031eb90",
+    "reviewer": "astra",
+    "model": "gpt-6.2-astra",
+    "filed": []
+  },
+  "rounds_spent": 1,
+  "round_cap": 33,
+  "plan": {
+    "report": "docs/reviews/01-heliograph/D01-T01-s22.md",
+    "candidate": "2085565a56f5547faeb610e6a8eb3d10de818ead",
+    "reviewer": "astra",
+    "model": "gpt-6.2-astra",
+    "effort": "medium",
+    "lenses": [
+      "plan"
+    ]
+  },
+  "schedule_sha": "2085565a56f5547faeb610e6a8eb3d10de818ead",
+  "schedule": {
+    "policy": "three-pass",
+    "pass_cap": 33,
+    "blocking": [
+      "P1",
+      "P2"
+    ],
+    "plan": {
+      "effort": "medium",
+      "lenses": [
+        "plan"
+      ]
+    },
+    "rounds": [
+      {
+        "effort": "medium",
+        "lenses": [
+          "adversarial",
+          "integration",
+          "source-defect",
+          "consistency",
+          "quality",
+          "optimization",
+          "design"
+        ]
+      }
+    ],
+    "completion": {
+      "effort": "low",
+      "lenses": [
+        "plan-delivery",
+        "record"
+      ]
+    },
+    "reconciliation": {
+      "effort": "low",
+      "lenses": [
+        "adversarial",
+        "integration",
+        "plan-delivery",
+        "record"
+      ]
+    },
+    "lenses": {
+      "thread-safety": "Which state is reached from two threads (UI, worker, callback, timer) without one lock or atomic owning it, and which lock order, wait, cancellation or teardown can deadlock or run after its owner is gone?",
+      "memory-safety": "Which pointer, reference, view, handle or iterator can outlive what it refers to, and which size, index or cast is trusted unchecked?"
+    }
+  },
+  "passes_spent": 5,
+  "pass_cap": 33
+}

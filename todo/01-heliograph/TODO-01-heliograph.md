@@ -56,7 +56,7 @@ title: "TODO-01 -- Heliograph"
 | 19 | §19 | Archive paths opened without following a swapped folder | §3 | [x] |
 | 20 | §20 | Windows launches from WSL that survive an interop timeout | §17 | [x] |
 | 21 | §21 | JSON for the inbox, log, show and check | §10 | [x] |
-| 22 | §22 | JSON for sending, job changes, archive and working | §10, §21 | [ ] |
+| 22 | §22 | JSON for sending, job changes, archive and working | §10, §21 | [x] |
 | 23 | §23 | Summary command read from the day's snapshot | §10 | [ ] |
 | 24 | §24 | Folder holds that outlast a busy Windows host | -- | [ ] |
 
@@ -714,9 +714,12 @@ Filed 2026-11-27 from the `D01 T01 §10` plan review (findings 4 for `archive`, 
 - [x] Reply `{"lane", "agent", "repository", "session"}` for `hello`, read back from the record the call wrote for that lane, repository and session (`session` `""` when none is named), and `{"store": <absolute folder>}` for `init`. Done when: one named session announcing itself from two repositories gets each repository's record; a refused `hello` leaves the record as it was; a fresh call opens the returned store; a repeated `init` exits 0 with the same store; and an `init` where `messages` cannot be made exits 3 with no `store`.
 - [x] Reply `{"lane", "paths", "overlaps": [{"lane", "path"}...]}` for `working`: `paths` the stored declaration as an array of normalized paths (forward slashes), `overlaps` one entry per other lane and matching stored path (the more specific path for a directory match), current declarations of this project only. A notification or peer read that fails after the declaration is stored gives the same value with `error` and `code`, stderr empty. Done when: several paths with Windows separators read back normalized; two peers and a directory match give the exact entries; a replaced declaration gives `[]`; expired, own and other-project declarations are absent; a repeat keeps the existing notice without a second; the peer's inbox and the caller's stored declaration are each checked; a full store at notification gives one value with the stored declaration, the overlap and the exit text mode gives (2, a refusal); and a refusal before the write leaves the earlier declaration.
 - [x] Reply `{"archived": <count>, "problems": [<text>...]}` for `archive` with one `problems` array (the reply writer adds no second one): `archived` the posts this call moved, the exit from the archive result (0 when it or a peer moved one, 1 when none was eligible, 3 with any problem and `error` and `code`). Done when: two archivers racing on one job both exit 0 with counts summing to one; an uncontended empty run gives `{"archived": 0, "problems": []}` and exit 1; a batch with one healthy and two damaged jobs gives both ids as two entries, the healthy post moved on disk and counted, exit 3, empty stderr and no duplicate key; and a missing store gives exit 3 with `problems` naming it.
-- [ ] Commit: `output: JSON for changes`
+- [x] Commit: `output: JSON for changes`
 
 **Test checkpoint:** `python3 ../SDK/tools/app_build.py .` exits 0 and the tests fail with any reply replaced by an echo of the call's words.
+
+> **Verified:** 2026-11-28 | §22 | 87c8e0547a06caf6e9c364bd6ac79bc0e031eb90
+> **Review:** `docs/reviews/d01-t01-s22.json`
 
 ## 23. Summary command read from the day's snapshot
 

@@ -52,12 +52,12 @@ Sections: 8 | Checklist items: 52
 | [x]    | D01 T01 §10 | JSON writer and one reply per call                 | none                | 7     |
 | [x]    | D01 T01 §12 | Expiry of seen heads-ups and findings              | none                | 8     |
 | [x]    | D01 T01 §21 | JSON for the inbox, log, show and check            | none                | 10    |
-| [ ]    | D01 T01 §22 | JSON for sending, job changes, archive and working | none                | 8     |
+| [x]    | D01 T01 §22 | JSON for sending, job changes, archive and working | none                | 8     |
 | [ ]    | D01 T01 §11 | Take the next job as a queue                       | none                | 5     |
 | [ ]    | D01 T01 §23 | Summary command read from the day's snapshot       | none                | 5     |
 | [ ]    | D01 T01 §13 | Design and help that match the program             | none                | 4     |
 | [ ]    | D01 T01 §24 | Folder holds that outlast a busy Windows host      | wsl-windows-interop | 5     |
 
-Progress: 19/24 verified sections, 3 ready to run now.
+Progress: 20/24 verified sections, 3 ready to run now.
 
-Checklist: 135/155 items completed (includes Commit items).
+Checklist: 136/155 items completed (includes Commit items).
