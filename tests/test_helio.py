@@ -4422,6 +4422,7 @@ class Expiry(Base):
         self.assertEqual((proc.returncode, err), (0, b""), out)
         self.assertEqual(json.loads(out)["held_unseen"], 0)
 
+    @unittest.skipIf(ON_WINDOWS, "counts opens through Linux inotify")
     def test_the_summary_does_not_look_into_the_archive_for_each_held_message(self):
         # An archive month exists (one message was archived); 30 unseen heads-ups of that month are held. Holding the month
         # folder for each of them is slow on a big store, most of all on Windows: the archive is listed once.
@@ -7866,6 +7867,7 @@ class DaySummary(Base):
         for mode in ((), ("--json",)):
             self.assertEqual(self.summary(now, *mode).returncode, 3)
 
+    @unittest.skipIf(ON_WINDOWS, "a 42,000-message store takes minutes on Windows, where every call reads every post; the bound is shared code")
     def test_a_snapshot_of_a_full_store_over_a_megabyte_reads_back(self):
         put(self.store / "helio.conf", "project: os\n")
         (self.store / "messages").mkdir(exist_ok=True)
