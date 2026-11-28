@@ -8270,6 +8270,7 @@ class DocsMatchProgram(Base):
             self.assertIn("no open job of that kind is one this caller may take", text)
             self.assertIn("the caller is `--as` or `HELIO_AS`", text)
 
+    @unittest.skipUnless(not ON_WINDOWS and shutil.which("bash"), "the walkthrough runs in a real bash, and there is none here (Windows)")
     def test_the_readme_walkthrough_is_a_real_run(self):
         block = re.search(r"```\n(\$ export HELIO_STORE=.*?)```", self.readme(), re.S).group(1)
         steps = []
@@ -8278,50 +8279,46 @@ class DocsMatchProgram(Base):
                 steps.append((line[2:], []))
             else:
                 steps[-1][1].append(line)
-        env = {k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "ANTIGRAVITY_CONVERSATION_ID")}
         ident, when = r"\d{16}-[0-9a-f]{6}", r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ"
 
         def normal(text):
             return re.sub(when, "<time>", re.sub(ident, "<id>", text)).strip()
 
-        ids = {}
-        with tempfile.TemporaryDirectory() as store, tempfile.TemporaryDirectory() as neutral:
-            home = Path(store).resolve()
+        with tempfile.TemporaryDirectory() as temp:
+            home, bin_dir, neutral = (Path(temp).resolve() / name for name in ("home", "bin", "cwd"))
+            for folder in (home, bin_dir, neutral):
+                folder.mkdir()
+            (bin_dir / "helio").symlink_to(PROGRAM)
+            env = {k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "ANTIGRAVITY_CONVERSATION_ID")}
+            env.update(HOME=str(home), PATH=f"{bin_dir}{os.pathsep}{env.get('PATH', '')}")
+
+            def bash(script):
+                return subprocess.run(["bash", "-c", script], capture_output=True, timeout=60, cwd=neutral, env=env)
 
             def inside(value):
                 resolved = Path(value).resolve()
                 return resolved == home or home in resolved.parents
 
-            # Each command is parsed once, as the shell reads it (quotes, and a # comment dropped); that one parse is checked
-            # and then run. Nothing runs until every store the walkthrough names lies inside the test's own temporary home.
-            parsed = []
-            for command, shown in steps:
-                body, text = "", command
-                piped = re.match(r'echo "(.*)" \| (helio .*)$', command)
-                if piped:
-                    body, text = piped.group(1) + "\n", piped.group(2)
-                words = shlex.split(text, comments=True)
-                if words[0] == "export":
-                    assignments = {}
-                    for word in words[1:]:
-                        name, _, value = word.partition("=")
-                        assignments[name] = store + value[1:] if value.startswith("~") else value  # ~ is the test's home
-                        self.assertTrue(inside(assignments[name]), f"{command}: {name} lies outside the test's home")
-                    parsed.append((assignments, None, body, shown))
-                else:
-                    self.assertEqual(words[0], "helio", command)
-                    for i, word in enumerate(words[:-1]):
+            # Nothing runs until bash itself says every store the walkthrough names lies inside the test's own home.
+            exports = "; ".join(command for command, _ in steps if command.startswith("export "))
+            given = bash(f'{exports}; printf "%s" "$HELIO_STORE"').stdout.decode()
+            self.assertTrue(given and inside(given), f"HELIO_STORE is {given!r}, outside the test's home")
+            for command, _ in steps:
+                words = re.sub(r"^echo \".*\" \| helio ", "", command)
+                if not command.startswith("export ") and "--store" in words:
+                    expanded = bash(f"{exports}; printf '%s\\n' {words.partition('helio ')[2] or words}").stdout.decode().splitlines()
+                    for i, word in enumerate(expanded[:-1]):
                         if word == "--store":
-                            self.assertTrue(inside(words[i + 1]), f"{command}: the store lies outside the test's home")
-                    parsed.append((None, words[1:], body, shown))
-            for assignments, args, body, shown in parsed:
-                if assignments is not None:
-                    env.update(assignments)
+                            self.assertTrue(inside(expanded[i + 1]), f"{command}: the store lies outside the test's home")
+            ids = {}
+            for command, shown in steps:
+                if command.startswith("export "):
                     continue
-                args = [ids.get(a, a) for a in args]
-                r = subprocess.run([str(PROGRAM), *args], input=body.encode(), capture_output=True, timeout=60, cwd=neutral, env=env)
+                for old, new in ids.items():
+                    command = command.replace(old, new)
+                r = bash(f"{exports}; {command}")
                 actual = r.stdout.decode() + r.stderr.decode()
-                self.assertEqual(normal(actual), normal("\n".join(shown)), " ".join(args))
+                self.assertEqual(normal(actual), normal("\n".join(shown)), command)
                 if len(shown) == 1 and re.fullmatch(ident, shown[0]):
                     ids[shown[0]] = actual.strip()
 
