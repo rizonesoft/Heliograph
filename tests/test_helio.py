@@ -3661,7 +3661,9 @@ class JobQueue(JsonCalls):
                 got.append(by_id[self.value(r, 0)["id"]])
 
         self.assertEqual(drain(), ["H", "L", "B", "A", "K", "I"])  # L: another project's request addressed to this lane
-        for name in ("C", "D", "E", "F", "G", "T"):  # ineligible (D and E are another project's, not addressed to this lane): chains untouched
+        # ineligible to a request poll (D and E are another project's, not addressed to this lane; the J handoffs are another
+        # kind): chains untouched
+        for name in ("C", "D", "E", "F", "G", "T", "J", "J2", "J3", "J4"):
             self.assertEqual(sorted(p.name for p in (self.store / "messages").glob(f"{ids[name]}.link.*")), chains[name], name)
         # what is left of the queue reveals nothing
         self.assertEqual(self.queue(now=t + 300).stdout, b"null\n")
