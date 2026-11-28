@@ -154,9 +154,9 @@ A closed job (done or refused) is archived 30 days after it closed. A heads-up, 
 
 Exit codes: 0 done, 1 nothing, 2 refused, 3 something failed or is damaged.
 
-Exit 3 can follow a change that is already stored: a job step is written, then a later read or flush fails. Run `helio show <id>` to see where the job stands before you retry. A send with `--key <text>` repeats safely, because the key stands for one message. A queue call (`helio take --kind`) is not retried blind: it may already have taken a job, so look at the job named in its error first.
+Exit 3 can follow a change that is already stored: a job step is written, then a later read or flush fails. Run `helio show <id>` to see where the job stands before you retry. A send with `--key <text>` repeats safely, because the key stands for one message. A queue call (`helio take --kind`) is not retried blind: it may already have taken a job. When its receipt could not be written (exit 3, "the output cannot be written") no job is named, but the job is held: your own inbox (`helio --as <lane>`, or `log --json`) lists the jobs your lane holds, so look there before you take more.
 
-The queue runs in a repository with a `helio.conf`, where `--lane` names a lane of its project. `helio take --kind request --lane neon-a --json` exits 0 with the job it took, exits 1 with `null` when no job is open, and exits 2 when the call is refused (for example, no `helio.conf`).
+The `--lane` form needs a repository with a `helio.conf`, because `--lane` names a lane of its project (without `--lane`, the caller is `--as` or `HELIO_AS`). `helio take --kind request --lane neon-a --json` exits 0 with the job it took, exits 1 with `null` when no open job of that kind is one this caller may take (other jobs may be open), and exits 2 when the call is refused (for example, `--lane` with no `helio.conf`).
 
 ## How does a job get only one taker?
 

@@ -8147,12 +8147,18 @@ class DocsMatchProgram(Base):
 
     def test_help_readme_and_design_name_the_dispatchers_commands(self):
         expected = self.dispatcher()
-        self.assertEqual(expected, {"inbox", "log", "check", "show", "take", "release", "done", "refuse", "hook", "answer", "working", "ask",
-                                    "hand", "tell", "find", "hello", "landed", "summary", "help", "init", "archive"})
         named = {"help": self.help_signatures(), "design": self.design_signatures(), "README": self.readme_signatures()}
         for where, signatures in named.items():
             found = {self.word_of(sig) for sig in signatures}
             self.assertEqual((where, sorted(found - expected), sorted(expected - found)), (where, [], []))
+        # whole signatures: every form one lists, the others list too (options, body and note are left out; the bare inbox is `helio`)
+        def form(sig):
+            sig = " ".join(sig.split()).replace(" [options] < body", "").replace(" < body", "").replace(" [note]", "")
+            return "helio" if sig == "helio --as <project/lane>" else sig
+        forms = {where: {form(sig) for sig in signatures} for where, signatures in named.items()}
+        for where in forms:
+            for other in forms:
+                self.assertEqual((where, other, sorted(forms[where] - forms[other])), (where, other, []))
 
     def test_every_signature_they_show_runs(self):
         for where, signatures in (("help", self.help_signatures()), ("design", self.design_signatures()), ("README", self.readme_signatures())):
@@ -8182,6 +8188,24 @@ class DocsMatchProgram(Base):
             refused = run(self.store, *args, me=None, cwd=bare)  # no helio.conf: --lane has no project
             self.assertEqual(refused.returncode, 2, refused.stdout)
 
+    @unittest.skipIf(ON_WINDOWS, "needs /dev/full")
+    def test_a_claim_whose_receipt_cannot_be_written_is_found_in_the_workers_inbox(self):
+        job = self.send(to="os/all", subject="Receipt")
+        env = {k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "ANTIGRAVITY_CONVERSATION_ID")}
+        with open("/dev/full", "wb") as full:
+            r = subprocess.run([str(PROGRAM), "take", "--kind", "request", "--lane", "a", "--json", "--store", str(self.store)],
+                               stdout=full, stderr=subprocess.PIPE, timeout=60, cwd=self.store, env=env)
+        self.assertEqual(r.returncode, 3, r.stderr)
+        self.assertNotIn(job.encode(), r.stderr)  # no job is named
+        inbox = self.helio("--json", me="os/a").stdout
+        held = [m for m in json.loads(inbox)["messages"] if m["id"] == job]
+        self.assertEqual([(m["state"], m["taker"]) for m in held], [("taken", "os/a")])
+        for text in (self.readme(), self.design()):
+            self.assertIn("When its receipt could not be written", text)
+            self.assertIn("your own inbox (`helio --as <lane>`, or `log --json`)", text)
+            self.assertIn("no open job of that kind is one this caller may take", text)
+            self.assertIn("the caller is `--as` or `HELIO_AS`", text)
+
     def test_the_readme_walkthrough_is_a_real_run(self):
         block = re.search(r"```\n(\$ export HELIO_STORE=.*?)```", self.readme(), re.S).group(1)
         steps = []
@@ -8206,7 +8230,9 @@ class DocsMatchProgram(Base):
                 piped = re.match(r'echo "(.*)" \| (helio .*)$', command)
                 if piped:
                     body, command = piped.group(1) + "\n", piped.group(2)
-                args = shlex.split(command)[1:]
+                words = shlex.split(command)
+                self.assertEqual(words[0], "helio", command)
+                args = words[1:]
                 args = [ids.get(a, a) for a in args]
                 r = subprocess.run([str(PROGRAM), *args], input=body.encode(), capture_output=True, timeout=60, cwd=neutral, env=env)
                 actual = r.stdout.decode() + r.stderr.decode()
@@ -8272,9 +8298,12 @@ class DocsMatchProgram(Base):
         self.assertFalse((ROOT / "tools/mail.py").exists())
         self.assertNotRegex(design, r"mail. folder is brought in")  # the import was dropped
         self.assertIn("the `mail` import was dropped", design)
+        steps = [line for line in design.splitlines() if re.match(r"\d+\. `tools/mail\.py`", line)]
+        self.assertEqual(len(steps), 1, steps)  # the step is kept, as history
+        self.assertIn("(done:", steps[0])  # and marked finished
         for line in design.splitlines():
             if "tools/mail.py" in line:
-                self.assertIn("done", line)  # the removal step is finished, not planned
+                self.assertIn("done", line)
         for line in design.splitlines():
             if "§55" in line and "is changed" in line:
                 self.assertIn("external", line)
