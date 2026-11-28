@@ -1,8 +1,11 @@
 """Messages are not lost, a job has one taker, and Windows and Linux share one store."""
 import hashlib
+import importlib.util
 import json
 import os
 import platform
+import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -8072,6 +8075,221 @@ class DaySummary(Base):
         readme = (Path(__file__).resolve().parent.parent / "README.md").read_text()
         self.assertRegex(readme, r"`helio summary`[^\n]*operator")
         self.assertIn("first call of the day", readme)
+
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+class DocsMatchProgram(Base):
+    """D01 T01 §13: the help, the README and the design say what the program does, and what they show runs."""
+
+    PLACEHOLDERS = {"<project/lane>": "os/apps", "<to>": "os/all", "<subject>": "Subject", "<commit>": "abcdef1", "<paths>": "ui/",
+                    "<agent>": "claude", "<request|handoff>": "request", "<lane>": "apps"}
+    DESIGN = ROOT / "docs/specs/2026-11-23-heliograph-design.md"
+    README = ROOT / "README.md"
+
+    def design(self):
+        return self.DESIGN.read_text()
+
+    def readme(self):
+        return self.README.read_text()
+
+    @staticmethod
+    def word_of(signature):
+        words = signature.split()[1:]
+        return "inbox" if not words or words[0].startswith("--") else words[0]
+
+    def dispatcher(self):
+        source = (ROOT / "engine/helio.c").read_text()
+        body = source[source.index("static int run(options"):]
+        return set(re.findall(r'\{"(\w+)", \d+, \d+\}', body)) | set(re.findall(r'same\(command, "(\w+)"\)', body))
+
+    def help_signatures(self):
+        text = self.helio("help", me=None).stdout.decode()
+        found = []
+        for line in text.splitlines():
+            if line.startswith("  helio"):
+                found += [" ".join(piece.split()) for piece in re.split(r"\s{3,}", line.strip()) if piece.startswith("helio ")]
+        return found
+
+    def design_signatures(self):
+        block = re.search(r"## Commands\n\n```\n(.*?)```", self.design(), re.S).group(1)
+        return [" ".join(re.split(r"\s{3,}", line.strip())[0].split()) for line in block.splitlines()]
+
+    def readme_signatures(self):
+        table = re.search(r"\| Command \| What it does \|\n\| --- \| --- \|\n((?:\|.*\n)+)", self.readme()).group(1)
+        found = []
+        for row in table.splitlines():
+            first = row.split(" | ")[0].lstrip("| ")
+            found += [span.replace("\\|", "|") for span in re.findall(r"`([^`]*)`", first)]
+        return found
+
+    def run_signature(self, signature):
+        """Runs one signature in a store prepared for it and returns its result."""
+        tokens = []
+        for token in signature.split()[1:]:
+            if token in ("[options]", "[note]", "<", "body"):
+                continue
+            if token.startswith("[--"):
+                token = token[1:]
+            token = token.removesuffix("]")
+            tokens.append(self.PLACEHOLDERS.get(token, token))
+        word = self.word_of(signature)
+        job = self.send(to="os/all", subject="Job")
+        tokens = [job if t == "<id>" else t for t in tokens]
+        if word in ("release", "done", "refuse", "landed"):
+            self.assertEqual(self.helio("take", job, me="os/apps").returncode, 0)
+        extra = ["--session", "s1"] if word in ("hello", "landed") else []
+        me = None if word in ("summary", "init", "help") or "--kind" in tokens else "os/apps"
+        if "--as" in tokens:
+            me = None
+        return self.helio(*tokens, *extra, me=me, body="a body")
+
+    def test_help_readme_and_design_name_the_dispatchers_commands(self):
+        expected = self.dispatcher()
+        self.assertEqual(expected, {"inbox", "log", "check", "show", "take", "release", "done", "refuse", "hook", "answer", "working", "ask",
+                                    "hand", "tell", "find", "hello", "landed", "summary", "help", "init", "archive"})
+        named = {"help": self.help_signatures(), "design": self.design_signatures(), "README": self.readme_signatures()}
+        for where, signatures in named.items():
+            found = {self.word_of(sig) for sig in signatures}
+            self.assertEqual((where, sorted(found - expected), sorted(expected - found)), (where, [], []))
+
+    def test_every_signature_they_show_runs(self):
+        for where, signatures in (("help", self.help_signatures()), ("design", self.design_signatures()), ("README", self.readme_signatures())):
+            self.assertTrue(signatures, where)
+            for signature in signatures:
+                with self.subTest(where=where, signature=signature):
+                    r = self.run_signature(signature)
+                    self.assertIn(r.returncode, (0, 1), (r.stdout, r.stderr))
+
+    def test_a_signature_the_program_refuses_is_caught(self):
+        r = self.run_signature("helio hook <agent> <event>")  # the old design line
+        self.assertEqual(r.returncode, 2)
+        r = self.run_signature("helio send <to> <subject>")
+        self.assertEqual(r.returncode, 2)
+
+    def test_the_queue_example_claims_drains_and_is_refused(self):
+        example = re.search(r"`(helio take --kind [^`]*--json)`", self.design()).group(1)
+        args = example.split()[1:]
+        self.assertEqual(args, ["take", "--kind", "request", "--lane", "neon-a", "--json"])
+        job = self.send(to="os/all", subject="Queue")
+        claimed = run(self.store, *args, me=None)  # the store folder holds a helio.conf with a project
+        self.assertEqual(claimed.returncode, 0, claimed.stderr)
+        self.assertEqual(json.loads(claimed.stdout)["id"], job)
+        drained = run(self.store, *args, me=None)
+        self.assertEqual((drained.returncode, drained.stdout), (1, b"null\n"))
+        with tempfile.TemporaryDirectory() as bare:
+            refused = run(self.store, *args, me=None, cwd=bare)  # no helio.conf: --lane has no project
+            self.assertEqual(refused.returncode, 2, refused.stdout)
+
+    def test_the_readme_walkthrough_is_a_real_run(self):
+        block = re.search(r"```\n(\$ export HELIO_STORE=.*?)```", self.readme(), re.S).group(1)
+        steps = []
+        for line in block.splitlines():
+            if line.startswith("$ "):
+                steps.append((line[2:], []))
+            else:
+                steps[-1][1].append(line)
+        env = {k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "ANTIGRAVITY_CONVERSATION_ID")}
+        ident, when = r"\d{16}-[0-9a-f]{6}", r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ"
+
+        def normal(text):
+            return re.sub(when, "<time>", re.sub(ident, "<id>", text)).strip()
+
+        ids = {}
+        with tempfile.TemporaryDirectory() as store, tempfile.TemporaryDirectory() as neutral:
+            for command, shown in steps:
+                if command.startswith("export "):
+                    env["HELIO_STORE"] = store
+                    continue
+                body = ""
+                piped = re.match(r'echo "(.*)" \| (helio .*)$', command)
+                if piped:
+                    body, command = piped.group(1) + "\n", piped.group(2)
+                args = shlex.split(command)[1:]
+                args = [ids.get(a, a) for a in args]
+                r = subprocess.run([str(PROGRAM), *args], input=body.encode(), capture_output=True, timeout=60, cwd=neutral, env=env)
+                actual = r.stdout.decode() + r.stderr.decode()
+                self.assertEqual(normal(actual), normal("\n".join(shown)), command)
+                if len(shown) == 1 and re.fullmatch(ident, shown[0]):
+                    ids[shown[0]] = actual.strip()
+
+    def test_the_readme_status_does_not_plan_what_is_shipped(self):
+        status = re.search(r"\| Area \| Status \| What you get \|\n\| --- \| :---: \| --- \|\n((?:\|.*\n)+)", self.readme()).group(1)
+        for row in status.splitlines():
+            cells = [c.strip() for c in row.strip("|").split("|")]
+            if "\U0001F4CB" in cells[1]:
+                for word in re.findall(r"`helio (\w+)", row):
+                    self.assertNotIn(word, self.dispatcher(), row)
+            if "JSON" in cells[0] or "queue" in cells[0]:
+                self.assertIn("\u2705", cells[1], row)
+        self.send(to="os/all", subject="Json")
+        self.assertIn("messages", json.loads(self.helio("log", "--json").stdout))  # JSON is real
+        self.assertEqual(self.helio("take", "--kind", "request", "--lane", "a", "--json", me=None).returncode, 0)  # and so is the queue
+
+    def test_limits_settings_and_archive_rules_are_stated_as_the_program_has_them(self):
+        source = (ROOT / "engine/helio.c").read_text()
+        shown, size = (int(n) for n in re.search(r"SHOW_MESSAGES = (\d+), SHOW_BYTES = (\d+)", source).groups())
+        silent = int(re.search(r"PLACE_SILENT_DEFAULT = (\d+)", (ROOT / "engine/place.h").read_text()).group(1))
+        for where, text in (("README", self.readme()), ("design", self.design())):
+            with self.subTest(where=where):
+                self.assertIn(f"{shown} messages and {size:,} bytes", text)
+                self.assertNotIn(f"{size:,} characters", text)
+                self.assertIn("30 days after it closed", text)
+                self.assertIn("30 days after it was sent", text)
+                self.assertIn("archive/<YYYY-MM>", text)
+                self.assertIn("month of its own id", text)
+                self.assertIn("200 messages", text)
+                self.assertIn("helio show <id>", text)
+        self.assertIn(f"`silent: <minutes>` (a line of `helio.conf`, {silent} by default)", self.readme())
+        self.assertIn(f"`silent: <minutes>` (a line of `helio.conf`, {silent} by default)", self.design())
+
+    def test_exit_3_can_follow_a_change_already_stored(self):
+        for where, text in (("README", self.readme()), ("design", self.design())):
+            with self.subTest(where=where):
+                self.assertIn("Exit 3 can follow a change that is already stored", text)
+                self.assertIn("helio show <id>", text)
+                self.assertIn("--key", text)
+                self.assertIn("not retried blind", text)
+
+    def test_the_store_is_where_the_docs_say(self):
+        spec = importlib.util.spec_from_file_location("helio_install_for_docs", ROOT / "tools/install.py")
+        installer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(installer)
+        with tempfile.TemporaryDirectory() as temp:
+            checkout = Path(temp) / "an odd parent" / "Heliograph"
+            self.assertEqual(installer.default_paths(checkout)[1], checkout.parent / "Heliograph-signals")
+        for where, text in (("README", self.readme()), ("design", self.design())):
+            with self.subTest(where=where):
+                self.assertIn("`Heliograph-signals` beside the checkout", text.replace("a folder named ", ""))
+                self.assertIn("`--store", text)
+                self.assertIn("`HELIO_STORE`", text)
+        self.assertNotIn("ImpossibleOS/Heliograph-signals", self.design().split("**Corrected 2026-11-28:**")[0])
+        self.assertIn("--store", (ROOT / "tools/install.py").read_text())
+
+    def test_the_design_keeps_its_historical_corrections_apart(self):
+        design = self.design()
+        self.assertFalse((ROOT / "tools/mail.py").exists())
+        self.assertNotRegex(design, r"mail. folder is brought in")  # the import was dropped
+        self.assertIn("the `mail` import was dropped", design)
+        for line in design.splitlines():
+            if "tools/mail.py" in line:
+                self.assertIn("done", line)  # the removal step is finished, not planned
+        for line in design.splitlines():
+            if "§55" in line and "is changed" in line:
+                self.assertIn("external", line)
+        self.assertIn("Corrected 2026-11-28", design)
+        # every file of this repository that the design names exists, and the generated one is said to be generated
+        for line in design.splitlines():
+            for path in re.findall(r"`((?:tools|engine|tests|docs|todo|src)/[\w./-]+|helio\.conf)`", line):
+                if "removed" not in line:  # the file the design says is gone
+                    self.assertTrue((ROOT / path).exists(), path)
+        self.assertRegex(design, r"`summary/<date>\.md` in the store \(a generated file\)")
+
+    def test_no_dashes_in_the_docs(self):
+        for text in (self.readme(), self.design()):
+            self.assertNotIn("\u2014", text)
+            self.assertNotIn("\u2013", text)
 
 
 if __name__ == "__main__":
