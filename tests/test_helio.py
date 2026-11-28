@@ -3456,6 +3456,45 @@ class JsonChanges(JsonCalls):
         v = self.value(self.helio("help", "--bad", "--json", me=None), 2)
         self.assertEqual(set(v), {"help", "error", "code"})
 
+    # completion review gap 1: a peer archiver wins after this call's step was written
+    def test_a_job_archived_by_a_peer_after_the_step_was_written_reports_its_state(self):
+        t = self.OLD + 63_000 * self.M
+        job = self.sent(t, "ask", "os/userland", "lost race", "--as", "os/main")
+        self.ok(t + 1, "take", job, "--as", "os/userland")
+        env = {k: v for k, v in os.environ.items() if k not in self.CLEAN}
+        proc = subprocess.Popen([str(RACER), "--now", str(t + 2), "--pause-cli", "after-write", str(self.store), "done", job, "ok", "--json",
+                                 "--as", "os/userland", "--store", str(self.store)],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.store, env=env)
+        try:
+            self.wait_paused("after-write")
+            self.assertEqual(run(self.store, "archive", me=None).returncode, 0)  # the peer finishes the move
+            out, err = self.resume("after-write", proc)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        self.assertEqual((proc.returncode, err), (2, b""))
+        self.assertEqual(json.loads(out), {"state": "done", "error": "it was archived", "code": 2})
+
+    # completion review gap 2: a refused init makes nothing
+    def test_an_init_that_cannot_resolve_its_folder_makes_nothing(self):
+        env = {k: v for k, v in os.environ.items() if k not in self.CLEAN}
+        before = sorted(p.name for p in self.store.iterdir())
+        # on a Windows working folder, "D:signals" is relative to the working folder of drive D, which is not known
+        r = subprocess.run([str(RACER), "--cwd", "C:\\work", "init", "--json", "--store", "D:signals"], capture_output=True, timeout=30,
+                           cwd=self.store, env=env)
+        v = self.value(r, 2)
+        self.assertEqual(set(v), {"error", "code"})
+        self.assertEqual(sorted(p.name for p in self.store.iterdir()), before)  # nothing was made, not even a folder named D:signals
+
+    # completion review gap 3: the shape of a refusal does not depend on the order of the options
+    def test_a_refusal_has_the_same_shape_in_either_order_of_the_options(self):
+        shapes = {"archive": {"archived", "problems", "error", "code"}, "check": {"ok", "problems", "error", "code"},
+                  "take": {"error", "code"}}
+        for command, keys in shapes.items():
+            for words in ((command, "--bad"), ("--bad", command)):
+                self.assertEqual(set(self.jcall(*words, me="os/main", code=2)), keys, words)
+
+
     # item 7: archive
     def test_archive_reports_what_this_call_moved(self):
         t = self.OLD + 56_000 * self.M

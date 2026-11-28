@@ -1027,29 +1027,39 @@ static bool fail_wsl_store(const char *folder) {
     return true;
 }
 
+#ifdef HELIO_TEST_HOOKS
+const char *helio_cwd_override = NULL; /* tests: the working folder init resolves against, to try another system's rules */
+#endif
+
 static int init(const char *folder, bool from_default) {
+    /* With --json the folder is resolved to an absolute path first, so a spelling that cannot be resolved is refused
+       before anything is made. */
+    text abs = {0};
+    if (reply.on) {
+        char *here = NULL;
+        const char *why = "the store cannot be made";
+        bool known = p_cwd(&here) == P_OK && here;
+#ifdef HELIO_TEST_HOOKS
+        if (helio_cwd_override) p_free(here), here = copy(helio_cwd_override, len(helio_cwd_override)), known = here != NULL;
+#endif
+        s_result ar = known ? place_absolute(&abs, here, folder, &why) : S_DAMAGED;
+        p_free(here);
+        if (ar != S_OK) {
+            text_free(&abs);
+            return fail(why, ar == S_REFUSED ? 2 : 3);
+        }
+    }
     text at = {0};
     p_result result = p_folder(folder);
     add(&at, folder), add(&at, "/messages");
     if (result == P_OK) result = at.failed ? P_FAILED : p_folder(at.data);
     text_free(&at);
     if (result == P_OK) {
-        if (reply.on) {
-            /* The folder as an absolute path, so a script can open the same store from anywhere. */
-            text abs = {0};
-            char *here = NULL;
-            const char *why = "the store cannot be made";
-            s_result ar = p_cwd(&here) == P_OK && here ? place_absolute(&abs, here, folder, &why) : S_DAMAGED;
-            p_free(here);
-            if (ar != S_OK) {
-                text_free(&abs);
-                return fail(why, ar == S_REFUSED ? 2 : 3);
-            }
-            json_put_text(fields(), "store", abs.data);
-            text_free(&abs);
-        }
+        if (reply.on) json_put_text(fields(), "store", abs.data);
+        text_free(&abs);
         return 0;
     }
+    text_free(&abs);
     if (from_default && fail_wsl_store(folder)) return 3;
     return fail("the store cannot be made", 3);
 }
@@ -1325,8 +1335,9 @@ int helio_paused(int count, char **args, void (*pause)(void *user, const char *s
     reply = (typeof(reply)){.on = json_flag(count, args), .key = "text"};
     if (reply.on) reply.key = reply_key_for(command_word(count, args));
     int code = parse(&o, count, args) ? run(&o, pause, user) : fail(o.why, 2);
-    bool archiving = o.count && same(o.words[0], "archive");
-    if (reply.on && o.count && (archiving || same(o.words[0], "check")) && reply.error && !reply.fields.length) {
+    const char *spoken = reply.on ? command_word(count, args) : ""; /* the same word whatever the order of the options */
+    bool archiving = same(spoken, "archive");
+    if (reply.on && (archiving || same(spoken, "check")) && reply.error && !reply.fields.length) {
         /* check and archive give their problems on every path: a call that failed before it could look reports itself as the problem. */
         json_list *f = fields();
         reply.key = NULL, reply.own_problems = true;

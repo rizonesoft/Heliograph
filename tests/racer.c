@@ -13,6 +13,7 @@
 #include "json.h"
 
 #ifdef HELIO_TEST_HOOKS
+extern const char *helio_cwd_override;
 extern bool plat_fail_flush;
 extern bool plat_fail_write_flush;
 extern bool plat_fail_sync;
@@ -271,6 +272,11 @@ int racer(int count, char **args) {
         bool good = !out.failed && (!out.data || p_print(out.data));
         text_free(&out);
         return good ? 0 : 3;
+    }
+    /* --cwd <working folder> <helio words>: init resolves its folder against that working folder. */
+    if (count >= 4 && same(args[1], "--cwd")) {
+        helio_cwd_override = args[2];
+        return helio(count - 2, args + 2);
     }
     /* --absolute <working folder> <folder>: the folder as an absolute path from that working folder (exit 2, and the
        reason on standard error, when it cannot be resolved), so Windows rules are tested on any host. */

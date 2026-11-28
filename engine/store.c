@@ -982,6 +982,15 @@ static s_result change_job(store *s, const char *id, actor me, change what, cons
         if (result != S_NOTHING) break;
         result = S_OK; /* the chain grew: decide again from the new end */
     }
+    if (result == S_REFUSED && jc && !jc->has_job && is_job(&m)) {
+        /* Archived by a peer after this call's step was written: the state the archived chain holds. */
+        message arch = {0};
+        const char *why = s->why;
+        job held = {0};
+        if (archive_read_message(s, id, &arch) == S_OK && store_job(s, &arch, &held) == S_OK) jc->has_job = true, jc->now = held;
+        message_free(&arch);
+        s->why = why;
+    }
     message_free(&m);
     return result;
 }
