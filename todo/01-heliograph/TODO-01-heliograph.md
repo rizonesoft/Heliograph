@@ -418,18 +418,21 @@ Seen heads-ups, findings and answers stay in the working store for ever. They le
 
 The design lists `send` where the program has `hand` and `find`, and still lists removing `tools/mail.py` as a step. Help, `README.md` and design are made to say the same.
 
+**Corrected 2026-11-28 (plan review, `docs/reviews/01-heliograph/D01-T01-s13.md`):** the items now cover the help's own command list, valid signatures and runnable examples, where the store is, the README's status, limits and archive rules, the framed inbox example, what exit 3 after a stored change means, and checks that fail on each of those, not only on a command name.
+
 **Phase:** 3
 **Needs:** none
 **Surface:** no
 
 **Build order:**
 
-1. Correct `docs/specs/2026-11-23-heliograph-design.md` and `README.md`. Done when: each command they name runs.
+1. Correct the help in `engine/helio.c`, `docs/specs/2026-11-23-heliograph-design.md` and `README.md`. Done when: each command and signature they name runs.
 2. Compare them in `tests/test_helio.py`. Done when: a command in one and not the other fails.
 
-- [ ] Correct the command list, the finished steps, and the obsolete `mail` folder migration line (`docs/specs/2026-11-23-heliograph-design.md:32`) in `docs/specs/2026-11-23-heliograph-design.md`, with the date. Done when: no command or file it names is missing. Cheaper substitute: a note that it is old.
-- [ ] State the new commands, times and limits in `README.md`, and the archive folder. Done when: the Status line is true of the program. Cheaper substitute: the help alone.
-- [ ] Compare the commands in the help of `engine/helio.c`, `README.md` and the design in `tests/test_helio.py`. Done when: a planted extra command fails it. Cheaper substitute: reading them.
+- [ ] List every command the dispatcher of `engine/helio.c` accepts in its help, with the words it takes: the inbox (bare and `inbox`), `log`, `check`, `show <id>`, `take <id>`, `take --kind <request|handoff> [--lane <lane>]`, `release`, `done`, `refuse`, `hook claude`, `answer`, `working`, `ask`, `hand`, `tell`, `find`, `hello`, `landed`, `archive`, `init`, `summary` and `help`. Done when: `helio help` names each, and each signature it shows runs (exit 0 or 1) in a prepared store.
+- [ ] Correct `docs/specs/2026-11-23-heliograph-design.md`, with a dated note: the command list with valid signatures (`hook claude`, not `hook <agent> <event>`; `hand` and `find` beside `ask` and `tell`; `summary`), where the store is (the installer's default beside the checkout, its `--store`, and `HELIO_STORE` or `--store` on a call; `tools/install.py`), the `mail` folder import and the `tools/mail.py` removal step marked as dropped and done, and that exit 3 can follow a change already stored, so a caller inspects with `show <id>` before it retries (a keyed send repeats safely; a queue call is not retried blind). Done when: every command, file and path it names exists or is said to be generated (the daily snapshot) or external (the OS roadmap step), and an install into a differently named parent puts the store where it says.
+- [ ] Make `README.md` true of the program: the Status table (JSON and taking the next job shipped), the `silent: <minutes>` setting and its 120-minute default, the display limit in bytes (5 messages, 2,000 bytes), the archive (a closed job 30 days after it closed; a heads-up, finding or answer 30 days after it was sent once those it is for have seen it; `archive/<YYYY-MM>` by the month of the message's id; at most 200 a day by the first call, or `helio archive`; an archived message still opens with `show <id>`), the walkthrough's inbox output with its fixed marks and `| ` lines, and the exit 3 guidance as in the design. Done when: the walkthrough transcript equals a real inbox response with the id and time normalized.
+- [ ] Compare in `tests/test_helio.py`: the commands of the dispatcher's table in `engine/helio.c` against those named by `helio help`, the command reference of `README.md` and the design's command list. Done when: a command planted in one of them, and one removed from all three, each fail it; a wrong signature (`hook <agent> <event>`), a wrong unit (characters for bytes), a wrong archive month rule, a planned mark on a shipped row, the `mail` import promise and the `tools/mail.py` removal step each fail it on its own; and the queue example runs in a checkout with `helio.conf`: a claim exits 0, a drained queue exits 1 with `null`, a refused call exits 2. Cheaper substitute: reading them.
 - [ ] Commit: `docs: the design matches the program`
 
 **Test checkpoint:** `python3 ../SDK/tools/app_build.py .` exits 0 and the new tests fail when their production change is reverted.
