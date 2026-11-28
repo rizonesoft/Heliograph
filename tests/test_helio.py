@@ -8270,8 +8270,18 @@ class DocsMatchProgram(Base):
             self.assertIn("no open job of that kind is one this caller may take", text)
             self.assertIn("the caller is `--as` or `HELIO_AS`", text)
 
-    @unittest.skipUnless(not ON_WINDOWS and shutil.which("bash"), "the walkthrough runs in a real bash, and there is none here (Windows)")
+    @staticmethod
+    def find_bash():
+        """A real bash: Git Bash on Windows (never the WSL launcher in System32), the one on PATH elsewhere."""
+        if ON_WINDOWS:
+            git = Path(r"C:\Program Files\Git\bin\bash.exe")
+            return str(git) if git.exists() else shutil.which("bash")
+        return shutil.which("bash")
+
     def test_the_readme_walkthrough_is_a_real_run(self):
+        bash_program = self.find_bash()
+        if not bash_program:
+            self.skipTest("the walkthrough runs in a real bash, and none is installed here")
         block = re.search(r"```\n(\$ export HELIO_STORE=.*?)```", self.readme(), re.S).group(1)
         steps = []
         for line in block.splitlines():
@@ -8288,39 +8298,59 @@ class DocsMatchProgram(Base):
             home, bin_dir, neutral = (Path(temp).resolve() / name for name in ("home", "bin", "cwd"))
             for folder in (home, bin_dir, neutral):
                 folder.mkdir()
-            (bin_dir / "helio").symlink_to(PROGRAM)
+            if ON_WINDOWS:
+                shutil.copy(PROGRAM, bin_dir / "helio.exe")
+            else:
+                (bin_dir / "helio").symlink_to(PROGRAM)
             env = {k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "ANTIGRAVITY_CONVERSATION_ID")}
             env.update(HOME=str(home), PATH=f"{bin_dir}{os.pathsep}{env.get('PATH', '')}")
 
             def bash(script):
-                return subprocess.run(["bash", "-c", script], capture_output=True, timeout=60, cwd=neutral, env=env)
+                return subprocess.run([bash_program, "-c", script], capture_output=True, timeout=120, cwd=neutral, env=env)
+
+            def native(path):  # a path as bash prints it, as this system reads it
+                if not ON_WINDOWS:
+                    return path
+                return bash("cygpath -w '" + path.replace("'", "") + "'").stdout.decode().strip()
 
             def inside(value):
-                resolved = Path(value).resolve()
+                resolved = Path(native(value)).resolve()
                 return resolved == home or home in resolved.parents
 
-            # Nothing runs until bash itself says every store the walkthrough names lies inside the test's own home.
-            exports = "; ".join(command for command, _ in steps if command.startswith("export "))
-            given = bash(f'{exports}; printf "%s" "$HELIO_STORE"').stdout.decode()
-            self.assertTrue(given and inside(given), f"HELIO_STORE is {given!r}, outside the test's home")
+            # Before anything runs, the same script in its written order with each helio command replaced by a probe of the
+            # store it would use: $HELIO_STORE as bash has it at that point, and the word after --store, expanded by bash.
+            probes = []
             for command, _ in steps:
-                words = re.sub(r"^echo \".*\" \| helio ", "", command)
-                if not command.startswith("export ") and "--store" in words:
-                    expanded = bash(f"{exports}; printf '%s\\n' {words.partition('helio ')[2] or words}").stdout.decode().splitlines()
-                    for i, word in enumerate(expanded[:-1]):
-                        if word == "--store":
-                            self.assertTrue(inside(expanded[i + 1]), f"{command}: the store lies outside the test's home")
-            ids = {}
-            for command, shown in steps:
                 if command.startswith("export "):
-                    continue
-                for old, new in ids.items():
-                    command = command.replace(old, new)
-                r = bash(f"{exports}; {command}")
-                actual = r.stdout.decode() + r.stderr.decode()
-                self.assertEqual(normal(actual), normal("\n".join(shown)), command)
-                if len(shown) == 1 and re.fullmatch(ident, shown[0]):
-                    ids[shown[0]] = actual.strip()
+                    probes.append(command)
+                else:
+                    store_word = re.search(r"--store (\S+)", command)
+                    probes.append("printf '%s\\n' \"$HELIO_STORE\"" + (f" {store_word.group(1)}" if store_word else ""))
+            probed = bash("\n".join(probes))
+            self.assertEqual(probed.returncode, 0, probed.stderr)
+            values = probed.stdout.decode().splitlines()
+            self.assertTrue(values, "the walkthrough names no store")
+            for value in values:
+                self.assertTrue(value and inside(value), f"a store of {value!r} lies outside the test's home")
+            # The walkthrough as written, as one script in its order; each helio command prints a marker line before its output.
+            lines, last_id = [], None
+            for index, (command, shown) in enumerate(steps):
+                if not command.startswith("export "):
+                    if last_id:
+                        command = command.replace(last_id, "$__id")
+                    lines.append(f"printf '%s\\n' '@@step-{index}@@'")
+                    lines.append(f'__out=$( {{ {command}; }} 2>&1 ); printf \'%s\\n\' "$__out"')
+                    if len(shown) == 1 and re.fullmatch(ident, shown[0]):
+                        last_id = shown[0]
+                        lines.append('__id=$__out')
+                else:
+                    lines.append(command)
+            ran = bash("\n".join(lines))
+            chunks = re.split(r"^@@step-(\d+)@@\n", ran.stdout.decode().replace("\r\n", "\n"), flags=re.M)
+            output = {int(chunks[i]): chunks[i + 1] for i in range(1, len(chunks) - 1, 2)}
+            for index, (command, shown) in enumerate(steps):
+                if not command.startswith("export "):
+                    self.assertEqual(normal(output.get(index, "")), normal("\n".join(shown)), command)
 
     STATUS_SECTIONS = {"Messages and jobs": (1, 3), "One taker for each job": (1,), "Routing by path": (14,), "Claude Code hook": (9,),
                        "Codex and Antigravity": (4,), "Due times, overlap warnings": (5,), "Daily summary": (23,),
