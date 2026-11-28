@@ -8177,6 +8177,28 @@ class DocsMatchProgram(Base):
             for name, (least, most) in table.items():
                 self.assertEqual((where, name, sorted(covered.get(name, ()))), (where, name, list(range(least, most + 1))))
 
+    def test_every_option_the_program_parses_is_documented_where_it_belongs(self):
+        source = (ROOT / "engine/helio.c").read_text(encoding="utf-8")
+        parse = source[source.index("static bool parse(options"):source.index("if (!o->session_flag) {")]
+        options = set(re.findall(r'same\(args\[i\], "(--[\w-]+)"\)', parse))
+        self.assertTrue({"--as", "--store", "--all", "--now", "--whenever", "--json", "--kind", "--lane"} <= options, options)
+        # the options only the queue form of take accepts, from the check that refuses them anywhere else
+        guard = re.search(r"if \(\(([^)]*)\) && !take_queue\)", source).group(1)
+        queue_only = {"--" + name for name in re.findall(r"o->(\w+)_flag", guard)}
+        self.assertEqual(queue_only, {"--kind", "--lane"})
+        readme, design = self.readme(), self.design()
+        references = {"help": self.helio("help", me=None).stdout.decode(),
+                      "README": readme[readme.index("| Command | What it does |"):readme.index("## How does a job get only one taker?")],
+                      "design": design[design.index("## Commands"):design.index("## Limits")]}
+        signatures = {"help": self.help_signatures(), "README": self.readme_signatures(), "design": self.design_signatures()}
+        for where, text in references.items():
+            for option in sorted(options):
+                self.assertRegex(text, re.escape(option) + r"(?![\w-])", (where, option))
+            queue = [sig for sig in signatures[where] if self.word_of(sig) == "take" and "<id>" not in sig]
+            self.assertEqual(len(queue), 1, (where, queue))
+            for option in sorted(queue_only):
+                self.assertIn(option, queue[0], (where, option))
+
     def test_every_signature_they_show_runs(self):
         for where, signatures in (("help", self.help_signatures()), ("design", self.design_signatures()), ("README", self.readme_signatures())):
             self.assertTrue(signatures, where)
@@ -8243,6 +8265,17 @@ class DocsMatchProgram(Base):
 
         ids = {}
         with tempfile.TemporaryDirectory() as store, tempfile.TemporaryDirectory() as neutral:
+            # before any command runs: every store the walkthrough names lies inside the test's own temporary home
+            home = Path(store).resolve()
+            for command, _ in steps:
+                words = shlex.split(command.partition("| ")[2] or command)
+                values = [w.partition("=")[2] for w in words if w.startswith("HELIO_STORE=") or w.startswith("export HELIO_STORE=")]
+                if words[:1] == ["export"]:
+                    values += [w.partition("=")[2] for w in words[1:]]
+                values += [words[i + 1] for i, w in enumerate(words[:-1]) if w == "--store"]
+                for value in values:
+                    resolved = Path(store + value[1:] if value.startswith("~") else value).resolve()
+                    self.assertTrue(resolved == home or home in resolved.parents, f"{value} lies outside the test's home")
             for command, shown in steps:
                 if command.startswith("export "):
                     name, _, value = command[len("export "):].partition("=")

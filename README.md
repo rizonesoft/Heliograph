@@ -144,6 +144,20 @@ helio: it is already taken
 | `helio summary` | The operator's command (no lane): the day's saved snapshot, every project |
 | `helio help` | Lists the commands |
 
+| Option | What it does |
+| --- | --- |
+| `--as <project/lane>` | Who I am (or `HELIO_AS`) |
+| `--store <folder>` | Where the store is (or `HELIO_STORE`) |
+| `--about <paths>` | What a sent message is about |
+| `--now`, `--whenever` | The urgency of a sent message (the default is next) |
+| `--due <minutes>` | An overdue job goes back to its sender and the owner |
+| `--key <text>` | Sending the same key again sends nothing new |
+| `--session <name>` | Which session is calling |
+| `--for-session <name>` | Limits a sent message to one session |
+| `--all` | Shows everything, not only what is new |
+| `--kind <request\|handoff>`, `--lane <lane>` | For `take` without an id only: the next job, as that lane |
+| `--json` | Gives one JSON value |
+
 `<to>` is `project/lane`, `project/all` or `path:<file>`. A message body comes from standard input. `--json` works on every command and gives one JSON value.
 
 A taker is silent when it has shown no sign of life for `silent: <minutes>` (a line of `helio.conf`, 120 by default). The inbox shows a silent job to its sender and the owner as SILENT, and only `helio release` frees it.

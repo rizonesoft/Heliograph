@@ -86,6 +86,22 @@ helio summary                                           the operator's day snaps
 helio help                                              the command list
 ```
 
+Options:
+
+```
+--as <project/lane>      who I am (or HELIO_AS)
+--store <folder>         where the store is (or HELIO_STORE)
+--about <paths>          what a sent message is about
+--now, --whenever        the urgency of a sent message (the default is next)
+--due <minutes>          an overdue job goes back to its sender and the owner
+--key <text>             sending the same key again sends nothing new
+--session <name>         which session is calling
+--for-session <name>     limits a sent message to one session
+--all                    everything, not only what is new
+--kind <request|handoff> --lane <lane>   for take without an id only: the next job, as that lane
+--json                   one JSON value
+```
+
 `<to>` is `project/lane`, `project/all` or `path:<file>`. `--json` on every command. Exit codes: 0 done, 1 nothing, 2 refused, 3 a damaged store or a failure. **Corrected 2026-11-28:** the list named a `send` command (the program has `ask`, `hand`, `tell` and `find`) and gave `hook` an agent and an event (the program accepts `hook claude` alone, and any further word is refused with exit 2). It gave `log|summary|check` as one line with no signature for `summary`, and left out `landed`, `hand`, `find`, `answer`, `hello`, `archive`, `init` and `help`.
 
 Exit 3 can follow a change that is already stored: a job step is written, then a later read or flush fails. A caller that gets 3 inspects with `helio show <id>` before it retries. A send with `--key <text>` repeats safely, because the key stands for one message. A queue call (`helio take --kind`) is not retried blind: it may already have taken a job. When its receipt could not be written (exit 3, "the output cannot be written") no job is named, but the job is held: your own inbox (`helio --as <project/lane>`, or `helio log --json --as <project/lane>`) lists the jobs your lane holds, so look there before you take more. The project is the one in `helio.conf`, and the lane is the `--lane` you gave.
