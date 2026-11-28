@@ -8281,7 +8281,8 @@ class DocsMatchProgram(Base):
                       Path(os.environ.get("LOCALAPPDATA", "")) / "Programs/Git/bin/bash.exe"]
         for folder in os.environ.get("PATH", "").split(os.pathsep):  # every git and every bash on PATH, not the first
             if folder:
-                candidates.append(Path(folder).parent / "bin/bash.exe")  # git.exe in Git\cmd: its bash is in Git\bin
+                if (Path(folder) / "git.exe").is_file():  # a Git install: git.exe in Git\cmd, its bash in Git\bin
+                    candidates.append(Path(folder).parent / "bin/bash.exe")
                 candidates.append(Path(folder) / "bash.exe")
         tried = set()
         for candidate in candidates:
