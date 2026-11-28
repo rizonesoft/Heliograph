@@ -342,6 +342,8 @@ A script must not parse lines meant for people. This section builds the writer a
 
 ## 11. Take the next job as a queue
 
+> **Started:** 2026-11-28T00:59:19Z
+
 The Gemini driver's queue is `helio take --kind request --lane neon-a --json`. It takes the most urgent, then oldest, open job of that kind.
 
 **Phase:** 3
