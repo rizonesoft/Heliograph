@@ -13,6 +13,7 @@ bool plat_fail_flush = false;
 bool plat_fail_write_flush = false;
 bool plat_fail_sync = false;
 uint64_t plat_now_override = 0;
+uint64_t plat_now_step = 0; /* when set, each reading of the clock moves it on by this much, for a test that crosses midnight */
 void (*plat_pause)(const char *stage) = NULL; /* called between steps of a platform call, for a test to act */
 unsigned long plat_last_hold_error = 0; /* the Windows error of the last refused folder hold, for a test to report */
 #endif
@@ -367,7 +368,11 @@ p_result p_cwd(char **path_out) {
 p_result p_input(size_t most, char **data, size_t *length) { return from(im_read_input(most, data, length)); }
 uint64_t p_now(void) {
 #ifdef HELIO_TEST_HOOKS
-    if (plat_now_override) return plat_now_override;
+    if (plat_now_override) {
+        uint64_t reading = plat_now_override;
+        plat_now_override += plat_now_step;
+        return reading;
+    }
 #endif
     return im_now();
 }

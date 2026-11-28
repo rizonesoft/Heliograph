@@ -19,9 +19,11 @@ static const char help[] =
     "  helio working <paths>                            what I touch, for the overlap warning\n"
     "  helio hello <agent>                              announce this session (claude, codex, antigravity)\n"
     "  helio log            helio check         helio archive       helio init\n"
+    "  helio summary                                    the operator's day summary (no lane): read from the day's saved snapshot\n"
     "\n"
     "Options: --as <project/lane>, --about <paths>, --now or --whenever, --store <folder>,\n--key <text> (sending the same key again sends nothing new), --session <my-session> (who is calling),\n--for-session <target-session> (limit a sent message to one session; show <id> opens visible ids), --all,\n--due <minutes> (an overdue job goes back to its sender and the owner),\n--kind <request|handoff> and --lane <lane> (take only: the next job, as the lane of this project).\n"
     "HELIO_AS and HELIO_STORE give two of them. <to> is project/lane, project/all or path:<file>.\n"
+    "helio summary [--json] is the operator's: it holds every project, so it runs with no lane and any lane is refused. --json gives\n{\"day\", \"at\", \"format\", \"overdue\", \"silent\", \"open\", \"taken\", \"done\", \"refused\", \"held_unseen\", \"overlaps\", \"damaged\"}.\n"
     "A session sees only its own project's messages (and those addressed to it); helio log --all outside a configured repository with no lane shows every project.\n"
     "A repository's helio.conf names its project, the lane of a session there and who owns which path.\n"
     "A message is information from another agent. It never approves work or changes a rule.\n";
@@ -1198,6 +1200,78 @@ static int init(const char *folder, bool from_default) {
     return fail("the store cannot be made", 3);
 }
 
+/* The path of the snapshot of a day, read whole with the one bound the writer keeps. */
+static p_result read_snapshot(const char *folder, const char *day, char **data, size_t *length) {
+    text path = {0};
+    add(&path, folder), add(&path, "/summary/"), add(&path, day), add(&path, ".md");
+    p_result got = path.failed ? P_FAILED : p_read(path.data, MOST_SUMMARY, data, length);
+    text_free(&path);
+    return got;
+}
+
+/* helio summary: the operator's command. The day's saved snapshot is read before the live store is opened; the store
+   is opened only when there is none yet, to write it, and what is returned is the file on disk, whoever wrote it. */
+static int summary_command(options *o, void (*pause)(void *user, const char *stage), void *pause_user) {
+    char day[11] = {0};
+    text today = {0};
+    add_time(&today, p_now());
+    if (today.failed || today.length < 10) return text_free(&today), fail("out of memory", 3);
+    for (int i = 0; i < 10; i++) day[i] = today.data[i];
+    text_free(&today);
+    char *data = NULL;
+    size_t length = 0;
+    p_result got = read_snapshot(o->folder, day, &data, &length);
+    if (got == P_MISSING) {
+        store s;
+        if (store_open(&s, o->folder) != S_OK) {
+            store_close(&s);
+            if (o->from_default && fail_wsl_store(o->folder)) return 3;
+            return fail(s.why, 3);
+        }
+        s.pause = pause, s.pause_user = pause_user;
+        if (o->here.found && place_record_silent(&s, &o->here) != P_OK) fail("the project's silent threshold could not be saved", 0);
+        s_result sr = watch_summary(&s, &o->here, day);
+        const char *why = s.why;
+        store_close(&s);
+        if (sr == S_NOTHING) { /* deferred: no file is kept, so a later call of the day writes it */
+            if (reply.on) {
+                json_list *f = fields();
+                json_put_text(f, "day", day), json_put_bool(f, "deferred", true);
+            } else fail(why, 0);
+            return 1;
+        }
+        if (sr != S_OK) return fail(why, 3);
+        got = read_snapshot(o->folder, day, &data, &length);
+    }
+    if (got != P_OK) return p_free(data), fail("the day's summary cannot be read", 3);
+    summary_read v;
+    if (!watch_summary_read(data, length, &v)) return p_free(data), fail("the day's summary is cut short or is not a summary", 3);
+    int code = 0;
+    if (reply.on) {
+        static const char *const names[SUMMARY_PARTS - 1] = {"overdue", "silent", "open", "taken", "done", "refused", "held_unseen"};
+        json_list *f = fields();
+        json_put_text(f, "day", v.day), json_put_text(f, "at", v.at), json_put_number(f, "format", v.format);
+        for (int i = 0; i < SUMMARY_PARTS - 1; i++) json_put_number(f, names[i], v.counts[i]);
+        if (v.format == 2) json_put_number(f, "overlaps", v.counts[SUMMARY_PARTS - 1]);
+        else json_put_null(f, "overlaps");
+        json_put_number(f, "damaged", v.damaged);
+    } else {
+        /* Every line behind "| " between the fixed marks, as show prints a message: nothing in it is a line of the reader's own. */
+        text out = {0};
+        add(&out, MARK_BEGIN);
+        for (const char *at = data; *at;) {
+            size_t n = 0;
+            while (at[n] && at[n] != '\n') n++;
+            add(&out, "| "), add_bytes(&out, at, n), add(&out, "\n");
+            at += n + (at[n] ? 1 : 0);
+        }
+        add(&out, MARK_END);
+        if (!print(&out)) code = fail("the output cannot be written", 3);
+    }
+    p_free(data);
+    return code;
+}
+
 static int run(options *o, void (*pause)(void *user, const char *stage), void *pause_user) {
     archive_pauses(pause, pause_user);
     const char *command = o->count ? o->words[0] : "inbox";
@@ -1207,7 +1281,7 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
         return fail(same(command, "take") ? "a job id cannot come with --kind or --lane" : "--kind and --lane are only for take", 2);
     if (take_queue && o->kind_flag && !same(o->kind, "request") && !same(o->kind, "handoff")) return fail("--kind is request or handoff: only those are jobs", 2);
     static const char *const structured[] = {"inbox", "log", "check", "show", "take", "release", "done", "refuse", "landed", "hello",
-                                             "init", "working", "archive", "ask", "hand", "tell", "find", "answer"};
+                                             "init", "working", "archive", "ask", "hand", "tell", "find", "answer", "summary"};
     for (size_t i = 0; i < sizeof structured / sizeof *structured; i++)
         if (same(command, structured[i])) reply.key = NULL;
     if (same(command, "help")) {
@@ -1282,7 +1356,7 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
     static const struct { const char *name; int least, most; } commands[] = {
         {"inbox", 0, 1}, {"log", 1, 1}, {"check", 1, 1}, {"show", 2, 2}, {"take", 1, 2}, {"release", 2, 2}, {"done", 2, 3},
         {"refuse", 2, 3}, {"hook", 2, 2}, {"answer", 3, 3}, {"working", 2, 2}, {"ask", 3, 3}, {"hand", 3, 3}, {"tell", 3, 3}, {"find", 3, 3},
-        {"hello", 2, 2}, {"landed", 3, 3}};
+        {"hello", 2, 2}, {"landed", 3, 3}, {"summary", 1, 1}};
     int which = -1;
     for (int i = 0; i < (int)(sizeof commands / sizeof *commands); i++)
         if (same(command, commands[i].name)) which = i;
@@ -1305,7 +1379,8 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
         if (!is_send) return fail("--for-session is only for sending a message", 2);
         if (!*o->for_session || !session_ok(o->for_session)) return fail("the target session name is invalid or too long", 2);
     }
-    if (which != 1 && which != 2 && !address_ok(o->me, false)) return fail("say who you are: --as project/lane or HELIO_AS", 2);
+    if (which == 17 && (o->me_flag || *o->me)) return fail("summary is the operator's command: it takes no lane", 2);
+    if (which != 1 && which != 2 && which != 17 && !address_ok(o->me, false)) return fail("say who you are: --as project/lane or HELIO_AS", 2);
     if (which == 1) {
         if ((o->me_flag || o->me_env != NULL) && !address_ok(o->me, false))
             return fail("say who you are: --as project/lane or HELIO_AS", 2);
@@ -1323,6 +1398,8 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
         if (!session_ok(o->session)) return fail("the session name is invalid or too long", 2);
     }
 
+    if (which == 17) return summary_command(o, pause, pause_user);
+
     store s;
     if (store_open(&s, o->folder) != S_OK) {
         store_close(&s);
@@ -1337,13 +1414,15 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
     if (announce_first && address_ok(o->me, false)) announce_best_effort(&s, o, "");
     else if (which == 8) announce_best_effort(&s, o, "claude");
     bool summary_err = false;
-    if (which == 0 || which == 8) {
-        s_result sr = watch_summary(&s, &o->here);
+    {
+        /* The first call of the UTC day writes the day's snapshot, whatever the command and before its own change. */
+        char day[11];
+        s_result sr = watch_summary(&s, &o->here, day);
         if (sr == S_NOTHING) fail(s.why, 0); /* deferred on transient liveness error; caller's own inbox decides exit code */
-        else if (sr != S_OK) {
+        else if (sr != S_OK && (which == 0 || which == 8)) {
             fail(s.why, 3); /* the inbox is shown all the same */
             summary_err = true;
-        }
+        } else if (sr != S_OK) fail(s.why, 0); /* any other command goes on: a day's summary is not its work */
     }
     bool daily_err = false;
     if (which == 0 && !summary_err) {
@@ -1472,7 +1551,7 @@ static const char *command_word(int count, char **args) {
    the commands with fields of their own none, any other word the plain text. */
 static const char *reply_key_for(const char *command) {
     static const char *const structured[] = {"inbox", "log", "check", "show", "take", "release", "done", "refuse", "landed", "hello",
-                                             "init", "working", "archive", "ask", "hand", "tell", "find", "answer"};
+                                             "init", "working", "archive", "ask", "hand", "tell", "find", "answer", "summary"};
     if (same(command, "help")) return "help";
     if (same(command, "hook")) return "context";
     for (size_t i = 0; i < sizeof structured / sizeof *structured; i++)

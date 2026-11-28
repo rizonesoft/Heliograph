@@ -413,10 +413,122 @@ static void add_summary_item(text *part, unsigned *count, const message *m, cons
     }
 }
 
-s_result watch_summary(store *s, const place *here) {
+/* The lanes that declared what they are working on: a name of the working folder ("project+lane") and its paths. */
+typedef struct {
+    char *name, *paths;
+} declared_lane;
+
+typedef struct {
+    declared_lane *items;
+    size_t count, cap;
+    bool failed;
+} declared_lanes;
+
+static bool gather_declared(void *user, const char *name) {
+    declared_lanes *d = user;
+    bool plus = false;
+    for (const char *c = name; *c; c++) {
+        if (*c == '.') return true; /* being written */
+        if (*c == '+') plus = true;
+    }
+    if (!plus) return true;
+    if (d->count == d->cap) {
+        size_t next = d->cap ? d->cap * 2 : 16;
+        declared_lane *grown = p_alloc(next * sizeof *grown);
+        if (!grown) return d->failed = true, false;
+        for (size_t i = 0; i < d->count; i++) grown[i] = d->items[i];
+        p_free(d->items);
+        d->items = grown, d->cap = next;
+    }
+    char *kept = copy(name, len(name));
+    if (!kept) return d->failed = true, false;
+    d->items[d->count++] = (declared_lane){kept, NULL};
+    return true;
+}
+
+/* How many bytes of a name come before its "+": the project. */
+static size_t project_length(const char *name) {
+    size_t n = 0;
+    while (name[n] && name[n] != '+') n++;
+    return n;
+}
+
+static void add_lane_name(text *out, const char *name) {
+    text spelled = {0};
+    for (const char *c = name; *c; c++) add_bytes(&spelled, *c == '+' ? "/" : c, 1);
+    clean(out, spelled.data ? spelled.data : "", true);
+    text_free(&spelled);
+}
+
+/* The pairs of lanes of one project that share a path in what they declared, at the instant now, counted into count and
+   listed (the first 100) in rows. Nothing is posted. A working folder that is not there is zero; false when a folder or
+   a declaration cannot be read, so the day's summary is not frozen without it. */
+static bool summary_overlaps(const store *s, uint64_t now, text *rows, unsigned *count) {
+    text folder = {0};
+    add(&folder, s->folder), add(&folder, "/working");
+    declared_lanes d = {0};
+    p_result listed_all = folder.failed ? P_FAILED : p_list(folder.data, gather_declared, &d);
+    bool ok = !d.failed && (listed_all == P_OK || listed_all == P_MISSING);
+    for (size_t i = 1; ok && i < d.count; i++) { /* sorted, so the rows do not depend on the order of the folder */
+        declared_lane at = d.items[i];
+        size_t k = i;
+        for (; k > 0 && compare(d.items[k - 1].name, at.name) > 0; k--) d.items[k] = d.items[k - 1];
+        d.items[k] = at;
+    }
+    for (size_t i = 0; ok && i < d.count; i++) {
+        text path = {0};
+        add(&path, folder.data), add(&path, "/"), add(&path, d.items[i].name);
+        char *data = NULL;
+        size_t length = 0;
+        p_result got = path.failed ? P_FAILED : p_read(path.data, MOST_PATHS + 64, &data, &length);
+        text_free(&path);
+        if (got != P_OK && got != P_MISSING) ok = false;
+        if (got == P_OK) {
+            uint64_t when = 0;
+            const char *at = data;
+            for (; *at >= '0' && *at <= '9'; at++) when = when * 10 + (uint64_t)(*at - '0');
+            if (*at == '\n' && when + 4ull * 3600 * 1000000 > now) {
+                size_t n = 0;
+                while (at[1 + n] && at[1 + n] != '\n') n++;
+                d.items[i].paths = copy(at + 1, n);
+                if (!d.items[i].paths) ok = false;
+            }
+        }
+        p_free(data);
+    }
+    for (size_t i = 0; ok && i < d.count; i++) {
+        if (!d.items[i].paths) continue;
+        for (size_t j = i + 1; j < d.count; j++) {
+            size_t n = project_length(d.items[i].name);
+            if (!d.items[j].paths || n != project_length(d.items[j].name)) continue;
+            bool same_project = true;
+            for (size_t c = 0; c < n && same_project; c++) same_project = d.items[i].name[c] == d.items[j].name[c];
+            text which = {0};
+            if (same_project && overlap(d.items[i].paths, d.items[j].paths, &which)) {
+                if (++*count <= 100) {
+                    add(rows, "- "), add_lane_name(rows, d.items[i].name), add(rows, " and "), add_lane_name(rows, d.items[j].name);
+                    add(rows, ": "), clean(rows, which.data ? which.data : "", true), add(rows, "\n");
+                }
+            }
+            if (which.failed) ok = false;
+            text_free(&which);
+        }
+    }
+    for (size_t i = 0; i < d.count; i++) p_free(d.items[i].name), p_free(d.items[i].paths);
+    p_free(d.items);
+    text_free(&folder);
+    return ok;
+}
+
+static const char *const SUMMARY_TITLES[SUMMARY_PARTS] = {"Overdue", "Silent", "Open", "Taken", "Done in the last day",
+                                                           "Refused in the last day", "Held unseen", "Overlaps"};
+
+s_result watch_summary(store *s, const place *here, char day_out[11]) {
+    uint64_t now = p_now(); /* one instant names the file, heads it and classifies every row */
     text day = {0}, folder = {0}, path = {0}, unique = {0};
-    add_time(&day, p_now());
+    add_time(&day, now);
     if (day.data) day.data[day.length = 10] = 0;
+    for (int i = 0; i < 11; i++) day_out[i] = day.data && i <= (int)day.length ? day.data[i] : 0;
     add(&folder, s->folder), add(&folder, "/summary");
     add(&path, folder.data ? folder.data : ""), add(&path, "/"), add(&path, day.data ? day.data : ""), add(&path, ".md");
     add_number(&unique, p_tick(), 0);
@@ -424,14 +536,12 @@ s_result watch_summary(store *s, const place *here) {
     char *there = NULL;
     size_t length;
     s_result result = S_OK;
-    p_result got = full ? P_FAILED : p_read(path.data, 1 << 20, &there, &length);
+    p_result got = full ? P_FAILED : p_read(path.data, MOST_SUMMARY, &there, &length);
     if (got != P_OK && got != P_MISSING) result = S_DAMAGED;
     else if (got == P_MISSING) {
-        static const char *const titles[] = {"Overdue", "Silent", "Open", "Taken", "Done in the last day", "Refused in the last day", "Held unseen"};
-        enum { PARTS = 7, HELD = 6 };
+        enum { PARTS = SUMMARY_PARTS, HELD = 6, OVERLAPS = 7 };
         text parts[PARTS] = {0}, out = {0};
         unsigned counts[PARTS] = {0}, damaged = 0;
-        uint64_t now = p_now();
         session_cache sc = {0};
         bool liveness_err = false, held_err = false;
         for (size_t i = 0; i < s->count; i++) {
@@ -480,25 +590,31 @@ s_result watch_summary(store *s, const place *here) {
             p_free(id);
         }
         sessions_cache_free(&sc);
-        if (liveness_err || held_err) {
+        bool work_err = !summary_overlaps(s, now, &parts[OVERLAPS], &counts[OVERLAPS]);
+        if (liveness_err || held_err || work_err) {
             /* Do not freeze an incomplete daily summary when session or threshold reads failed:
                return S_NOTHING (deferred) so the caller prints a diagnostic, retries on the next
                call once the transient fault clears, and lets the caller's own inbox decide its exit code. */
             for (int i = 0; i < PARTS; i++) text_free(&parts[i]);
             s->why = liveness_err ? "the summary was deferred: session or threshold could not be read"
-                                  : "the summary was deferred: a seen mark or the sessions could not be read for a held message";
+                     : held_err   ? "the summary was deferred: a seen mark or the sessions could not be read for a held message"
+                                  : "the summary was deferred: what a lane is working on could not be read";
             p_free(there), text_free(&day), text_free(&folder), text_free(&path), text_free(&unique);
             return S_NOTHING;
         } else {
-            add(&out, "# Heliograph "), add(&out, day.data), add(&out, "\n\nAs it stood at "), add_time(&out, now), add(&out, ".\n");
+            add(&out, "# Heliograph "), add(&out, day.data), add(&out, "\n\nAs it stood at "), add_time(&out, now), add(&out, ".\nFormat: 2\n");
             for (int i = 0; i < PARTS; i++) {
-                add(&out, "\n## "), add(&out, titles[i]), add(&out, ": "), add_number(&out, counts[i], 0), add(&out, "\n\n");
+                add(&out, "\n## "), add(&out, SUMMARY_TITLES[i]), add(&out, ": "), add_number(&out, counts[i], 0), add(&out, "\n\n");
                 if (parts[i].data) add(&out, parts[i].data);
                 if (counts[i] > 100 && i != HELD) add(&out, "- and more: helio log\n");
                 if (parts[i].failed) out.failed = true;
                 text_free(&parts[i]);
             }
-            if (damaged) add(&out, "\nDamaged: "), add_number(&out, damaged, 0), add(&out, ". See helio check.\n");
+            add(&out, "\nDamaged: "), add_number(&out, damaged, 0);
+            if (damaged) add(&out, ". See helio check.");
+            add(&out, "\n\nEnd of summary.\n");
+            if (!out.failed && out.length > MOST_SUMMARY) out.failed = true; /* the reader would refuse it */
+            if (s->pause) s->pause(s->pause_user, "summary-scanned"); /* test pause: the store may change, a peer may write first */
             p_result wrote = out.failed || p_folder(folder.data) != P_OK ? P_FAILED : p_write(path.data, out.data, out.length, false, unique.data);
             if (wrote != P_OK && wrote != P_EXISTS) result = S_DAMAGED;
             text_free(&out);
@@ -507,4 +623,101 @@ s_result watch_summary(store *s, const place *here) {
     if (result != S_OK) s->why = "the summary cannot be written";
     p_free(there), text_free(&day), text_free(&folder), text_free(&path), text_free(&unique);
     return result;
+}
+
+/* The text of a line at cursor, without its newline; false at the end. */
+typedef struct {
+    const char *at, *end;
+} lines;
+
+static bool next_line(lines *c, const char **line, size_t *n) {
+    if (c->at >= c->end) return false;
+    *line = c->at;
+    size_t k = 0;
+    while (c->at + k < c->end && c->at[k] != '\n') k++;
+    *n = k;
+    c->at += k + 1;
+    return true;
+}
+
+static bool line_starts(const char *line, size_t n, const char *prefix) {
+    size_t m = len(prefix);
+    if (n < m) return false;
+    for (size_t i = 0; i < m; i++) if (line[i] != prefix[i]) return false;
+    return true;
+}
+
+static bool line_is(const char *line, size_t n, const char *text) {
+    return n == len(text) && line_starts(line, n, text);
+}
+
+/* The count after a heading's or the damage line's colon: 1 to 9 digits and then the end, or the damage note. */
+static bool line_count(const char *line, size_t n, size_t from, const char *tail, unsigned *out) {
+    size_t at = from;
+    unsigned v = 0;
+    for (; at < n && line[at] >= '0' && line[at] <= '9' && at - from < 9; at++) v = v * 10 + (unsigned)(line[at] - '0');
+    if (at == from) return false;
+    if (at < n && !(*tail && line_is(line + at, n - at, tail))) return false;
+    *out = v;
+    return true;
+}
+
+/* A line past the blank ones; false at the end. */
+static bool next_text(lines *c, const char **line, size_t *n) {
+    while (next_line(c, line, n)) if (*n) return true;
+    return false;
+}
+
+bool watch_summary_read(const char *data, size_t length, summary_read *out) {
+    *out = (summary_read){0};
+    if (!length || len(data) != length || data[length - 1] != '\n') return false; /* cut short, or not text */
+    lines c = {data, data + length};
+    const char *line;
+    size_t n;
+    if (!next_text(&c, &line, &n) || !line_starts(line, n, "# Heliograph ") || n != 23) return false;
+    for (int i = 0; i < 10; i++) out->day[i] = line[13 + i];
+    uint64_t t = 0;
+    char stamp[21] = "0000-00-00T00:00:00Z";
+    for (int i = 0; i < 10; i++) stamp[i] = out->day[i];
+    if (!read_time(stamp, &t)) return false;
+    if (!next_text(&c, &line, &n) || !line_starts(line, n, "As it stood at ") || n != 15 + 20 + 1 || line[n - 1] != '.') return false;
+    for (int i = 0; i < 20; i++) out->at[i] = line[15 + i];
+    if (!read_time(out->at, &t)) return false;
+    for (int i = 0; i < 10; i++) if (out->at[i] != out->day[i]) return false; /* the header and the rows share one day */
+    lines mark = c;
+    out->format = 1;
+    if (next_text(&c, &line, &n) && line_is(line, n, "Format: 2")) out->format = 2;
+    else c = mark; /* a snapshot of the earlier writer: no format line */
+    int parts = out->format == 2 ? SUMMARY_PARTS : SUMMARY_PARTS - 1;
+    bool have_heading = false;
+    for (int i = 0; i < parts; i++) {
+        if (!have_heading && !next_text(&c, &line, &n)) return false;
+        have_heading = false;
+        char head[48] = "## ";
+        size_t h = 3;
+        for (const char *z = SUMMARY_TITLES[i]; *z; z++) head[h++] = *z;
+        head[h++] = ':', head[h++] = ' ';
+        if (!line_starts(line, n, head) || !line_count(line, n, h, "", &out->counts[i])) return false;
+        for (;;) { /* the rows of the part, to the next heading or the damage line */
+            lines before = c;
+            if (!next_line(&c, &line, &n)) break;
+            if (line_starts(line, n, "## ") && i + 1 < parts) {
+                have_heading = true;
+                break;
+            }
+            if (line_starts(line, n, "Damaged: ") && i + 1 == parts) {
+                c = before;
+                break;
+            }
+        }
+        if (i + 1 < parts && !have_heading) return false;
+    }
+    bool damage_line = next_text(&c, &line, &n);
+    if (damage_line) {
+        if (!line_starts(line, n, "Damaged: ") || !line_count(line, n, 9, ". See helio check.", &out->damaged)) return false;
+    } else if (out->format == 2) return false;
+    if (out->format == 2) {
+        if (!next_text(&c, &line, &n) || !line_is(line, n, "End of summary.")) return false;
+    }
+    return !next_text(&c, &line, &n); /* nothing after the end */
 }

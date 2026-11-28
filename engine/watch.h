@@ -63,5 +63,24 @@ bool watch_classify_job(store *s, const place *here, const message *m, const job
 bool watch_classify_session_silent(store *s, const place *here, const message *m, uint64_t since_us, uint64_t clock_now,
                                    session_cache *sc, bool *silent_out);
 
-/* Writes summary/<day>.md once a day, UTC. */
-s_result watch_summary(store *s, const place *here);
+/* The largest snapshot, for the writer and the reader alike: every held id of a full store (MOST_NAMES names at up to 32
+   bytes a line) and a megabyte for the parts that list their first 100 rows. */
+enum { MOST_SUMMARY = MOST_NAMES * 32 + (1 << 20), SUMMARY_PARTS = 8 };
+
+/* Writes summary/<day>.md once a day, UTC, when it is not there: one clock instant names the file, heads it and
+   classifies every row. day is the file's day (YYYY-MM-DD), whatever the result. S_OK when the file is there (made
+   now or by a call that was faster), S_NOTHING when a read the summary needs failed (the day is deferred and no file
+   is kept), S_DAMAGED when it cannot be written. Counts the pairs of lanes of one project whose live `working`
+   declarations share a path; posts no notice. */
+s_result watch_summary(store *s, const place *here, char day[11]);
+
+/* What a snapshot file says, read once the whole file is checked. format is 2 for a file with a Format line and 1 for
+   one of the earlier writer, which has no overlaps part (counts[7] is 0 and format says so). */
+typedef struct summary_read {
+    char day[11], at[21];
+    unsigned format, counts[SUMMARY_PARTS], damaged;
+} summary_read;
+
+/* True when data (length bytes) is a whole snapshot of either format: its header, every part with its count, and for
+   format 2 the damage line and the end line. False for a file that is cut short or not a snapshot. */
+bool watch_summary_read(const char *data, size_t length, summary_read *out);

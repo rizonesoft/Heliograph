@@ -57,7 +57,7 @@ Legend: ✅ works · 📋 planned
 | Claude Code hook | ✅ | New messages at the start of a session and with each prompt |
 | Codex and Antigravity | ✅ | They run `helio` between sections of an unattended run |
 | Due times, overlap warnings | ✅ | Shown by the inbox and by `helio working` |
-| Daily summary | ✅ | Written by the first inbox or hook of the day |
+| Daily summary | ✅ | Saved by the first call of the day; `helio summary` reads it |
 | Archive by month, expiry | ✅ | Closed jobs and seen notes move after 30 days; unseen ones stay, counted daily |
 | Silent takers, messages for one session | ✅ | `helio hello`, `silent:` reporting, and `--for-session` targeting |
 | Projects kept apart in log and show | ✅ | `may_see` scopes `log`, `show`, `answer`, and job commands to your project |
@@ -123,8 +123,11 @@ helio: it is already taken
 | `helio show <id>` | Shows one message and marks it seen |
 | `helio take`, `release`, `done`, `refuse` `<id>` | Moves a job on |
 | `helio landed <id> <commit>` | Links a commit (7 to 64 hex digits) to a job without closing it |
+| `helio summary` | The operator's command (no lane): the day's saved snapshot, every project |
 | `helio working <paths>` | Says what I touch, and warns when someone else touches it |
 | `helio log`, `check`, `help` | Your project's messages (`log --all` outside a repo: all), the store check, help |
+
+`helio summary` is the operator's: it runs with no `--as`, no `HELIO_AS` and no lane from a `helio.conf`, because the snapshot holds every project, and any lane is refused with exit 2. The first call of the UTC day saves `summary/<day>.md` before its own change, and `summary` reads that file, never a recount. `--json` gives `{"day", "at", "format", "overdue", "silent", "open", "taken", "done", "refused", "held_unseen", "overlaps", "damaged"}`; `overlaps` is the number of pairs of lanes of one project sharing a path at that moment, and `null` for a file of the earlier writer. Exit 1 with `{"day", "deferred": true}` means a read the snapshot needs failed and no file was kept, so a later call of the day writes it.
 
 Exit codes: 0 done, 1 nothing, 2 refused, 3 something failed or is damaged, and what was asked may have happened. Send with `--key` to repeat a send safely.
 

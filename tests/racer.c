@@ -18,6 +18,7 @@ extern bool plat_fail_flush;
 extern bool plat_fail_write_flush;
 extern bool plat_fail_sync;
 extern uint64_t plat_now_override;
+extern uint64_t plat_now_step;
 extern void (*plat_pause)(const char *stage);
 extern unsigned long plat_last_hold_error;
 extern size_t store_max_names;
@@ -356,6 +357,13 @@ int racer(int count, char **args) {
         if (same(args[3], "--pause-cli") || (starts(args[3], "--fail-") && len(args[3]) > 10 && same(args[3] + len(args[3]) - 4, "-cli")))
             return racer(count - 2, args + 2);
         return helio(count - 2, args + 2);
+    }
+    if (count >= 5 && same(args[1], "--now-step")) { /* --now-step <us> <step> <helio args>: a clock that moves on by step at each reading */
+        uint64_t v = 0, step = 0;
+        for (const char *p = args[2]; *p >= '0' && *p <= '9'; p++) v = v * 10 + (uint64_t)(*p - '0');
+        for (const char *p = args[3]; *p >= '0' && *p <= '9'; p++) step = step * 10 + (uint64_t)(*p - '0');
+        plat_now_override = v, plat_now_step = step;
+        return helio(count - 3, args + 3);
     }
     if (count >= 4 && same(args[1], "--max-names")) {
         size_t lim = 0;
