@@ -8158,14 +8158,24 @@ class DocsMatchProgram(Base):
         for where, signatures in named.items():
             found = {self.word_of(sig) for sig in signatures}
             self.assertEqual((where, sorted(found - expected), sorted(expected - found)), (where, [], []))
-        # whole signatures: every form one lists, the others list too (options, body and note are left out; the bare inbox is `helio`)
-        def form(sig):
-            sig = " ".join(sig.split()).replace(" [options] < body", "").replace(" < body", "").replace(" [note]", "")
-            return "helio" if sig == "helio --as <project/lane>" else sig
-        forms = {where: {form(sig) for sig in signatures} for where, signatures in named.items()}
+        # whole signatures, brackets included: every form one lists, the others list too
+        forms = {where: {" ".join(sig.split()) for sig in signatures} for where, signatures in named.items()}
         for where in forms:
             for other in forms:
                 self.assertEqual((where, other, sorted(forms[where] - forms[other])), (where, other, []))
+        # and each command's words, from the dispatcher's table: the forms cover every count of words it accepts
+        source = (ROOT / "engine/helio.c").read_text(encoding="utf-8")
+        table = {name: (int(least), int(most)) for name, least, most in re.findall(r'\{"(\w+)", (\d+), (\d+)\}', source)}
+        for where, signatures in named.items():
+            covered = {}
+            for sig in signatures:
+                bare = re.sub(r"\[--lane <lane>\]|--kind <[^>]*>|--as <[^>]*>", "", " ".join(sig.split()))
+                words = [w for w in bare.split()[1:] if w not in ("[options]", "<", "body")]
+                needed = sum(1 for w in words if not w.startswith("["))
+                counts = covered.setdefault(self.word_of(sig), set())
+                counts.update(range(needed, len(words) + 1))
+            for name, (least, most) in table.items():
+                self.assertEqual((where, name, sorted(covered.get(name, ()))), (where, name, list(range(least, most + 1))))
 
     def test_every_signature_they_show_runs(self):
         for where, signatures in (("help", self.help_signatures()), ("design", self.design_signatures()), ("README", self.readme_signatures())):
@@ -8204,12 +8214,16 @@ class DocsMatchProgram(Base):
                                stdout=full, stderr=subprocess.PIPE, timeout=60, cwd=self.store, env=env)
         self.assertEqual(r.returncode, 3, r.stderr)
         self.assertNotIn(job.encode(), r.stderr)  # no job is named
-        inbox = self.helio("--json", me="os/a").stdout
-        held = [m for m in json.loads(inbox)["messages"] if m["id"] == job]
-        self.assertEqual([(m["state"], m["taker"]) for m in held], [("taken", "os/a")])
         for text in (self.readme(), self.design()):
             self.assertIn("When its receipt could not be written", text)
-            self.assertIn("your own inbox (`helio --as <lane>`, or `log --json`)", text)
+            # the documented forms, run literally with the placeholder filled in: project of helio.conf, lane given
+            found = re.search(r"your own inbox \(`(helio --as <project/lane>)`, or `(helio log --json --as <project/lane>)`\)", text)
+            self.assertTrue(found, "the recovery forms are not written with <project/lane>")
+            inbox, log = (self.helio(*sig.replace("<project/lane>", "os/a").split()[1:], me=None) for sig in found.groups())
+            self.assertEqual(inbox.returncode, 0, inbox.stderr)
+            self.assertIn(f"{job}  ".encode(), inbox.stdout)
+            held = [m for m in json.loads(log.stdout)["messages"] if m["id"] == job]
+            self.assertEqual([(m["state"], m["taker"]) for m in held], [("taken", "os/a")])
             self.assertIn("no open job of that kind is one this caller may take", text)
             self.assertIn("the caller is `--as` or `HELIO_AS`", text)
 
@@ -8231,7 +8245,8 @@ class DocsMatchProgram(Base):
         with tempfile.TemporaryDirectory() as store, tempfile.TemporaryDirectory() as neutral:
             for command, shown in steps:
                 if command.startswith("export "):
-                    env["HELIO_STORE"] = store
+                    name, _, value = command[len("export "):].partition("=")
+                    env[name] = value.replace("~", store, 1) if value.startswith("~") else value  # as written, ~ is the test's home
                     continue
                 body = ""
                 piped = re.match(r'echo "(.*)" \| (helio .*)$', command)
@@ -8247,15 +8262,21 @@ class DocsMatchProgram(Base):
                 if len(shown) == 1 and re.fullmatch(ident, shown[0]):
                     ids[shown[0]] = actual.strip()
 
+    STATUS_SECTIONS = {"Messages and jobs": (1, 3), "One taker for each job": (1,), "Routing by path": (14,), "Claude Code hook": (9,),
+                       "Codex and Antigravity": (4,), "Due times, overlap warnings": (5,), "Daily summary": (23,),
+                       "Archive by month, expiry": (2, 12), "Silent takers, messages for one session": (5, 6),
+                       "Projects kept apart in log and show": (7,), "Mark for landed work": (8,), "Fixed marks around shown messages": (9,),
+                       "JSON, taking the next job as a queue": (10, 11, 21, 22)}
+
     def test_the_readme_status_does_not_plan_what_is_shipped(self):
+        plan = (ROOT / "todo/01-heliograph/TODO-01-heliograph.md").read_text(encoding="utf-8")
+        shipped = {int(n): done == "x" for n, done in re.findall(r"^\| \d+ \| \u00a7(\d+) \|[^|]*\|[^|]*\| \[(.)\] \|$", plan, re.M)}
         status = re.search(r"\| Area \| Status \| What you get \|\n\| --- \| :---: \| --- \|\n((?:\|.*\n)+)", self.readme()).group(1)
-        for row in status.splitlines():
-            cells = [c.strip() for c in row.strip("|").split("|")]
-            if "\U0001F4CB" in cells[1]:
-                for word in re.findall(r"`helio (\w+)", row):
-                    self.assertNotIn(word, self.dispatcher(), row)
-            if "JSON" in cells[0] or "queue" in cells[0]:
-                self.assertIn("\u2705", cells[1], row)
+        rows = [[c.strip() for c in row.strip("|").split("|")] for row in status.splitlines()]
+        self.assertEqual([r[0] for r in rows], list(self.STATUS_SECTIONS))  # a new row needs its sections named here
+        for area, mark, _ in rows:
+            done = all(shipped[n] for n in self.STATUS_SECTIONS[area])
+            self.assertEqual(mark, "\u2705" if done else "\U0001F4CB", area)
         self.send(to="os/all", subject="Json")
         self.assertIn("messages", json.loads(self.helio("log", "--json").stdout))  # JSON is real
         self.assertEqual(self.helio("take", "--kind", "request", "--lane", "a", "--json", me=None).returncode, 0)  # and so is the queue

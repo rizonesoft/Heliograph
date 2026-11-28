@@ -121,12 +121,12 @@ helio: it is already taken
 
 | Command | What it does |
 | --- | --- |
-| `helio` or `helio inbox` | Shows my inbox: new messages and open jobs |
-| `helio ask <to> <subject>` | Sends a job |
-| `helio hand <to> <subject>` | Sends work I pass on |
-| `helio tell <to> <subject>` | Sends a heads-up |
-| `helio find <to> <subject>` | Sends something I found |
-| `helio answer <id> <subject>` | Sends a reply to a message's sender |
+| `helio --as <project/lane>` or `helio inbox` | Shows my inbox: new messages and open jobs |
+| `helio ask <to> <subject> [options] < body` | Sends a job |
+| `helio hand <to> <subject> [options] < body` | Sends work I pass on |
+| `helio tell <to> <subject> [options] < body` | Sends a heads-up |
+| `helio find <to> <subject> [options] < body` | Sends something I found |
+| `helio answer <id> <subject> < body` | Sends a reply to a message's sender |
 | `helio show <id>` | Shows one message and marks it seen |
 | `helio take <id>` | Takes a job |
 | `helio take --kind <request\|handoff> [--lane <lane>]` | Takes the next open job of that kind |
@@ -154,7 +154,7 @@ A closed job (done or refused) is archived 30 days after it closed. A heads-up, 
 
 Exit codes: 0 done, 1 nothing, 2 refused, 3 something failed or is damaged.
 
-Exit 3 can follow a change that is already stored: a job step is written, then a later read or flush fails. Run `helio show <id>` to see where the job stands before you retry. A send with `--key <text>` repeats safely, because the key stands for one message. A queue call (`helio take --kind`) is not retried blind: it may already have taken a job. When its receipt could not be written (exit 3, "the output cannot be written") no job is named, but the job is held: your own inbox (`helio --as <lane>`, or `log --json`) lists the jobs your lane holds, so look there before you take more.
+Exit 3 can follow a change that is already stored: a job step is written, then a later read or flush fails. Run `helio show <id>` to see where the job stands before you retry. A send with `--key <text>` repeats safely, because the key stands for one message. A queue call (`helio take --kind`) is not retried blind: it may already have taken a job. When its receipt could not be written (exit 3, "the output cannot be written") no job is named, but the job is held: your own inbox (`helio --as <project/lane>`, or `helio log --json --as <project/lane>`) lists the jobs your lane holds, so look there before you take more. The project is the one in `helio.conf`, and the lane is the `--lane` you gave.
 
 The `--lane` form needs a repository with a `helio.conf`, because `--lane` names a lane of its project (without `--lane`, the caller is `--as` or `HELIO_AS`). `helio take --kind request --lane neon-a --json` exits 0 with the job it took, exits 1 with `null` when no open job of that kind is one this caller may take (other jobs may be open), and exits 2 when the call is refused (for example, `--lane` with no `helio.conf`).
 
