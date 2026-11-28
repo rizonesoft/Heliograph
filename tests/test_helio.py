@@ -8279,16 +8279,22 @@ class DocsMatchProgram(Base):
         # accepted only if it really is Git Bash (the WSL launcher in System32 has no cygpath).
         candidates = [Path(r"C:\Program Files\Git\bin\bash.exe"),
                       Path(os.environ.get("LOCALAPPDATA", "")) / "Programs/Git/bin/bash.exe"]
-        git = shutil.which("git")
-        if git:
-            candidates.append(Path(git).resolve().parent.parent / "bin/bash.exe")
-        if shutil.which("bash"):
-            candidates.append(Path(shutil.which("bash")))
+        for folder in os.environ.get("PATH", "").split(os.pathsep):  # every git and every bash on PATH, not the first
+            if folder:
+                candidates.append(Path(folder).parent / "bin/bash.exe")  # git.exe in Git\cmd: its bash is in Git\bin
+                candidates.append(Path(folder) / "bash.exe")
+        tried = set()
         for candidate in candidates:
-            if candidate.is_file():
+            key = str(candidate).lower()
+            if key in tried or not candidate.is_file():
+                continue
+            tried.add(key)
+            try:  # one that cannot start, or starts too slowly, is passed over for the next
                 probe = subprocess.run([str(candidate), "-c", "command -v cygpath"], capture_output=True, timeout=30)
-                if probe.returncode == 0 and probe.stdout.strip():
-                    return str(candidate)
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            if probe.returncode == 0 and probe.stdout.strip():
+                return str(candidate)
         return None
 
     def test_the_readme_walkthrough_is_a_real_run(self):
