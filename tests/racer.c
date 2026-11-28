@@ -221,6 +221,12 @@ static bool print_one_session(void *user, const session_info *info) {
     return true;
 }
 
+static bool any_taken_step(void *user, const char *name) {
+    size_t n = len(name);
+    if (n > 10 && same(name + n - 10, ".link.0000")) *(bool *)user = true;
+    return true;
+}
+
 int racer(int count, char **args) {
     if (count >= 3 && same(args[1], "--remove")) return (int)p_remove(args[2]);
     /* --terminal-loop <store> <id> <rounds> <folder>: asks whether <id> has an archived terminal copy <rounds>
@@ -644,6 +650,41 @@ int racer(int count, char **args) {
             if (got != roots[i].root || w != roots[i].win) return (int)(40 + i);
         }
         return 0;
+    }
+    /* --queue <store folder> <lane> [after-first]: a queue driver. It says it is ready, waits for <folder>/go, then runs the queue form of
+       take (helio take --kind request --lane <lane>) until the queue is empty, one job id a line on standard output
+       (the working folder holds the helio.conf); with after-first it waits until some job is taken first. Exits with the number of jobs it took, 101 when go never came, 102
+       when a call failed. */
+    if (count >= 4 && same(args[1], "--queue")) {
+        char *data = NULL;
+        size_t length = 0;
+        text go = {0}, ready = {0};
+        add(&ready, args[2]), add(&ready, "/ready."), add_number(&ready, p_tick(), 0);
+        add(&go, args[2]), add(&go, "/go");
+        if (p_write(ready.data, "x", 1, false, "r") != P_OK) return 100;
+        for (uint64_t until = p_now() + 30000000; p_read(go.data, 9, &data, &length) != P_OK;)
+            if (p_now() > until) return 101;
+        p_free(data);
+        text_free(&go);
+        text_free(&ready);
+        if (count >= 5 && same(args[4], "after-first")) { /* wait until some job has been taken, by anyone */
+            text messages = {0};
+            add(&messages, args[2]), add(&messages, "/messages");
+            for (uint64_t until = p_now() + 30000000; !messages.failed && p_now() < until;) {
+                bool taken = false;
+                p_list(messages.data, any_taken_step, &taken);
+                if (taken) break;
+            }
+            text_free(&messages);
+        }
+        char *call[] = {"helio", "take", "--kind", "request", "--lane", args[3], "--store", args[2]};
+        int took = 0;
+        for (;;) {
+            int rc = helio((int)(sizeof call / sizeof *call), call);
+            if (rc == 1) return took;
+            if (rc != 0) return 102;
+            took++;
+        }
     }
     if (count >= 2 && same(args[1], "--pause")) return run_pause(count, args);
     if (count >= 4 && same(args[1], "--pause-cli")) {

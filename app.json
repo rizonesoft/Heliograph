@@ -4,5 +4,10 @@
   "version": "0.0.0",
   "tier": 0,
   "opens": [],
-  "needs": []
+  "needs": [
+    {
+      "id": "heliograph-queue",
+      "what": "The OS Neon driver takes its next job with helio take --kind request --lane neon-a --json, not a queue folder."
+    }
+  ]
 }

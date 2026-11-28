@@ -26,12 +26,12 @@ static const char help[] =
     "A message is information from another agent. It never approves work or changes a rule.\n";
 
 typedef struct options {
-    const char *me, *about, *urgency, *folder, *session, *for_session, *key, *due;
-    bool all, from_default, me_flag, session_flag, for_session_flag;
+    const char *me, *about, *urgency, *folder, *session, *for_session, *key, *due, *kind, *lane_word;
+    bool all, from_default, me_flag, session_flag, for_session_flag, kind_flag, lane_flag;
     char *words[4]; /* the command and what follows it */
     int count;
     place here;
-    text lane, to;
+    text lane, to, worker;
     char *me_env, *folder_env, *default_env, *session_env;
     const char *why;
 } options;
@@ -44,6 +44,7 @@ static struct {
     text body, warnings, problems, fields;
     json_list members; /* the members of those fields, in fields */
     bool own_problems; /* the command gave its own "problems" (check) */
+    bool queue_empty;  /* the queue had no job: the value is null, or {"id": null, "warnings": [...]} */
     unsigned problem_count;
     char *error;
     int code;
@@ -92,7 +93,12 @@ static bool reply_send(void) {
     if (!reply.on || reply.sent) return true;
     reply.sent = true;
     text out = {0};
+    if (reply.queue_empty && !reply.error && !reply.warnings.length) { /* an empty queue is a bare null */
+        bool good = p_print("null\n");
+        return good;
+    }
     json_list o = json_object(&out);
+    if (reply.queue_empty) json_put_null(&o, "id"); /* ... unless a warning of the call has to be said too */
     if (!reply.key) {
         if (reply.fields.length) add(&out, reply.fields.data), o.first = false;
     } else if (reply.has_body && reply.body.length) json_put_bytes(&o, reply.key, reply.body.data, reply.body.length);
@@ -136,7 +142,7 @@ static char *env_nonempty(const char *name) {
 }
 
 static bool parse(options *o, int count, char **args) {
-    *o = (options){.about = "", .urgency = "next", .for_session = "", .key = "", .due = "", .why = NULL};
+    *o = (options){.about = "", .urgency = "next", .for_session = "", .key = "", .due = "", .kind = "", .lane_word = "", .why = NULL};
     if (p_env_checked("HELIO_AS", &o->me_env) == P_FAILED) return o->why = "out of memory", false;
     o->folder_env = p_env("HELIO_STORE"), o->default_env = p_env("HELIO_DEFAULT_STORE");
     if (!o->default_env || !*o->default_env) {
@@ -158,6 +164,8 @@ static bool parse(options *o, int count, char **args) {
                            : same(args[i], "--due") ? &o->due
                            : same(args[i], "--about") ? &o->about
                            : same(args[i], "--store") ? &o->folder
+                           : same(args[i], "--kind") ? &o->kind
+                           : same(args[i], "--lane") ? &o->lane_word
                            : NULL;
         if (value) {
             if (++i == count) return o->why = "an option has no value", false;
@@ -166,6 +174,8 @@ static bool parse(options *o, int count, char **args) {
             if (value == &o->me) o->me_flag = true;
             if (value == &o->session) o->session_flag = true;
             if (value == &o->for_session) o->for_session_flag = true;
+            if (value == &o->kind) o->kind_flag = true;
+            if (value == &o->lane_word) o->lane_flag = true;
         } else if (same(args[i], "--all")) o->all = true;
         else if (same(args[i], "--now")) o->urgency = "now";
         else if (same(args[i], "--whenever")) o->urgency = "whenever";
@@ -903,6 +913,96 @@ static int landed_reply(const char *folder, const char *id, const char *commit) 
     return good ? 0 : fail("the commits on the job cannot be read", 3);
 }
 
+/* The reply of a job change that succeeded: the job after the step this call wrote. */
+static void change_fields(const char *id, const job_change *changed) {
+    json_list *f = fields();
+    json_put_text(f, "id", id), json_put_text(f, "state", STATE_NAMES[changed->now.state]);
+    json_put_text(f, "taker", *changed->now.taker ? changed->now.taker : NULL);
+    json_put_text(f, "closed_by", *changed->now.closer ? changed->now.closer : NULL);
+}
+
+/* Taking the next job: the open jobs of one kind that the worker may take, most urgent first, then oldest sent. */
+typedef struct {
+    char *id;
+    unsigned rank;
+    uint64_t when;
+} candidate;
+
+typedef struct {
+    const char *kind;
+    actor me;
+    candidate *items;
+    size_t count, cap;
+    bool failed;
+} queue;
+
+static bool collect_candidate(store *s, const message *m, void *user) {
+    (void)s;
+    queue *q = user;
+    if (!same(m->kind, q->kind) || !is_for(m, q->me)) return true; /* the rules of a direct take, with the whole actor */
+    if (q->count == q->cap) {
+        size_t cap = q->cap ? q->cap * 2 : 64;
+        candidate *next = p_alloc(cap * sizeof *next);
+        if (!next) return q->failed = true, false;
+        if (q->count) memcpy(next, q->items, q->count * sizeof *next);
+        p_free(q->items);
+        q->items = next, q->cap = cap;
+    }
+    char *id = copy(m->id, len(m->id));
+    if (!id) return q->failed = true, false;
+    q->items[q->count++] = (candidate){.id = id, .rank = same(m->urgency, "now") ? 0 : same(m->urgency, "next") ? 1 : 2, .when = message_time(m)};
+    return true;
+}
+
+static bool before(const candidate *a, const candidate *b) {
+    if (a->rank != b->rank) return a->rank < b->rank;
+    if (a->when != b->when) return a->when < b->when;
+    return compare(a->id, b->id) < 0;
+}
+
+/* Claims the first job of the order that is still open. Only a lost race (the job is taken, closed or archived by
+   another) lets it try the next; damage or any other refusal stops, naming the job, and claims nothing more. */
+static int take_next(store *s, const options *o, actor me) {
+    queue q = {.kind = o->kind, .me = me};
+    size_t unreadable = every(s, collect_candidate, &q); /* a post that cannot be read cannot be told eligible */
+    int code = 1;
+    if (q.failed) code = fail("out of memory", 3);
+    for (size_t i = 1; !q.failed && i < q.count; i++) { /* insertion sort: no C library */
+        candidate c = q.items[i];
+        size_t at = i;
+        for (; at > 0 && before(&c, &q.items[at - 1]); at--) q.items[at] = q.items[at - 1];
+        q.items[at] = c;
+    }
+    for (size_t i = 0; !q.failed && i < q.count; i++) {
+        job_change changed = {0};
+        s_result r = store_take(s, q.items[i].id, me, &changed);
+        if (r == S_OK) {
+            if (reply.on) change_fields(q.items[i].id, &changed);
+            else {
+                text out = {0};
+                add(&out, q.items[i].id), add(&out, "\n");
+                code = print(&out) ? 0 : fail("the output cannot be written", 3);
+                break;
+            }
+            code = 0;
+            break;
+        }
+        bool lost = r == S_REFUSED && ((changed.has_job && changed.now.state != OPEN) || same(s->why, "it was archived") || same(s->why, "there is no such message"));
+        if (lost) continue;
+        text why = {0};
+        add(&why, s->why ? s->why : "it failed"), add(&why, ": "), add(&why, q.items[i].id);
+        code = fail(why.failed ? s->why : why.data, r);
+        text_free(&why);
+        break;
+    }
+    /* Nothing taken while a post could not be read: the queue may not be empty, so it is damage, as the inbox says. */
+    if (code == 1 && unreadable) code = fail("something here is damaged: see helio check", 3);
+    if (code == 1 && reply.on) reply.queue_empty = true;
+    for (size_t i = 0; i < q.count; i++) p_free(q.items[i].id);
+    p_free(q.items);
+    return code;
+}
+
 static int post(store *s, options *o, const char *kind, const char *to, const char *repository, const char *re) {
     char *body = NULL;
     size_t length = 0;
@@ -1141,7 +1241,7 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
     }
 
     static const struct { const char *name; int least, most; } commands[] = {
-        {"inbox", 0, 1}, {"log", 1, 1}, {"check", 1, 1}, {"show", 2, 2}, {"take", 2, 2}, {"release", 2, 2}, {"done", 2, 3},
+        {"inbox", 0, 1}, {"log", 1, 1}, {"check", 1, 1}, {"show", 2, 2}, {"take", 1, 2}, {"release", 2, 2}, {"done", 2, 3},
         {"refuse", 2, 3}, {"hook", 2, 2}, {"answer", 3, 3}, {"working", 2, 2}, {"ask", 3, 3}, {"hand", 3, 3}, {"tell", 3, 3}, {"find", 3, 3},
         {"hello", 2, 2}, {"landed", 3, 3}};
     int which = -1;
@@ -1149,6 +1249,21 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
         if (same(command, commands[i].name)) which = i;
     if (which < 0) return fail("there is no such command: see helio help", 2);
     if (o->count < commands[which].least || o->count > commands[which].most) return fail("that command needs other words: see helio help", 2);
+    bool queue = which == 4 && o->count == 1; /* take --kind <kind> [--lane <lane>]: the next job, not a named one */
+    if (queue && !o->kind_flag) return fail("take needs a job id, or --kind request or --kind handoff", 2);
+    if ((o->kind_flag || o->lane_flag) && !queue)
+        return fail(which == 4 ? "a job id cannot come with --kind or --lane" : "--kind and --lane are only for take", 2);
+    if (queue && !same(o->kind, "request") && !same(o->kind, "handoff")) return fail("--kind is request or handoff: only those are jobs", 2);
+    if (queue && o->lane_flag) {
+        /* The worker is the lane of the project of helio.conf; --lane wins over an inherited HELIO_AS, as --as does, and
+           a --as naming another lane is a conflict. */
+        if (!o->here.found || !*o->here.project) return fail("--lane needs a project: there is no helio.conf here", 2);
+        add(&o->worker, o->here.project), add(&o->worker, "/"), add(&o->worker, o->lane_word);
+        if (o->worker.failed) return fail("out of memory", 3);
+        if (!address_ok(o->worker.data, false)) return fail("--lane is not a valid lane", 2);
+        if (o->me_flag && !same(o->me, o->worker.data)) return fail("--as names another lane than --lane", 2);
+        o->me = o->worker.data;
+    }
     if (o->for_session_flag) {
         bool is_send = which == 9 || (which >= 11 && which <= 14);
         if (!is_send) return fail("--for-session is only for sending a message", 2);
@@ -1207,6 +1322,8 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
     const char *note = o->count == 3 ? o->words[2] : "";
     int code;
     s_result result;
+    if (queue) code = take_next(&s, o, me);
+    else {
     switch (which) {
     case 0: code = inbox(&s, me, &o->here, o->all); if (summary_err || daily_err) code = 3; break;
     case 1: code = whole_log(&s, (actor){.lane = o->me, .session = o->session}, &o->here, o->all); break;
@@ -1279,14 +1396,11 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
         result = which == 4 ? store_take(&s, o->words[1], me, wanted) : which == 5 ? store_release(&s, o->words[1], me, wanted)
                                                                                   : store_end(&s, o->words[1], me, which == 6, note, wanted);
         if (reply.on && changed.has_job) {
-            json_list *f = fields();
-            if (result == S_OK) { /* the job after the step this call wrote */
-                json_put_text(f, "id", o->words[1]), json_put_text(f, "state", STATE_NAMES[changed.now.state]);
-                json_put_text(f, "taker", *changed.now.taker ? changed.now.taker : NULL);
-                json_put_text(f, "closed_by", *changed.now.closer ? changed.now.closer : NULL);
-            } else json_put_text(f, "state", STATE_NAMES[changed.now.state]); /* refused: the state as it stands */
+            if (result == S_OK) change_fields(o->words[1], &changed); /* the job after the step this call wrote */
+            else json_put_text(fields(), "state", STATE_NAMES[changed.now.state]); /* refused: the state as it stands */
         }
         code = result == S_OK ? 0 : fail(s.why, result);
+    }
     }
     if (!announce_first && !announced && which != 8 && which != 15 && address_ok(o->me, false)) announce_best_effort(&s, o, "");
     store_close(&s);
@@ -1295,7 +1409,7 @@ static int run(options *o, void (*pause)(void *user, const char *stage), void *p
 
 /* True when --json is one of the call's words, not the value of an option that takes one. */
 static bool json_flag(int count, char **args) {
-    static const char *const valued[] = {"--as", "--session", "--for-session", "--key", "--due", "--about", "--store"};
+    static const char *const valued[] = {"--as", "--session", "--for-session", "--key", "--due", "--about", "--store", "--kind", "--lane"};
     for (int i = 1; i < count; i++) {
         bool takes = false;
         for (size_t k = 0; k < sizeof valued / sizeof *valued; k++) takes = takes || same(args[i], valued[k]);
@@ -1308,7 +1422,7 @@ static bool json_flag(int count, char **args) {
 /* The command word of a call, found before the words are read in full, so that a refusal while reading them already
    has the command's shape: the first word that is not an option or an option's value ("inbox" when there is none). */
 static const char *command_word(int count, char **args) {
-    static const char *const valued[] = {"--as", "--session", "--for-session", "--key", "--due", "--about", "--store"};
+    static const char *const valued[] = {"--as", "--session", "--for-session", "--key", "--due", "--about", "--store", "--kind", "--lane"};
     for (int i = 1; i < count; i++) {
         bool takes = false;
         for (size_t k = 0; k < sizeof valued / sizeof *valued; k++) takes = takes || same(args[i], valued[k]);
@@ -1350,7 +1464,7 @@ int helio_paused(int count, char **args, void (*pause)(void *user, const char *s
     reply = (typeof(reply)){0};
     archive_pauses(NULL, NULL); /* the pause belongs to this call only */
     p_free(o.me_env), p_free(o.folder_env), p_free(o.default_env), p_free(o.session_env);
-    text_free(&o.lane), text_free(&o.to), place_close(&o.here);
+    text_free(&o.lane), text_free(&o.to), text_free(&o.worker), place_close(&o.here);
     return code;
 }
 

@@ -3564,6 +3564,262 @@ class JsonChanges(JsonCalls):
         self.assertIn("no store", v["problems"][0])
 
 
+class JobQueue(JsonCalls):
+    """D01 T01 §11: take the next job as a queue (helio take --kind request --lane neon-a)."""
+
+    CLEAN = ("HELIO_AS", "HELIO_STORE", "HELIO_SESSION", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "ANTIGRAVITY_CONVERSATION_ID")
+
+    def queue(self, *words, code=0, cwd=None, session=None, extra_env=None, now=None, kind="request", lane="neon-a", json_flag=True):
+        args = ["take", "--kind", kind, "--lane", lane, *words] + (["--json"] if json_flag else []) + (["--session", session] if session else [])
+        if now:
+            return self.at(now, *args, cwd=cwd)
+        return run(self.store, *args, me=None, cwd=cwd, extra_env=extra_env)
+
+    def jobs_state(self):
+        return {str(p.relative_to(self.store)): p.read_bytes() for p in sorted((self.store / "messages").glob("*"))}
+
+    # item 1: the two forms of take
+    def test_the_driver_call_takes_a_request_and_malformed_calls_change_nothing(self):
+        job = self.sent(self.OLD, "ask", "os/neon-a", "known", "--as", "os/main")
+        before = self.jobs_state()
+        bad = (("take",), ("take", job, "--kind", "request"), ("take", job, "--lane", "neon-a"), ("take", "--kind"), ("take", "--lane"),
+               ("take", "--lane", "neon-a"), ("take", "--kind", "answer", "--lane", "neon-a"), ("take", "--kind", "headsup", "--lane", "neon-a"),
+               ("take", "--kind", "request", "--lane", "--json"), ("log", "--kind", "request"), ("inbox", "--lane", "neon-a"),
+               ("show", job, "--kind", "request"))
+        for words in bad:
+            r = run(self.store, *words, me=None)
+            self.assertEqual(r.returncode, 2, (words, r.stdout, r.stderr))
+            self.assertEqual(self.jobs_state(), before, words)
+        # a literal --json as the lane's value is the lane, not the flag: a text refusal
+        r = run(self.store, "take", "--kind", "request", "--lane", "--json", me=None)
+        self.assertEqual((r.returncode, r.stdout), (2, b""))
+        # a refusal in JSON mode is one value
+        self.assertEqual(set(self.value(run(self.store, "take", "--json", me=None), 2)), {"error", "code"})
+        # options before the verb work too, and the exact driver call takes the job
+        v = self.value(run(self.store, "--kind", "request", "--lane", "neon-a", "take", "--json", me=None), 0)
+        self.assertEqual(v, {"id": job, "state": "taken", "taker": "os/neon-a", "closed_by": None})
+
+    # item 2: the worker
+    def test_the_worker_is_the_lane_of_the_projects_helio_conf(self):
+        job = self.sent(self.OLD, "ask", "os/all", "who", "--as", "os/main")
+        before = self.jobs_state()
+        with tempfile.TemporaryDirectory() as bare_dir:
+            for case, kwargs in (("no project", {"cwd": bare_dir}), ("invalid lane", {"lane": "A/b"}), ("empty lane", {"lane": ""}), ("conflicting --as", {})):
+                args = ["take", "--kind", "request", "--lane", kwargs.get("lane", "neon-a"), "--json"] + (["--as", "os/other"] if case == "conflicting --as" else [])
+                r = subprocess.run([str(PROGRAM), *args, "--store", str(self.store)], capture_output=True, timeout=30, cwd=kwargs.get("cwd", self.store))
+                self.assertEqual(self.value(r, 2)["code"], 2, case)
+                self.assertEqual(self.jobs_state(), before, case)
+        # --lane wins over an inherited HELIO_AS
+        r = self.queue(extra_env={"HELIO_AS": "os/other"})
+        self.assertEqual(self.value(r, 0)["taker"], "os/neon-a")
+        self.assertEqual(self.shown(self.OLD + 10, job)["taker"], "os/neon-a")
+
+    # item 3: eligibility and order
+    def test_only_jobs_the_worker_may_take_are_chosen_most_urgent_then_oldest(self):
+        M = self.M
+        t = self.OLD + 70_000 * M
+        repo_a = self.store / "repo-a"
+        repo_a.mkdir()
+        put(repo_a / "helio.conf", "project: os\nrepository: repo-a\n")
+        self.assertEqual(self.helio("hello", "claude", me="os/dev1", cwd=repo_a).returncode, 0)  # so that repo-a is busy: a path job is scoped
+        ids = {}
+
+        def send(name, us, *args, cwd=None, body=b"b"):
+            r = self.at(us, *args, body=body, cwd=cwd)
+            self.assertEqual(r.returncode, 0, (name, r.stderr))
+            ids[name] = r.stdout.decode().strip()
+
+        send("A", t + 10, "ask", "os/neon-a", "A", "--as", "os/main")
+        send("B", t + 5, "ask", "os/all", "B", "--as", "os/main")
+        send("C", t + 6, "ask", "os/all", "C own broadcast", "--as", "os/neon-a")
+        send("D", t + 7, "ask", "other/neon-a", "D cross project", "--as", "other/main")
+        send("E", t + 8, "ask", "other/all", "E foreign broadcast", "--as", "other/main")
+        send("F", t + 1, "ask", "os/neon-a", "F session", "--as", "os/main", "--for-session", "sX")
+        send("G", t + 2, "ask", "path:docs/x.md", "G repository", "--as", "os/main", cwd=repo_a)
+        send("H", t + 50, "ask", "os/neon-a", "H now", "--as", "os/main", "--now")
+        send("I", t + 1, "ask", "os/neon-a", "I whenever", "--as", "os/main", "--whenever")
+        send("K", t + 40, "ask", "os/neon-a", "K newer", "--as", "os/main")
+        send("J", t + 20, "hand", "os/neon-a", "J handoff", "--as", "os/main")
+        send("T", t + 21, "tell", "os/neon-a", "T headsup", "--as", "os/main")
+        self.assertIn("repository: repo-a\n", (self.store / f"messages/{ids['G']}.post").read_text())
+        # A is taken and released by someone else's step: its send time still puts it before the newer K
+        self.ok(t + 100, "take", ids["A"], "--as", "os/neon-a"); self.ok(t + 101, "release", ids["A"], "--as", "os/neon-a")
+        by_id = {v: k for k, v in ids.items()}
+        chains = {name: sorted(p.name for p in (self.store / "messages").glob(f"{i}.link.*")) for name, i in ids.items()}
+
+        def drain(kind="request", cwd=None, session=None):
+            got = []
+            while True:
+                r = self.queue(now=t + 200 + len(got), cwd=cwd, session=session, kind=kind)
+                if r.returncode == 1:
+                    self.assertEqual((r.stdout, r.stderr), (b"null\n", b""))
+                    return got
+                got.append(by_id[self.value(r, 0)["id"]])
+
+        self.assertEqual(drain(), ["H", "B", "A", "K", "I"])
+        for name in ("C", "D", "E", "F", "G", "J", "T"):  # ineligible: chains untouched
+            self.assertEqual(sorted(p.name for p in (self.store / "messages").glob(f"{ids[name]}.link.*")), chains[name], name)
+        # what is left of the queue reveals nothing
+        self.assertEqual(self.queue(now=t + 300).stdout, b"null\n")
+        self.assertEqual(drain(kind="handoff"), ["J"])
+        self.assertEqual(drain(session="sX"), ["F"])
+        self.assertEqual(drain(cwd=repo_a), ["G"])
+
+    # item 4: which failures let the queue try the next job
+    def test_the_loser_of_a_race_takes_the_second_job_in_the_same_call(self):
+        t = self.OLD + 71_000 * self.M
+        first = self.sent(t, "ask", "os/all", "first", "--as", "os/main")
+        second = self.sent(t + 1, "ask", "os/all", "second", "--as", "os/main")
+        env = {k: v for k, v in os.environ.items() if k not in self.CLEAN}
+        proc = subprocess.Popen([str(RACER), "--pause-cli", "write", str(self.store), "take", "--kind", "request", "--lane", "loser", "--json", "--store", str(self.store)],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.store, env=env)
+        try:
+            self.wait_for_pause("write")
+            winner = self.value(self.queue(now=t + 2, lane="winner"), 0)  # the other contender takes the first job meanwhile
+            out, err = self.resume_pause("write", proc)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        self.assertEqual((proc.returncode, err), (0, b""))
+        self.assertEqual(winner["id"], first)
+        self.assertEqual(json.loads(out), {"id": second, "state": "taken", "taker": "os/loser", "closed_by": None})
+
+    def test_damage_stops_the_queue_and_leaves_the_next_job_open(self):
+        t = self.OLD + 72_000 * self.M
+        first = self.sent(t, "ask", "os/all", "damaged", "--as", "os/main")
+        second = self.sent(t + 1, "ask", "os/all", "next", "--as", "os/main")
+        put(self.store / f"messages/{first}.link.0000", "corrupt\n")
+        v = self.value(self.queue(now=t + 5), 3)
+        self.assertEqual(v["code"], 3)
+        self.assertIn(first, v["error"])
+        self.assertEqual(list((self.store / "messages").glob(f"{second}.link.*")), [])
+
+    def test_an_unreadable_post_makes_an_empty_queue_damage(self):
+        # Nothing could be taken while a post could not be read: it might be an eligible job, so the answer is 3, not 1.
+        put(self.store / "messages/1800000000000000-dead01.post", "cut short")
+        r = subprocess.run([str(PROGRAM), "take", "--kind", "request", "--json", "--as", "os/neon-a", "--store", str(self.store)],
+                           capture_output=True, timeout=30, cwd=self.store)
+        self.assertEqual((r.returncode, r.stderr), (3, b""), r.stdout)
+        self.assertEqual(json.loads(r.stdout)["code"], 3)
+        (self.store / "messages/1800000000000000-dead01.post").unlink()
+        r = subprocess.run([str(PROGRAM), "take", "--kind", "request", "--json", "--as", "os/neon-a", "--store", str(self.store)],
+                           capture_output=True, timeout=30, cwd=self.store)
+        self.assertEqual((r.returncode, r.stdout), (1, b"null\n"))
+
+    def test_a_failure_after_the_step_was_published_stops_the_queue(self):
+        t = self.OLD + 73_000 * self.M
+        first = self.sent(t, "ask", "os/all", "published", "--as", "os/main")
+        second = self.sent(t + 1, "ask", "os/all", "untouched", "--as", "os/main")
+        env = {k: v for k, v in os.environ.items() if k not in self.CLEAN}
+        proc = subprocess.Popen([str(RACER), "--pause-cli", "after-write", str(self.store), "take", "--kind", "request", "--lane", "a", "--json", "--store", str(self.store)],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.store, env=env)
+        try:
+            self.wait_for_pause("after-write")
+            put(self.store / f"messages/{first}.link.0000", "corrupt\n")
+            out, err = self.resume_pause("after-write", proc)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        self.assertEqual((proc.returncode, err), (3, b""))
+        v = json.loads(out)
+        self.assertEqual((v["code"], first in v["error"]), (3, True))
+        self.assertEqual(list((self.store / "messages").glob(f"{second}.link.*")), [])
+
+    # item 5: the reply
+    def test_the_reply_is_the_committed_step_and_the_claim_can_be_recovered(self):
+        t = self.OLD + 74_000 * self.M
+        job = self.sent(t, "ask", "os/all", "reply", "--as", "os/main")
+        env = {k: v for k, v in os.environ.items() if k not in self.CLEAN}
+        proc = subprocess.Popen([str(RACER), "--pause-cli", "after-write", str(self.store), "take", "--kind", "request", "--lane", "a", "--json", "--session", "s1", "--store", str(self.store)],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.store, env=env)
+        try:
+            self.wait_for_pause("after-write")
+            self.assertEqual(self.helio("release", job, me="os/owner").returncode, 0)  # a peer steps in
+            out, err = self.resume_pause("after-write", proc)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        v = json.loads(out)
+        self.assertEqual(v, {"id": job, "state": "taken", "taker": "os/a", "closed_by": None})  # the peer's release is not described
+        self.assertEqual(self.shown(t + 100, job, me="os/a")["state"], "open")
+        # the claiming session can take it again, and a sibling session cannot finish that take
+        v = self.value(self.queue(now=t + 101, lane="a", session="s1"), 0)
+        self.assertEqual(v["id"], job)
+        shown = self.shown(t + 102, job, me="os/a")
+        self.assertEqual({k: shown[k] for k in ("state", "taker", "closed_by")}, {k: v[k] for k in ("state", "taker", "closed_by")})
+        self.assertEqual(self.helio("done", job, "--session", "s2", me="os/a").returncode, 2)
+        self.assertEqual(self.helio("release", job, "--session", "s1", me="os/a").returncode, 0)
+        # text mode: the id and a newline
+        r = run(self.store, "take", "--kind", "request", "--lane", "a", me=None)
+        self.assertEqual((r.returncode, r.stdout), (0, job.encode() + b"\n"))
+
+    # item 6: the empty queue
+    def test_an_empty_queue_is_a_bare_null_or_an_object_with_its_warning(self):
+        r = self.queue()
+        self.assertEqual((r.returncode, r.stdout, r.stderr), (1, b"null\n", b""))
+        r = self.queue(json_flag=False)
+        self.assertEqual((r.returncode, r.stdout, r.stderr), (1, b"", b""))
+        sessions = self.store / "sessions"
+        shutil.rmtree(sessions, ignore_errors=True)
+        put(sessions, "not a folder\n")
+        try:
+            r = self.queue()
+        finally:
+            sessions.unlink()
+        v = self.value(r, 1)
+        self.assertIsNone(v["id"])
+        self.assertTrue(v["warnings"], v)
+
+    # item 7: eight drivers, from Windows and WSL, over one store
+    @unittest.skipUnless(WSL, "needs WSL")
+    def test_windows_and_linux_queue_drivers_take_each_job_once(self):
+        t = self.OLD + 75_000 * self.M
+        seeded = [self.sent(t + n, "ask", "os/all", f"job-{n}", "--as", "os/main") for n in range(100)]
+        windows = subprocess.run(["wslpath", "-w", str(self.store)], capture_output=True, text=True, check=True, timeout=30).stdout.strip()
+        drivers = [(str(BUILD / "racer.exe"), windows, f"w{n}") for n in range(4)] + [(str(RACER), str(self.store), f"l{n}") for n in range(4)]
+        # The Linux drivers are far faster: they begin once Windows has taken a job, so that both systems contend for the rest.
+        started = [subprocess.Popen([program, "--queue", folder, lane, *(["after-first"] if program == str(RACER) else [])],
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.store)
+                   for program, folder, lane in drivers]
+        try:
+            for _ in range(300):
+                if len(list(self.store.glob("ready.*"))) == len(drivers):
+                    break
+                time.sleep(0.1)
+            else:
+                self.fail(f"only {len(list(self.store.glob('ready.*')))} of {len(drivers)} drivers got ready")
+            put(self.store / "go", "x")
+            results = [p.communicate(timeout=240) + (p.returncode,) for p in started]
+        finally:
+            for p in started:
+                p.kill()
+        took = {}
+        for (program, folder, lane), (out, err, rc) in zip(drivers, results):
+            self.assertEqual(rc, len(out.split()), (lane, rc, err))
+            took[lane] = out.decode().split()
+        every = [i for ids in took.values() for i in ids]
+        self.assertEqual(sorted(every), sorted(seeded))  # each of the 100 exactly once
+        self.assertTrue(any(took[f"w{n}"] for n in range(4)), took)  # both systems took work
+        self.assertTrue(any(took[f"l{n}"] for n in range(4)), took)
+        for lane, ids in took.items():
+            for i in ids:
+                self.assertIn(f"by: os/{lane}\n", (self.store / f"messages/{i}.link.0000").read_text(), (lane, i))
+
+    def wait_for_pause(self, stage):
+        for _ in range(300):
+            if (self.store / f"paused.{stage}").exists():
+                return
+            time.sleep(0.05)
+        self.fail(f"no pause at {stage}")
+
+    def resume_pause(self, stage, proc):
+        put(self.store / f"resume.{stage}", "go")
+        out, err = proc.communicate(timeout=30)
+        for name in (f"paused.{stage}", f"resume.{stage}"):
+            (self.store / name).unlink(missing_ok=True)
+        return out, err
+
+
 class OutsideWatch:
     """Every open, listing, read, write and creation inside the watched folders, through Linux inotify: a store
     operation that followed a link out of the store shows here, whatever it then did with what it found."""
