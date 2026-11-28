@@ -821,7 +821,92 @@ static s_result archived_marks(const char *folder, const char *id, str_list *out
     return ok ? S_OK : S_DAMAGED;
 }
 
+/* The ids that have a post in the archive, listed once: a set of copies, open addressing. */
+struct archive_posts {
+    char **slots;
+    size_t cap, count;
+    bool failed;
+};
+
+static size_t post_slot(const archive_posts *a, const char *id, size_t n) {
+    uint64_t h = 14695981039346656037ull;
+    for (size_t i = 0; i < n; i++) h = (h ^ (unsigned char)id[i]) * 1099511628211ull;
+    size_t at = (size_t)(h % a->cap);
+    while (a->slots[at] && !(len(a->slots[at]) == n && starts(a->slots[at], id))) at = (at + 1) % a->cap;
+    return at;
+}
+
+static bool posts_add(archive_posts *a, const char *id, size_t n) {
+    if (a->count * 2 >= a->cap) {
+        archive_posts bigger = {.cap = a->cap ? a->cap * 2 : 1024};
+        bigger.slots = p_alloc(bigger.cap * sizeof *bigger.slots);
+        if (!bigger.slots) return a->failed = true, false;
+        for (size_t i = 0; i < a->cap; i++)
+            if (a->slots[i]) bigger.slots[post_slot(&bigger, a->slots[i], len(a->slots[i]))] = a->slots[i];
+        p_free(a->slots);
+        a->slots = bigger.slots, a->cap = bigger.cap;
+    }
+    size_t at = post_slot(a, id, n);
+    if (a->slots[at]) return true;
+    if (!(a->slots[at] = copy(id, n))) return a->failed = true, false;
+    a->count++;
+    return true;
+}
+
+static bool collect_archived_post(void *user, const char *name) {
+    size_t n = len(name);
+    if (n > 5 && same(name + n - 5, ".post")) return posts_add(user, name, n - 5);
+    return true;
+}
+
+typedef struct {
+    str_list months;
+} month_names;
+
+static bool collect_month(void *user, const char *name) {
+    month_names *m = user;
+    return list_push(&m->months, name, len(name)) || (m->months.failed = true, false);
+}
+
+s_result archive_posts_load(const char *folder, archive_posts **out) {
+    *out = NULL;
+    archive_posts *a = p_alloc(sizeof *a);
+    if (!a) return S_DAMAGED;
+    month_names mn = {0};
+    p_dir *d = NULL;
+    p_result r = arch_hold(folder, NULL, &d);
+    if (r == P_OK) {
+        r = p_dir_list(d, collect_month, &mn);
+        p_dir_close(d);
+    }
+    bool ok = (r == P_OK || r == P_MISSING) && !mn.months.failed;
+    for (size_t i = 0; ok && i < mn.months.count; i++) {
+        p_result lr = arch_list(folder, mn.months.items[i], collect_archived_post, a, NULL);
+        ok = (lr == P_OK || lr == P_MISSING) && !a->failed;
+    }
+    list_free(&mn.months);
+    if (!ok) return archive_posts_free(a), S_DAMAGED;
+    *out = a;
+    return S_OK;
+}
+
+bool archive_posts_has(const archive_posts *a, const char *id) {
+    return a->cap && a->slots[post_slot(a, id, len(id))];
+}
+
+void archive_posts_free(archive_posts *a) {
+    if (!a) return;
+    for (size_t i = 0; i < a->cap; i++) p_free(a->slots[i]);
+    p_free(a->slots);
+    p_free(a);
+}
+
 s_result archive_expiry_of(store *s, const message *m, char *const *seen_live, size_t live_count, uint64_t now, expiry *out) {
+    return archive_expiry_known(s, m, seen_live, live_count, now, NULL, out);
+}
+
+s_result archive_expiry_known(store *s, const message *m, char *const *seen_live, size_t live_count, uint64_t now,
+                              const archive_posts *known, expiry *out) {
     *out = EXPIRY_NOT_YET;
     char *const *seen = seen_live;
     size_t seen_count = live_count;
@@ -830,7 +915,7 @@ s_result archive_expiry_of(store *s, const message *m, char *const *seen_live, s
         /* When a copy of the post is in the archive, so may be some marks. A mark leaves the live store only after
            its archive copy is durable, so the live marks and then the archived ones miss none. */
         for (size_t i = 0; i < live_count; i++) list_push(&all, seen_live[i], len(seen_live[i]));
-        s_result ar = all.failed ? S_DAMAGED : archived_marks(s->folder, m->id, &all);
+        s_result ar = all.failed ? S_DAMAGED : known && !archive_posts_has(known, m->id) ? S_OK : archived_marks(s->folder, m->id, &all);
         if (ar == S_DAMAGED) {
             list_free(&all);
             s->why = "a seen mark in the archive cannot be read";

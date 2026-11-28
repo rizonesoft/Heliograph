@@ -4387,6 +4387,61 @@ class Expiry(Base):
             self.assertEqual((self.store / f"archive/{self.month(msg)}/{name}").read_bytes(), data)
         self.assertEqual(list((self.store / "messages").glob(f"{msg}.*")), [])
 
+    @unittest.skipIf(ON_WINDOWS, "counts opens through Linux inotify")
+    def test_a_message_moved_while_the_snapshot_reads_it_is_not_held(self):
+        # The archive is listed once per snapshot; a message archived after that listing, while its marks are read,
+        # is still found seen (its vanished mark sends the snapshot to the archive), never counted as held.
+        # An earlier message already in the archive, so the snapshot has an archive to list (a set without this id).
+        other = self.post_at(self.T0, "tell", "os/apps", "archived before")
+        msg = self.post_at(self.T0 + self.DAY, "tell", "os/apps", "moved mid-snapshot")
+        late = self.T0 + self.D30
+        self.assertEqual(self.at(late, "show", other, me="os/apps").returncode, 0)
+        self.assertEqual(self.at(late, "show", msg, me="os/apps").returncode, 0)
+        self.archive_at(late, 0)
+        self.assertFalse(self.live(other))
+        self.assertTrue(self.live(msg))  # 29 days old: not yet
+        first = late + self.DAY
+        for f in (self.store / "summary").glob("*"):
+            f.unlink()
+        clean = {k: v for k, v in os.environ.items() if k not in ("HELIO_AS", "HELIO_STORE", "HELIO_SESSION", "CLAUDE_CODE_SESSION_ID")}
+        stage = "summary-marks"
+        with subprocess.Popen(
+            [str(RACER), "--now", str(first), "--pause-cli", stage, str(self.store), "summary", "--json", "--store", str(self.store)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=self.store.parent, env=clean,
+        ) as proc:
+            try:
+                Archive.wait_for(self, self.store / f"paused.{stage}")
+                # The archiver runs on the next day, so it is not the first call of the snapshot's day and writes none.
+                self.archive_at(first + self.DAY, 0)
+                self.assertFalse(self.live(msg))
+                put(self.store / f"resume.{stage}", "go\n")
+                out, err = proc.communicate(timeout=60)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+        self.assertEqual((proc.returncode, err), (0, b""), out)
+        self.assertEqual(json.loads(out)["held_unseen"], 0)
+
+    def test_the_summary_does_not_look_into_the_archive_for_each_held_message(self):
+        # An archive month exists (one message was archived); 30 unseen heads-ups of that month are held. Holding the month
+        # folder for each of them is slow on a big store, most of all on Windows: the archive is listed once.
+        seen = self.post_at(self.T0, "tell", "os/apps", "seen")
+        late = self.T0 + self.D30
+        self.assertEqual(self.at(late, "show", seen, me="os/apps").returncode, 0)
+        self.archive_at(late, 0)
+        for i in range(30):
+            self.post_at(self.T0 + 1 + i, "tell", "os/apps", f"held {i}")
+        month = self.month(seen)
+        watch = OutsideWatch([self.store / "archive", self.store / "archive" / month])
+        try:
+            r = self.at(late + self.DAY, "summary", "--json")
+            found = watch.events()
+        finally:
+            watch.close()
+        self.assertEqual(json.loads(r.stdout)["held_unseen"], 30, r.stderr)
+        opens = [name for mask, name in found if int(mask, 16) & 0x20]  # IN_OPEN
+        self.assertLessEqual(len(opens), 8, opens)  # a fixed few, not one for each of the 30
+
     def test_a_post_put_back_beside_a_finished_move_is_moved_again_not_held(self):
         # A keyed retry killed after it published leaves a live post whose marks are all in the archive.
         msg = self.post_at(self.T0, "tell", "os/apps", "put back", "--key", "k-back")

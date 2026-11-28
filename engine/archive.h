@@ -59,6 +59,17 @@ s_result archive_has_terminal_job(const char *folder, const char *id, unsigned *
    listing that fails part way is S_DAMAGED and no decision. seen holds the names of its marks, already validated. */
 s_result archive_expiry_of(store *s, const message *m, char *const *seen, size_t seen_count, uint64_t now, expiry *out);
 
+/* The ids that have a post in the archive, listed once for a caller that decides many messages (the day's summary):
+   a message not in the set has no archived copy and no archived marks, so it costs no archive access. A listing that
+   fails is S_DAMAGED. */
+typedef struct archive_posts archive_posts;
+s_result archive_posts_load(const char *folder, archive_posts **out);
+bool archive_posts_has(const archive_posts *a, const char *id);
+void archive_posts_free(archive_posts *a);
+/* archive_expiry_of with that set (NULL: look in the archive for each message). */
+s_result archive_expiry_known(store *s, const message *m, char *const *seen, size_t seen_count, uint64_t now,
+                              const archive_posts *known, expiry *out);
+
 /* A finished move: a terminal archived job, or an archived post of a message that is not a job (*non_job), whose
    live post the caller found gone. S_NOTHING when nothing is archived, S_DAMAGED when the archive is. */
 s_result archive_has_closed(const char *folder, const char *id, unsigned *links_out, bool *non_job);

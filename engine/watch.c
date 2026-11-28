@@ -359,13 +359,16 @@ s_result watch_working(store *s, const place *p, const char *me, const char *pat
 /* Decides whether a heads-up, finding or answer past 30 days is held for someone who has not seen it. Its seen marks
    are the names after its post in the sorted listing; one that cannot be read or is damaged, or a sessions listing
    that fails, leaves the decision unmade (false), so the day's summary is deferred rather than frozen without it. */
-static bool summary_held(store *s, size_t post_at, const message *m, uint64_t now, bool *held) {
+static bool summary_held(store *s, size_t post_at, const message *m, uint64_t now, archive_posts **known, bool *held) {
     *held = false;
     if (archive_expiry(m, NULL, 0, NULL, 0, now) == EXPIRY_NOT_YET) return true; /* a young one is not read */
+    /* The archive is listed once for the whole snapshot, not looked into for each message. */
+    if (!*known && archive_posts_load(s->folder, known) != S_OK) return false;
     size_t id_n = len(m->id);
     char **seen = NULL;
     size_t count = 0, cap = 0;
-    bool ok = true;
+    bool ok = true, vanished = false;
+    if (s->pause) s->pause(s->pause_user, "summary-marks"); /* test pause: after the listing, before the marks are read */
     for (size_t k = post_at + 1; ok && k < s->count; k++) {
         const char *name = s->names[k];
         bool mine = true;
@@ -379,7 +382,10 @@ static bool summary_held(store *s, size_t post_at, const message *m, uint64_t no
         size_t length = 0;
         p_result r = at.failed ? P_FAILED : p_read(at.data, MOST_FILE, &data, &length);
         text_free(&at);
-        if (r == P_MISSING) continue;
+        if (r == P_MISSING) { /* listed, then gone: a mark leaves only after its archive copy is durable */
+            vanished = true;
+            continue;
+        }
         ok = r == P_OK && store_valid_seen_event(ev) && length == 5 && same(data, "seen\n");
         p_free(data);
         if (!ok) break;
@@ -397,7 +403,9 @@ static bool summary_held(store *s, size_t post_at, const message *m, uint64_t no
         seen[count++] = (char *)ev;
     }
     expiry e = EXPIRY_NOT_YET;
-    if (ok) ok = archive_expiry_of(s, m, seen, count, now, &e) == S_OK;
+    /* A mark that vanished since the listing was moved meanwhile, perhaps after the archive was listed: then the archive
+       itself is read for this message (NULL), so a move during the snapshot never turns a seen message into a held one. */
+    if (ok) ok = archive_expiry_known(s, m, seen, count, now, vanished ? NULL : *known, &e) == S_OK;
     p_free(seen);
     *held = ok && e == EXPIRY_HELD;
     return ok;
@@ -544,6 +552,7 @@ s_result watch_summary(store *s, const place *here, char day_out[11]) {
         unsigned counts[PARTS] = {0}, damaged = 0;
         session_cache sc = {0};
         bool liveness_err = false, held_err = false;
+        archive_posts *archived = NULL;
         for (size_t i = 0; i < s->count; i++) {
             size_t n = len(s->names[i]);
             if (n <= 5 || !same(s->names[i] + n - 5, ".post")) continue;
@@ -578,7 +587,7 @@ s_result watch_summary(store *s, const place *here, char day_out[11]) {
                 }
             } else {
                 bool held = false;
-                if (!summary_held(s, i, &m, now, &held)) held_err = true;
+                if (!summary_held(s, i, &m, now, &archived, &held)) held_err = true;
                 else if (held) {
                     /* Every held id is listed, the first 100 in full: there is no other place that names them. */
                     job none = {0};
@@ -590,6 +599,7 @@ s_result watch_summary(store *s, const place *here, char day_out[11]) {
             p_free(id);
         }
         sessions_cache_free(&sc);
+        archive_posts_free(archived);
         bool work_err = !summary_overlaps(s, now, &parts[OVERLAPS], &counts[OVERLAPS]);
         if (liveness_err || held_err || work_err) {
             /* Do not freeze an incomplete daily summary when session or threshold reads failed:
