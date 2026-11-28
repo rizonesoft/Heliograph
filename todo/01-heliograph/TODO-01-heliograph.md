@@ -734,6 +734,8 @@ Filed 2026-11-27 from the `D01 T01 §10` plan review (findings 4 for `archive`, 
 
 ## 23. Summary command read from the day's snapshot
 
+> **Started:** 2026-11-28T03:06:28Z
+
 Filed 2026-11-27 from the `D01 T01 §10` plan review (findings 5 for the overlap count, 6). The design lists `helio summary` and a daily overlap count (design, "How does it watch?"); `summary/<day>.md` is written by the first inbox of the day and has no overlap count.
 
 **Phase:** 3
