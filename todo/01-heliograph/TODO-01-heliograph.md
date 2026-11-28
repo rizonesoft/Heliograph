@@ -414,6 +414,8 @@ Seen heads-ups, findings and answers stay in the working store for ever. They le
 
 ## 13. Design and help that match the program
 
+> **Started:** 2026-11-28T08:50:58Z
+
 The design lists `send` where the program has `hand` and `find`, and still lists removing `tools/mail.py` as a step. Help, `README.md` and design are made to say the same.
 
 **Phase:** 3
