@@ -8089,10 +8089,10 @@ class DocsMatchProgram(Base):
     README = ROOT / "README.md"
 
     def design(self):
-        return self.DESIGN.read_text()
+        return self.DESIGN.read_text(encoding="utf-8")
 
     def readme(self):
-        return self.README.read_text()
+        return self.README.read_text(encoding="utf-8")
 
     @staticmethod
     def word_of(signature):
@@ -8100,7 +8100,7 @@ class DocsMatchProgram(Base):
         return "inbox" if not words or words[0].startswith("--") else words[0]
 
     def dispatcher(self):
-        source = (ROOT / "engine/helio.c").read_text()
+        source = (ROOT / "engine/helio.c").read_text(encoding="utf-8")
         body = source[source.index("static int run(options"):]
         return set(re.findall(r'\{"(\w+)", \d+, \d+\}', body)) | set(re.findall(r'same\(command, "(\w+)"\)', body))
 
@@ -8228,9 +8228,9 @@ class DocsMatchProgram(Base):
         self.assertEqual(self.helio("take", "--kind", "request", "--lane", "a", "--json", me=None).returncode, 0)  # and so is the queue
 
     def test_limits_settings_and_archive_rules_are_stated_as_the_program_has_them(self):
-        source = (ROOT / "engine/helio.c").read_text()
+        source = (ROOT / "engine/helio.c").read_text(encoding="utf-8")
         shown, size = (int(n) for n in re.search(r"SHOW_MESSAGES = (\d+), SHOW_BYTES = (\d+)", source).groups())
-        silent = int(re.search(r"PLACE_SILENT_DEFAULT = (\d+)", (ROOT / "engine/place.h").read_text()).group(1))
+        silent = int(re.search(r"PLACE_SILENT_DEFAULT = (\d+)", (ROOT / "engine/place.h").read_text(encoding="utf-8")).group(1))
         for where, text in (("README", self.readme()), ("design", self.design())):
             with self.subTest(where=where):
                 self.assertIn(f"{shown} messages and {size:,} bytes", text)
@@ -8265,7 +8265,7 @@ class DocsMatchProgram(Base):
                 self.assertIn("`--store", text)
                 self.assertIn("`HELIO_STORE`", text)
         self.assertNotIn("ImpossibleOS/Heliograph-signals", self.design().split("**Corrected 2026-11-28:**")[0])
-        self.assertIn("--store", (ROOT / "tools/install.py").read_text())
+        self.assertIn("--store", (ROOT / "tools/install.py").read_text(encoding="utf-8"))
 
     def test_the_design_keeps_its_historical_corrections_apart(self):
         design = self.design()
